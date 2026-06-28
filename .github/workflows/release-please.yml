@@ -1,0 +1,71 @@
+name: Release Please
+
+# Action pinning: third-party `uses:` refs are pinned to full 40-char commit
+# SHAs with a `# vX.Y.Z` comment. First-party `actions/*` remain on
+# major-version tags — GitHub controls those refs and rotates signing keys.
+#
+# Token preference: RELEASE_PLEASE_TOKEN (PAT or GitHub App installation
+# token) over the default GITHUB_TOKEN. The default token does NOT trigger
+# downstream workflows on PRs it opens (GitHub's anti-recursion safeguard),
+# so release PRs never run the required CI check and cannot auto-merge. A
+# user-scoped PAT acts like a real user, so CI fires normally.
+# Required PAT scopes: contents:write, pull-requests:write, workflows:write.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release-please:
+    name: Run release-please
+    runs-on: ubuntu-latest
+    # Root package at `.` emits un-prefixed outputs (`release_created`,
+    # `tag_name`). There is no `.--release_created` output for the root path.
+    outputs:
+      root_release_created: ${{ steps.release.outputs.release_created }}
+      root_tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  npm-publish:
+    name: Publish to npm
+    needs: release-please
+    if: ${{ needs.release-please.outputs.root_release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Publish
+        run: pnpm publish --no-git-checks --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
