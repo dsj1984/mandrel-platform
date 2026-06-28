@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.0...mandrel-platform-v0.2.1) (2026-06-28)
+
+
+### Fixed
+
+* **release:** drop install step from npm-publish job ([1104767](https://github.com/dsj1984/mandrel-platform/commit/1104767b8e81e8e80dc0e15be72ea811485efe66))
+
 ## [0.2.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.1.0...mandrel-platform-v0.2.0) (2026-06-28)
 
 
