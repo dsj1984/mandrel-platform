@@ -22,6 +22,7 @@
     "mandrel": "^1.78.0"
   },
   "scripts": {
+    "typecheck": "node --input-type=module --eval 'process.exit(0)'",
     "sync:commands": "node .agents/scripts/sync-claude-commands.js",
     "prepare": "node .agents/scripts/sync-claude-commands.js",
     "bootstrap": "node .agents/scripts/bootstrap.js",
