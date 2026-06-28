@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/dsj1984/mandrel-platform/blob/main/config/main-protection.schema.json",
+  "title": "Main Branch Protection Contract",
+  "description": "Defines the required status checks and branch protection settings for the main branch. Validated by scripts/check-required-contexts.mjs to prevent phantom-check drift.",
+  "type": "object",
+  "required": ["branch", "requiredStatusChecks"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference."
+    },
+    "branch": {
+      "type": "string",
+      "description": "The protected branch name.",
+      "default": "main"
+    },
+    "requiredStatusChecks": {
+      "type": "array",
+      "description": "The exact check context names that must pass before a PR can merge. Keep this list as short as possible — ideally one aggregator context (e.g. ci-required).",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "aggregatorJob": {
+      "type": "string",
+      "description": "The workflow job whose result is the single required branch-protection context. Must match the first entry in requiredStatusChecks."
+    },
+    "upstreamJobs": {
+      "type": "array",
+      "description": "The workflow job names that the aggregatorJob depends on. scripts/check-required-contexts.mjs validates these names exist in the workflow files.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "enforceAdmins": {
+      "type": "boolean",
+      "description": "Whether branch protection rules apply to repository administrators.",
+      "default": false
+    },
+    "requireLinearHistory": {
+      "type": "boolean",
+      "description": "Require a linear commit history (no merge commits).",
+      "default": false
+    },
+    "allowForcePushes": {
+      "type": "boolean",
+      "description": "Allow force pushes to the protected branch.",
+      "default": false
+    },
+    "allowDeletions": {
+      "type": "boolean",
+      "description": "Allow the protected branch to be deleted.",
+      "default": false
+    },
+    "_note": {
+      "type": "string",
+      "description": "Human-readable note for maintainers."
+    }
+  }
+}

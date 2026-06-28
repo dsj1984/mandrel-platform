@@ -6,10 +6,11 @@
   ],
   "aggregatorJob": "ci-required",
   "upstreamJobs": [
-    "static-analysis",
-    "security",
-    "tests-and-baselines",
-    "build"
+    "lint",
+    "typecheck",
+    "unit",
+    "contract",
+    "e2e"
   ],
   "enforceAdmins": false,
   "requireLinearHistory": false,
