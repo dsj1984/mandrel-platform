@@ -1,0 +1,277 @@
+{
+  "$schema": "../schemas/agentrc.schema.json",
+  "project": {
+    "baseBranch": "main",
+    "paths": {
+      "agentRoot": ".agents",
+      "docsRoot": "docs",
+      "tempRoot": "temp"
+    },
+    "docsContextFiles": [
+      "architecture.md",
+      "data-dictionary.md",
+      "decisions.md",
+      "patterns.md"
+    ],
+    "commands": {
+      "lintBaseline": "npx eslint . --format json",
+      "test": "npm test",
+      "typecheck": null,
+      "formatCheck": "npx biome format .",
+      "formatWrite": "npx biome format --write ."
+    }
+  },
+  "github": {
+    "owner": "[OWNER]",
+    "repo": "[REPO]",
+    "projectNumber": null,
+    "projectOwner": null,
+    "operatorHandle": "@[USERNAME]",
+    "branchProtection": {
+      "enforce": true,
+      "requiredChecks": [
+        { "name": "lint", "cmd": ["npm", "run", "lint"] },
+        { "name": "format:check", "cmd": ["npm", "run", "format:check"] },
+        { "name": "test", "cmd": ["npm", "test"] },
+        {
+          "name": "baselines",
+          "cmd": ["node", ".agents/scripts/check-baselines.js"]
+        }
+      ]
+    },
+    "mergeMethods": {
+      "allow_squash_merge": true,
+      "allow_rebase_merge": false,
+      "allow_merge_commit": false,
+      "allow_auto_merge": true,
+      "delete_branch_on_merge": true
+    },
+    "notifications": {
+      "mentionOperator": false,
+      "commentEvents": ["state-transition", "story-merged", "operator-message"],
+      "webhookEvents": [
+        "epic-started",
+        "epic-progress",
+        "epic-blocked",
+        "epic-unblocked",
+        "epic-complete"
+      ]
+    }
+  },
+  "planning": {
+    "context": {
+      "maxBytes": 50000,
+      "summaryMode": "auto"
+    },
+    "codebaseSnapshot": {
+      "tier": "skinny",
+      "include": [
+        ".agents/scripts/**",
+        "src/**",
+        "lib/**",
+        "app/**",
+        "packages/**"
+      ],
+      "exclude": [
+        "**/node_modules/**",
+        "**/dist/**",
+        "**/build/**",
+        "**/coverage/**",
+        "**/*.test.*",
+        "**/*.spec.*"
+      ],
+      "recentCommitWindow": 30
+    },
+    "riskHeuristics": [
+      "Destructive or irreversible data mutations (dropping tables, deleting rows without soft-delete or backup, truncating production state).",
+      "Modifications to shared security or auth infrastructure (IAM policies, auth middleware, session or token handling, secret rotation).",
+      "Changes to CI/CD, deployment pipelines, or release gating that could disable safety checks or ship unverified code to production.",
+      "Monorepo-wide AST or text replacements touching overlapping files in parallel (catastrophic merge-conflict risk across concurrent agents).",
+      "Schema migrations that rewrite existing rows or drop columns without a backfill or rollback plan."
+    ],
+    "taskSizing": {
+      "softFiles": 15,
+      "hardFiles": 30,
+      "maxAcceptance": 14,
+      "softAcceptanceCount": 10
+    }
+  },
+  "delivery": {
+    "execution": { "timeoutMs": 600000 },
+    "maxTokenBudget": 300000,
+    "lease": { "ttlMs": 900000 },
+    "ci": {
+      "skipForStoryPushes": true
+    },
+    "preflight": {
+      "maxStories": 50,
+      "maxWaves": 10,
+      "maxInstallCostSeconds": 600,
+      "maxGithubApiRequests": 5000,
+      "maxClaudeQuotaTokens": 2000000
+    },
+    "docsFreshness": {
+      "paths": ["README.md"]
+    },
+    "deliverRunner": {
+      "concurrencyCap": 3,
+      "progressReportIntervalSec": 120,
+      "verifyConcurrencyCap": 4
+    },
+    "worktreeIsolation": {
+      "enabled": true,
+      "root": ".worktrees",
+      "nodeModulesStrategy": "pnpm-store",
+      "primeFromPath": null,
+      "allowSymlinkOnWindows": false,
+      "reapOnSuccess": true,
+      "reapOnCancel": true,
+      "bootstrapFiles": [".env", ".mcp.json"]
+    },
+    "signals": {
+      "hotspot": { "p95Multiplier": 1.25 },
+      "rework": { "editsPerFile": 5 },
+      "retry": { "repeatCount": 3 }
+    },
+    "codeReview": {
+      "providers": [
+        { "name": "native" },
+        { "name": "security-review", "scopes": ["epic"], "optional": true },
+        {
+          "name": "ultrareview",
+          "scopes": ["epic"],
+          "manualPrompt": true,
+          "when": { "label": "risk::high" }
+        }
+      ],
+      "maxFixAttempts": 3,
+      "maxFixScopeFiles": 5
+    },
+    "quality": {
+      "gateScoping": { "scope": "diff", "diffRef": "main" },
+      "gates": {
+        "lint": {
+          "enabled": true,
+          "baselinePath": "baselines/lint.json",
+          "tolerance": { "kind": "absolute", "value": 0 },
+          "floors": { "*": { "errorCount": 0 } }
+        },
+        "coverage": {
+          "enabled": true,
+          "baselinePath": "baselines/coverage.json",
+          "tolerance": { "kind": "absolute", "value": 0 },
+          "floors": { "*": { "lines": 90, "branches": 85, "functions": 90 } },
+          "coveragePath": "coverage/coverage-final.json",
+          "timeoutMs": 600000
+        },
+        "crap": {
+          "enabled": true,
+          "baselinePath": "baselines/crap.json",
+          "tolerance": { "kind": "absolute", "value": 0.05 },
+          "floors": { "*": { "max": 30, "p95": 20, "methodsAbove20": 50 } },
+          "targetDirs": ["src"],
+          "newMethodCeiling": 30,
+          "requireCoverage": true,
+          "friction": { "markerKey": "crap-baseline-regression" },
+          "refreshTag": "baseline-refresh:",
+          "ignoreGlobs": ["**/fixtures/**", "**/*.generated.ts"]
+        },
+        "maintainability": {
+          "enabled": true,
+          "baselinePath": "baselines/maintainability.json",
+          "tolerance": { "kind": "absolute", "value": 0.5 },
+          "floors": { "*": { "min": 70, "p50": 80 } },
+          "targetDirs": ["src", "tests"],
+          "ignoreGlobs": ["**/fixtures/**", "**/*.generated.ts"]
+        },
+        "mutation": {
+          "enabled": true,
+          "baselinePath": "baselines/mutation.json",
+          "tolerance": { "kind": "percent", "value": 0 },
+          "floors": { "*": { "score": 60 } },
+          "strykerConfigPath": null
+        },
+        "lighthouse": {
+          "enabled": false,
+          "baselinePath": "baselines/lighthouse.json",
+          "tolerance": { "kind": "absolute", "value": 0 },
+          "floors": {
+            "*": {
+              "performance": 0,
+              "accessibility": 0,
+              "bestPractices": 0,
+              "seo": 0
+            }
+          },
+          "baseUrl": null,
+          "routes": []
+        },
+        "bundle-size": {
+          "enabled": false,
+          "baselinePath": "baselines/bundle-size.json",
+          "tolerance": { "kind": "percent", "value": 0 },
+          "floors": { "*": {} },
+          "bundles": []
+        },
+        "duplication": {
+          "enabled": false,
+          "baselinePath": "baselines/duplication.json",
+          "tolerance": { "kind": "absolute", "value": 1 },
+          "floors": { "*": { "percentage": 25 } },
+          "targetDirs": ["src"],
+          "refreshTimeoutMs": 60000,
+          "ignoreGlobs": ["**/fixtures/**", "**/*.generated.ts"]
+        }
+      },
+      "codingGuardrails": {
+        "cyclomaticFlag": 8,
+        "cyclomaticMustFix": 12,
+        "miDropMustRefactor": 1.5,
+        "requireSiblingTest": false
+      },
+      "autoRefresh": {
+        "enabled": true,
+        "miDropCap": 1.5,
+        "crapJumpCap": 5,
+        "scope": "diff"
+      },
+      "baselineEpsilon": {
+        "maintainability": 0.5,
+        "crap": 0.5,
+        "coverage": 0.1,
+        "mutation": 0.5,
+        "lint": 0,
+        "lighthouse": 1,
+        "bundle-size": 1024,
+        "duplication": 0.5
+      }
+    },
+    "lifecycle": {
+      "timeouts": {
+        "acceptance.reconcile": 600,
+        "epic.finalize": 600,
+        "epic.watch": 1800
+      },
+      "heartbeatWarnSeconds": 60
+    },
+    "refactorStage": {
+      "enabled": false
+    },
+    "acceptanceEval": {
+      "maxRounds": 2
+    }
+  },
+  "qa": {
+    "featureRoot": "tests/features",
+    "fixturesManifest": "tests/fixtures/personas.json",
+    "signInSeam": {
+      "skill": "stack/qa/sign-in"
+    },
+    "personas": {
+      "admin": { "credentialRef": "QA_ADMIN_CREDENTIAL" },
+      "member": { "signInSkill": "stack/qa/sign-in-member" }
+    },
+    "consoleAllowlist": ["Download the React DevTools", "[HMR]"],
+    "designTokens": "src/styles/tokens.css"
+  }
+}

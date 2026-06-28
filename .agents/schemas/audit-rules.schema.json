@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mandrel.dev/schemas/audit-rules.schema.json",
+  "title": "AuditRulesManifest",
+  "description": "Schema describing the audit-rules.json manifest read by select-audits.js and lib/audit-suite/runner.js. The manifest enumerates registered audit workflows and the triggers / substitution keys each one accepts.",
+  "type": "object",
+  "required": ["version", "audits"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Manifest schema version. Bumped when the audits[] entry shape changes."
+    },
+    "audits": {
+      "type": "object",
+      "description": "Map of audit workflow name (matching the workflow filename without extension) to its trigger configuration.",
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": { "$ref": "#/definitions/auditEntry" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "definitions": {
+    "auditEntry": {
+      "type": "object",
+      "required": ["triggers"],
+      "additionalProperties": false,
+      "properties": {
+        "triggers": { "$ref": "#/definitions/triggers" },
+        "substitutionKeys": {
+          "type": "array",
+          "description": "Substitution keys this audit accepts via run-audit-suite --substitution. Empty array means no caller-supplied keys are allowed.",
+          "items": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "triggers": {
+      "type": "object",
+      "description": "Selection criteria for whether this audit runs against a given ticket / changeset. At least one of `gates` or `alwaysRun: true` must be set for select-audits.js to ever pick the audit.",
+      "additionalProperties": false,
+      "properties": {
+        "gates": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^gate[0-9]+$" },
+          "uniqueItems": true,
+          "description": "Quality-gate identifiers (gate1..gateN) that include this audit."
+        },
+        "alwaysRun": {
+          "type": "boolean",
+          "description": "If true, the audit is always selected regardless of keyword / file-pattern matches."
+        },
+        "keywords": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "description": "Case-insensitive keywords matched against the ticket title + body."
+        },
+        "filePatterns": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "description": "Glob patterns matched against changed files in the diff."
+        }
+      }
+    }
+  }
+}

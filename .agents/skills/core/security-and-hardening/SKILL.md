@@ -1,0 +1,400 @@
+---
+name: security-and-hardening
+description:
+  Hardens code against vulnerabilities. Use when handling user input,
+  authentication, data storage, or external integrations. The non-negotiable
+  security MUSTs live in `.agents/rules/security-baseline.md`; this skill shows
+  how to apply them with code patterns, decision trees, and review checklists.
+---
+
+# Security and Hardening
+
+## Policy Capsule
+
+- The non-negotiable MUSTs live in `.agents/rules/security-baseline.md`; that rule wins on conflict. Open a PR against the rule rather than working around it in this skill.
+- Validate ALL client input (body, query, headers, path params) at the edge with a strict schema (e.g., Zod). Never trust client-side validation as a security boundary.
+- Parameterize every database query. Never concatenate user input into SQL/NoSQL filters or shell commands.
+- Hash passwords with bcrypt (≥12 rounds), scrypt, or argon2; plaintext storage is forbidden. Session cookies MUST be `httpOnly`, `secure`, and carry an explicit `sameSite`. Never put auth tokens in `localStorage`/`sessionStorage`.
+- Every protected endpoint checks **authorization**, not just authentication; verify resource ownership server-side before any state change and never trust client-asserted roles.
+- Encode HTML output via the framework's auto-escaping; sanitize any unavoidable raw HTML with a vetted library (e.g., DOMPurify). Never feed user data to `eval()`, `Function()`, or `innerHTML`/`dangerouslySetInnerHTML` unsanitized.
+- Exclude sensitive fields (password hashes, reset tokens, internal IDs) from API responses and never expose stack traces or internal error details to clients.
+- Never log PII (emails, full credit cards, session tokens, phone numbers). Destructure safe properties; don't log whole objects.
+- Configure security headers (`Content-Security-Policy`, `Strict-Transport-Security`, `X-Frame-Options`, `X-Content-Type-Options`) and restrict CORS to an explicit allowlist — wildcard `*` is forbidden on credentialed endpoints.
+- Pull all secrets from environment variables; never commit `.env`, default API keys, or fallback secrets. `.env.example` (placeholders only) is the committed shape.
+- Surface security-expanding changes (new auth flows, new PII categories, new integrations, CORS / rate-limit changes, file uploads, elevated permissions) under a "Security surface" section in the PR body and on the ticket, label `risk::high`, and link the relevant baseline MUST. This documents the surface — it does not pause execution. `agent::blocked` is only for unrecoverable runtime blockers.
+
+The non-negotiable MUSTs — input validation, authentication, authorization,
+output encoding, transport, headers, secrets, forbidden practices — live in
+[`.agents/rules/security-baseline.md`](../../../rules/security-baseline.md),
+which is the SSOT. This skill shows **how** to apply those MUSTs with code
+patterns and process guidance; read the rule for the **what**. When the rule
+and this skill diverge, the rule wins — open a PR against the rule rather
+than working around it here.
+
+## When to Use
+
+- Building anything that accepts user input
+- Implementing authentication or authorization
+- Storing or transmitting sensitive data
+- Integrating with external APIs or services
+- Adding file uploads, webhooks, or callbacks
+- Handling payment or PII data
+
+## Security Surfacing, Not Runtime Pause
+
+Some changes are not unsafe by themselves but expand the security surface
+enough that the change must be **explicitly documented** in the PR
+description and on the originating ticket so a reviewer can sign off in
+band. Documenting them is the gate — they do **not** pause execution:
+
+- Adding new authentication flows or changing auth logic
+- Storing new categories of sensitive data (PII, payment info)
+- Adding new external service integrations
+- Changing CORS configuration
+- Adding file upload handlers
+- Modifying rate limiting or throttling
+- Granting elevated permissions or roles
+
+For each item that applies, call it out under a "Security surface" section
+in the PR body and on the parent ticket, label the change `risk::high`,
+and link the relevant `security-baseline.md` MUST. Reviewers gate the
+merge; the agent keeps moving.
+
+`agent::blocked` remains the **only** runtime pause label. Use it for
+unrecoverable blockers (missing prerequisite, ambiguous spec a sub-agent
+cannot resolve), not for "this change is sensitive." Sensitive changes
+ship through the documentation path above.
+
+## OWASP Top 10 Prevention Patterns
+
+The patterns below show **how** to satisfy the MUSTs in
+[`security-baseline.md`](../../../rules/security-baseline.md). The MUSTs
+themselves (parameterize queries, hash passwords, encode output, verify
+ownership, set headers, restrict CORS, exclude sensitive fields) are listed
+in the rule.
+
+### 1. Injection (SQL, NoSQL, OS Command)
+
+See [security-baseline § Output & Rendering](../../../rules/security-baseline.md#output--rendering).
+
+```typescript
+// BAD: SQL injection via string concatenation
+const query = `SELECT * FROM users WHERE id = '${userId}'`;
+
+// GOOD: Parameterized query
+const user = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+
+// GOOD: ORM with parameterized input
+const user = await prisma.user.findUnique({ where: { id: userId } });
+```
+
+### 2. Broken Authentication
+
+See [security-baseline § Authentication](../../../rules/security-baseline.md#authentication).
+
+```typescript
+import { hash, compare } from 'bcrypt';
+
+const SALT_ROUNDS = 12;
+const hashedPassword = await hash(plaintext, SALT_ROUNDS);
+const isValid = await compare(plaintext, hashedPassword);
+
+// Session management
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET, // From environment, not code
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+    },
+  }),
+);
+```
+
+### 3. Cross-Site Scripting (XSS)
+
+See [security-baseline § Output & Rendering](../../../rules/security-baseline.md#output--rendering).
+
+```typescript
+// BAD: Rendering user input as HTML
+element.innerHTML = userInput;
+
+// GOOD: Use framework auto-escaping (React does this by default)
+return <div>{userInput}</div>;
+
+// If you MUST render HTML, sanitize first
+import DOMPurify from 'dompurify';
+const clean = DOMPurify.sanitize(userInput);
+```
+
+### 4. Broken Access Control
+
+See [security-baseline § Authorization](../../../rules/security-baseline.md#authorization).
+
+```typescript
+app.patch('/api/tasks/:id', authenticate, async (req, res) => {
+  const task = await taskService.findById(req.params.id);
+
+  if (task.ownerId !== req.user.id) {
+    return res.status(403).json({
+      error: {
+        code: 'FORBIDDEN',
+        message: 'Not authorized to modify this task',
+      },
+    });
+  }
+
+  const updated = await taskService.update(req.params.id, req.body);
+  return res.json(updated);
+});
+```
+
+### 5. Security Misconfiguration
+
+See [security-baseline § Transport & Headers](../../../rules/security-baseline.md#transport--headers).
+
+```typescript
+import helmet from 'helmet';
+app.use(helmet());
+
+app.use(
+  helmet.contentSecurityPolicy({
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'"],
+    },
+  }),
+);
+
+app.use(
+  cors({
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || 'http://localhost:3000',
+    credentials: true,
+  }),
+);
+```
+
+### 6. Sensitive Data Exposure
+
+See [security-baseline § Output & Rendering](../../../rules/security-baseline.md#output--rendering)
+and [§ Secrets Management](../../../rules/security-baseline.md#secrets-management).
+
+```typescript
+function sanitizeUser(user: UserRecord): PublicUser {
+  const { passwordHash, resetToken, ...publicFields } = user;
+  return publicFields;
+}
+
+const API_KEY = process.env.STRIPE_API_KEY;
+if (!API_KEY) throw new Error('STRIPE_API_KEY not configured');
+```
+
+## Input Validation Patterns
+
+See [security-baseline § Input Validation](../../../rules/security-baseline.md#input-validation).
+
+### Schema Validation at Boundaries
+
+```typescript
+import { z } from 'zod';
+
+const CreateTaskSchema = z.object({
+  title: z.string().min(1).max(200).trim(),
+  description: z.string().max(2000).optional(),
+  priority: z.enum(['low', 'medium', 'high']).default('medium'),
+  dueDate: z.string().datetime().optional(),
+});
+
+app.post('/api/tasks', async (req, res) => {
+  const result = CreateTaskSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(422).json({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid input',
+        details: result.error.flatten(),
+      },
+    });
+  }
+  const task = await taskService.create(result.data);
+  return res.status(201).json(task);
+});
+```
+
+### File Upload Safety
+
+```typescript
+const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+
+function validateUpload(file: UploadedFile) {
+  if (!ALLOWED_TYPES.includes(file.mimetype)) {
+    throw new ValidationError('File type not allowed');
+  }
+  if (file.size > MAX_SIZE) {
+    throw new ValidationError('File too large (max 5MB)');
+  }
+  // Don't trust the file extension — check magic bytes if critical
+}
+```
+
+## Triaging npm audit Results
+
+The MUST is in [security-baseline § Dependency Hygiene](../../../rules/security-baseline.md#dependency-hygiene).
+This decision tree shows how to prioritize:
+
+```text
+npm audit reports a vulnerability
+├── Severity: critical or high
+│   ├── Is the vulnerable code reachable in your app?
+│   │   ├── YES --> Fix immediately (update, patch, or replace the dependency)
+│   │   └── NO (dev-only dep, unused code path) --> Fix soon, but not a blocker
+│   └── Is a fix available?
+│       ├── YES --> Update to the patched version
+│       └── NO --> Check for workarounds, consider replacing the dependency, or add to allowlist with a review date
+├── Severity: moderate
+│   ├── Reachable in production? --> Fix in the next release cycle
+│   └── Dev-only? --> Fix when convenient, track in backlog
+└── Severity: low
+    └── Track and fix during regular dependency updates
+```
+
+**Key questions:**
+
+- Is the vulnerable function actually called in your code path?
+- Is the dependency a runtime dependency or dev-only?
+- Is the vulnerability exploitable given your deployment context (e.g., a
+  server-side vulnerability in a client-only app)?
+
+When you defer a fix, document the reason and set a review date.
+
+## Rate Limiting
+
+```typescript
+import rateLimit from 'express-rate-limit';
+
+// General API rate limit
+app.use(
+  '/api/',
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+  }),
+);
+
+// Stricter limit for auth endpoints (the rule MUSTs rate-limiting on auth)
+app.use(
+  '/api/auth/',
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+  }),
+);
+```
+
+## Secrets Management Layout
+
+See [security-baseline § Secrets Management](../../../rules/security-baseline.md#secrets-management).
+
+```text
+.env files:
+  ├── .env.example  → Committed (template with placeholder values)
+  ├── .env          → NOT committed (contains real secrets)
+  └── .env.local    → NOT committed (local overrides)
+
+.gitignore must include:
+  .env
+  .env.local
+  .env.*.local
+  *.pem
+  *.key
+```
+
+**Always check before committing:**
+
+```bash
+# Check for accidentally staged secrets
+git diff --cached | grep -i "password\|secret\|api_key\|token"
+```
+
+## Security Review Checklist
+
+Use this when reviewing your own change before requesting human review. Each
+item maps to a section in
+[`security-baseline.md`](../../../rules/security-baseline.md).
+
+```markdown
+### Authentication
+
+- [ ] Passwords hashed with bcrypt/scrypt/argon2 (salt rounds ≥ 12)
+- [ ] Session tokens are httpOnly, secure, sameSite
+- [ ] Login has rate limiting
+- [ ] Password reset tokens expire
+
+### Authorization
+
+- [ ] Every endpoint checks user permissions
+- [ ] Users can only access their own resources
+- [ ] Admin actions require admin role verification
+
+### Input
+
+- [ ] All user input validated at the boundary
+- [ ] SQL queries are parameterized
+- [ ] HTML output is encoded/escaped
+
+### Data
+
+- [ ] No secrets in code or version control
+- [ ] Sensitive fields excluded from API responses
+- [ ] PII encrypted at rest (if applicable)
+
+### Infrastructure
+
+- [ ] Security headers configured (CSP, HSTS, etc.)
+- [ ] CORS restricted to known origins
+- [ ] Dependencies audited for vulnerabilities
+- [ ] Error messages don't expose internals
+```
+
+## Common Rationalizations
+
+| Rationalization                                     | Reality                                                                         |
+| --------------------------------------------------- | ------------------------------------------------------------------------------- |
+| "This is an internal tool, security doesn't matter" | Internal tools get compromised. Attackers target the weakest link.              |
+| "We'll add security later"                          | Security retrofitting is 10x harder than building it in. Add it now.            |
+| "No one would try to exploit this"                  | Automated scanners will find it. Security by obscurity is not security.         |
+| "The framework handles security"                    | Frameworks provide tools, not guarantees. You still need to use them correctly. |
+| "It's just a prototype"                             | Prototypes become production. Security habits from day one.                     |
+
+## Red Flags
+
+- User input passed directly to database queries, shell commands, or HTML
+  rendering
+- Secrets in source code or commit history
+- API endpoints without authentication or authorization checks
+- Missing CORS configuration or wildcard (`*`) origins
+- No rate limiting on authentication endpoints
+- Stack traces or internal errors exposed to users
+- Dependencies with known critical vulnerabilities
+
+## Verification
+
+After implementing security-relevant code, confirm against the rule:
+
+- [ ] `npm audit` shows no critical or high vulnerabilities
+- [ ] No secrets in source code or git history
+- [ ] All user input validated at system boundaries
+- [ ] Authentication and authorization checked on every protected endpoint
+- [ ] Security headers present in response (check with browser DevTools)
+- [ ] Error responses don't expose internal details
+- [ ] Rate limiting active on auth endpoints

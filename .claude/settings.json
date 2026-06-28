@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .agents/scripts/sync-claude-commands.js"
+          }
+        ]
+      }
+    ]
+  }
+}

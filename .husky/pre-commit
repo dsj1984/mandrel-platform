@@ -1,0 +1,6 @@
+# Stabilized quality gates (Epic #1386 / Story #1401):
+# catch MI/CRAP drift at git-commit time so the agent refactors before the
+# diff is closed. quality:preview wraps both gates with --changed-since HEAD
+# --staged and exits non-zero on any threshold violation, blocking the
+# commit and rendering the per-file delta table to stderr.
+node .agents/scripts/quality-preview.js --changed-since HEAD --staged

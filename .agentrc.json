@@ -1,0 +1,22 @@
+{
+  "$schema": "./.agents/schemas/agentrc.schema.json",
+  "project": {
+    "baseBranch": "main",
+    "paths": {
+      "agentRoot": ".agents",
+      "docsRoot": "docs",
+      "tempRoot": "temp"
+    }
+  },
+  "github": {
+    "owner": "dsj1984",
+    "repo": "mandrel-platform",
+    "operatorHandle": "@dsj1984",
+    "projectNumber": 8
+  },
+  "delivery": {
+    "ci": {
+      "skipForStoryPushes": true
+    }
+  }
+}

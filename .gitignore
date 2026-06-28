@@ -1,0 +1,12 @@
+
+# Claude Code command projection is generated from .agents/workflows/ — do not commit.
+.claude/commands/
+
+# Project-scoped MCP config carries secrets — keep out of git.
+.mcp.json
+
+# Secrets live in .env (e.g. GITHUB_TOKEN) — never commit it. Only .env.example (placeholders) is checked in.
+.env
+
+# Per-clone install record written by bootstrap — not a source artifact.
+.agents/.install-manifest.json

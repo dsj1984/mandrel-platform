@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mandrel/.agents/schemas/mi-report.schema.json",
+  "title": "MaintainabilityReport",
+  "description": "Structured `--json` output envelope emitted by check-maintainability.js. Parity shape with crap-report (kernelVersion, summary, violations) minus fixGuidance — MI scores don't decompose along the two CRAP axes, so per-violation remediation guidance is intentionally absent.",
+  "type": "object",
+  "required": ["kernelVersion", "summary", "violations"],
+  "additionalProperties": false,
+  "properties": {
+    "kernelVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "MI report envelope version. Bumped when the envelope shape changes."
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "total",
+        "regressions",
+        "newFiles",
+        "improvements",
+        "scope",
+        "diffRef"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "regressions": { "type": "integer", "minimum": 0 },
+        "newFiles": { "type": "integer", "minimum": 0 },
+        "improvements": { "type": "integer", "minimum": 0 },
+        "scope": {
+          "type": "string",
+          "enum": ["diff", "full"],
+          "description": "Story #1394: which scope produced this envelope. `diff` (default) = filter scan + baseline against the resolved git ref; `full` = full-repo scan via the `--full-scope` opt-out."
+        },
+        "diffRef": {
+          "type": ["string", "null"],
+          "description": "Story #1394: the git ref the diff was scoped against (e.g. `main`, `epic/1386`), or null when `scope === 'full'`."
+        }
+      }
+    },
+    "violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "current", "baseline", "drop", "kind"],
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": "string" },
+          "current": { "type": "number" },
+          "baseline": { "type": "number" },
+          "drop": { "type": "number" },
+          "kind": { "type": "string", "enum": ["regression"] }
+        }
+      }
+    }
+  }
+}

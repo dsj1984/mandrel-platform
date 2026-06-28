@@ -1,0 +1,12 @@
+{
+  "dependencies": {
+    "mandrel": "^1.78.0"
+  },
+  "scripts": {
+    "sync:commands": "node .agents/scripts/sync-claude-commands.js",
+    "prepare": "node .agents/scripts/sync-claude-commands.js",
+    "bootstrap": "node .agents/scripts/bootstrap.js",
+    "quality:preview": "node .agents/scripts/quality-preview.js --changed-since HEAD",
+    "quality:watch": "node .agents/scripts/quality-watch.js"
+  }
+}

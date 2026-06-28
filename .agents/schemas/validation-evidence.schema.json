@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "validation-evidence",
+  "title": "Validation Evidence",
+  "description": "Per-scope record of which validation gates have passed against which commit SHA. Written by lib/validation-evidence.js under the per-Epic temp tree at temp/epic-<epicId>/validation-evidence.json (Epic-scoped) or temp/epic-<epicId>/stories/story-<storyId>/validation-evidence.json (Story-scoped). Standalone Stories (no parent Epic) use a storyId-anchored keyspace at temp/standalone/stories/story-<storyId>/validation-evidence.json. All paths are gitignored via temp/. Consumed by close-validation, epic-code-review, the acceptance self-eval critic, and /deliver Phase 3 (close-validation) to skip identical re-runs against an already-validated tree. The `storyId` field carries the scope id and equals the epic id for Epic-scoped records.",
+  "type": "object",
+  "required": ["storyId", "schemaVersion", "records"],
+  "properties": {
+    "storyId": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "GitHub Issue number of the Story this evidence file belongs to."
+    },
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Evidence-record schema version. Bumped on breaking changes to the record shape."
+    },
+    "records": {
+      "type": "array",
+      "description": "One record per gate that has passed. Each subsequent successful run replaces the prior record for that gate.",
+      "items": {
+        "type": "object",
+        "required": [
+          "gateName",
+          "commitSha",
+          "commandConfigHash",
+          "exitCode",
+          "timestamp"
+        ],
+        "properties": {
+          "gateName": {
+            "type": "string",
+            "enum": [
+              "typecheck",
+              "lint",
+              "test",
+              "format",
+              "check-maintainability",
+              "check-crap"
+            ],
+            "description": "Stable gate identifier. Closed enum — additions require a schema bump."
+          },
+          "commitSha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{7,64}$",
+            "description": "Output of `git rev-parse HEAD` at the moment the gate passed."
+          },
+          "commandConfigHash": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "description": "sha256 of the canonical JSON of { cmd, args, cwd } used to invoke the gate. Skip is gated on exact-match with the current invocation."
+          },
+          "exitCode": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Exit code recorded for the passing run. Always 0 today; reserved for future non-zero soft-pass semantics."
+          },
+          "durationMs": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Wall-clock duration of the passing run, in milliseconds. Optional."
+          },
+          "inputFingerprint": {
+            "type": ["string", "null"],
+            "description": "Optional sha256 (or other stable digest) of the byte-identical inputs the gate consumed. When present, shouldSkip() will match on this even if the commit SHA has moved — letting docs-only or whitespace-only commits skip an unchanged gate."
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO-8601 timestamp recorded when the gate passed."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
