@@ -1,0 +1,44 @@
+# Shared setup-toolchain composite action (Story #3).
+#
+# Installs pnpm (version read from the repo's packageManager field), Node.js
+# (version read from .nvmrc), and project dependencies via
+# `pnpm install --frozen-lockfile`.
+#
+# Usage:
+#   - name: Setup toolchain
+#     uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
+#     with:
+#       cache: 'true'   # set 'false' on self-hosted runners with a warm store
+#
+# SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
+name: Setup Toolchain
+description: >
+  Install pnpm (from packageManager field), Node.js (from .nvmrc), and
+  project dependencies. Pass cache: 'false' on self-hosted runners that
+  maintain their own warm pnpm store.
+
+inputs:
+  cache:
+    description: >
+      Enable pnpm store caching via actions/setup-node. Set to 'false' on
+      self-hosted runners that maintain their own warm pnpm store.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Setup pnpm
+      uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      with:
+        run_install: false
+
+    - name: Setup Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version-file: .nvmrc
+        cache: ${{ inputs.cache == 'true' && 'pnpm' || '' }}
+
+    - name: Install dependencies
+      shell: bash
+      run: pnpm install --frozen-lockfile
