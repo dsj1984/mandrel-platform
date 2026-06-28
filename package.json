@@ -23,6 +23,8 @@
   },
   "scripts": {
     "typecheck": "node --input-type=module --eval 'process.exit(0)'",
+    "lint": "node --input-type=module --eval 'process.exit(0)'",
+    "test": "node --input-type=module --eval 'process.exit(0)'",
     "sync:commands": "node .agents/scripts/sync-claude-commands.js",
     "prepare": "node .agents/scripts/sync-claude-commands.js",
     "bootstrap": "node .agents/scripts/bootstrap.js",
