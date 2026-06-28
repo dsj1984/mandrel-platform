@@ -1,0 +1,5 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Alias — the canonical preset lives at default.json (repo root). Consumers use: github>dsj1984/mandrel-platform.",
+  "extends": ["github>dsj1984/mandrel-platform"]
+}
