@@ -15,6 +15,7 @@
   },
   "files": [
     "config/",
+    "default.json",
     "scripts/",
     "templates/"
   ],
