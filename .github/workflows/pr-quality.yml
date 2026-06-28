@@ -1,0 +1,337 @@
+# Shared PR-quality reusable workflow (Story #4).
+#
+# Consumable as a `workflow_call` target by any consumer repo. Tiers:
+#   lint + format-check → typecheck → unit → contract → e2e/smoke
+#
+# Each tier is independently enable-toggled via inputs so repos can opt out of
+# tiers they haven't built yet. The aggregator job (`ci-required`) is the only
+# required branch-protection context consumers need to register.
+#
+# Sharding: jobs that support parallelism accept a `shards` input. When
+# shards > 1, configure the matrix at the call site by passing a JSON-encoded
+# shard index array via the `shard-matrix` input (e.g. "[1,2,3]" for 3 shards).
+# When shards == 1 (default), `shard-matrix` defaults to "[1]".
+#
+# SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
+# setup-toolchain composite pinned to the commit that introduced it (Story #3):
+#   dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+name: PR Quality
+
+on:
+  workflow_call:
+    inputs:
+      # Runner label — e.g. 'ubuntu-latest', or '["self-hosted","domio-runner"]'
+      runner:
+        description: >
+          Runs-on label for all jobs. Single string (e.g. 'ubuntu-latest') or a
+          JSON-encoded label array string (e.g. '["self-hosted","domio-runner"]').
+          Defaults to ubuntu-latest.
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+
+      # Shard count for jobs that support parallelism (unit, contract, e2e/smoke).
+      shards:
+        description: >
+          Number of parallel shards to split the test suite across. Defaults to 1
+          (no sharding). When > 1, also set shard-matrix to the matching index
+          array (e.g. "[1,2,3]" for shards: 3).
+        required: false
+        type: number
+        default: 1
+
+      # JSON-encoded shard index array, e.g. "[1]" or "[1,2,3]".
+      # Must match `shards`. Defaults to "[1]" (single shard, no parallelism).
+      shard-matrix:
+        description: >
+          JSON-encoded array of shard indices that drives the matrix strategy for
+          test jobs. Must agree with `shards` (e.g. shards:3 → shard-matrix:"[1,2,3]").
+          Defaults to "[1]".
+        required: false
+        type: string
+        default: '[1]'
+
+      # Per-tier enable toggles.
+      enable-lint:
+        description: 'Enable the lint + format-check tier.'
+        required: false
+        type: boolean
+        default: true
+
+      enable-typecheck:
+        description: 'Enable the typecheck tier.'
+        required: false
+        type: boolean
+        default: true
+
+      enable-unit:
+        description: 'Enable the unit-test tier.'
+        required: false
+        type: boolean
+        default: true
+
+      enable-contract:
+        description: 'Enable the contract-test tier.'
+        required: false
+        type: boolean
+        default: true
+
+      enable-e2e:
+        description: 'Enable the e2e / smoke tier (Playwright).'
+        required: false
+        type: boolean
+        default: true
+
+      # Cache toggle for the setup-toolchain composite action.
+      toolchain-cache:
+        description: >
+          Passed through to setup-toolchain's `cache` input. Set to 'false' on
+          self-hosted runners that maintain their own warm pnpm store.
+        required: false
+        type: string
+        default: 'true'
+
+    secrets:
+      # Turbo remote cache credentials (athportal pattern — §5 of initial-roadmap.md).
+      TURBO_TOKEN:
+        description: 'Turbo remote cache read/write token.'
+        required: false
+      TURBO_TEAM:
+        description: 'Turbo team slug for remote cache scoping.'
+        required: false
+
+# Permissions: callers inherit the calling workflow's token permissions.
+# We declare the minimum needed here; callers may narrow further.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so stale PR pushes don't queue up.
+concurrency:
+  group: pr-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Tier 1: Lint + format-check ───────────────────────────────────────────
+  lint:
+    name: Lint & format
+    if: ${{ inputs.enable-lint }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        with:
+          cache: ${{ inputs.toolchain-cache }}
+
+      - name: Lint
+        run: pnpm run lint
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      - name: Format check
+        run: pnpm run format:check
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+  # ── Tier 2: Typecheck ─────────────────────────────────────────────────────
+  typecheck:
+    name: Typecheck
+    if: ${{ inputs.enable-typecheck }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        with:
+          cache: ${{ inputs.toolchain-cache }}
+
+      - name: Typecheck
+        run: pnpm run typecheck
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+  # ── Tier 3: Unit tests ────────────────────────────────────────────────────
+  unit:
+    name: Unit (${{ matrix.shard }}/${{ inputs.shards }})
+    if: ${{ inputs.enable-unit }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(inputs.shard-matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        with:
+          cache: ${{ inputs.toolchain-cache }}
+
+      - name: Unit tests (shard ${{ matrix.shard }}/${{ inputs.shards }})
+        run: pnpm run test:unit --shard=${{ matrix.shard }}/${{ inputs.shards }}
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-results-${{ matrix.shard }}
+          path: |
+            **/test-results/
+            **/coverage/
+          retention-days: 7
+
+  # ── Tier 4: Contract tests ────────────────────────────────────────────────
+  contract:
+    name: Contract (${{ matrix.shard }}/${{ inputs.shards }})
+    if: ${{ inputs.enable-contract }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(inputs.shard-matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        with:
+          cache: ${{ inputs.toolchain-cache }}
+
+      - name: Contract tests (shard ${{ matrix.shard }}/${{ inputs.shards }})
+        run: pnpm run test:contract --shard=${{ matrix.shard }}/${{ inputs.shards }}
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      - name: Upload contract results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: contract-results-${{ matrix.shard }}
+          path: '**/test-results/'
+          retention-days: 7
+
+  # ── Tier 5: E2E / Smoke (Playwright) ─────────────────────────────────────
+  e2e:
+    name: E2E / Smoke (${{ matrix.shard }}/${{ inputs.shards }})
+    if: ${{ inputs.enable-e2e }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(inputs.shard-matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        with:
+          cache: ${{ inputs.toolchain-cache }}
+
+      - name: Resolve Playwright version
+        id: pw-version
+        shell: bash
+        run: |
+          PW_VERSION=$(node -e "const p=require('./node_modules/@playwright/test/package.json');console.log(p.version)")
+          echo "version=${PW_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps
+
+      - name: Install browser OS dependencies (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps
+
+      - name: E2E / Smoke (shard ${{ matrix.shard }}/${{ inputs.shards }})
+        run: pnpm run test:e2e --shard=${{ matrix.shard }}/${{ inputs.shards }}
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          path: |
+            **/playwright-report/
+            **/test-results/
+          retention-days: 14
+
+  # ── Aggregator: single required branch-protection context ─────────────────
+  #
+  # `ci-required` is the ONLY context consumers should register in their
+  # branch-protection ruleset. It passes when every enabled tier succeeds (or
+  # is skipped via its enable toggle). This pattern eliminates required-check-
+  # name drift — the job name is defined exactly once here.
+  ci-required:
+    name: ci-required
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - lint
+      - typecheck
+      - unit
+      - contract
+      - e2e
+    steps:
+      - name: Check all tier results
+        shell: bash
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TYPECHECK_RESULT: ${{ needs.typecheck.result }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: |
+          failed=()
+          for tier_result in \
+            "lint:${LINT_RESULT}" \
+            "typecheck:${TYPECHECK_RESULT}" \
+            "unit:${UNIT_RESULT}" \
+            "contract:${CONTRACT_RESULT}" \
+            "e2e:${E2E_RESULT}"; do
+            tier="${tier_result%%:*}"
+            result="${tier_result##*:}"
+            if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
+              failed+=("${tier}(${result})")
+            fi
+          done
+
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "❌ Failed tiers: ${failed[*]}" >&2
+            exit 1
+          fi
+
+          echo "✅ All enabled tiers passed."
