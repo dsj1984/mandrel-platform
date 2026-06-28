@@ -645,7 +645,7 @@ Two independent tracks. The consumer track (H1/H2) is every repo's High-severity
 
 ### 7.4 Wave B — Converge runtime, tooling & dependency placement
 
-- [ ] **C1 — Converge onto the shared baseline** · domio [#1534](https://github.com/dsj1984/domio/issues/1534), athportal [#2005](https://github.com/dsj1984/athportal/issues/2005), swarm-os [#111](https://github.com/Beestera/swarm-os/issues/111) · `blocked_by` H1+H2 (same repo) · **M** (domio), **S** (others).
+- [x] **C1 — Converge onto the shared baseline** · domio [#1534](https://github.com/dsj1984/domio/issues/1534), athportal [#2005](https://github.com/dsj1984/athportal/issues/2005), swarm-os [#111](https://github.com/Beestera/swarm-os/issues/111) · `blocked_by` H1+H2 (same repo) · **M** (domio), **S** (others).
   - Pin Node to one exact 24.x in `.nvmrc`+`engines`; add `.npmrc engine-strict=true`; resolve CI Node via `node-version-file:.nvmrc`. domio migrate 22→24 + replace 6× `node-version:"22"` (`ci-pr.yml:210`).
   - domio → pnpm 11.5.2; move 26-entry overrides `package.json#pnpm`→`pnpm-workspace.yaml`; swarm-os tighten Turbo floor `^2.3.3`→`^2.9.16`.
   - Adopt the stricter CVE gate (block all unsuppressed High/Crit + dated allowlist); domio port `audit-check.mjs` off `audit-fixable-gate.mjs`.
@@ -680,9 +680,9 @@ Two independent tracks. The consumer track (H1/H2) is every repo's High-severity
 All 27 Stories exist (§7.1) and carry native `blocked_by` edges. Tick each as it is **delivered**; brackets are sequential, items within a bracket parallelize.
 
 1. [x] **`mandrel-platform` (#8):** MP-1 (#2) → MP-2 (#3) → {MP-3 #4, MP-4 #5, MP-5 #6, MP-6 #7, MP-7 #8, MP-9 #10} → MP-8 (#9). **Cut a release (SHA tag) before any consumer Wave C/D.**
-2. [ ] **domio (#4):** H1 (#1532) + H2 (#1533) → C1 (#1534).
-3. [ ] **athportal (#6):** H1 (#2003) + H2 (#2004) → C1 (#2005).
-4. [ ] **swarm-os (#1):** H1 (#109) + H2 (#110) → C1 (#111).
+2. [x] **domio (#4):** H1 (#1532) + H2 (#1533) → C1 (#1534).
+3. [x] **athportal (#6):** H1 (#2003) + H2 (#2004) → C1 (#2005).
+4. [x] **swarm-os (#1):** H1 (#109) + H2 (#110) → C1 (#111).
 5. [ ] After `mandrel-platform` #3/#4 released **and** a repo's C1 delivered → X1 (domio #1535, athportal #2006, swarm-os #112).
 6. [ ] After `mandrel-platform` #5/#7/#8/#9/#10 released **and** a repo's X1 delivered → X2 (domio #1536, athportal #2007, swarm-os #113).
 7. [ ] After a repo's X2 delivered → F1 (domio #1537, athportal #2008, swarm-os #114).
