@@ -1,0 +1,19 @@
+{
+  "$schema": "../../config/main-protection.schema.json",
+  "branch": "main",
+  "requiredStatusChecks": [
+    "ci-required"
+  ],
+  "aggregatorJob": "ci-required",
+  "upstreamJobs": [
+    "static-analysis",
+    "security",
+    "tests-and-baselines",
+    "build"
+  ],
+  "enforceAdmins": false,
+  "requireLinearHistory": false,
+  "allowForcePushes": false,
+  "allowDeletions": false,
+  "_note": "Consumer projects copy this file to their own docs/runbooks/ and adjust upstreamJobs to match their CI workflow job names. Do not add individual upstream job names to requiredStatusChecks — only the aggregator name is stable."
+}
