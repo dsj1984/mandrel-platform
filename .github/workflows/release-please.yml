@@ -62,9 +62,6 @@ jobs:
           node-version-file: .nvmrc
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile --ignore-scripts
-
       - name: Publish
         run: pnpm publish --no-git-checks --access public
         env:
