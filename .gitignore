@@ -1,4 +1,10 @@
 
+# Installed dependencies — restored from package-lock.json, never committed.
+node_modules/
+
+# Workspace scratch dir (CLAUDE.md §6) — transient outputs, excluded from Git.
+temp/
+
 # Claude Code command projection is generated from .agents/workflows/ — do not commit.
 .claude/commands/
 
@@ -7,6 +13,10 @@
 
 # Secrets live in .env (e.g. GITHUB_TOKEN) — never commit it. Only .env.example (placeholders) is checked in.
 .env
+
+# Per-developer local overrides (CLAUDE.md §1.E) — personal prefs, never committed.
+.agentrc.local.json
+.agents/instructions.local.md
 
 # Per-clone install record written by bootstrap — not a source artifact.
 .agents/.install-manifest.json
