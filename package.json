@@ -1,4 +1,23 @@
 {
+  "name": "mandrel-platform",
+  "version": "0.1.0",
+  "description": "Shared CI/deploy workflows, composite toolchain action, npm config package, Renovate preset, and operator runbook templates.",
+  "license": "MIT",
+  "packageManager": "pnpm@11.5.2",
+  "engines": {
+    "node": "24.16.0",
+    "pnpm": ">=11.5.2"
+  },
+  "exports": {
+    "./tsconfig.base.json": "./config/tsconfig.base.json",
+    "./biome.base.json": "./config/biome.base.json",
+    "./scripts/*": "./scripts/*"
+  },
+  "files": [
+    "config/",
+    "scripts/",
+    "templates/"
+  ],
   "dependencies": {
     "mandrel": "^1.78.0"
   },
