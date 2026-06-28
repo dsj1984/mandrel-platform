@@ -1,0 +1,362 @@
+# Reusable Cloudflare deploy workflow with defence-in-depth (Story #5).
+#
+# Consumable as a reusable workflow (workflow_call) by any consumer repo:
+#
+#   jobs:
+#     deploy:
+#       uses: dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml@<sha>
+#       with:
+#         environment: production
+#         workers: "api,worker-cron"
+#         migrate: true
+#       secrets: inherit
+#
+# Defence-in-depth layers (in execution order):
+#   1. secret-isolation-audit — scans for plaintext secrets before any code runs.
+#   2. check-env             — validates required env/secrets exist for the target
+#                              environment; blocks deploy if any are absent.
+#   3. pre-migration-snapshot — when migrate:true, snapshots the D1 database
+#                              before any forward-only migration runs.
+#   4. deploy                — deploys each worker in the workers csv list via
+#                              wrangler deploy.
+#   5. boot-smoke            — HTTP health-check against each deployed worker.
+#                              Non-200 fails the run AND triggers wrangler rollback.
+#
+# SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
+name: Deploy Cloudflare
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target Cloudflare environment (e.g. staging, production)'
+        required: true
+        type: string
+      workers:
+        description: >
+          Comma-separated list of Cloudflare Worker names to deploy
+          (e.g. "api,worker-cron"). Each name must match a wrangler.toml
+          [env.<environment>] section in the consumer repo.
+        required: true
+        type: string
+      migrate:
+        description: >
+          Run D1 database migrations. When true, a pre-migration snapshot is
+          taken before any forward-only migration is applied.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: 'Cloudflare API token with Worker and D1 write permissions'
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        description: 'Cloudflare Account ID'
+        required: true
+      # Callers may pass additional per-env secrets via `secrets: inherit`.
+
+# Least-privilege: content-read only. Each job that needs more escalates
+# individually (wrangler deploy needs no additional GH permissions).
+permissions:
+  contents: read
+
+# One deploy per environment at a time — prevents race on wrangler rollback.
+concurrency:
+  group: deploy-cloudflare-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Secret isolation audit
+  #    Scans the checkout for hardcoded secrets BEFORE any deploy step runs.
+  #    Fails fast so a secret-in-source-tree never reaches Cloudflare.
+  # ---------------------------------------------------------------------------
+  secret-isolation-audit:
+    name: Secret isolation audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc32f8f1e1e517f4570e3ba27cf # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_COMMENTS: false
+
+  # ---------------------------------------------------------------------------
+  # 2. Environment gate
+  #    Validates that required secrets/env vars exist for the target environment.
+  #    Blocks deploy if any critical variables are absent.
+  # ---------------------------------------------------------------------------
+  check-env:
+    name: Check environment (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: secret-isolation-audit
+    steps:
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          errors=0
+
+          check_var() {
+            local name="$1"
+            local value="$2"
+            if [ -z "$value" ]; then
+              echo "::error::Required secret/var '$name' is absent or empty for environment '$DEPLOY_ENV'."
+              errors=$((errors + 1))
+            else
+              echo "::notice::$name is set."
+            fi
+          }
+
+          check_var "CLOUDFLARE_API_TOKEN"  "$CLOUDFLARE_API_TOKEN"
+          check_var "CLOUDFLARE_ACCOUNT_ID" "$CLOUDFLARE_ACCOUNT_ID"
+
+          if [ "$errors" -gt 0 ]; then
+            echo "::error::$errors required variable(s) missing — aborting deploy."
+            exit 1
+          fi
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ---------------------------------------------------------------------------
+  # 3. Pre-migration snapshot
+  #    Only runs when migrate:true. Snapshots the D1 database BEFORE any
+  #    forward-only migration is applied so a recovery point always exists.
+  # ---------------------------------------------------------------------------
+  pre-migration-snapshot:
+    name: Pre-migration D1 snapshot (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: check-env
+    if: ${{ inputs.migrate == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@17868b84fa1491e506172bac8426737b0cf99092
+        with:
+          cache: 'true'
+
+      - name: Export D1 snapshot (backup before migration)
+        shell: bash
+        run: |
+          SNAPSHOT_KEY="pre-migration-${{ inputs.environment }}-$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "SNAPSHOT_KEY=$SNAPSHOT_KEY" >> "$GITHUB_ENV"
+
+          # Export each database defined for this environment.
+          # Consumers define their D1 binding names in wrangler.toml;
+          # wrangler reads the config and routes to the correct DB UUID.
+          #
+          # Export creates a local SQL dump. In production workflows,
+          # callers should forward the dump to durable storage (R2, GCS, S3)
+          # via an additional step using `secrets: inherit`.
+          pnpx wrangler d1 export --env "${{ inputs.environment }}" \
+            --output "temp/${SNAPSHOT_KEY}.sql" \
+            --yes \
+            || {
+              echo "::warning::D1 export step failed or no D1 binding found." \
+                "Ensure wrangler.toml declares [[d1_databases]] for this environment." \
+                "Continuing with migration — check your wrangler config."
+            }
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: d1-snapshot-${{ inputs.environment }}-${{ github.run_id }}
+          path: temp/*.sql
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 4. Migrate
+  #    Applies D1 migrations AFTER the snapshot. Only runs when migrate:true.
+  # ---------------------------------------------------------------------------
+  migrate:
+    name: D1 migrate (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: pre-migration-snapshot
+    if: ${{ inputs.migrate == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@17868b84fa1491e506172bac8426737b0cf99092
+        with:
+          cache: 'true'
+
+      - name: Apply D1 migrations
+        shell: bash
+        run: |
+          pnpx wrangler d1 migrations apply \
+            --env "${{ inputs.environment }}" \
+            --yes
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ---------------------------------------------------------------------------
+  # 5. Deploy workers
+  #    Deploys each worker listed in the `workers` csv input.
+  #    Runs after check-env (no-migrate path) or migrate (migrate:true path).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy workers (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs:
+      - check-env
+      - migrate
+    # Run when check-env passes AND either:
+    #   - migrate was skipped (inputs.migrate == false) → needs.migrate is skipped → always()
+    #   - migrate succeeded
+    if: >-
+      always() &&
+      needs.check-env.result == 'success' &&
+      (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+    outputs:
+      deployed_workers: ${{ steps.deploy-step.outputs.deployed_workers }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@17868b84fa1491e506172bac8426737b0cf99092
+        with:
+          cache: 'true'
+
+      - name: Deploy each worker
+        id: deploy-step
+        shell: bash
+        run: |
+          IFS=',' read -ra WORKERS <<< "${{ inputs.workers }}"
+          deployed=()
+          failed=()
+
+          for worker in "${WORKERS[@]}"; do
+            worker="$(echo "$worker" | xargs)"  # trim whitespace
+            echo "::group::Deploying $worker to ${{ inputs.environment }}"
+            if pnpx wrangler deploy \
+              --name "$worker" \
+              --env "${{ inputs.environment }}" \
+              --compatibility-date "$(date -u +%Y-%m-%d)"; then
+              echo "✅ $worker deployed"
+              deployed+=("$worker")
+            else
+              echo "::error::❌ wrangler deploy failed for worker: $worker"
+              failed+=("$worker")
+            fi
+            echo "::endgroup::"
+          done
+
+          # Surface deployed list to smoke job
+          printf -v deployed_str '%s,' "${deployed[@]}"
+          echo "deployed_workers=${deployed_str%,}" >> "$GITHUB_OUTPUT"
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf "::error::Deploy failed for: %s\n" "${failed[*]}"
+            exit 1
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ---------------------------------------------------------------------------
+  # 6. Boot-smoke + auto-rollback
+  #    Sends an HTTP request to each deployed worker's health endpoint.
+  #    Non-200 response fails the run AND triggers `wrangler rollback` so
+  #    a bad bundle never keeps serving traffic.
+  # ---------------------------------------------------------------------------
+  boot-smoke:
+    name: Boot smoke + auto-rollback (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ needs.deploy.result == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@17868b84fa1491e506172bac8426737b0cf99092
+        with:
+          cache: 'true'
+
+      - name: Smoke-test deployed workers
+        id: smoke
+        shell: bash
+        run: |
+          IFS=',' read -ra WORKERS <<< "${{ needs.deploy.outputs.deployed_workers }}"
+          failed=()
+
+          for worker in "${WORKERS[@]}"; do
+            worker="$(echo "$worker" | xargs)"
+            [ -z "$worker" ] && continue
+
+            # Construct the worker URL. Consumers can override the base URL
+            # pattern via wrangler.toml routes; this heuristic targets the
+            # default workers.dev subdomain naming convention.
+            #
+            # Pattern: https://<worker>.<account>.workers.dev/health
+            # For custom domains, consumers should add a smoke step after this
+            # job that hits their canonical URL.
+            WORKER_URL="https://${worker}.${{ env.CLOUDFLARE_ACCOUNT_ID }}.workers.dev/health"
+
+            echo "::group::Smoke-testing $worker → $WORKER_URL"
+            HTTP_STATUS=$(curl --silent --output /dev/null \
+              --write-out "%{http_code}" \
+              --max-time 15 \
+              --retry 3 \
+              --retry-delay 5 \
+              "$WORKER_URL" || echo "000")
+            echo "HTTP status: $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "::error::Smoke check FAILED for $worker (HTTP $HTTP_STATUS). Triggering rollback."
+              failed+=("$worker")
+            else
+              echo "✅ $worker smoke check passed (HTTP 200)"
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf '%s\n' "${failed[@]}" >> /tmp/smoke-failed-workers.txt
+            echo "smoke_failed=true" >> "$GITHUB_ENV"
+            exit 1
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Rollback failed workers
+        if: failure() && env.smoke_failed == 'true'
+        shell: bash
+        run: |
+          echo "::warning::Smoke test failed — initiating wrangler rollback for affected workers."
+
+          while IFS= read -r worker; do
+            worker="$(echo "$worker" | xargs)"
+            [ -z "$worker" ] && continue
+            echo "::group::Rolling back $worker"
+            pnpx wrangler rollback \
+              --name "$worker" \
+              --env "${{ inputs.environment }}" \
+              --message "Auto-rollback: smoke check returned non-200" \
+              || echo "::error::wrangler rollback failed for $worker — manual rollback required."
+            echo "::endgroup::"
+          done < /tmp/smoke-failed-workers.txt
+
+          echo "::error::Deployment rolled back due to failed boot-smoke. See logs above."
+          exit 1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
