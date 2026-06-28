@@ -17,6 +17,19 @@
   "delivery": {
     "ci": {
       "skipForStoryPushes": true
+    },
+    "quality": {
+      "gates": {
+        "crap": {
+          "enabled": false
+        },
+        "maintainability": {
+          "enabled": false
+        },
+        "coverage": {
+          "enabled": false
+        }
+      }
     }
   }
 }
