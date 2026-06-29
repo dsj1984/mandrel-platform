@@ -656,9 +656,10 @@ Two independent tracks. The consumer track (H1/H2) is every repo's High-severity
 
 ### 7.5 Wave C — Adopt shared setup + PR-quality
 
-- [ ] **X1 — Adopt setup-toolchain + pr-quality** · domio [#1535](https://github.com/dsj1984/domio/issues/1535), athportal [#2006](https://github.com/dsj1984/athportal/issues/2006), swarm-os [#112](https://github.com/Beestera/swarm-os/issues/112) · `blocked_by` mp **#3 (MP-2)**, **#4 (MP-3)**, C1 · **M–L**.
+- [x] **X1 — Adopt setup-toolchain + pr-quality** · domio [#1535](https://github.com/dsj1984/domio/issues/1535), athportal [#2006](https://github.com/dsj1984/athportal/issues/2006), swarm-os [#112](https://github.com/Beestera/swarm-os/issues/112) · `blocked_by` mp **#3 (MP-2)**, **#4 (MP-3)**, C1 · **M–L**.
   - Replace the local setup composite with `dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>`; reduce the PR-quality CI to a caller of `.../pr-quality.yml@<sha>` (runner label + shards); delete local originals once green; rename the required check to the shared aggregator.
   - **Closes:** §3 #1/#2/#5, §4.3 (consumer side); §5 Medium (caching). **Release-gate:** MP-2/MP-3 released with a pinnable SHA (§6.5).
+  - **Done (all three CLOSED / `agent::done`):** cutover complete in every repo — no local setup composites remain, PR-quality is a thin caller of the shared workflow. Pins: athportal `pr-quality.yml@v0.3.1` (`185f28b`) + setup-toolchain@v0.3.1; domio `pr-quality.yml@v0.3.1`; swarm-os `pr-quality.yml@v0.2.1` (`e7f6d6d`) — functional (ubuntu runner, and v0.2.1 predates the #30/#32/#35 regressions), version-bump to v0.3.1 folds naturally into its X2.
 
 ### 7.6 Wave D — Adopt shared deploy + config + Renovate
 
@@ -687,8 +688,8 @@ All 27 original Stories exist (§7.1) and carry native `blocked_by` edges, plus 
 2. [x] **domio (#4):** H1 (#1532) + H2 (#1533) → C1 (#1534).
 3. [x] **athportal (#6):** H1 (#2003) + H2 (#2004) → C1 (#2005).
 4. [x] **swarm-os (#1):** H1 (#109) + H2 (#110) → C1 (#111).
-5. [ ] After `mandrel-platform` #3/#4 released **and** a repo's C1 delivered → X1 (domio #1535, athportal #2006, swarm-os #112). **Gate satisfied — pinnable SHA: `mandrel-platform-v0.3.1` / `185f28b93958886be86fc30db05c53fe60db9a85`** (first version verified to run a cross-repo caller end-to-end through "Set up job"; v0.2.3–v0.3.0 hit the #30/#32/#35 reusable-workflow footgun chain). Self-hosted runners also pass `pnpm-dest: '${{ runner.temp }}/pnpm'` (Story #25).
-6. [ ] After `mandrel-platform` #5/#7/#8/#9/#10 released **and** a repo's X1 delivered → X2 (domio #1536, athportal #2007, swarm-os #113). **Bundle X3** (portability lint: domio #1544, athportal #2013, swarm-os #121) into the same PR — mandrel-platform `v0.3.0` ships the script.
+5. [x] After `mandrel-platform` #3/#4 released **and** a repo's C1 delivered → X1 (domio #1535, athportal #2006, swarm-os #112). **Delivered — all three CLOSED / `agent::done`.** Pinnable SHA `mandrel-platform-v0.3.1` / `185f28b93958886be86fc30db05c53fe60db9a85` (first version verified to run a cross-repo caller end-to-end through "Set up job"; v0.2.3–v0.3.0 hit the #30/#32/#35 footgun chain). athportal + domio on v0.3.1; swarm-os on v0.2.1 (functional, bumps during X2). Self-hosted runners also pass `pnpm-dest: '${{ runner.temp }}/pnpm'` (Story #25).
+6. [ ] After `mandrel-platform` #5/#7/#8/#9/#10 released **and** a repo's X1 delivered → X2 (domio #1536, athportal #2007, swarm-os #113). **Gate satisfied — X2 ready to deliver** (MP-4/6/7/8/9 all CLOSED + released in v0.3.1; artifacts present: `deploy-cloudflare.yml`, `config/tsconfig.base.json`, `config/biome.base.json`, `config/renovate.json` + root `default.json`, `main-protection.json`, runbooks, `check-required-contexts.mjs`; X1 done per repo). **Bundle X3** (portability lint: domio #1544, athportal #2013, swarm-os #121) into the same PR — mandrel-platform `v0.3.0`+ ships the script. *X3 issues still need `agent::ready` before dispatch.*
 7. [ ] After a repo's X2 delivered → F1 (domio #1537, athportal #2008, swarm-os #114).
 
 **Protocol & gates**
