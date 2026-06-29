@@ -4,15 +4,15 @@
  *
  * Cross-repo portability lint for reusable workflows and composite actions.
  *
- * GitHub validates a reusable workflow's `workflow_call` interface (and a
- * composite action's interface) only when it is *called from another repo* —
- * never when its own repo runs CI on it. That blind spot has shipped four
- * consecutive consumer-facing breakages from this repo (see the #24 → #29 →
- * #30 → #32 chain on the athportal Story #2006 worktree), each a silent
- * "workflow file issue / 0 jobs started" that no in-repo check could catch.
+ * GitHub validates a reusable workflow's / composite action's interface only
+ * when it is *called from another repo* — never when its own repo runs CI on
+ * it. That blind spot has shipped five consecutive consumer-facing breakages
+ * from this repo (the #24 → #29 → #30 → #32 → #35 chain on the athportal /
+ * domio Story worktrees), each a silent "workflow file issue / 0 jobs" or a
+ * "Set up job" load failure that no in-repo check could catch.
  *
- * This lint closes the blind spot by statically asserting the two invariants
- * that GitHub only enforces at cross-repo call time:
+ * This lint closes the blind spot by statically asserting the invariants that
+ * GitHub only enforces at cross-repo call / action-load time:
  *
  *   1. RELATIVE `uses:` PATHS (e.g. `uses: ./.github/actions/foo`) are
  *      PROHIBITED inside a reusable workflow. A cross-repo caller checks out
@@ -24,9 +24,20 @@
  *      input `default:` fields are PROHIBITED. GitHub evaluates these during
  *      interface validation, where contexts like `runner.*` do not yet exist,
  *      so the call fails silently. The SAME footgun applies to composite
- *      `action.yml` input `default:` values — a composite default is never
- *      expression-evaluated, so `${{ }}` is passed through as a literal string.
- *      (Caused #32 / v0.2.4 and #30's setup-toolchain default regression.)
+ *      `action.yml` input `default:` and `description:` values — a composite
+ *      default is never expression-evaluated (passed through as a literal),
+ *      and a `${{ }}` in a composite description throws "Unrecognized
+ *      named-value" at action-load time ("Set up job"). (Caused #32 / #35.)
+ *
+ *   3. INTERNAL SHA PINS must point to a CLEAN manifest. A reusable workflow
+ *      that pins a first-party action by `owner/repo/path@<sha>` is validated
+ *      here against the manifest AT THAT SHA — not just the working-tree copy.
+ *      A pin left lagging on a pre-fix commit re-introduces a footgun the
+ *      working tree already fixed: this is exactly #35, where pr-quality.yml
+ *      kept pinning setup-toolchain@<pre-fix-sha> after the description was
+ *      cleaned in the working tree, so every consumer job died at "Set up
+ *      job". Requires git history (run CI checkout with fetch-depth: 0); the
+ *      check degrades to a skipped NOTE when the pinned blob is unreachable.
  *
  * What this lint deliberately does NOT flag: `${{ }}` in `runs.steps[].with`
  * (e.g. `dest: ${{ inputs['pnpm-dest'] || format('{0}/pnpm', runner.temp) }}`)
@@ -38,6 +49,7 @@
  *   node scripts/check-workflow-portability.mjs
  *   node scripts/check-workflow-portability.mjs --workflows-dir .github/workflows
  *   node scripts/check-workflow-portability.mjs --actions-dir .github/actions
+ *   node scripts/check-workflow-portability.mjs --no-pin-check   # skip Rule 3
  *
  * Exit codes:
  *   0 — every reusable workflow and composite action is cross-repo portable
@@ -45,15 +57,19 @@
  *
  * Consumer adoption:
  *   Copy this script into your project's `scripts/` directory, then wire it
- *   into your CI alongside check-required-contexts.mjs:
+ *   into your CI alongside check-required-contexts.mjs. Use fetch-depth: 0 on
+ *   the checkout so Rule 3 can resolve pinned blobs:
  *
+ *   - uses: actions/checkout@<sha>
+ *     with: { fetch-depth: 0 }
  *   - name: Lint workflow portability
  *     run: node scripts/check-workflow-portability.mjs
  *
  *   It is dependency-free (no YAML parser) so it copies cleanly into any repo.
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { resolve, join, relative, basename } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -63,15 +79,18 @@ import { resolve, join, relative, basename } from "node:path";
 const args = process.argv.slice(2);
 let workflowsDir = null;
 let actionsDir = null;
+let pinCheck = true;
 
 for (let i = 0; i < args.length; i++) {
   if ((args[i] === "--workflows-dir" || args[i] === "-w") && args[i + 1]) {
     workflowsDir = args[++i];
   } else if ((args[i] === "--actions-dir" || args[i] === "-a") && args[i + 1]) {
     actionsDir = args[++i];
+  } else if (args[i] === "--no-pin-check") {
+    pinCheck = false;
   } else if (args[i] === "--help" || args[i] === "-h") {
     process.stdout.write(
-      "Usage: node scripts/check-workflow-portability.mjs [--workflows-dir <dir>] [--actions-dir <dir>]\n"
+      "Usage: node scripts/check-workflow-portability.mjs [--workflows-dir <dir>] [--actions-dir <dir>] [--no-pin-check]\n"
     );
     process.exit(0);
   }
@@ -171,6 +190,159 @@ function walkYaml(content) {
 const EXPR = /\$\{\{/;
 
 // ---------------------------------------------------------------------------
+// Content checks (reused for both working-tree files and pinned blobs)
+// ---------------------------------------------------------------------------
+
+/** Reusable-workflow checks (Rules 1 & 2). Returns [{line, message}]. */
+function checkWorkflowContent(content) {
+  const violations = [];
+  const records = walkYaml(content);
+
+  const isReusable = records.some(
+    (r) => r.path.join(".") === "on.workflow_call" || r.path.join(".").startsWith("on.workflow_call.")
+  );
+  if (!isReusable) return violations;
+
+  // Rule 1: no relative `uses:` anywhere in a reusable workflow.
+  content.split("\n").forEach((raw, idx) => {
+    if (/^\s*uses:\s*['"]?\.\//.test(raw)) {
+      violations.push({
+        line: idx + 1,
+        message:
+          `relative \`uses: ./\` path in a reusable workflow — a cross-repo ` +
+          `caller resolves \`./\` against its own checkout. Use absolute ` +
+          `\`owner/repo/path@ref\` form.`,
+      });
+    }
+  });
+
+  // Rule 2: no `${{ }}` in workflow_call input/secret description or default.
+  for (const r of records) {
+    const p = r.path.join(".");
+    const isInputMeta = /^on\.workflow_call\.inputs\.[^.]+\.(description|default)$/.test(p);
+    const isSecretMeta = /^on\.workflow_call\.secrets\.[^.]+\.description$/.test(p);
+    if ((isInputMeta || isSecretMeta) && EXPR.test(r.value)) {
+      const field = r.path[r.path.length - 1];
+      const name = r.path[r.path.length - 2];
+      violations.push({
+        line: r.lineNo,
+        message:
+          `\`\${{ }}\` expression in workflow_call \`${name}.${field}\` — ` +
+          `GitHub evaluates this during interface validation (where ` +
+          `runner.*/secrets.* do not exist), failing every cross-repo call. ` +
+          `Write it as plain text.`,
+      });
+    }
+  }
+
+  return violations;
+}
+
+/** Composite-action checks (Rules 3/4 of the original; manifest cleanliness). */
+function checkActionContent(content) {
+  const violations = [];
+  const records = walkYaml(content);
+
+  for (const r of records) {
+    const p = r.path.join(".");
+    if (/^inputs\.[^.]+\.(default|description)$/.test(p) && EXPR.test(r.value)) {
+      const field = r.path[r.path.length - 1];
+      const name = r.path[r.path.length - 2];
+      violations.push({
+        line: r.lineNo,
+        message:
+          `\`\${{ }}\` expression in action input \`${name}.${field}\` — ` +
+          `composite ${field}s are not expression-evaluated; \`${field}\` ` +
+          `throws "Unrecognized named-value" at action-load time. Move ` +
+          `runtime expressions into \`runs.steps[].with\`, or write it as ` +
+          `plain text.`,
+      });
+    }
+  }
+
+  return violations;
+}
+
+// ---------------------------------------------------------------------------
+// Internal SHA-pin guard (Rule 3) — validate the PINNED manifest, not just
+// the working tree. Catches a self-reference that lags a fix (e.g. #35).
+// ---------------------------------------------------------------------------
+
+let gitAvailable = null;
+function isGitRepo() {
+  if (gitAvailable !== null) return gitAvailable;
+  try {
+    execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    gitAvailable = true;
+  } catch {
+    gitAvailable = false;
+  }
+  return gitAvailable;
+}
+
+/** `git show <sha>:<path>` → file content, or null if unreachable. */
+function gitShow(sha, path) {
+  try {
+    return execFileSync("git", ["show", `${sha}:${path}`], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 8 * 1024 * 1024,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Collect internal (same-repo, full-SHA-pinned) `uses:` references from a
+ * workflow/action file. "Internal" is detected structurally: the sub-path
+ * after `owner/repo/` exists in the local working tree. External refs
+ * (actions/checkout, pnpm/action-setup, …) resolve to no local path and are
+ * skipped — so the heuristic needs no knowledge of this repo's own slug.
+ */
+function collectInternalPins(content) {
+  const pins = [];
+  content.split("\n").forEach((raw, idx) => {
+    const m = raw.match(
+      /uses:\s*['"]?[\w.-]+\/[\w.-]+\/([^@\s'"]+)@([0-9a-fA-F]{40})/
+    );
+    if (!m) return;
+    const subpath = m[1];
+    const sha = m[2];
+    const local = join(repoRoot, subpath);
+    if (!existsSync(local)) return; // external ref → skip
+    pins.push({ subpath, sha, line: idx + 1 });
+  });
+  return pins;
+}
+
+/** Resolve a pinned ref's manifest path + kind ('action' | 'workflow'). */
+function resolvePinnedManifest(subpath) {
+  const local = join(repoRoot, subpath);
+  let st;
+  try {
+    st = statSync(local);
+  } catch {
+    return null;
+  }
+  if (st.isDirectory()) {
+    for (const name of ["action.yml", "action.yaml"]) {
+      if (existsSync(join(local, name))) return { path: `${subpath}/${name}`, kind: "action" };
+    }
+    return null;
+  }
+  if (/\.ya?ml$/.test(subpath)) {
+    const kind = basename(subpath).startsWith("action.") ? "action" : "workflow";
+    return { path: subpath, kind };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // File discovery
 // ---------------------------------------------------------------------------
 
@@ -212,10 +384,11 @@ function listActionFiles(dir) {
 }
 
 // ---------------------------------------------------------------------------
-// Lint rules
+// Per-file lint
 // ---------------------------------------------------------------------------
 
-/** Collect violations for a single file. Returns an array of {line, message}. */
+const pinSkips = [];
+
 function lintFile(filePath) {
   const violations = [];
   let content;
@@ -225,68 +398,38 @@ function lintFile(filePath) {
     return [{ line: 0, message: `cannot read file: ${err.message}` }];
   }
 
-  const records = walkYaml(content);
   const isWorkflow = filePath.startsWith(resolvedWorkflowsDir);
   const isAction =
     basename(filePath) === "action.yml" || basename(filePath) === "action.yaml";
 
-  if (isWorkflow) {
-    const isReusable = records.some(
-      (r) => r.path.join(".") === "on.workflow_call" || r.path.join(".").startsWith("on.workflow_call.")
-    );
-    if (!isReusable) return violations; // ordinary workflow — nothing to enforce
+  // Rules 1 & 2 (workflows) and the manifest checks (actions) on the live file.
+  if (isWorkflow) violations.push(...checkWorkflowContent(content));
+  if (isAction) violations.push(...checkActionContent(content));
 
-    // Rule 1: no relative `uses:` anywhere in a reusable workflow.
-    content.split("\n").forEach((raw, idx) => {
-      if (/^\s*uses:\s*['"]?\.\//.test(raw)) {
-        violations.push({
-          line: idx + 1,
-          message:
-            `relative \`uses: ./\` path in a reusable workflow — a cross-repo ` +
-            `caller resolves \`./\` against its own checkout. Use absolute ` +
-            `\`owner/repo/path@ref\` form.`,
-        });
+  // Rule 3: validate internal SHA-pinned references against their pinned blob.
+  if (pinCheck && isGitRepo()) {
+    for (const pin of collectInternalPins(content)) {
+      const manifest = resolvePinnedManifest(pin.subpath);
+      if (!manifest) continue;
+      const pinned = gitShow(pin.sha, manifest.path);
+      if (pinned === null) {
+        pinSkips.push(
+          `${relative(repoRoot, filePath)}:${pin.line} — pinned ${pin.subpath}@${pin.sha.slice(0, 7)} ` +
+          `(blob unreachable; run checkout with fetch-depth: 0 to enable Rule 3)`
+        );
+        continue;
       }
-    });
-
-    // Rule 2: no `${{ }}` in workflow_call input/secret description or default.
-    for (const r of records) {
-      const p = r.path.join(".");
-      const isInputMeta =
-        /^on\.workflow_call\.inputs\.[^.]+\.(description|default)$/.test(p);
-      const isSecretMeta =
-        /^on\.workflow_call\.secrets\.[^.]+\.description$/.test(p);
-      if ((isInputMeta || isSecretMeta) && EXPR.test(r.value)) {
-        const field = r.path[r.path.length - 1];
-        const name = r.path[r.path.length - 2];
+      const pinnedViolations =
+        manifest.kind === "action"
+          ? checkActionContent(pinned)
+          : checkWorkflowContent(pinned);
+      for (const v of pinnedViolations) {
         violations.push({
-          line: r.lineNo,
+          line: pin.line,
           message:
-            `\`\${{ }}\` expression in workflow_call \`${name}.${field}\` — ` +
-            `GitHub evaluates this during interface validation (where ` +
-            `runner.*/secrets.* do not exist), failing every cross-repo call. ` +
-            `Write it as plain text.`,
-        });
-      }
-    }
-  }
-
-  if (isAction) {
-    // Rule 3/4: no `${{ }}` in composite-action input default or description.
-    // A composite default is never expression-evaluated (the literal string is
-    // passed through); a description expression is misleading and needless.
-    for (const r of records) {
-      const p = r.path.join(".");
-      if (/^inputs\.[^.]+\.(default|description)$/.test(p) && EXPR.test(r.value)) {
-        const field = r.path[r.path.length - 1];
-        const name = r.path[r.path.length - 2];
-        violations.push({
-          line: r.lineNo,
-          message:
-            `\`\${{ }}\` expression in action input \`${name}.${field}\` — ` +
-            `composite ${field}s are not expression-evaluated; the literal ` +
-            `string is used as-is. Move runtime expressions into ` +
-            `\`runs.steps[].with\`, or write the ${field} as plain text.`,
+            `internal pin \`${pin.subpath}@${pin.sha.slice(0, 7)}\` points to a ` +
+            `manifest with a portability defect (${manifest.path}:${v.line}) — ` +
+            `${v.message} Bump the pin to a commit whose manifest is clean.`,
         });
       }
     }
@@ -305,7 +448,8 @@ const allFiles = [...workflowFiles, ...actionFiles];
 
 process.stdout.write(
   `[check-workflow-portability] Workflows: ${relative(repoRoot, resolvedWorkflowsDir)}/ (${workflowFiles.length})\n` +
-  `[check-workflow-portability] Actions  : ${relative(repoRoot, resolvedActionsDir)}/ (${actionFiles.length})\n`
+  `[check-workflow-portability] Actions  : ${relative(repoRoot, resolvedActionsDir)}/ (${actionFiles.length})\n` +
+  `[check-workflow-portability] Pin check: ${pinCheck ? (isGitRepo() ? "on" : "on (git unavailable — skipped)") : "off"}\n`
 );
 
 if (allFiles.length === 0) {
@@ -325,6 +469,13 @@ for (const file of allFiles) {
   for (const v of violations) {
     process.stderr.write(`     ${rel}:${v.line} — ${v.message}\n`);
   }
+}
+
+if (pinSkips.length > 0) {
+  process.stdout.write(
+    `\n[check-workflow-portability] ⚠️  ${pinSkips.length} internal pin(s) could not be verified (Rule 3 skipped):\n`
+  );
+  for (const s of pinSkips) process.stdout.write(`     ${s}\n`);
 }
 
 if (total > 0) {

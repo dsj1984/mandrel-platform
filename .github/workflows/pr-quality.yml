@@ -15,7 +15,10 @@
 # SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
 # setup-toolchain MUST use an absolute cross-repo reference — GitHub prohibits
 # relative `uses:` paths in reusable workflows called from another repository.
-# Pinned to the commit that introduced the pnpm-dest empty-string fallback fix.
+# Pinned to mandrel-platform-v0.3.0 (869bbbf), whose action.yml manifest is
+# expression-clean. This pin is guarded by scripts/check-workflow-portability.mjs
+# (Rule 3): if it ever lags onto a commit whose manifest carries a `${{ }}`
+# footgun, CI fails before release (the #35 failure mode).
 name: PR Quality
 
 on:
@@ -137,7 +140,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@519a337ca42840544dc8d05aff4f346bfa04f335
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -165,7 +168,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@519a337ca42840544dc8d05aff4f346bfa04f335
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -191,7 +194,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@519a337ca42840544dc8d05aff4f346bfa04f335
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -227,7 +230,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@519a337ca42840544dc8d05aff4f346bfa04f335
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -261,7 +264,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@519a337ca42840544dc8d05aff4f346bfa04f335
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
