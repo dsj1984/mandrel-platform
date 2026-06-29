@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.1...mandrel-platform-v0.11.2) (2026-06-29)
+
+
+### Fixed
+
+* **security:** run Semgrep on Python 3.11 + install setuptools (pkg_resources) ([#78](https://github.com/dsj1984/mandrel-platform/issues/78)) ([d120e47](https://github.com/dsj1984/mandrel-platform/commit/d120e47a6b9e4bdcce1aa8f69805aeddf85b2046))
+
 ## [0.11.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.0...mandrel-platform-v0.11.1) (2026-06-29)
 
 
