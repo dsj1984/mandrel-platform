@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.3](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.2...mandrel-platform-v0.11.3) (2026-06-29)
+
+
+### Fixed
+
+* **security:** default Semgrep SAST to p/default (p/ci was too narrow) ([#80](https://github.com/dsj1984/mandrel-platform/issues/80)) ([e28ab07](https://github.com/dsj1984/mandrel-platform/commit/e28ab072614726a8deb215f39e7a7a661987e970))
+* **security:** replace bash-4 declare -A with bash-3.2-compatible case statement (refs [#82](https://github.com/dsj1984/mandrel-platform/issues/82)) ([#84](https://github.com/dsj1984/mandrel-platform/issues/84)) ([d8aca8c](https://github.com/dsj1984/mandrel-platform/commit/d8aca8c084708db717be49c21312daf7ca158ad5))
+
 ## [0.11.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.1...mandrel-platform-v0.11.2) (2026-06-29)
 
 
