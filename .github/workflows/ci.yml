@@ -8,12 +8,21 @@
 # the main-protection contract: it asserts every context in requiredStatusChecks
 # and every job in upstreamJobs is actually emitted by a workflow in this repo.
 #
+# The portability lint (`check-workflow-portability`) closes the cross-repo
+# blind spot: GitHub validates a reusable workflow's / composite action's
+# interface only when a CONSUMER repo calls it, so footguns like relative
+# `uses: ./` paths and `${{ }}` expressions in input descriptions/defaults
+# ship green here and break every consumer. The lint asserts both invariants
+# statically (see the #24 → #29 → #30 → #32 blocker chain that motivated it).
+#
 # Consumer adoption:
-#   Copy scripts/check-required-contexts.mjs into your project's scripts/
-#   directory, then add the step below to your PR-quality workflow:
+#   Copy scripts/check-required-contexts.mjs and scripts/check-workflow-portability.mjs
+#   into your project's scripts/ directory, then add the steps below to your CI:
 #
 #     - name: Lint branch-protection contract
 #       run: node scripts/check-required-contexts.mjs
+#     - name: Lint workflow portability
+#       run: node scripts/check-workflow-portability.mjs
 #
 #   See docs/runbooks/branch-protection-setup.md for the full setup guide.
 #
@@ -57,6 +66,31 @@ jobs:
       - name: Lint branch-protection contract
         run: node scripts/check-required-contexts.mjs
 
+  # ── Cross-repo portability lint ───────────────────────────────────────────
+  #
+  # Statically asserts the two invariants GitHub only enforces at cross-repo
+  # call time: no relative `uses: ./` paths in reusable workflows, and no
+  # `${{ }}` expressions in workflow_call input/secret descriptions or input
+  # defaults (and composite-action input defaults). These footguns produce a
+  # silent "workflow file issue / 0 jobs" for consumers but pass in-repo CI —
+  # the exact failure mode of #30 and #32. Consumers copy
+  # scripts/check-workflow-portability.mjs and run the same step.
+  check-workflow-portability:
+    name: Lint workflow portability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Lint workflow portability
+        run: node scripts/check-workflow-portability.mjs
+
   # ── Aggregator: single required branch-protection context ─────────────────
   #
   # Mirrors the ci-required pattern from pr-quality.yml: a single stable
@@ -69,15 +103,18 @@ jobs:
     if: always()
     needs:
       - check-required-contexts
+      - check-workflow-portability
     steps:
       - name: Check all job results
         shell: bash
         env:
           CTX_RESULT: ${{ needs.check-required-contexts.result }}
+          PORT_RESULT: ${{ needs.check-workflow-portability.result }}
         run: |
           failed=()
           for job_result in \
-            "check-required-contexts:${CTX_RESULT}"; do
+            "check-required-contexts:${CTX_RESULT}" \
+            "check-workflow-portability:${PORT_RESULT}"; do
             job="${job_result%%:*}"
             result="${job_result##*:}"
             if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
