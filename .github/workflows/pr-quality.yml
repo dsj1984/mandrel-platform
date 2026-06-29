@@ -523,24 +523,19 @@ jobs:
             echo "Full-tree SAST (no PR context)."
           fi
 
-      # Semgrep ships on PyPI (not npm), so the SAST sub-step needs Python, not
-      # the pnpm/Node toolchain. `actions/setup-python` provisions a pinned
-      # interpreter on any runner (ubuntu-hosted or self-hosted) so the gate is
-      # runner-agnostic.
-      - name: Setup Python (for Semgrep SAST)
-        if: ${{ inputs.enable-sast }}
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          # 3.11 ships setuptools/pkg_resources by default; 3.12 removed it,
-          # which crashes semgrep's opentelemetry import
-          # (ModuleNotFoundError: pkg_resources). We also install setuptools
-          # explicitly below as a belt-and-suspenders guarantee.
-          python-version: '3.11'
-
-      # SAST via Semgrep, installed from PyPI at a pinned version. `--error`
-      # makes findings fail the job WITHOUT relying on a SARIF / Code Scanning
-      # upload, so the gate blocks on a private repo with no GHAS. (The GHAS
-      # CodeQL path documented on the job header is the alternative.)
+      # SAST via Semgrep, installed from PyPI at a pinned version against the
+      # runner's SYSTEM python3. We deliberately do NOT use
+      # `actions/setup-python`: on a vanilla self-hosted runner with no
+      # RUNNER_TOOL_CACHE configured, setup-python falls back to the
+      # GitHub-hosted tool-cache path (`/Users/runner/hostedtoolcache` on
+      # macOS) and dies `mkdir: /Users/runner: Permission denied` — before
+      # Semgrep ever runs (Story #85: domio #1550 / athportal #2021). Both
+      # ubuntu-latest and macOS/Linux self-hosted runners ship a usable
+      # `python3`, so installing against it keeps the gate runner-agnostic
+      # with no per-runner tool-cache config. `--error` makes findings fail the
+      # job WITHOUT relying on a SARIF / Code Scanning upload, so the gate
+      # blocks on a private repo with no GHAS. (The GHAS CodeQL path documented
+      # on the job header is the alternative.)
       - name: SAST (Semgrep, blocking, no SARIF upload)
         if: ${{ inputs.enable-sast }}
         shell: bash
@@ -553,27 +548,66 @@ jobs:
           set -euo pipefail
           # Pinned Semgrep release from PyPI. `semgrep scan --error` exits
           # non-zero on any finding; `--config` selects the ruleset (default
-          # OSS 'auto'). Bump this pin deliberately.
+          # OSS 'p/default'). Bump this pin deliberately.
+          #
           # `setuptools` provides `pkg_resources`, which semgrep's transitive
           # opentelemetry dependency imports but does not declare — absent by
-          # default on Python ≥3.12.
-          python -m pip install --quiet --disable-pip-version-check setuptools 'semgrep==1.97.0'
-          echo "Running $(semgrep --version 2>/dev/null) (config: ${SEMGREP_CONFIG})"
-          if [ -n "${BASELINE:-}" ]; then
-            echo "PR-diff SAST: baselining against ${BASELINE} (only new findings block)."
+          # default on Python ≥3.12. We install it alongside the pinned
+          # semgrep so the run works on a 3.12+ system interpreter too.
+          #
+          # Install strategy (system-python, no hosted tool cache):
+          #   • Prefer `pipx` when present — it isolates the install in its own
+          #     venv and exposes `semgrep` on PATH, without polluting the
+          #     system site-packages. We `--system-site-packages` so the venv
+          #     can see a system `setuptools`, then `pipx inject` a pinned one
+          #     as a belt-and-suspenders guarantee for `pkg_resources`.
+          #   • Otherwise fall back to `python3 -m pip install --user`, which
+          #     also needs no tool cache and installs into the user site dir.
+          SEMGREP_PIN='semgrep==1.97.0'
+
+          run_semgrep() {
+            echo "Running $(semgrep --version 2>/dev/null) (config: ${SEMGREP_CONFIG})"
+            if [ -n "${BASELINE:-}" ]; then
+              echo "PR-diff SAST: baselining against ${BASELINE} (only new findings block)."
+            else
+              echo "Full-tree SAST (no baseline)."
+            fi
+            # `${BASELINE:+--baseline-commit "$BASELINE"}` expands to the flag
+            # pair only when BASELINE is non-empty; on push/schedule it vanishes
+            # and Semgrep scans the full tree.
+            semgrep scan \
+              --config "${SEMGREP_CONFIG}" \
+              ${BASELINE:+--baseline-commit "$BASELINE"} \
+              --error \
+              --disable-version-check \
+              --metrics=off \
+              --quiet
+          }
+
+          if command -v pipx >/dev/null 2>&1; then
+            echo "Installing ${SEMGREP_PIN} via pipx (system python3)."
+            # `--force` keeps the step idempotent across reused self-hosted
+            # runners (a prior `pipx install semgrep` would otherwise abort
+            # with "already installed").
+            pipx install --force --pip-args='--disable-pip-version-check' \
+              --system-site-packages "${SEMGREP_PIN}"
+            pipx inject semgrep setuptools >/dev/null 2>&1 || true
+            # pipx exposes apps under ~/.local/bin, which may not be on PATH on
+            # a fresh runner. `pipx ensurepath` is interactive-shell-oriented;
+            # prepend the bin dir directly so `semgrep` resolves this step.
+            PATH="${HOME}/.local/bin:${PATH}"
+            export PATH
+            run_semgrep
           else
-            echo "Full-tree SAST (no baseline)."
+            echo "pipx not found; installing ${SEMGREP_PIN} via python3 -m pip install --user."
+            python3 -m pip install --user --quiet --disable-pip-version-check \
+              setuptools "${SEMGREP_PIN}"
+            # `pip install --user` drops console scripts in the user-base bin
+            # dir, which is not always on PATH on a fresh runner — add it.
+            PATH="$(python3 -m site --user-base)/bin:${PATH}"
+            export PATH
+            run_semgrep
           fi
-          # `${BASELINE:+--baseline-commit "$BASELINE"}` expands to the flag pair
-          # only when BASELINE is non-empty; on push/schedule it vanishes and
-          # Semgrep scans the full tree.
-          semgrep scan \
-            --config "${SEMGREP_CONFIG}" \
-            ${BASELINE:+--baseline-commit "$BASELINE"} \
-            --error \
-            --disable-version-check \
-            --metrics=off \
-            --quiet
           echo "✅ Semgrep found no blocking findings."
 
   # ── Aggregator: single required branch-protection context ─────────────────
