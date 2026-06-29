@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.8.0...mandrel-platform-v0.9.0) (2026-06-29)
+
+
+### Added
+
+* **deploy:** add build-artifact handoff to deploy-cloudflare (refs [#56](https://github.com/dsj1984/mandrel-platform/issues/56)) ([#59](https://github.com/dsj1984/mandrel-platform/issues/59)) ([c4e8fd6](https://github.com/dsj1984/mandrel-platform/commit/c4e8fd67debdba6a29ee2d39396adc40718846b3))
+
 ## [0.8.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.7.0...mandrel-platform-v0.8.0) (2026-06-29)
 
 
