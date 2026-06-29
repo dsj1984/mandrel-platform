@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.0...mandrel-platform-v0.11.1) (2026-06-29)
+
+
+### Fixed
+
+* **security:** install Semgrep from PyPI and use a metrics-off-compatible ruleset ([#76](https://github.com/dsj1984/mandrel-platform/issues/76)) ([a0f681b](https://github.com/dsj1984/mandrel-platform/commit/a0f681b48c36117f9066705c532956af9745b99e))
+
 ## [0.11.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.10.0...mandrel-platform-v0.11.0) (2026-06-29)
 
 
