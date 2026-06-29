@@ -51,6 +51,22 @@ on:
         description: 'Target Cloudflare environment (e.g. staging, production)'
         required: true
         type: string
+      gh-environment:
+        description: >
+          GitHub Deployment Environment name to attach to every
+          secret-touching job, so a consumer whose deploy secrets are
+          Environment-scoped (the recommended isolation pattern) can resolve
+          them. This is DISTINCT from the "environment" input above: that one
+          is the Cloudflare --env label (DEPLOY_ENV -> wrangler --env), whereas
+          this one is a GitHub Deployment Environment used purely for secret
+          scoping and protection rules. Leave empty (the default) for
+          repo-scoped / D1 consumers — an empty value attaches no GitHub
+          Environment and behaviour is unchanged. Set it (e.g. staging,
+          production) only when your CLOUDFLARE_* / TURSO_* / SENTRY_AUTH_TOKEN
+          secrets live in a GitHub Environment of that name.
+        required: false
+        type: string
+        default: ''
       workers:
         description: >
           Comma-separated list of Cloudflare Worker names to deploy
@@ -258,6 +274,9 @@ jobs:
   # ---------------------------------------------------------------------------
   check-env:
     name: Check environment (${{ inputs.environment }})
+    # GitHub Deployment Environment (distinct from the Cloudflare --env label).
+    # Empty (the default) attaches no Environment — behaviour is unchanged.
+    environment: ${{ inputs.gh-environment }}
     runs-on: ubuntu-latest
     needs: secret-isolation-audit
     steps:
@@ -316,6 +335,9 @@ jobs:
   # ---------------------------------------------------------------------------
   pre-migration-snapshot:
     name: Pre-migration snapshot (${{ inputs.environment }})
+    # GitHub Deployment Environment (distinct from the Cloudflare --env label).
+    # Empty (the default) attaches no Environment — behaviour is unchanged.
+    environment: ${{ inputs.gh-environment }}
     runs-on: ubuntu-latest
     needs: check-env
     if: ${{ inputs.migrate == true }}
@@ -391,6 +413,9 @@ jobs:
   # ---------------------------------------------------------------------------
   migrate:
     name: Migrate (${{ inputs.environment }})
+    # GitHub Deployment Environment (distinct from the Cloudflare --env label).
+    # Empty (the default) attaches no Environment — behaviour is unchanged.
+    environment: ${{ inputs.gh-environment }}
     runs-on: ubuntu-latest
     needs: pre-migration-snapshot
     if: ${{ inputs.migrate == true }}
@@ -454,6 +479,9 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy workers (${{ inputs.environment }})
+    # GitHub Deployment Environment (distinct from the Cloudflare --env label).
+    # Empty (the default) attaches no Environment — behaviour is unchanged.
+    environment: ${{ inputs.gh-environment }}
     runs-on: ubuntu-latest
     needs:
       - check-env
@@ -592,6 +620,9 @@ jobs:
   # ---------------------------------------------------------------------------
   boot-smoke:
     name: Boot smoke + auto-rollback (${{ inputs.environment }})
+    # GitHub Deployment Environment (distinct from the Cloudflare --env label).
+    # Empty (the default) attaches no Environment — behaviour is unchanged.
+    environment: ${{ inputs.gh-environment }}
     runs-on: ubuntu-latest
     needs: deploy
     if: ${{ needs.deploy.result == 'success' && inputs.smoke == true }}
