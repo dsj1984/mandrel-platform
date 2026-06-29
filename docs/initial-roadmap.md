@@ -683,7 +683,7 @@ All 27 Stories exist (§7.1) and carry native `blocked_by` edges. Tick each as i
 2. [x] **domio (#4):** H1 (#1532) + H2 (#1533) → C1 (#1534).
 3. [x] **athportal (#6):** H1 (#2003) + H2 (#2004) → C1 (#2005).
 4. [x] **swarm-os (#1):** H1 (#109) + H2 (#110) → C1 (#111).
-5. [ ] After `mandrel-platform` #3/#4 released **and** a repo's C1 delivered → X1 (domio #1535, athportal #2006, swarm-os #112).
+5. [ ] After `mandrel-platform` #3/#4 released **and** a repo's C1 delivered → X1 (domio #1535, athportal #2006, swarm-os #112). **Gate satisfied — pinnable SHA: `mandrel-platform-v0.2.3` / `8a1c47c84e3abe195d8b221b73765d47bd3fbabc`.** Self-hosted runners also need `pnpm-dest: '${{ runner.temp }}/pnpm'` (fixed in v0.2.3, Story #25 + pnpm-dest fallback fix).
 6. [ ] After `mandrel-platform` #5/#7/#8/#9/#10 released **and** a repo's X1 delivered → X2 (domio #1536, athportal #2007, swarm-os #113).
 7. [ ] After a repo's X2 delivered → F1 (domio #1537, athportal #2008, swarm-os #114).
 
@@ -691,7 +691,7 @@ All 27 Stories exist (§7.1) and carry native `blocked_by` edges. Tick each as i
 
 - **One repo per session.** Deliver each repo's Stories from a session rooted in that repo's directory (§7.1) — delivery tooling operates on the repo it runs in.
 - **Steps 2–4 run now, concurrently with step 1.** Consumer hardening + convergence are the highest-severity fixes (§5 High) and do not wait on `mandrel-platform`.
-- **Release-gate the cutover.** Do not start Wave C/D (`X1`/`X2`) until the `mandrel-platform` units they call are merged **and** released with a pinnable SHA/tag (§6.5); back-fill the `@<sha>` placeholders in each X1/X2 body at that point.
+- **Release-gate the cutover.** Do not start Wave C/D (`X1`/`X2`) until the `mandrel-platform` units they call are merged **and** released with a pinnable SHA/tag (§6.5); back-fill the `@<sha>` placeholders in each X1/X2 body at that point. **Wave C gate is now open: use `mandrel-platform-v0.2.3` (`8a1c47c`).**
 - **`swarm-os` is cross-org (`Beestera`).** Its native `blocked_by` links to `dsj1984/mandrel-platform` are set and verified; delivery still happens from the swarm-os session.
 
 **Sequencing rationale.** Wave A leads because every consumer item is a High finding whose failure mode is live exposure (an unscanned secret, a green-but-broken prod deploy, an irreversible migration, a phantom required check), each fixable in isolation today; and the producer foundation must exist before any cutover. Within H2, reconciling required-check names **precedes** applying branch protection so no phantom context wedges every PR. Wave B establishes one runtime/tooling baseline because the shared workflows (Waves C/D) cannot assume uniformity that doesn't yet exist — centralizing onto three divergent baselines just pushes drift into the shared layer's inputs. Waves C/D collapse the triplicated CI/deploy/config artifacts into versioned shared units, safe only once the per-repo defence-in-depth from Wave A exists to become those units' bodies. Wave E lands last: security headers, CORS, observability, and doc reconciliation are real but non-bleeding, cheapest to apply uniformly once the substrate exists, and docs must trail the code/workflow changes that made them stale.
