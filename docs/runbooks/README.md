@@ -26,6 +26,7 @@ Process-level runbooks that are substantially identical across all projects. The
 | [`environments-provisioning.md`](environments-provisioning.md) | Standing up Cloudflare, GitHub Environments, Infisical, Turso from scratch |
 | [`incident-response.md`](incident-response.md) | Severity classification, escalation path, response steps, postmortem template |
 | [`slo.md`](slo.md) | SLO framework, canonical targets, error-budget policy, rollback triggers |
+| [`pin-drift-dashboard.md`](pin-drift-dashboard.md) | Cross-consumer pin-drift dashboard: split-pin / release-lag detection across consumers |
 
 ### Project-local runbooks (stay in each consumer repo)
 
