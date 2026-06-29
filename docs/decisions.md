@@ -33,4 +33,28 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
-_No decisions recorded yet. Add the first entry above this line._
+## 2026-06-29 — `platform-sync` adoption CLI lives in `scripts/`, not the `mandrel` harness
+
+**Context.** Adoption of mandrel-platform was a manual per-repo cutover, which
+let three drift states accrue (§4.1): split/stale `uses:` SHA pins,
+local-copy runbooks instead of reference stubs, and un-simplified
+`renovate`/`tsconfig` that re-implement the shared SSOT. MP-14 (#69) calls for
+a repeatable `mandrel sync`-analogue command. Two homes were possible: the
+`mandrel` AI-harness package, or this repo's `scripts/` distribution channel.
+
+**Decision.** Ship it as `scripts/platform-sync.mjs` in mandrel-platform,
+distributed through the same `./scripts/*` package export consumers already use
+for `audit-check.mjs` / `check-required-contexts.mjs`. Ref→SHA resolution uses
+`git ls-remote` (no checkout, works for tags/branches/floating `@v1`), with an
+offline `--sha` escape hatch for tests. Runbook materialization is link-only
+and content-marker-guarded so it never clobbers an operator's filled-in stub or
+a hand-authored local copy. `extends` reconciliation prepends the SSOT so
+consumer overrides still win. The command is idempotent with a `--dry-run`
+plan-only mode.
+
+**Consequences.** Keeps the ownership boundary clean (§2.2): `mandrel` governs
+agent behaviour, `mandrel-platform` governs delivery and is consumable by any
+repo, AI-driven or not. Consumers get drift-repair as one command instead of a
+manual checklist. Cost: the CLI must track the `uses:` slug and the SSOT
+extends-targets, which are now asserted by `scripts/platform-sync.test.mjs`
+(wired into `npm test`).
