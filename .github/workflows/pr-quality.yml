@@ -97,8 +97,8 @@ on:
         description: >
           Passed through to setup-toolchain's `pnpm-dest` input. Controls where
           pnpm/action-setup installs the pnpm shim. Leave empty to use
-          setup-toolchain's default (${{ runner.temp }}/pnpm). Self-hosted
-          callers should set this explicitly (e.g. '${{ runner.temp }}/pnpm')
+          setup-toolchain's default (runner.temp/pnpm). Self-hosted callers
+          should set this explicitly (e.g. the runner.temp/pnpm expression)
           to avoid $HOME races and git-clean eviction.
         required: false
         type: string

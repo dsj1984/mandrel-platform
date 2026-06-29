@@ -43,7 +43,7 @@ inputs:
       (or pass an empty string) to use the default: runner.temp/pnpm —
       job-scoped, not under $HOME, safe for concurrent self-hosted jobs and
       unaffected by git clean -ffdx. Self-hosted callers should set this
-      explicitly (e.g. '${{ runner.temp }}/pnpm').
+      explicitly to the runner.temp/pnpm expression.
     required: false
     default: ''
 
