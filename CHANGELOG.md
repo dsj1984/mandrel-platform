@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.4](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.3...mandrel-platform-v0.11.4) (2026-06-29)
+
+
+### Fixed
+
+* **security:** scope Semgrep SAST to the PR diff on pull_request (refs [#87](https://github.com/dsj1984/mandrel-platform/issues/87)) ([#88](https://github.com/dsj1984/mandrel-platform/issues/88)) ([d85ae20](https://github.com/dsj1984/mandrel-platform/commit/d85ae207ce66732e6a2cc1532695d687f69751cc))
+
 ## [0.11.3](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.2...mandrel-platform-v0.11.3) (2026-06-29)
 
 
