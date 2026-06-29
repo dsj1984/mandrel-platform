@@ -12,7 +12,7 @@
 # shard index array via the `shard-matrix` input (e.g. "[1,2,3]" for 3 shards).
 # When shards == 1 (default), `shard-matrix` defaults to "[1]".
 #
-# SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
+# SHA-pinned third-party actions per roadmap.md.
 # setup-toolchain MUST use an absolute cross-repo reference — GitHub prohibits
 # relative `uses:` paths in reusable workflows called from another repository.
 # Pinned to mandrel-platform-v0.3.0 (869bbbf), whose action.yml manifest is
@@ -108,7 +108,7 @@ on:
         default: ''
 
     secrets:
-      # Turbo remote cache credentials (athportal pattern — §5 of initial-roadmap.md).
+      # Turbo remote cache credentials (athportal pattern — roadmap.md).
       TURBO_TOKEN:
         description: 'Turbo remote cache read/write token.'
         required: false
