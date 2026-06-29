@@ -22,7 +22,10 @@
 #                              default; overridable via migrate-command, gated by
 #                              an optional pre-migrate-assert-command host guard).
 #   5. deploy                — optionally runs build-command (with build-env),
-#                              then deploys each worker via wrangler deploy.
+#                              then deploys each worker via wrangler deploy, or
+#                              runs a consumer-supplied deploy-command (for
+#                              pnpm-workspace monorepos with no root wrangler
+#                              config) that replaces the built-in deploy loop.
 #   6. boot-smoke            — HTTP health-check against each deployed worker, or
 #                              a consumer-supplied smoke-command. Non-200 fails
 #                              the run AND triggers wrangler rollback. The
@@ -121,6 +124,22 @@ on:
         required: false
         type: string
         default: ''
+      deploy-command:
+        description: >
+          Optional deploy command run in the deploy job. When set, it REPLACES
+          the built-in per-worker root-level "wrangler deploy" loop (symmetric
+          to snapshot-command / migrate-command / build-command / smoke-command).
+          Use this for pnpm-workspace monorepos that have no root wrangler
+          config, where each worker must be deployed from its own package dir
+          (e.g. cd apps/api && wrangler deploy, or wrangler deploy --config
+          dist/server/wrangler.json). It runs once in the checkout root with
+          WORKERS (the deployed csv), DEPLOY_ENV, the Cloudflare creds, and any
+          forwarded named secrets exported. The deployed_workers output is set
+          to the workers input so downstream smoke / rollback targeting keeps
+          working. When unset, the built-in root-level deploy loop runs.
+        required: false
+        type: string
+        default: ''
       smoke:
         description: >
           Run the built-in boot-smoke + auto-rollback job. Default true. Set
@@ -173,7 +192,32 @@ on:
       CLOUDFLARE_ACCOUNT_ID:
         description: 'Cloudflare Account ID'
         required: true
-      # Callers may pass additional per-env secrets via `secrets: inherit`.
+      # ----- Optional named secret passthrough (Story #46) -----
+      # Explicitly-declared optional secrets so a caller can wire per-env
+      # secrets into the seam step shells (snapshot / migrate /
+      # pre-migrate-assert / build / deploy-command). They are mapped into
+      # each seam step's `env:` only when provided. Declared explicitly (vs a
+      # dynamic `secrets[<runtime-name>]` index) because dynamic secret
+      # indexing is not reliably supported in reusable workflows under
+      # `secrets: inherit`; explicit optional secrets reach the step shells
+      # deterministically with zero plaintext leakage (never via `with:`).
+      # Callers may still forward any further secrets via `secrets: inherit`
+      # and reference them from their own seam commands.
+      TURSO_DATABASE_URL:
+        description: 'Optional Turso database URL for non-D1 snapshot/migrate seam commands.'
+        required: false
+      TURSO_AUTH_TOKEN:
+        description: 'Optional Turso auth token for non-D1 snapshot/migrate seam commands.'
+        required: false
+      SENTRY_AUTH_TOKEN:
+        description: 'Optional Sentry auth token for source-map upload during build-command / deploy-command.'
+        required: false
+      PUBLIC_CLERK_PUBLISHABLE_KEY:
+        description: 'Optional Clerk publishable key for build-command / deploy-command.'
+        required: false
+      CLERK_SECRET_KEY:
+        description: 'Optional Clerk secret key for build-command / deploy-command.'
+        required: false
 
 # Least-privilege: content-read only. Each job that needs more escalates
 # individually (wrangler deploy needs no additional GH permissions).
@@ -323,6 +367,12 @@ jobs:
           SNAPSHOT_COMMAND: ${{ inputs.snapshot-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional named secret passthrough (Story #46).
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
 
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -365,6 +415,12 @@ jobs:
           PRE_MIGRATE_ASSERT_COMMAND: ${{ inputs.pre-migrate-assert-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional named secret passthrough (Story #46).
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
 
       - name: Apply migrations
         shell: bash
@@ -383,6 +439,12 @@ jobs:
           MIGRATE_COMMAND: ${{ inputs.migrate-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional named secret passthrough (Story #46).
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
 
   # ---------------------------------------------------------------------------
   # 5. Deploy workers
@@ -443,11 +505,42 @@ jobs:
           BUILD_ENV: ${{ inputs.build-env }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional named secret passthrough (Story #46).
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
 
       - name: Deploy each worker
         id: deploy-step
         shell: bash
         run: |
+          # ----- Consumer-supplied deploy replaces the built-in loop -----
+          # For pnpm-workspace monorepos with no root wrangler config, the
+          # built-in root-level loop errors ("application detection logic has
+          # been run in the root of a workspace"). deploy-command lets the
+          # consumer publish each worker from its own package dir. It runs once
+          # with WORKERS (the csv) + DEPLOY_ENV + Cloudflare creds + any
+          # forwarded named secrets exported. deployed_workers is set to the
+          # workers input so downstream smoke / rollback targeting keeps working.
+          if [ -n "$DEPLOY_COMMAND" ]; then
+            echo "::group::Running consumer deploy-command"
+            export WORKERS="$WORKERS_CSV"
+            if bash -c "$DEPLOY_COMMAND"; then
+              echo "✅ consumer deploy-command succeeded"
+            else
+              echo "::error::Consumer deploy-command FAILED."
+              echo "::endgroup::"
+              exit 1
+            fi
+            echo "::endgroup::"
+            # Downstream smoke / rollback target the requested workers csv.
+            echo "deployed_workers=${WORKERS_CSV}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ----- Built-in root-level deploy loop (default) -----
           IFS=',' read -ra WORKERS <<< "$WORKERS_CSV"
           deployed=()
           failed=()
@@ -479,8 +572,15 @@ jobs:
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
           WORKERS_CSV: ${{ inputs.workers }}
+          DEPLOY_COMMAND: ${{ inputs.deploy-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional named secret passthrough (Story #46).
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
 
   # ---------------------------------------------------------------------------
   # 6. Boot-smoke + auto-rollback
