@@ -667,9 +667,9 @@ Two independent tracks. The consumer track (H1/H2) is every repo's High-severity
   - Standardize the migration-label-guard via the shared deploy workflow (fix athportal wrong path `scripts/migration-label-guard.mjs:18-19`; swarm-os has none; domio exact-host allowlist). One wrangler config format across both apps; one advanced `compatibility_date` (un-stick athportal `2025-01-01`).
   - **Closes:** §3 #3/#6/#7/#8, §4.4/#4.6/§4.7 (consumer side). **Release-gate:** MP-4/6/7/8/9 released.
 
-- [ ] **X3 — Adopt cross-repo workflow portability lint** · domio [#1544](https://github.com/dsj1984/domio/issues/1544), athportal [#2013](https://github.com/dsj1984/athportal/issues/2013), swarm-os [#121](https://github.com/Beestera/swarm-os/issues/121) · `blocked_by` mp **v0.2.5** (script source); pairs with **X2** · **S**.
-  - Copy `scripts/check-workflow-portability.mjs` from `mandrel-platform` (v0.2.5+) and run it as a CI self-test step alongside `check-required-contexts.mjs`, feeding `ci-required`. The lint statically asserts the two cross-repo footguns GitHub only validates at *call* time: relative `uses: ./` paths in reusable workflows, and `${{ }}` expressions in `workflow_call`/composite input descriptions & defaults. Fix any violation it surfaces locally (swarm-os has a local `.github/actions/setup/action.yml` to cover).
-  - **Closes:** the cross-repo footgun-detection gap exposed by the mandrel-platform #24 → #29 → #30 → #32 chain (consumer side). **Source-gate:** mandrel-platform `v0.2.5` released (✅). Dependency-free; bundle into the X2 PR.
+- [ ] **X3 — Adopt cross-repo workflow portability lint** · domio [#1544](https://github.com/dsj1984/domio/issues/1544), athportal [#2013](https://github.com/dsj1984/athportal/issues/2013), swarm-os [#121](https://github.com/Beestera/swarm-os/issues/121) · `blocked_by` mp **v0.3.0** (script source); pairs with **X2** · **S**.
+  - Copy `scripts/check-workflow-portability.mjs` from `mandrel-platform` (v0.3.0+) and run it as a CI self-test step alongside `check-required-contexts.mjs`, feeding `ci-required`. The lint statically asserts the two cross-repo footguns GitHub only validates at *call* time: relative `uses: ./` paths in reusable workflows, and `${{ }}` expressions in `workflow_call`/composite input descriptions & defaults. Fix any violation it surfaces locally (swarm-os has a local `.github/actions/setup/action.yml` to cover).
+  - **Closes:** the cross-repo footgun-detection gap exposed by the mandrel-platform #24 → #29 → #30 → #32 chain (consumer side). **Source-gate:** mandrel-platform `v0.3.0` / `869bbbf` released (✅). Dependency-free; bundle into the X2 PR.
 
 ### 7.7 Wave E — Platform hardening, observability & docs
 
@@ -688,7 +688,7 @@ All 27 original Stories exist (§7.1) and carry native `blocked_by` edges, plus 
 3. [x] **athportal (#6):** H1 (#2003) + H2 (#2004) → C1 (#2005).
 4. [x] **swarm-os (#1):** H1 (#109) + H2 (#110) → C1 (#111).
 5. [ ] After `mandrel-platform` #3/#4 released **and** a repo's C1 delivered → X1 (domio #1535, athportal #2006, swarm-os #112). **Gate satisfied — pinnable SHA: `mandrel-platform-v0.2.3` / `8a1c47c84e3abe195d8b221b73765d47bd3fbabc`.** Self-hosted runners also need `pnpm-dest: '${{ runner.temp }}/pnpm'` (fixed in v0.2.3, Story #25 + pnpm-dest fallback fix).
-6. [ ] After `mandrel-platform` #5/#7/#8/#9/#10 released **and** a repo's X1 delivered → X2 (domio #1536, athportal #2007, swarm-os #113). **Bundle X3** (portability lint: domio #1544, athportal #2013, swarm-os #121) into the same PR — mandrel-platform `v0.2.5` ships the script.
+6. [ ] After `mandrel-platform` #5/#7/#8/#9/#10 released **and** a repo's X1 delivered → X2 (domio #1536, athportal #2007, swarm-os #113). **Bundle X3** (portability lint: domio #1544, athportal #2013, swarm-os #121) into the same PR — mandrel-platform `v0.3.0` ships the script.
 7. [ ] After a repo's X2 delivered → F1 (domio #1537, athportal #2008, swarm-os #114).
 
 **Protocol & gates**
