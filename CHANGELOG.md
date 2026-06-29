@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.3.0...mandrel-platform-v0.3.1) (2026-06-29)
+
+
+### Fixed
+
+* **ci:** bump setup-toolchain pin off stale 519a337; guard internal pin lag ([d993b4f](https://github.com/dsj1984/mandrel-platform/commit/d993b4fc2d20c273e56df1b1ea2c6b941d5c6ca5))
+
 ## [0.3.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.5...mandrel-platform-v0.3.0) (2026-06-29)
 
 
