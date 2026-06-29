@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.5](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.4...mandrel-platform-v0.11.5) (2026-06-29)
+
+
+### Fixed
+
+* **security:** install Semgrep against system python3 for self-hosted SAST (refs [#85](https://github.com/dsj1984/mandrel-platform/issues/85)) ([#90](https://github.com/dsj1984/mandrel-platform/issues/90)) ([1a60e42](https://github.com/dsj1984/mandrel-platform/commit/1a60e42c681c9758439bb6beda2a3d7e655ebbba))
+
 ## [0.11.4](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.3...mandrel-platform-v0.11.4) (2026-06-29)
 
 
