@@ -22,7 +22,7 @@
 # to runner.temp keeps the shim job-scoped, not under $HOME, and unaffected by
 # `git clean -ffdx` on the next run.
 #
-# SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
+# SHA-pinned third-party actions per roadmap.md.
 name: Setup Toolchain
 description: >
   Install pnpm (from packageManager field), Node.js (from .nvmrc), and

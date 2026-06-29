@@ -33,13 +33,13 @@ motivated the audit are gone — a fix now lands in one place and is inherited.
 
 ### 1.1 What `mandrel-platform` ships
 
-The §6.2-era target layout is fully realized. Three distribution channels out of
-one repo:
+The originally-planned target layout is fully realized. Three distribution
+channels out of one repo:
 
 - **Reusable workflows** (`workflow_call`, SHA-pinned, Renovate-updatable):
   - `pr-quality.yml` — lint / typecheck / unit / contract / e2e tiers, single
     `ci-required` aggregator, per-job timeouts, Turbo + Playwright caching.
-    *(Note: carries no secret-scan/SAST tier — see §4.1.)*
+    *(Note: carries no secret-scan/SAST tier — see §4.3.)*
   - `deploy-cloudflare.yml` — isolation-audit, consumer-side build-artifact
     handoff, pre-migration Turso snapshot, boot-smoke, auto-rollback.
   - `codeql.yml` — unconditional SAST (not visibility-gated).
@@ -92,7 +92,7 @@ shared releases: **`pr-quality.yml@v0.3.1` (`185f28b`)** and
 ¹ swarm-os runs `migrate: false` by design (Turso/libSQL, no D1 migrations), so
 the pre-migration snapshot step is intentionally inert there.
 
-The bottom three rows are the live exposure carried into §4.1. Everything above
+The bottom three rows are the live exposure carried into §4.3. Everything above
 them matches — and in several places exceeds — what the roadmap promised.
 
 ---
@@ -118,7 +118,7 @@ exactly what `mandrel-platform` did.
 | Runtime drift (domio Node 22 / pnpm 10; loose Turbo floors; no `engine-strict`; advisory pins) | Converged: Node `24.16.0` exact, pnpm `11.5.2`, `engine-strict`, overrides in `pnpm-workspace.yaml` | C1 |
 | `tsconfig`/CVE-gate/Renovate config copied 3× | npm config package + Renovate preset | MP-6/MP-7 → X2 |
 | `main-protection.json` drift; phantom required checks that wedge PRs | Canonical contract + `check-required-contexts.mjs` self-test | MP-8 → X2; H2 (interim) |
-| No SAST anywhere; private-repo secret scan a green no-op; staging auto-deploys with no CI gate | CodeQL workflow + per-repo secret scan + `workflow_run` staging gate | MP-5, H1, H2 — **see §4.1, partially reopened** |
+| No SAST anywhere; private-repo secret scan a green no-op; staging auto-deploys with no CI gate | CodeQL workflow + per-repo secret scan + `workflow_run` staging gate | MP-5, H1, H2 — **see §4.3, partially reopened** |
 | Security headers / CORS missing on 2 of 3 (own `security-baseline.md` violation) | Ported domio's CSP/headers; `hono/cors` allowlists | F1 |
 | Observability decided but not wired; runbooks overstate signal | AE + Logpush + working Sentry per Worker | F1 |
 | Docs drift (Pages↔Worker, singular `environment.md`, stale runbooks) | Reconciled; plural `environments.md`; shared runbook templates | F1, MP-9 |
@@ -143,7 +143,7 @@ These decisions still govern the platform and should not be re-litigated:
 - **Documentation split (reference, don't copy).** Common *process* runbooks live
   once in `mandrel-platform` and are linked; each project keeps its own
   `docs/environments.md` and project-specific runbooks with local values. *(Two
-  consumers still hold local copies instead of references — §4.1.)*
+  consumers still hold local copies instead of references — §4.3.)*
 - **Runner choice is the one justified divergence.** Self-hosted (domio/athportal)
   vs `ubuntu-latest` (swarm-os) stays a per-repo input and must not be flattened.
 
@@ -222,17 +222,56 @@ from v0.6.0 onward.
 
 ## 4. Forward roadmap (post-v0.10.0)
 
-Verification on 2026-06-29 confirmed the bulk of the work but surfaced genuinely
-outstanding items. These are real, not invented — each carries the evidence that
-established it.
+Verification on 2026-06-29 confirmed the bulk of the delivered work but surfaced
+genuinely outstanding items (the prior "nothing outstanding" was inaccurate).
+These were fleshed out the same day into **11 Stories** — 5 on the producer, 1×3
++ 1×3 on the consumers — each with native GitHub `blocked_by` edges (cross-repo,
+and cross-org for swarm-os). §4.1 is the register, §4.2 the execution order; §4.3
+and §4.4 carry the evidence each Story closes.
 
-### 4.1 Outstanding — residual gaps from delivered work
+### 4.1 Story register
 
-**🔴 HIGH — Private-repo SAST and PR secret-scanning gates are not load-bearing
-(reopens the original §5 HIGH finding).** The audit's single highest-risk
-finding — "security gates marked required are green no-ops on private repos" —
-was marked closed (H2/F1) but is only partially resolved, and the closure claim
-never acknowledged the underlying GitHub-Advanced-Security limitation.
+**Producer — `mandrel-platform`** (Project [#8](https://github.com/users/dsj1984/projects/8)):
+
+| Story | Ticket | `blocked_by` | Sev / effort |
+|---|---|---|---|
+| MP-10 — private-repo-capable security tier in shared workflows | [#65](https://github.com/dsj1984/mandrel-platform/issues/65) | — | 🔴 HIGH / M |
+| MP-11 — Renovate rule to auto-bump consumer `uses:` pins | [#66](https://github.com/dsj1984/mandrel-platform/issues/66) | — | 🟠 MED / S |
+| MP-12 — cross-consumer pin-drift dashboard | [#67](https://github.com/dsj1984/mandrel-platform/issues/67) | — | 🟡 LOW / S |
+| MP-13 — v1.0 stabilization (public input contract + `@v1`) | [#68](https://github.com/dsj1984/mandrel-platform/issues/68) | MP-10, MP-11, MP-12 | 🟠 MED / M |
+| MP-14 — `platform sync` scaffold/adoption CLI | [#69](https://github.com/dsj1984/mandrel-platform/issues/69) | — | ⚪ opt / L |
+
+**Consumers — same Story per repo** (native `blocked_by` shown):
+
+| Story | Scope | domio | athportal | swarm-os | `blocked_by` |
+|---|---|---|---|---|---|
+| H3 | Adopt shared security tier; restore blocking PR secret-scan + SAST; enforce in branch protection | [#1550](https://github.com/dsj1984/domio/issues/1550) | [#2021](https://github.com/dsj1984/athportal/issues/2021) | [#128](https://github.com/Beestera/swarm-os/issues/128) | MP-10 (#65) |
+| G1 | Convergence residuals — CORS / Renovate-preset / Biome / AE+Logpush / runbook references / pin sweep | [#1551](https://github.com/dsj1984/domio/issues/1551) | [#2022](https://github.com/dsj1984/athportal/issues/2022) | [#127](https://github.com/Beestera/swarm-os/issues/127) | MP-11 (#66) |
+
+### 4.2 Execution order (waves)
+
+```text
+WAVE 1  Close the HIGH    MP-10 (#65) ─▶ H3·domio (#1550), H3·athportal (#2021), H3·swarm-os (#128)
+WAVE 2  Stop the drift    MP-11 (#66) + MP-12 (#67) ─▶ G1·domio (#1551), G1·athportal (#2022), G1·swarm-os (#127)
+WAVE 3  Stabilize         MP-13 (#68, after MP-10/11/12) ; MP-14 (#69)
+```
+
+**Critical path:** `MP-10 → H3 (×3)` is the only live-exposure track and starts
+now (no upstream dependency). `MP-11`/`MP-12` are independent of MP-10 and run in
+parallel; their consumer `G1` adoption follows. `MP-13` gates on the three earlier
+producer Stories so v1.0 freezes a contract with the gaps already closed. `MP-14`
+is optional and unblocked. Within each consumer Story, sub-items with no producer
+dependency (domio's `hono/cors`, athportal's AE/Logpush, the runbook references)
+may start before the gating producer Story lands.
+
+### 4.3 Outstanding — what each Story closes
+
+**🔴 HIGH · MP-10 (#65) → H3 (#1550 / #2021 / #128) — Private-repo SAST and PR
+secret-scanning gates are not load-bearing (reopens the founding audit's HIGH
+"no-op gates" finding).** The audit's single highest-risk finding — "security gates marked
+required are green no-ops on private repos" — was marked closed (H2/F1) but is
+only partially resolved, and the closure claim never acknowledged the underlying
+GitHub-Advanced-Security limitation.
 
 - **swarm-os:** `codeql.yml` runs analysis but sets `upload: never` ("the upload
   API returns 403 on the free private plan; flip to `upload: always` once GHAS is
@@ -256,76 +295,68 @@ never acknowledged the underlying GitHub-Advanced-Security limitation.
   `upload: never` → `always`. Either way, re-verify the gate actually blocks, then
   wire it into branch protection.
 
-**🟠 MEDIUM — Consumers lag the latest platform release and split pins across
-chains.** Every consumer pins `pr-quality.yml@v0.3.1` (`185f28b`) and
+**🟠 MEDIUM · MP-11 (#66) + MP-12 (#67) → G1 (#1551 / #2022 / #127) — Consumers
+lag the latest platform release and split pins across chains.** Every consumer
+pins `pr-quality.yml@v0.3.1` (`185f28b`) and
 `deploy-cloudflare.yml@v0.9.0` (`a606ad7`) — two different release SHAs per repo,
 neither on the current v0.10.0, with no automated bump or drift detection. This is
 universal (not athportal-specific) and silent.
 - **Fix:** add a Renovate rule (github-actions manager) to bump the `uses:` SHAs,
-  and a scheduled cross-consumer drift check (see §4.2) that flags lag and split
-  pins. A v1.0 contract freeze with `@v1` pinning (§4.2) would largely dissolve
-  this class.
+  and a scheduled cross-consumer drift check (MP-12, #67) that flags lag and split
+  pins. A v1.0 contract freeze with `@v1` pinning (MP-13, #68) would largely
+  dissolve this class.
 
-**🟠 MEDIUM — domio lacks a `hono/cors` per-env origin allowlist.** It relies on
+**🟠 MEDIUM · G1·domio (#1551) — domio lacks a `hono/cors` per-env origin
+allowlist.** It relies on
 security headers alone; athportal (`apiCors()`) and swarm-os (`cors({…})`) both
-ship per-env allowlists. The §5 Medium CORS finding was mapped to F1 and marked
-done, but domio's API has no explicit origin allowlist middleware.
+ship per-env allowlists. The founding audit's Medium CORS finding was mapped to F1
+and marked done, but domio's API has no explicit origin allowlist middleware.
 - **Fix:** register `hono/cors` on domio's API with a per-environment allowlist
   (`PUBLIC_SITE_URL`), no wildcard-with-credentials, + a contract test rejecting
   disallowed origins.
 
-**🟡 LOW — domio `renovate.json` not reduced to the platform preset.** Still 116
-lines of local `config:recommended` + groupings + package rules; athportal and
-swarm-os both collapsed to `{"extends":["github>dsj1984/mandrel-platform"]}` +
-repo-specific overrides.
+**🟡 LOW · G1·domio (#1551) — domio `renovate.json` not reduced to the platform
+preset.** Still 116 lines of local `config:recommended` + groupings + package
+rules; athportal and swarm-os both collapsed to
+`{"extends":["github>dsj1984/mandrel-platform"]}` + repo-specific overrides.
 
-**🟡 LOW — domio still Prettier+ESLint, not Biome.** The C1 Biome-first
-convergence target is incomplete in domio only (athportal and swarm-os are
-Biome-first). Decide whether to finish the migration or document the divergence as
-deliberate.
+**🟡 LOW · G1·domio (#1551) — domio still Prettier+ESLint, not Biome.** The C1
+Biome-first convergence target is incomplete in domio only (athportal and swarm-os
+are Biome-first). Decide whether to finish the migration or document the
+divergence as deliberate.
 
-**🟡 LOW — athportal observability is partial.** Sentry releases are wired, but the
-Analytics Engine binding is empty and Logpush is unwired, despite the F1 claim of
-"AE + Logpush per Worker." (domio and swarm-os have both.)
+**🟡 LOW · G1·athportal (#2022) — athportal observability is partial.** Sentry
+releases are wired, but the Analytics Engine binding is empty and Logpush is
+unwired, despite the F1 claim of "AE + Logpush per Worker." (domio and swarm-os
+have both.)
 
-**🟡 LOW — athportal & swarm-os runbooks are local copies, not references.** The
-§6.1 "reference, don't copy" rule and the F1 doc claim call for linking the shared
-`mandrel-platform` runbooks; both repos hold local re-implementations instead.
-(domio cross-references the shared set.)
+**🟡 LOW · G1·athportal (#2022) + G1·swarm-os (#127) — runbooks are local copies,
+not references.** The §2.2 "reference, don't copy" rule and the F1 doc claim call
+for linking the shared `mandrel-platform` runbooks; both repos hold local
+re-implementations instead. (domio cross-references the shared set.)
 
-### 4.2 Opportunities — now that the platform is proven
+### 4.4 Opportunities — now that the platform is proven
 
-- **(M) Private-repo security tier in the shared workflow.** The same change that
-  closes the §4.1 HIGH, framed as a platform feature: a reusable security tier all
-  consumers inherit, ending per-repo ad-hoc coverage for good. *Highest-value
-  next investment.*
-- **(S) Cross-consumer drift dashboard.** A scheduled job asserting every consumer
-  pins a single mandrel-platform SHA across all chains and flags lag behind the
-  latest release. Would have caught the split-pin state automatically.
-- **(L) `platform sync` scaffold CLI.** The operator-facing analogue of
-  `mandrel sync` (deferred from the original §3.10/§6.1): pin consumer workflow
+- **MP-10 (#65) — Private-repo security tier in the shared workflow.** The same
+  change that closes the §4.3 HIGH, framed as a platform feature: a reusable
+  security tier all consumers inherit, ending per-repo ad-hoc coverage for good.
+  *Highest-value next investment.*
+- **MP-12 (#67) — Cross-consumer drift dashboard.** A scheduled job asserting every
+  consumer pins a single mandrel-platform SHA across all chains and flags lag
+  behind the latest release. Would have caught the split-pin state automatically.
+- **MP-14 (#69) — `platform sync` scaffold CLI.** The operator-facing analogue of
+  `mandrel sync` (deferred from the founding audit's unification set): pin consumer workflow
   SHAs, materialize runbook reference-stubs, and reconcile `renovate`/`tsconfig`
   extends. Would have prevented the SHA split, domio's un-simplified Renovate, and
   the local-copy runbooks — turning one-time manual cutovers into a repeatable
   command.
-- **(M) v1.0 stabilization milestone.** Document the public `workflow_call`
-  input/secret contract and a deprecation policy, then let consumers pin `@v1`
-  instead of raw SHAs — directly reducing the drift in §4.1.
-- **(M) Onboard additional repos.** The ownership boundary was designed so any
-  repo (AI-driven or not) can adopt the platform without touching `mandrel`. With
-  three real consumers and a live smoke gate, the marginal cost of a fourth is low
-  and validates the distribution model.
-
-### 4.3 Suggested sequencing
-
-1. **Close the HIGH first.** Build the shared security tier (§4.2 first bullet);
-   it resolves the §4.1 HIGH across all consumers and is the only live-exposure
-   item. Re-verify gates block, then enforce in branch protection.
-2. **Stop the drift.** Land the Renovate `uses:` bump rule + drift dashboard
-   (§4.2), then sweep the consumers to the latest release; bundle domio's CORS,
-   Renovate-preset, and Biome cleanups into its sweep.
-3. **Finish the long tail.** athportal AE/Logpush; athportal & swarm-os runbook
-   references.
-4. **Then stabilize.** Cut v1.0 with a frozen input contract and move consumers to
-   `@v1`; consider onboarding a fourth repo and the `platform sync` CLI as the
-   distribution model matures.
+- **MP-13 (#68) — v1.0 stabilization milestone.** Document the public
+  `workflow_call` input/secret contract and a deprecation policy, then let
+  consumers pin `@v1` instead of raw SHAs — directly reducing the drift class
+  above.
+- **Onboard additional repos** *(future direction — not yet ticketed).* The
+  ownership boundary was designed so any repo (AI-driven or not) can adopt the
+  platform without touching `mandrel`. With three real consumers and a live smoke
+  gate, the marginal cost of a fourth is low and validates the distribution model;
+  it is a natural follow-on once MP-13/MP-14 make adoption a pinned `@v1` + a
+  `platform sync` command.

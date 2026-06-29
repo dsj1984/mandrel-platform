@@ -7,7 +7,7 @@
 # Consumable as a reusable workflow (workflow_call) or as a documented
 # copy-target for consumer repos (domio/swarm-os, athportal, etc.).
 #
-# SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
+# SHA-pinned third-party actions per roadmap.md.
 name: CodeQL
 
 on:
