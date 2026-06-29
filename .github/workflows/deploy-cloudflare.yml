@@ -234,6 +234,18 @@ on:
       CLERK_SECRET_KEY:
         description: 'Optional Clerk secret key for build-command / deploy-command.'
         required: false
+      SENTRY_PROJECT:
+        description: 'Optional Sentry project slug for source-map upload during build-command.'
+        required: false
+      SENTRY_ORG:
+        description: 'Optional Sentry org slug for source-map upload during build-command.'
+        required: false
+      PUBLIC_SENTRY_DSN:
+        description: 'Optional public Sentry DSN baked into the client build.'
+        required: false
+      SITE_URL:
+        description: 'Optional canonical site URL baked at build time (Astro.site).'
+        required: false
 
 # Least-privilege: content-read only. Each job that needs more escalates
 # individually (wrangler deploy needs no additional GH permissions).
@@ -395,6 +407,10 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
+          SITE_URL: ${{ secrets.SITE_URL }}
 
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -446,6 +462,10 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
+          SITE_URL: ${{ secrets.SITE_URL }}
 
       - name: Apply migrations
         shell: bash
@@ -470,6 +490,10 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
+          SITE_URL: ${{ secrets.SITE_URL }}
 
   # ---------------------------------------------------------------------------
   # 5. Deploy workers
@@ -539,6 +563,10 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
+          SITE_URL: ${{ secrets.SITE_URL }}
 
       - name: Deploy each worker
         id: deploy-step
@@ -609,6 +637,10 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
           CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
+          SITE_URL: ${{ secrets.SITE_URL }}
 
   # ---------------------------------------------------------------------------
   # 6. Boot-smoke + auto-rollback
