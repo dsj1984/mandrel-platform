@@ -502,7 +502,11 @@ jobs:
         if: ${{ inputs.enable-sast }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: '3.12'
+          # 3.11 ships setuptools/pkg_resources by default; 3.12 removed it,
+          # which crashes semgrep's opentelemetry import
+          # (ModuleNotFoundError: pkg_resources). We also install setuptools
+          # explicitly below as a belt-and-suspenders guarantee.
+          python-version: '3.11'
 
       # SAST via Semgrep, installed from PyPI at a pinned version. `--error`
       # makes findings fail the job WITHOUT relying on a SARIF / Code Scanning
@@ -518,7 +522,10 @@ jobs:
           # Pinned Semgrep release from PyPI. `semgrep scan --error` exits
           # non-zero on any finding; `--config` selects the ruleset (default
           # OSS 'auto'). Bump this pin deliberately.
-          python -m pip install --quiet --disable-pip-version-check 'semgrep==1.97.0'
+          # `setuptools` provides `pkg_resources`, which semgrep's transitive
+          # opentelemetry dependency imports but does not declare — absent by
+          # default on Python ≥3.12.
+          python -m pip install --quiet --disable-pip-version-check setuptools 'semgrep==1.97.0'
           echo "Running $(semgrep --version 2>/dev/null) (config: ${SEMGREP_CONFIG})"
           semgrep scan \
             --config "${SEMGREP_CONFIG}" \
