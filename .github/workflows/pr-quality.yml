@@ -373,8 +373,11 @@ jobs:
   # verified against a pinned SHA-256.
   #
   #   • Secret scan — pinned gitleaks binary over the PR diff (blocking).
-  #   • SAST        — pinned Semgrep over the working tree, `--error` fails the
-  #                   job on any finding (blocking, no SARIF upload).
+  #   • SAST        — pinned Semgrep, `--error` fails the job on any finding
+  #                   (blocking, no SARIF upload). On pull_request events it is
+  #                   scoped to the PR diff via `--baseline-commit <base.sha>`
+  #                   (mirroring the secret scan), so only findings INTRODUCED
+  #                   by the PR block; on push / schedule it scans the full tree.
   #
   # GHAS path (alternative, documented per AC): repos that DO have GitHub
   # Advanced Security can instead run CodeQL (codeql.yml) and flip its
@@ -498,6 +501,28 @@ jobs:
           fi
           echo "✅ No secrets detected."
 
+      # Resolve the Semgrep SAST baseline, mirroring the gitleaks PR-diff
+      # scoping above. On pull_request events the baseline is the PR's merge
+      # base (`base.sha`), so `--baseline-commit` makes Semgrep report only
+      # findings INTRODUCED by the PR (pre-existing debt is suppressed). On
+      # push / schedule / other events the baseline is empty → full-tree scan.
+      # `fetch-depth: 0` on the checkout above makes the base commit available.
+      - name: Resolve SAST baseline
+        id: sast-baseline
+        if: ${{ inputs.enable-sast }}
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_SHA:-}" ]; then
+            echo "baseline=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+            echo "PR-diff SAST baseline: ${BASE_SHA}"
+          else
+            echo "baseline=" >> "$GITHUB_OUTPUT"
+            echo "Full-tree SAST (no PR context)."
+          fi
+
       # SAST via Semgrep, installed from PyPI at a pinned version against the
       # runner's SYSTEM python3. We deliberately do NOT use
       # `actions/setup-python`: on a vanilla self-hosted runner with no
@@ -516,6 +541,9 @@ jobs:
         shell: bash
         env:
           SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+          # PR merge base on pull_request events, empty otherwise. When set,
+          # `--baseline-commit` scopes findings to those introduced by the PR.
+          BASELINE: ${{ steps.sast-baseline.outputs.baseline }}
         run: |
           set -euo pipefail
           # Pinned Semgrep release from PyPI. `semgrep scan --error` exits
@@ -539,8 +567,17 @@ jobs:
 
           run_semgrep() {
             echo "Running $(semgrep --version 2>/dev/null) (config: ${SEMGREP_CONFIG})"
+            if [ -n "${BASELINE:-}" ]; then
+              echo "PR-diff SAST: baselining against ${BASELINE} (only new findings block)."
+            else
+              echo "Full-tree SAST (no baseline)."
+            fi
+            # `${BASELINE:+--baseline-commit "$BASELINE"}` expands to the flag
+            # pair only when BASELINE is non-empty; on push/schedule it vanishes
+            # and Semgrep scans the full tree.
             semgrep scan \
               --config "${SEMGREP_CONFIG}" \
+              ${BASELINE:+--baseline-commit "$BASELINE"} \
               --error \
               --disable-version-check \
               --metrics=off \
