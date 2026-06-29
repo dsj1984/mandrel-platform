@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.3.1...mandrel-platform-v0.4.0) (2026-06-29)
+
+
+### Added
+
+* **ci:** add live cross-repo reusable-workflow smoke test ([b95e088](https://github.com/dsj1984/mandrel-platform/commit/b95e088d3f324d525e60fc9fb3c610d58c4ecdce))
+
+
+### Fixed
+
+* **deploy:** add command seams to deploy-cloudflare.yml + fix boot-smoke URL (refs [#41](https://github.com/dsj1984/mandrel-platform/issues/41)) ([#44](https://github.com/dsj1984/mandrel-platform/issues/44)) ([c54b0d3](https://github.com/dsj1984/mandrel-platform/commit/c54b0d34eb86b2f241ff7cee0ce91d9a436d319b))
+
 ## [0.3.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.3.0...mandrel-platform-v0.3.1) (2026-06-29)
 
 
