@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.4...mandrel-platform-v0.2.5) (2026-06-29)
+
+
+### Fixed
+
+* **ci:** strip ${{ }} expressions from pnpm-dest input descriptions ([39fa8a4](https://github.com/dsj1984/mandrel-platform/commit/39fa8a43dc42dbca2bd3b87640ceee04c19b3ef7))
+
 ## [0.2.4](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.3...mandrel-platform-v0.2.4) (2026-06-29)
 
 
