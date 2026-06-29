@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.11.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.10.0...mandrel-platform-v0.11.0) (2026-06-29)
+
+
+### Added
+
+* **ci:** cross-consumer pin-drift dashboard (MP-12) ([#67](https://github.com/dsj1984/mandrel-platform/issues/67)) ([#73](https://github.com/dsj1984/mandrel-platform/issues/73)) ([a2d1251](https://github.com/dsj1984/mandrel-platform/commit/a2d12513c2b8ccf60d4e28dbd9b440ce9831b2e3))
+* **cli:** add platform-sync adoption/drift-repair CLI (refs [#69](https://github.com/dsj1984/mandrel-platform/issues/69)) ([#75](https://github.com/dsj1984/mandrel-platform/issues/75)) ([cba63d4](https://github.com/dsj1984/mandrel-platform/commit/cba63d480d0854ea77355c11644f55d3f03c2a19))
+* **renovate:** auto-bump consumer mandrel-platform uses: pins (refs [#66](https://github.com/dsj1984/mandrel-platform/issues/66)) ([#71](https://github.com/dsj1984/mandrel-platform/issues/71)) ([14490be](https://github.com/dsj1984/mandrel-platform/commit/14490be505e8dbab5a9aeb704d497664e7da5f3e))
+* **security:** add private-repo-capable security tier to shared pr-quality workflow (refs [#65](https://github.com/dsj1984/mandrel-platform/issues/65)) ([#74](https://github.com/dsj1984/mandrel-platform/issues/74)) ([1789d28](https://github.com/dsj1984/mandrel-platform/commit/1789d2899900a06882d1c8ac68e07d7ac3934fef))
+
 ## [0.10.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.9.0...mandrel-platform-v0.10.0) (2026-06-29)
 
 
