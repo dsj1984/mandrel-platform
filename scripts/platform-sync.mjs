@@ -1,0 +1,450 @@
+#!/usr/bin/env node
+/**
+ * platform-sync.mjs — mandrel-platform adoption / drift-repair CLI (MP-14).
+ *
+ * The operator-facing analogue of `mandrel sync`. Run it from the root of a
+ * **consumer** repo to adopt mandrel-platform — or to repair the three drift
+ * states the founding audit (§4.1) called out:
+ *
+ *   1. SPLIT PINS — consumer workflows reference
+ *      `dsj1984/mandrel-platform/...@<sha>` at mixed/stale SHAs. This command
+ *      resolves a chosen release ref (e.g. `mandrel-platform-v0.10.0`, or the
+ *      `@v1` floating tag once MP-13 ships it) to its commit SHA and rewrites
+ *      every first-party `uses:` pin to that single SHA — leaving the
+ *      `# <ref>` trailing comment so the pin stays human-auditable and
+ *      Renovate's `helpers:pinGitHubActionDigests`-style bump rule can track
+ *      it (MP-11).
+ *
+ *   2. LOCAL-COPY RUNBOOKS — consumer holds full local copies of the shared
+ *      process runbooks instead of thin reference stubs (§2.2 "reference,
+ *      don't copy"). This command materializes the canonical reference stubs
+ *      from `templates/runbooks/` into the consumer's `docs/runbooks/`,
+ *      **link-only** — it never overwrites a stub the operator has already
+ *      filled in (idempotent by content-marker detection).
+ *
+ *   3. UN-SIMPLIFIED CONFIG — consumer's `renovate.json` / `tsconfig.json`
+ *      hand-reimplement what the shared preset / base config already provide.
+ *      This command reconciles the `extends` chains so the consumer extends
+ *      the SSOT (`github>dsj1984/mandrel-platform` for Renovate,
+ *      `mandrel-platform/tsconfig.base.json` for TypeScript).
+ *
+ * Idempotent: re-running on an already-synced consumer makes no changes and
+ * reports `unchanged`. `--dry-run` prints the planned diff without touching
+ * disk or the network mutation.
+ *
+ * Usage (from the consumer repo root):
+ *   node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref mandrel-platform-v0.10.0
+ *   node .../platform-sync.mjs --ref v1 --dry-run
+ *   node .../platform-sync.mjs --ref <ref> --consumer /path/to/consumer --templates /path/to/mandrel-platform/templates
+ *
+ * Flags:
+ *   --ref <ref>          (required) release tag / branch / floating tag to pin to.
+ *   --dry-run            plan only; no disk writes, no SHA resolution network call
+ *                        when --sha is also supplied.
+ *   --sha <40-hex>       skip ref→SHA resolution and pin to this SHA directly
+ *                        (offline / test mode).
+ *   --consumer <dir>     consumer repo root (default: process.cwd()).
+ *   --templates <dir>    mandrel-platform templates/ dir (default: resolved
+ *                        relative to this script — works when run from
+ *                        node_modules/mandrel-platform/scripts/).
+ *   --repo <owner/repo>  first-party slug to pin (default: dsj1984/mandrel-platform).
+ *   --json               emit the result envelope as JSON on stdout.
+ *
+ * Exit codes:
+ *   0 — sync applied or already in sync (or dry-run printed cleanly).
+ *   1 — a fatal error (unresolvable ref, missing templates, malformed config).
+ */
+
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// ---------------------------------------------------------------------------
+// Arg parsing
+// ---------------------------------------------------------------------------
+
+const args = process.argv.slice(2);
+const opts = {
+  ref: null,
+  sha: null,
+  dryRun: false,
+  consumer: process.cwd(),
+  templates: null,
+  repo: "dsj1984/mandrel-platform",
+  json: false,
+};
+
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === "--ref" && args[i + 1]) opts.ref = args[++i];
+  else if (a === "--sha" && args[i + 1]) opts.sha = args[++i];
+  else if (a === "--dry-run") opts.dryRun = true;
+  else if (a === "--consumer" && args[i + 1]) opts.consumer = resolve(args[++i]);
+  else if (a === "--templates" && args[i + 1]) opts.templates = resolve(args[++i]);
+  else if (a === "--repo" && args[i + 1]) opts.repo = args[++i];
+  else if (a === "--json") opts.json = true;
+  else if (a === "--help" || a === "-h") {
+    printHelp();
+    process.exit(0);
+  } else {
+    fail(`Unknown argument: ${a}`);
+  }
+}
+
+function printHelp() {
+  // Echo the usage block from the file header so `--help` stays in sync.
+  process.stdout.write(
+    [
+      "platform-sync — mandrel-platform adoption / drift-repair CLI (MP-14)",
+      "",
+      "Usage (from the consumer repo root):",
+      "  node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref <ref> [--dry-run]",
+      "",
+      "Flags:",
+      "  --ref <ref>          (required) release tag / branch / floating tag to pin to.",
+      "  --dry-run            plan only; no disk writes.",
+      "  --sha <40-hex>       skip ref->SHA resolution; pin to this SHA (offline mode).",
+      "  --consumer <dir>     consumer repo root (default: cwd).",
+      "  --templates <dir>    mandrel-platform templates/ dir (default: resolved from script).",
+      "  --repo <owner/repo>  first-party slug to pin (default: dsj1984/mandrel-platform).",
+      "  --json               emit the result envelope as JSON.",
+      "",
+    ].join("\n")
+  );
+}
+
+function fail(msg) {
+  process.stderr.write(`❌ platform-sync: ${msg}\n`);
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Logging — quiet under --json (the envelope is the only stdout artifact).
+// ---------------------------------------------------------------------------
+
+function log(msg) {
+  if (!opts.json) process.stdout.write(`${msg}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// Defaults requiring resolution
+// ---------------------------------------------------------------------------
+
+if (!opts.ref) fail("--ref <release-tag|branch|floating-tag> is required.");
+if (opts.sha && !/^[0-9a-fA-F]{40}$/.test(opts.sha)) {
+  fail(`--sha must be a 40-character hex commit SHA (got: ${opts.sha}).`);
+}
+
+// templates/ defaults to the dir adjacent to this script's package root.
+// When run from node_modules/mandrel-platform/scripts/, that is
+// node_modules/mandrel-platform/templates/.
+if (!opts.templates) {
+  opts.templates = resolve(__dirname, "..", "templates");
+}
+const runbookTemplatesDir = join(opts.templates, "runbooks");
+
+// ---------------------------------------------------------------------------
+// 1. Resolve the chosen ref → commit SHA
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve `ref` (tag/branch/floating tag) on the remote `repo` to its full
+ * 40-char commit SHA. Uses `git ls-remote`, which needs no checkout and works
+ * for tags, annotated tags (peeled `^{}`), and branches. In --dry-run with an
+ * explicit --sha we skip the network entirely.
+ */
+function resolveSha() {
+  if (opts.sha) return opts.sha;
+  const remote = `https://github.com/${opts.repo}.git`;
+  let out;
+  try {
+    out = execFileSync("git", ["ls-remote", remote, opts.ref, `${opts.ref}^{}`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    fail(
+      `could not resolve ref '${opts.ref}' on ${opts.repo}: ${
+        (err && err.stderr) || err.message
+      }`
+    );
+  }
+  const lines = out.trim().split("\n").filter(Boolean);
+  if (lines.length === 0) {
+    fail(`ref '${opts.ref}' not found on ${opts.repo}.`);
+  }
+  // Prefer the peeled (`^{}`) line for annotated tags — that is the commit the
+  // tag ultimately points at, which is what a `uses: ...@<sha>` pin must use.
+  const peeled = lines.find((l) => l.endsWith(`^{}`));
+  const chosen = peeled || lines[0];
+  const sha = chosen.split(/\s+/)[0];
+  if (!/^[0-9a-fA-F]{40}$/.test(sha)) {
+    fail(`resolved ref '${opts.ref}' to a non-SHA value: '${sha}'.`);
+  }
+  return sha;
+}
+
+// ---------------------------------------------------------------------------
+// 2. Pin first-party `uses:` SHAs in consumer workflows
+// ---------------------------------------------------------------------------
+
+/** Recursively collect `.yml`/`.yaml` files under a directory. */
+function collectYaml(dir) {
+  const found = [];
+  if (!existsSync(dir)) return found;
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    const st = statSync(full);
+    if (st.isDirectory()) found.push(...collectYaml(full));
+    else if (/\.ya?ml$/.test(entry)) found.push(full);
+  }
+  return found;
+}
+
+/**
+ * Rewrite every first-party `uses: <repo>/<path>@<oldSha>` to the target SHA.
+ * The match mirrors check-workflow-portability.mjs's internal-pin regex but is
+ * scoped to the configured `repo` slug (the consumer's workflows reference
+ * mandrel-platform explicitly, so the slug is known). Preserves any trailing
+ * `# <comment>` but rewrites it to `# <ref>` so the human-readable annotation
+ * tracks the chosen release.
+ */
+function pinWorkflows(targetSha) {
+  const workflowsDir = join(opts.consumer, ".github", "workflows");
+  const actionsDir = join(opts.consumer, ".github", "actions");
+  const files = [...collectYaml(workflowsDir), ...collectYaml(actionsDir)];
+  const slug = opts.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // uses: dsj1984/mandrel-platform/<subpath>@<40hex>   [optional trailing comment]
+  const pinRe = new RegExp(
+    `(uses:\\s*['"]?${slug}/[^@\\s'"]+@)([0-9a-fA-F]{40})(['"]?)([^\\n]*)`,
+    "g"
+  );
+  const changes = [];
+  for (const file of files) {
+    const before = readFileSync(file, "utf8");
+    let touched = false;
+    const after = before.replace(pinRe, (_m, head, oldSha, quote, trailing) => {
+      // Drop any existing trailing comment; re-attach a fresh `# <ref>`.
+      const newTrailing = ` # ${opts.ref}`;
+      if (oldSha.toLowerCase() === targetSha.toLowerCase()) {
+        // SHA already correct — but normalize the comment if it drifted.
+        const normalized = `${head}${oldSha}${quote}${newTrailing}`;
+        const current = `${head}${oldSha}${quote}${trailing}`;
+        if (normalized !== current) touched = true;
+        return normalized;
+      }
+      touched = true;
+      changes.push({ file: rel(file), from: oldSha.slice(0, 7), to: targetSha.slice(0, 7) });
+      return `${head}${targetSha}${quote}${newTrailing}`;
+    });
+    if (touched && after !== before) {
+      if (!opts.dryRun) writeFileSync(file, after);
+    }
+  }
+  return changes;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Materialize runbook reference stubs (link, don't copy)
+// ---------------------------------------------------------------------------
+
+// Content marker every materialized stub carries so re-runs are idempotent and
+// operator-edited stubs are never clobbered.
+const STUB_MARKER = "> **Thin local stub.**";
+
+/**
+ * Copy each `templates/runbooks/*.md` (except the index README) into the
+ * consumer's `docs/runbooks/`, but only when the destination is ABSENT. An
+ * existing destination is left untouched — whether it is an already-adopted
+ * stub or a local copy the operator must reconcile by hand (we surface the
+ * latter as a `localCopy` warning rather than silently overwriting their work).
+ */
+function materializeRunbooks() {
+  const created = [];
+  const skipped = [];
+  const localCopies = [];
+  if (!existsSync(runbookTemplatesDir)) {
+    fail(`runbook templates not found at ${runbookTemplatesDir}.`);
+  }
+  const destDir = join(opts.consumer, "docs", "runbooks");
+  for (const entry of readdirSync(runbookTemplatesDir)) {
+    if (!entry.endsWith(".md")) continue;
+    if (entry.toLowerCase() === "readme.md") continue; // index, not a stub
+    const src = join(runbookTemplatesDir, entry);
+    const dest = join(destDir, entry);
+    if (existsSync(dest)) {
+      const body = readFileSync(dest, "utf8");
+      if (body.includes(STUB_MARKER)) {
+        skipped.push(rel(dest)); // already a reference stub — idempotent no-op
+      } else {
+        localCopies.push(rel(dest)); // full local copy — operator must reconcile
+      }
+      continue;
+    }
+    if (!opts.dryRun) {
+      mkdirSync(destDir, { recursive: true });
+      writeFileSync(dest, readFileSync(src, "utf8"));
+    }
+    created.push(rel(dest));
+  }
+  return { created, skipped, localCopies };
+}
+
+// ---------------------------------------------------------------------------
+// 4. Reconcile renovate / tsconfig `extends`
+// ---------------------------------------------------------------------------
+
+const RENOVATE_PRESET = `github>${"dsj1984/mandrel-platform"}`;
+const TSCONFIG_BASE = "mandrel-platform/tsconfig.base.json";
+
+/** Parse JSON tolerating `//` and block comments (jsonc), preserving nothing
+ * but the parsed value — we re-serialize with 2-space indent. */
+function parseJsonc(text) {
+  const stripped = text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+  return JSON.parse(stripped);
+}
+
+function reconcileRenovate() {
+  // Renovate config can live at a few canonical paths.
+  const candidates = [
+    "renovate.json",
+    "renovate.json5",
+    ".github/renovate.json",
+    ".renovaterc.json",
+  ].map((p) => join(opts.consumer, p));
+  const path = candidates.find((p) => existsSync(p));
+  if (!path) return { action: "absent", file: null };
+  let cfg;
+  try {
+    cfg = parseJsonc(readFileSync(path, "utf8"));
+  } catch (err) {
+    fail(`could not parse Renovate config at ${rel(path)}: ${err.message}`);
+  }
+  const extendsArr = Array.isArray(cfg.extends) ? [...cfg.extends] : [];
+  if (extendsArr.includes(RENOVATE_PRESET)) {
+    return { action: "unchanged", file: rel(path) };
+  }
+  // Prepend the SSOT preset so consumer overrides (later entries) still win.
+  cfg.extends = [RENOVATE_PRESET, ...extendsArr];
+  if (!opts.dryRun) writeFileSync(path, `${JSON.stringify(cfg, null, 2)}\n`);
+  return { action: "reconciled", file: rel(path), added: RENOVATE_PRESET };
+}
+
+function reconcileTsconfig() {
+  const path = join(opts.consumer, "tsconfig.json");
+  if (!existsSync(path)) return { action: "absent", file: null };
+  let cfg;
+  try {
+    cfg = parseJsonc(readFileSync(path, "utf8"));
+  } catch (err) {
+    fail(`could not parse tsconfig at ${rel(path)}: ${err.message}`);
+  }
+  // `extends` may be a string or (TS 5.0+) an array.
+  const current = cfg.extends;
+  const hasBase = Array.isArray(current)
+    ? current.includes(TSCONFIG_BASE)
+    : current === TSCONFIG_BASE;
+  if (hasBase) return { action: "unchanged", file: rel(path) };
+  if (current === undefined) {
+    cfg.extends = TSCONFIG_BASE;
+  } else if (Array.isArray(current)) {
+    // Base first so the consumer's own extends override it.
+    cfg.extends = [TSCONFIG_BASE, ...current];
+  } else {
+    cfg.extends = [TSCONFIG_BASE, current];
+  }
+  if (!opts.dryRun) writeFileSync(path, `${JSON.stringify(cfg, null, 2)}\n`);
+  return { action: "reconciled", file: rel(path), added: TSCONFIG_BASE };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function rel(p) {
+  return relative(opts.consumer, p) || p;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+function main() {
+  if (!existsSync(opts.consumer)) {
+    fail(`consumer dir not found: ${opts.consumer}`);
+  }
+
+  const targetSha = resolveSha();
+  log(`▶ platform-sync — ref '${opts.ref}' → ${targetSha.slice(0, 7)} (${opts.repo})`);
+  if (opts.dryRun) log("  (dry-run: no files will be written)");
+
+  const pins = pinWorkflows(targetSha);
+  const runbooks = materializeRunbooks();
+  const renovate = reconcileRenovate();
+  const tsconfig = reconcileTsconfig();
+
+  const changed =
+    pins.length > 0 ||
+    runbooks.created.length > 0 ||
+    renovate.action === "reconciled" ||
+    tsconfig.action === "reconciled";
+
+  // Human-readable summary
+  log("");
+  log(`  pins:      ${pins.length} workflow pin(s) ${opts.dryRun ? "would be " : ""}updated`);
+  for (const c of pins) log(`             - ${c.file}: ${c.from} → ${c.to}`);
+  log(
+    `  runbooks:  ${runbooks.created.length} stub(s) ${
+      opts.dryRun ? "would be " : ""
+    }materialized, ${runbooks.skipped.length} already present`
+  );
+  for (const f of runbooks.created) log(`             + ${f}`);
+  for (const f of runbooks.localCopies) {
+    log(`             ⚠ ${f}: full local copy detected — reconcile to a reference stub by hand (§2.2)`);
+  }
+  log(`  renovate:  ${renovate.action}${renovate.file ? ` (${renovate.file})` : ""}`);
+  log(`  tsconfig:  ${tsconfig.action}${tsconfig.file ? ` (${tsconfig.file})` : ""}`);
+  log("");
+  log(
+    changed
+      ? opts.dryRun
+        ? "✅ dry-run: changes planned (see above). Re-run without --dry-run to apply."
+        : "✅ sync applied."
+      : "✅ already in sync — no changes."
+  );
+
+  if (opts.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          ref: opts.ref,
+          sha: targetSha,
+          repo: opts.repo,
+          consumer: opts.consumer,
+          dryRun: opts.dryRun,
+          changed,
+          pins,
+          runbooks,
+          renovate,
+          tsconfig,
+        },
+        null,
+        2
+      )}\n`
+    );
+  }
+}
+
+main();

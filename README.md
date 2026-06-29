@@ -117,6 +117,49 @@ is detected by Renovate).
 
 ---
 
+## Adoption CLI (`platform-sync`)
+
+`scripts/platform-sync.mjs` is the operator-facing analogue of `mandrel sync`:
+a single idempotent command a **consumer** repo runs to adopt mandrel-platform
+or to repair the three drift states the founding audit flagged (split pins,
+local-copy runbooks, un-simplified config). Run it from the consumer repo root:
+
+```bash
+# Pin every first-party `uses:` to a release and reconcile config + runbooks
+node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref mandrel-platform-v0.10.0
+
+# Preview the plan without touching disk
+node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref v1 --dry-run
+```
+
+What it does (each step is idempotent — a re-run on an already-synced repo
+reports `already in sync`):
+
+1. **Pins workflow SHAs.** Resolves `--ref` (a release tag, branch, or the
+   floating `@v1` tag once MP-13 ships it) to its commit SHA via
+   `git ls-remote`, then rewrites every
+   `uses: dsj1984/mandrel-platform/...@<sha>` reference in the consumer's
+   `.github/workflows/` and `.github/actions/` to that single SHA. External
+   actions (`actions/checkout`, …) are left untouched. The trailing
+   `# <ref>` comment is refreshed so the pin stays human-auditable and
+   Renovate (MP-11) can track it.
+2. **Materializes runbook reference stubs** (§2.2 *link, don't copy*). Copies
+   the thin stubs from `templates/runbooks/` into the consumer's
+   `docs/runbooks/` **only when absent** — an already-adopted stub is skipped,
+   and a full local copy (no stub marker) is surfaced as a warning to
+   reconcile by hand, never silently overwritten.
+3. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
+   consumer's Renovate `extends` and `mandrel-platform/tsconfig.base.json` to
+   its `tsconfig.json` `extends`. The SSOT goes first so the consumer's own
+   later entries continue to override it.
+
+**Flags:** `--ref <ref>` (required), `--dry-run`, `--sha <40-hex>` (skip
+network ref resolution — offline/test mode), `--consumer <dir>` (default:
+cwd), `--templates <dir>`, `--repo <owner/repo>`, `--json` (machine-readable
+result envelope on stdout).
+
+---
+
 ## Development
 
 ```bash

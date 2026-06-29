@@ -15,6 +15,16 @@ Each stub:
 
 ## How to adopt (downstream repo)
 
+**Automated path (recommended).** The adoption CLI materializes every stub for
+you (link-only, never clobbering a stub you've already filled in) as part of a
+full sync — see [`scripts/platform-sync.mjs`](../../README.md#adoption-cli-platform-sync):
+
+```bash
+node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref mandrel-platform-v0.10.0
+```
+
+**Manual path.**
+
 1. Copy the stub(s) you need into your project's `docs/runbooks/`:
    ```bash
    cp node_modules/mandrel-platform/templates/runbooks/deploy-promotion.md \

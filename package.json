@@ -25,7 +25,8 @@
   "scripts": {
     "typecheck": "node --input-type=module --eval 'process.exit(0)'",
     "lint": "node --input-type=module --eval 'process.exit(0)'",
-    "test": "node --input-type=module --eval 'process.exit(0)'",
+    "test": "node --test \"scripts/**/*.test.mjs\"",
+    "platform:sync": "node scripts/platform-sync.mjs",
     "sync:commands": "node .agents/scripts/sync-claude-commands.js",
     "prepare": "node .agents/scripts/sync-claude-commands.js",
     "bootstrap": "node .agents/scripts/bootstrap.js",
