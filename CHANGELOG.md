@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.6.0...mandrel-platform-v0.7.0) (2026-06-29)
+
+
+### Added
+
+* **deploy:** add gh-environment input so Environment-scoped secrets resolve (refs [#51](https://github.com/dsj1984/mandrel-platform/issues/51)) ([#53](https://github.com/dsj1984/mandrel-platform/issues/53)) ([1016934](https://github.com/dsj1984/mandrel-platform/commit/1016934cbd8803dc32ee2a55124f178c687597bd))
+
 ## [0.6.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.5.1...mandrel-platform-v0.6.0) (2026-06-29)
 
 
