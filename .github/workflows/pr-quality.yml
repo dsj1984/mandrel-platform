@@ -13,8 +13,9 @@
 # When shards == 1 (default), `shard-matrix` defaults to "[1]".
 #
 # SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
-# setup-toolchain composite pinned to the commit that introduced it (Story #3):
-#   dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+# setup-toolchain is a first-party action in this repo; referenced by relative
+# path (./.github/actions/setup-toolchain) so consumers who pin pr-quality.yml
+# at a SHA automatically use the setup-toolchain at that exact same commit.
 name: PR Quality
 
 on:
@@ -136,7 +137,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        uses: ./.github/actions/setup-toolchain
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -164,7 +165,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        uses: ./.github/actions/setup-toolchain
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -190,7 +191,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        uses: ./.github/actions/setup-toolchain
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -226,7 +227,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        uses: ./.github/actions/setup-toolchain
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -260,7 +261,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
+        uses: ./.github/actions/setup-toolchain
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
