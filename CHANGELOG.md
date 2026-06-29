@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.9.0...mandrel-platform-v0.10.0) (2026-06-29)
+
+
+### Added
+
+* **deploy:** freeze deploy-cloudflare secret allowlist at {CLOUDFLARE_*, TURSO_*} (refs [#61](https://github.com/dsj1984/mandrel-platform/issues/61)) ([#62](https://github.com/dsj1984/mandrel-platform/issues/62)) ([e20e576](https://github.com/dsj1984/mandrel-platform/commit/e20e5765216804dcde6627be58ee3ebc23e119c3))
+
 ## [0.9.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.8.0...mandrel-platform-v0.9.0) (2026-06-29)
 
 
