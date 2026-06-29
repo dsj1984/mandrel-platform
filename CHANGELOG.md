@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.5.0...mandrel-platform-v0.5.1) (2026-06-29)
+
+
+### Fixed
+
+* **deploy:** correct invalid gitleaks-action pin to real v2.3.9 SHA (Closes [#49](https://github.com/dsj1984/mandrel-platform/issues/49)) ([4532ff7](https://github.com/dsj1984/mandrel-platform/commit/4532ff7ff9096d2b3849689d4daf52c5c2e85dfa))
+
 ## [0.5.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.4.0...mandrel-platform-v0.5.0) (2026-06-29)
 
 
