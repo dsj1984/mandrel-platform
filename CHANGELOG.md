@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.1...mandrel-platform-v0.2.2) (2026-06-29)
+
+
+### Fixed
+
+* **actions:** setup-toolchain incompatible with self-hosted runners (cache: false + git-clean path) ([#25](https://github.com/dsj1984/mandrel-platform/issues/25)) ([#26](https://github.com/dsj1984/mandrel-platform/issues/26)) ([c5647e7](https://github.com/dsj1984/mandrel-platform/commit/c5647e7bc23c5eb8d0af62f5a84821d9f6cd8511))
+
 ## [0.2.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.0...mandrel-platform-v0.2.1) (2026-06-28)
 
 
