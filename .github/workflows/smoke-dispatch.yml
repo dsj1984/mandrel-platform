@@ -8,8 +8,12 @@
 # `smoke/cross-repo` commit status back on this SHA. The release-please
 # `await-smoke` gate blocks npm-publish until that status is green.
 #
-# Requires the SMOKE_DISPATCH_TOKEN secret (fine-grained PAT with actions:write
-# on the smoke repo + commit-statuses:write on this repo).
+# Tokens:
+#   - the pending self-status uses the built-in GITHUB_TOKEN (statuses: write).
+#   - the cross-repo dispatch uses SMOKE_DISPATCH_TOKEN (a fine-grained PAT with
+#     Contents: write on the smoke repo — required by the repository_dispatch
+#     API). The smoke repo's gate posts the final status back using the same
+#     PAT, which therefore also needs Commit statuses: write on THIS repo.
 name: Dispatch Cross-repo Smoke
 
 on:
@@ -19,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: smoke-dispatch-${{ github.sha }}
@@ -30,23 +35,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Set pending status + dispatch smoke
+      - name: Mark commit pending (built-in token)
         env:
-          GH_TOKEN: ${{ secrets.SMOKE_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # Mark the commit pending; the smoke's gate job resolves it.
           gh api -X POST "repos/${REPO}/statuses/${SHA}" \
             -f state=pending \
             -f context=smoke/cross-repo \
             -f description="cross-repo smoke dispatched" >/dev/null
+          echo "smoke/cross-repo set pending on ${SHA}"
 
-          # Fire repository_dispatch at the smoke repo carrying this SHA.
+      - name: Dispatch smoke (PAT)
+        env:
+          GH_TOKEN: ${{ secrets.SMOKE_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
           printf '{"event_type":"mandrel-smoke","client_payload":{"sha":"%s"}}' "${SHA}" > payload.json
           gh api -X POST repos/dsj1984/mandrel-platform-smoke/dispatches --input payload.json >/dev/null
-
-          echo "Dispatched mandrel-smoke for ${SHA}; smoke/cross-repo set pending."
+          echo "Dispatched mandrel-smoke for ${SHA}"

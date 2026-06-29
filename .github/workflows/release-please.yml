@@ -53,6 +53,7 @@ jobs:
     timeout-minutes: 25
     permissions:
       contents: read
+      statuses: read
     steps:
       - name: Poll smoke/cross-repo status on the release commit
         env:
