@@ -91,6 +91,18 @@ on:
         type: string
         default: 'true'
 
+      # pnpm shim destination for self-hosted runners.
+      pnpm-dest:
+        description: >
+          Passed through to setup-toolchain's `pnpm-dest` input. Controls where
+          pnpm/action-setup installs the pnpm shim. Leave empty to use
+          setup-toolchain's default (${{ runner.temp }}/pnpm). Self-hosted
+          callers should set this explicitly (e.g. '${{ runner.temp }}/pnpm')
+          to avoid $HOME races and git-clean eviction.
+        required: false
+        type: string
+        default: ''
+
     secrets:
       # Turbo remote cache credentials (athportal pattern — §5 of initial-roadmap.md).
       TURBO_TOKEN:
@@ -127,6 +139,7 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
         with:
           cache: ${{ inputs.toolchain-cache }}
+          pnpm-dest: ${{ inputs.pnpm-dest }}
 
       - name: Lint
         run: pnpm run lint
@@ -154,6 +167,7 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
         with:
           cache: ${{ inputs.toolchain-cache }}
+          pnpm-dest: ${{ inputs.pnpm-dest }}
 
       - name: Typecheck
         run: pnpm run typecheck
@@ -179,6 +193,7 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
         with:
           cache: ${{ inputs.toolchain-cache }}
+          pnpm-dest: ${{ inputs.pnpm-dest }}
 
       - name: Unit tests (shard ${{ matrix.shard }}/${{ inputs.shards }})
         run: pnpm run test:unit --shard=${{ matrix.shard }}/${{ inputs.shards }}
@@ -214,6 +229,7 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
         with:
           cache: ${{ inputs.toolchain-cache }}
+          pnpm-dest: ${{ inputs.pnpm-dest }}
 
       - name: Contract tests (shard ${{ matrix.shard }}/${{ inputs.shards }})
         run: pnpm run test:contract --shard=${{ matrix.shard }}/${{ inputs.shards }}
@@ -247,6 +263,7 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@9d9310176dbef2e15c31dec050300a40f5b63217
         with:
           cache: ${{ inputs.toolchain-cache }}
+          pnpm-dest: ${{ inputs.pnpm-dest }}
 
       - name: Resolve Playwright version
         id: pw-version

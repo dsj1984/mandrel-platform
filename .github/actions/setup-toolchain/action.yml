@@ -4,18 +4,31 @@
 # (version read from .nvmrc), and project dependencies via
 # `pnpm install --frozen-lockfile`.
 #
-# Usage:
+# Usage (ubuntu runners — default):
 #   - name: Setup toolchain
 #     uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
 #     with:
-#       cache: 'true'   # set 'false' on self-hosted runners with a warm store
+#       cache: 'true'
+#
+# Usage (self-hosted runners — cache: false + stable pnpm-dest):
+#   - name: Setup toolchain
+#     uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
+#     with:
+#       cache: 'false'
+#       pnpm-dest: '${{ runner.temp }}/pnpm'
+#
+# On self-hosted topologies where multiple job processes share $HOME, concurrent
+# jobs race on ~/setup-pnpm (the pnpm/action-setup default). Setting pnpm-dest
+# to runner.temp keeps the shim job-scoped, not under $HOME, and unaffected by
+# `git clean -ffdx` on the next run.
 #
 # SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
 name: Setup Toolchain
 description: >
   Install pnpm (from packageManager field), Node.js (from .nvmrc), and
   project dependencies. Pass cache: 'false' on self-hosted runners that
-  maintain their own warm pnpm store.
+  maintain their own warm pnpm store. Pass pnpm-dest to override the pnpm
+  shim install location (defaults to runner.temp/pnpm for concurrency safety).
 
 inputs:
   cache:
@@ -24,6 +37,15 @@ inputs:
       self-hosted runners that maintain their own warm pnpm store.
     required: false
     default: 'true'
+  pnpm-dest:
+    description: >
+      Directory where pnpm/action-setup installs the pnpm shim. Defaults to
+      ${{ runner.temp }}/pnpm — job-scoped, not under $HOME, safe for
+      concurrent self-hosted jobs and unaffected by git clean -ffdx.
+      Self-hosted callers should set this explicitly to match their runner
+      topology (e.g. '${{ runner.temp }}/pnpm').
+    required: false
+    default: '${{ runner.temp }}/pnpm'
 
 runs:
   using: composite
@@ -32,6 +54,7 @@ runs:
       uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
       with:
         run_install: false
+        dest: ${{ inputs.pnpm-dest }}
 
     - name: Setup Node.js
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
