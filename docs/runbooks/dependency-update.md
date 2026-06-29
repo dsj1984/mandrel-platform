@@ -15,6 +15,21 @@ All projects use Renovate for automated dependency updates. The shared preset (r
 - **Auto-merge:** Patch and minor updates auto-merge when CI is green. Major updates require manual approval via the Dependency Dashboard.
 - **Grouping:** Related packages (Cloudflare, Sentry, Clerk, ESLint, etc.) are grouped into single PRs.
 - **GitHub Actions:** Action SHAs are updated with full SHA pinning on every bump.
+- **mandrel-platform `uses:` pins:** A `github-actions` manager rule bumps SHA-pinned references to mandrel-platform's reusable workflows and composite actions (`uses: dsj1984/mandrel-platform/...@<sha>`), grouped into a single **"mandrel-platform workflows"** PR. This stops consumers from drifting onto split, stale pins (e.g. `pr-quality.yml` on an old release while `deploy-cloudflare.yml` is on another).
+
+### Pinning mandrel-platform `uses:` so Renovate can bump it
+
+Renovate only updates a **bare-SHA** action pin when a version comment follows it. Pin mandrel-platform workflow/action references with a trailing `# <tag>` comment:
+
+```yaml
+# ✅ bumped by the "mandrel-platform workflows" group
+- uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha> # v0.10.0
+
+# ❌ bare SHA, no comment — Renovate leaves it pinned forever
+- uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
+```
+
+The grouped PR rides the same weekly schedule and 3-day `minimumReleaseAge` as every other update, and auto-merges on green CI like other patch/minor bumps.
 
 ### Reviewing Renovate PRs
 

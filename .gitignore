@@ -14,6 +14,9 @@ temp/
 # Secrets live in .env (e.g. GITHUB_TOKEN) — never commit it. Only .env.example (placeholders) is checked in.
 .env
 
+# Auto-managed active-story marker — regenerated on story-init, deleted on story-close. Never committed.
+.env.local
+
 # Per-developer local overrides (CLAUDE.md §1.E) — personal prefs, never committed.
 .agentrc.local.json
 .agents/instructions.local.md

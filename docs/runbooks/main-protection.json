@@ -10,7 +10,8 @@
     "typecheck",
     "unit",
     "contract",
-    "e2e"
+    "e2e",
+    "security"
   ],
   "enforceAdmins": false,
   "requireLinearHistory": false,
