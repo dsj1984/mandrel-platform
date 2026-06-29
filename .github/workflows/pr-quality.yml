@@ -109,21 +109,23 @@ on:
         type: boolean
         default: true
 
-      # Semgrep ruleset config for the SAST sub-step. Defaults to the curated
-      # CI registry ruleset 'p/ci'. NOTE: do not use 'auto' here — `auto`
-      # requires metrics to be ON (it phones semgrep.dev to tailor the rule
-      # set), which is incompatible with the `--metrics=off` privacy posture
-      # of the SAST step. Override with another registry ref (e.g.
-      # 'p/security-audit', 'p/default') or a path at the call site.
+      # Semgrep ruleset config for the SAST sub-step. Defaults to the broad
+      # registry ruleset 'p/default', which catches real vuln classes
+      # (eval, command injection, taint flows). NOTE: 'p/ci' was rejected as
+      # the default — it is too narrow (0 findings on eval()/command-injection
+      # fixtures). Do NOT use 'auto' here either — `auto` requires metrics ON
+      # (it phones semgrep.dev to tailor the rule set), incompatible with the
+      # `--metrics=off` privacy posture of the SAST step. Override with another
+      # registry ref (e.g. 'p/security-audit') or a path at the call site.
       semgrep-config:
         description: >
-          Semgrep config passed to `semgrep scan --config`. Default 'p/ci'
-          (curated OSS CI ruleset; no Semgrep AppSec Platform login required).
-          Must be a concrete ruleset/path — 'auto' is unsupported because the
-          step runs with --metrics=off.
+          Semgrep config passed to `semgrep scan --config`. Default 'p/default'
+          (broad OSS ruleset; no Semgrep AppSec Platform login required). Must
+          be a concrete ruleset/path — 'auto' is unsupported because the step
+          runs with --metrics=off.
         required: false
         type: string
-        default: 'p/ci'
+        default: 'p/default'
 
       # Pinned gitleaks version for the secret-scan sub-step. The asset is
       # selected per-platform (darwin/linux x amd64/arm64) and verified
