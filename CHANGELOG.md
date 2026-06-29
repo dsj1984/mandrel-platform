@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.4.0...mandrel-platform-v0.5.0) (2026-06-29)
+
+
+### Added
+
+* **deploy:** add deploy-command seam + named secret passthrough (refs [#46](https://github.com/dsj1984/mandrel-platform/issues/46)) ([#47](https://github.com/dsj1984/mandrel-platform/issues/47)) ([20f29fb](https://github.com/dsj1984/mandrel-platform/commit/20f29fbc75a439a3bd6f9cd1e2fe458f90fc1a2c))
+
 ## [0.4.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.3.1...mandrel-platform-v0.4.0) (2026-06-29)
 
 
