@@ -86,6 +86,51 @@ on:
         type: boolean
         default: true
 
+      # Security tier (Story #65 / MP-10). Private-repo-capable: the secret
+      # scan and SAST sub-steps run a pinned binary directly and assert on its
+      # exit code, so they BLOCK on a finding even on a private repo with no
+      # GitHub Advanced Security (no SARIF / Code Scanning upload required).
+      enable-security:
+        description: >
+          Enable the security tier (PR-diff secret scan + SAST). Blocking on
+          findings; works on private repos without GHAS. Default true.
+        required: false
+        type: boolean
+        default: true
+
+      # SAST toggle nested under the security tier. Some repos run their SAST
+      # via a dedicated CodeQL/GHAS path and only want the secret scan here.
+      enable-sast:
+        description: >
+          Enable the Semgrep SAST sub-step inside the security tier. Set false
+          when the repo runs SAST via a dedicated CodeQL/GHAS workflow and only
+          wants the PR-diff secret scan from this tier. Default true.
+        required: false
+        type: boolean
+        default: true
+
+      # Semgrep ruleset config for the SAST sub-step. Defaults to the bundled
+      # 'auto' config (language-aware OSS rules). Override with a path or a
+      # registry ref (e.g. 'p/ci') at the call site.
+      semgrep-config:
+        description: >
+          Semgrep config passed to `semgrep scan --config`. Default 'auto'
+          (the OSS auto ruleset; no Semgrep AppSec Platform login required).
+        required: false
+        type: string
+        default: 'auto'
+
+      # Pinned gitleaks version for the secret-scan sub-step. The asset is
+      # selected per-platform (darwin/linux x amd64/arm64) and verified
+      # against a pinned SHA-256 before execution.
+      gitleaks-version:
+        description: >
+          Pinned gitleaks release version (without the leading 'v') for the
+          PR-diff secret scan. Default 8.30.1.
+        required: false
+        type: string
+        default: '8.30.1'
+
       # Cache toggle for the setup-toolchain composite action.
       toolchain-cache:
         description: >
@@ -309,6 +354,170 @@ jobs:
             **/test-results/
           retention-days: 14
 
+  # ── Tier 6: Security (PR-diff secret scan + SAST) ─────────────────────────
+  #
+  # Private-repo-capable security tier (Story #65 / MP-10). Both sub-steps run
+  # a pinned binary directly and BLOCK the job on a finding via a non-zero
+  # exit code — no SARIF / Code Scanning upload, so the gate is load-bearing on
+  # a PRIVATE repo with NO GitHub Advanced Security (the failure mode that left
+  # athportal's `gitleaks-pr` + CodeQL green no-ops and stripped swarm-os's CI
+  # secret scan). Cross-platform: the gitleaks asset selector resolves the
+  # right binary for self-hosted darwin/linux runners AND ubuntu-latest, each
+  # verified against a pinned SHA-256.
+  #
+  #   • Secret scan — pinned gitleaks binary over the PR diff (blocking).
+  #   • SAST        — pinned Semgrep over the working tree, `--error` fails the
+  #                   job on any finding (blocking, no SARIF upload).
+  #
+  # GHAS path (alternative, documented per AC): repos that DO have GitHub
+  # Advanced Security can instead run CodeQL (codeql.yml) and flip its
+  # `upload: never` → `always` to surface findings as a blocking Code Scanning
+  # check. This tier is the no-GHAS-required default so every consumer inherits
+  # an effective gate regardless of plan.
+  security:
+    name: Security (secret scan + SAST)
+    if: ${{ inputs.enable-security }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Full history so the gitleaks PR-diff scan can resolve the merge
+          # base; a shallow clone would miss commits introduced by the PR.
+          fetch-depth: 0
+
+      # Resolve the gitleaks PR-diff commit range. On pull_request events the
+      # scan is scoped to the commits the PR introduces (merge-base..head); on
+      # push / other events it falls back to a full-tree scan.
+      - name: Resolve secret-scan range
+        id: range
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            echo "mode=pr" >> "$GITHUB_OUTPUT"
+            echo "range=${BASE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "PR-diff secret scan: ${BASE_SHA}..${HEAD_SHA}"
+          else
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "range=" >> "$GITHUB_OUTPUT"
+            echo "Full-tree secret scan (no PR context)."
+          fi
+
+      # Download + verify a PINNED gitleaks binary. Cross-platform asset
+      # selector: maps runner.os/runner.arch → the release asset, then verifies
+      # the archive against a pinned SHA-256 before extraction. Supports
+      # self-hosted darwin/linux (arm64 + x64) and ubuntu-latest. Pinning the
+      # binary (not the gitleaks-action) is what makes this gate work on a
+      # private repo with no GHAS and no license: the action's org features
+      # require GITLEAKS_LICENSE, the binary does not.
+      - name: Secret scan (pinned gitleaks, blocking)
+        shell: bash
+        env:
+          GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+          SCAN_MODE: ${{ steps.range.outputs.mode }}
+          SCAN_RANGE: ${{ steps.range.outputs.range }}
+        run: |
+          set -euo pipefail
+
+          # Pinned SHA-256 checksums for gitleaks 8.30.1 release archives.
+          # Bump alongside inputs.gitleaks-version when the pin moves.
+          declare -A SHA256=(
+            ["8.30.1_darwin_arm64"]="b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5"
+            ["8.30.1_darwin_x64"]="dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709"
+            ["8.30.1_linux_arm64"]="e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"
+            ["8.30.1_linux_x64"]="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          )
+
+          # Cross-platform asset selector: runner.os/arch → gitleaks asset slug.
+          os="$(uname -s)"
+          arch="$(uname -m)"
+          case "$os" in
+            Darwin) gl_os="darwin" ;;
+            Linux)  gl_os="linux" ;;
+            *) echo "::error::Unsupported OS for gitleaks asset selector: $os"; exit 1 ;;
+          esac
+          case "$arch" in
+            arm64|aarch64) gl_arch="arm64" ;;
+            x86_64|amd64)  gl_arch="x64" ;;
+            *) echo "::error::Unsupported arch for gitleaks asset selector: $arch"; exit 1 ;;
+          esac
+
+          slug="${GITLEAKS_VERSION}_${gl_os}_${gl_arch}"
+          expected="${SHA256[$slug]:-}"
+          if [ -z "$expected" ]; then
+            echo "::error::No pinned checksum for gitleaks $slug — update the SHA256 map for this version/platform."
+            exit 1
+          fi
+
+          asset="gitleaks_${GITLEAKS_VERSION}_${gl_os}_${gl_arch}.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          tmp="$(mktemp -d)"
+          echo "Downloading pinned gitleaks: ${url}"
+          curl -fsSL "$url" -o "${tmp}/${asset}"
+
+          # Verify the pinned SHA-256 before trusting the binary.
+          actual="$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::gitleaks checksum mismatch for ${asset}: expected ${expected}, got ${actual}"
+            exit 1
+          fi
+          echo "✅ gitleaks ${asset} checksum verified."
+
+          tar -xzf "${tmp}/${asset}" -C "${tmp}" gitleaks
+          chmod +x "${tmp}/gitleaks"
+          "${tmp}/gitleaks" version
+
+          # Blocking scan: gitleaks exits non-zero on a leak (default exit-code
+          # 1), failing this job. No license, no SARIF upload — works on a
+          # private repo with no GHAS.
+          # --redact=100 (not bare --redact, whose optional uint would otherwise
+          # swallow the trailing '.' path arg). Exit code 1 on a leak (gitleaks
+          # default) fails this job.
+          if [ "$SCAN_MODE" = "pr" ]; then
+            echo "Scanning PR diff range: ${SCAN_RANGE}"
+            "${tmp}/gitleaks" git --log-opts="${SCAN_RANGE}" --redact=100 --verbose --no-banner .
+          else
+            echo "Scanning full working tree."
+            "${tmp}/gitleaks" dir --redact=100 --verbose --no-banner .
+          fi
+          echo "✅ No secrets detected."
+
+      - name: Setup toolchain (for SAST)
+        if: ${{ inputs.enable-sast }}
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
+        with:
+          cache: ${{ inputs.toolchain-cache }}
+          pnpm-dest: ${{ inputs.pnpm-dest }}
+
+      # SAST via Semgrep run from the pinned OSS package. `--error` makes
+      # findings fail the job WITHOUT relying on a SARIF / Code Scanning
+      # upload, so the gate blocks on a private repo with no GHAS. (The GHAS
+      # CodeQL path documented on the job header is the alternative.)
+      - name: SAST (Semgrep, blocking, no SARIF upload)
+        if: ${{ inputs.enable-sast }}
+        shell: bash
+        env:
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+        run: |
+          set -euo pipefail
+          # Pinned Semgrep release. `semgrep scan --error` exits non-zero on any
+          # finding; `--config` selects the ruleset (default OSS 'auto').
+          echo "Running Semgrep (config: ${SEMGREP_CONFIG})"
+          pnpm dlx semgrep@1.97.0 scan \
+            --config "${SEMGREP_CONFIG}" \
+            --error \
+            --disable-version-check \
+            --metrics=off \
+            --quiet
+          echo "✅ Semgrep found no blocking findings."
+
   # ── Aggregator: single required branch-protection context ─────────────────
   #
   # `ci-required` is the ONLY context consumers should register in their
@@ -326,6 +535,7 @@ jobs:
       - unit
       - contract
       - e2e
+      - security
     steps:
       - name: Check all tier results
         shell: bash
@@ -335,6 +545,7 @@ jobs:
           UNIT_RESULT: ${{ needs.unit.result }}
           CONTRACT_RESULT: ${{ needs.contract.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
         run: |
           failed=()
           for tier_result in \
@@ -342,7 +553,8 @@ jobs:
             "typecheck:${TYPECHECK_RESULT}" \
             "unit:${UNIT_RESULT}" \
             "contract:${CONTRACT_RESULT}" \
-            "e2e:${E2E_RESULT}"; do
+            "e2e:${E2E_RESULT}" \
+            "security:${SECURITY_RESULT}"; do
             tier="${tier_result%%:*}"
             result="${tier_result##*:}"
             if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
