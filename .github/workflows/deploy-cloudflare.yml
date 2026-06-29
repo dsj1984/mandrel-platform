@@ -140,6 +140,28 @@ on:
         required: false
         type: string
         default: ''
+      build-artifact:
+        description: >
+          Optional name of a build artifact (uploaded by the consumer's own
+          build job earlier in the same run) to download into the deploy job
+          before deploying. When set, the deploy job downloads this artifact
+          and SKIPS build-command entirely (the deploy-ready output is already
+          built consumer-side, so no framework rebuild and no build secrets
+          cross this reusable-workflow boundary). When empty (the default),
+          behaviour is unchanged — build-command runs exactly as it does today.
+          This is the consumer-side-build handoff that freezes the deploy
+          secret allowlist at the stable CLOUDFLARE_* / TURSO_* set.
+        required: false
+        type: string
+        default: ''
+      build-artifact-path:
+        description: >
+          Optional extraction path for the downloaded build-artifact. When
+          empty (the default), the artifact is extracted into the checkout
+          root / working directory. Only consulted when build-artifact is set.
+        required: false
+        type: string
+        default: ''
       deploy-command:
         description: >
           Optional deploy command run in the deploy job. When set, it REPLACES
@@ -528,8 +550,24 @@ jobs:
         with:
           cache: 'true'
 
+      # Consumer-side-build handoff (Story #56): when build-artifact is set,
+      # download the prebuilt deploy-ready output the consumer's own build job
+      # uploaded earlier in this run. The build-command step below is skipped
+      # (no framework rebuild, no build secrets cross the boundary). Artifacts
+      # are run-scoped and reusable-workflow jobs share the caller's run, so
+      # the handoff works without any cross-run plumbing.
+      - name: Download build artifact (optional)
+        if: ${{ inputs.build-artifact != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.build-artifact }}
+          path: ${{ inputs.build-artifact-path }}
+
       - name: Build (optional)
-        if: ${{ inputs.build-command != '' }}
+        # Skip the framework rebuild when a prebuilt artifact was supplied — a
+        # build-artifact caller already has the deploy-ready output downloaded
+        # above. A build-command caller (build-artifact empty) is unchanged.
+        if: ${{ inputs.build-command != '' && inputs.build-artifact == '' }}
         shell: bash
         run: |
           # Export build-time env (one KEY=VALUE per line) before the build so
