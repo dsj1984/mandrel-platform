@@ -25,6 +25,13 @@
       "automerge": false
     },
     {
+      "description": "Bump SHA-pinned mandrel-platform reusable-workflow and composite-action uses: pins (github-actions manager). Renovate only updates a bare-SHA pin when the consumer adds a version comment after it, e.g. uses: dsj1984/mandrel-platform/...@<sha> # v0.10.0 — see the dependency-update runbook. Grouped into one PR and scheduled via the preset's weekly window + 3-day minimumReleaseAge.",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["dsj1984/mandrel-platform"],
+      "groupName": "mandrel-platform workflows",
+      "groupSlug": "mandrel-platform"
+    },
+    {
       "description": "Group Astro packages",
       "matchPackagePatterns": ["^astro$", "^@astrojs/"],
       "groupName": "Astro packages",
