@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.5...mandrel-platform-v0.3.0) (2026-06-29)
+
+
+### Added
+
+* **ci:** add cross-repo workflow portability lint ([d00ba73](https://github.com/dsj1984/mandrel-platform/commit/d00ba739c103dbb2b8589479ed0a19ddf49b0899))
+
 ## [0.2.5](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.4...mandrel-platform-v0.2.5) (2026-06-29)
 
 
