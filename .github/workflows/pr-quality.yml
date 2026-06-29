@@ -109,16 +109,21 @@ on:
         type: boolean
         default: true
 
-      # Semgrep ruleset config for the SAST sub-step. Defaults to the bundled
-      # 'auto' config (language-aware OSS rules). Override with a path or a
-      # registry ref (e.g. 'p/ci') at the call site.
+      # Semgrep ruleset config for the SAST sub-step. Defaults to the curated
+      # CI registry ruleset 'p/ci'. NOTE: do not use 'auto' here — `auto`
+      # requires metrics to be ON (it phones semgrep.dev to tailor the rule
+      # set), which is incompatible with the `--metrics=off` privacy posture
+      # of the SAST step. Override with another registry ref (e.g.
+      # 'p/security-audit', 'p/default') or a path at the call site.
       semgrep-config:
         description: >
-          Semgrep config passed to `semgrep scan --config`. Default 'auto'
-          (the OSS auto ruleset; no Semgrep AppSec Platform login required).
+          Semgrep config passed to `semgrep scan --config`. Default 'p/ci'
+          (curated OSS CI ruleset; no Semgrep AppSec Platform login required).
+          Must be a concrete ruleset/path — 'auto' is unsupported because the
+          step runs with --metrics=off.
         required: false
         type: string
-        default: 'auto'
+        default: 'p/ci'
 
       # Pinned gitleaks version for the secret-scan sub-step. The asset is
       # selected per-platform (darwin/linux x amd64/arm64) and verified
@@ -489,15 +494,18 @@ jobs:
           fi
           echo "✅ No secrets detected."
 
-      - name: Setup toolchain (for SAST)
+      # Semgrep ships on PyPI (not npm), so the SAST sub-step needs Python, not
+      # the pnpm/Node toolchain. `actions/setup-python` provisions a pinned
+      # interpreter on any runner (ubuntu-hosted or self-hosted) so the gate is
+      # runner-agnostic.
+      - name: Setup Python (for Semgrep SAST)
         if: ${{ inputs.enable-sast }}
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          cache: ${{ inputs.toolchain-cache }}
-          pnpm-dest: ${{ inputs.pnpm-dest }}
+          python-version: '3.12'
 
-      # SAST via Semgrep run from the pinned OSS package. `--error` makes
-      # findings fail the job WITHOUT relying on a SARIF / Code Scanning
+      # SAST via Semgrep, installed from PyPI at a pinned version. `--error`
+      # makes findings fail the job WITHOUT relying on a SARIF / Code Scanning
       # upload, so the gate blocks on a private repo with no GHAS. (The GHAS
       # CodeQL path documented on the job header is the alternative.)
       - name: SAST (Semgrep, blocking, no SARIF upload)
@@ -507,10 +515,12 @@ jobs:
           SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
         run: |
           set -euo pipefail
-          # Pinned Semgrep release. `semgrep scan --error` exits non-zero on any
-          # finding; `--config` selects the ruleset (default OSS 'auto').
-          echo "Running Semgrep (config: ${SEMGREP_CONFIG})"
-          pnpm dlx semgrep@1.97.0 scan \
+          # Pinned Semgrep release from PyPI. `semgrep scan --error` exits
+          # non-zero on any finding; `--config` selects the ruleset (default
+          # OSS 'auto'). Bump this pin deliberately.
+          python -m pip install --quiet --disable-pip-version-check 'semgrep==1.97.0'
+          echo "Running $(semgrep --version 2>/dev/null) (config: ${SEMGREP_CONFIG})"
+          semgrep scan \
             --config "${SEMGREP_CONFIG}" \
             --error \
             --disable-version-check \
