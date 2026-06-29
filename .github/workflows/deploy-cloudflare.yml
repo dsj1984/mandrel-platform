@@ -41,6 +41,14 @@
 # path (export/apply + workers.dev smoke) — except the smoke host is now the
 # corrected account subdomain rather than the account ID.
 #
+# Secret surface (FROZEN — Story #61, build-split capstone): only the stable
+# {CLOUDFLARE_*, TURSO_*} set crosses this reusable-workflow boundary. CF creds
+# deploy; TURSO creds feed the non-D1 snapshot/migrate seam commands. The former
+# optional build-secret allowlist (Story #46: SENTRY_*, CLERK_*, SITE_URL) is
+# gone: consumers build CONSUMER-SIDE and hand the deploy-ready output over via
+# the build-artifact input (Story #56), so no build secret reaches this workflow.
+# build-command stays (now secretless; build-env carries plaintext public values).
+#
 # SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
 name: Deploy Cloudflare
 
@@ -62,8 +70,8 @@ on:
           scoping and protection rules. Leave empty (the default) for
           repo-scoped / D1 consumers — an empty value attaches no GitHub
           Environment and behaviour is unchanged. Set it (e.g. staging,
-          production) only when your CLOUDFLARE_* / TURSO_* / SENTRY_AUTH_TOKEN
-          secrets live in a GitHub Environment of that name.
+          production) only when your CLOUDFLARE_* / TURSO_* secrets live in a
+          GitHub Environment of that name.
         required: false
         type: string
         default: ''
@@ -123,9 +131,13 @@ on:
       build-command:
         description: >
           Optional build command run in the deploy job BEFORE wrangler deploy
-          (e.g. "pnpm build" or "astro build"). Build-time env from build-env
-          is exported into the shell before this runs, so prerender/astro
-          builds bake the correct build-time values.
+          (e.g. "pnpm build" or "astro build"). Now SECRETLESS: only plaintext
+          build-env values and the stable {CLOUDFLARE_*, TURSO_*} secrets are
+          in scope — no build secrets cross this boundary. Build-time env from
+          build-env is exported into the shell before this runs, so
+          prerender/astro builds bake the correct build-time values. Prefer the
+          consumer-side build + build-artifact handoff for any build that needs
+          its own secrets.
         required: false
         type: string
         default: ''
@@ -133,10 +145,12 @@ on:
         description: >
           Optional build-time environment passthrough, one KEY=VALUE per line.
           Each line is exported into the build shell before build-command runs.
-          Use for prerender-only build-time values (e.g. CHAT_DISABLED,
-          PUBLIC_TURNSTILE_SITE_KEY, ENVIRONMENT, SITE_URL). Do NOT put secrets
-          here in plaintext — forward those via secrets:inherit and reference
-          them from build-command instead.
+          Use for prerender-only PLAINTEXT build-time values (e.g.
+          CHAT_DISABLED, PUBLIC_TURNSTILE_SITE_KEY, ENVIRONMENT, SITE_URL). Do
+          NOT put secrets here in plaintext. Build secrets no longer cross this
+          reusable-workflow boundary at all: consumers build consumer-side and
+          hand the deploy-ready output over via build-artifact, so the deploy
+          secret surface is frozen at {CLOUDFLARE_*, TURSO_*}.
         required: false
         type: string
         default: ''
@@ -171,10 +185,11 @@ on:
           config, where each worker must be deployed from its own package dir
           (e.g. cd apps/api && wrangler deploy, or wrangler deploy --config
           dist/server/wrangler.json). It runs once in the checkout root with
-          WORKERS (the deployed csv), DEPLOY_ENV, the Cloudflare creds, and any
-          forwarded named secrets exported. The deployed_workers output is set
-          to the workers input so downstream smoke / rollback targeting keeps
-          working. When unset, the built-in root-level deploy loop runs.
+          WORKERS (the deployed csv), DEPLOY_ENV, the Cloudflare creds, and the
+          frozen {CLOUDFLARE_*, TURSO_*} secret set exported (no build secrets).
+          The deployed_workers output is set to the workers input so downstream
+          smoke / rollback targeting keeps working. When unset, the built-in
+          root-level deploy loop runs.
         required: false
         type: string
         default: ''
@@ -230,43 +245,24 @@ on:
       CLOUDFLARE_ACCOUNT_ID:
         description: 'Cloudflare Account ID'
         required: true
-      # ----- Optional named secret passthrough (Story #46) -----
-      # Explicitly-declared optional secrets so a caller can wire per-env
-      # secrets into the seam step shells (snapshot / migrate /
-      # pre-migrate-assert / build / deploy-command). They are mapped into
-      # each seam step's `env:` only when provided. Declared explicitly (vs a
-      # dynamic `secrets[<runtime-name>]` index) because dynamic secret
-      # indexing is not reliably supported in reusable workflows under
-      # `secrets: inherit`; explicit optional secrets reach the step shells
-      # deterministically with zero plaintext leakage (never via `with:`).
-      # Callers may still forward any further secrets via `secrets: inherit`
-      # and reference them from their own seam commands.
+      # ----- Migrate secret passthrough (frozen allowlist) -----
+      # The deploy secret surface is FROZEN at {CLOUDFLARE_*, TURSO_*}
+      # (build-split capstone, Story #61). The former optional build-secret
+      # allowlist (Story #46: SENTRY_*, PUBLIC_CLERK_PUBLISHABLE_KEY,
+      # CLERK_SECRET_KEY, SITE_URL) has been removed: every consumer now builds
+      # consumer-side and hands the deploy-ready output over via build-artifact,
+      # so no build secret crosses this reusable-workflow boundary. Only the two
+      # TURSO secrets below remain optional — the non-D1 snapshot/migrate seam
+      # commands consume them. The CLOUDFLARE_* secrets above are required for
+      # deploy. Callers may still forward further secrets via `secrets: inherit`
+      # and reference them from their own seam commands, but the workflow itself
+      # maps only the frozen set into its seam-step `env:` blocks (never via
+      # `with:`).
       TURSO_DATABASE_URL:
         description: 'Optional Turso database URL for non-D1 snapshot/migrate seam commands.'
         required: false
       TURSO_AUTH_TOKEN:
         description: 'Optional Turso auth token for non-D1 snapshot/migrate seam commands.'
-        required: false
-      SENTRY_AUTH_TOKEN:
-        description: 'Optional Sentry auth token for source-map upload during build-command / deploy-command.'
-        required: false
-      PUBLIC_CLERK_PUBLISHABLE_KEY:
-        description: 'Optional Clerk publishable key for build-command / deploy-command.'
-        required: false
-      CLERK_SECRET_KEY:
-        description: 'Optional Clerk secret key for build-command / deploy-command.'
-        required: false
-      SENTRY_PROJECT:
-        description: 'Optional Sentry project slug for source-map upload during build-command.'
-        required: false
-      SENTRY_ORG:
-        description: 'Optional Sentry org slug for source-map upload during build-command.'
-        required: false
-      PUBLIC_SENTRY_DSN:
-        description: 'Optional public Sentry DSN baked into the client build.'
-        required: false
-      SITE_URL:
-        description: 'Optional canonical site URL baked at build time (Astro.site).'
         required: false
 
 # Least-privilege: content-read only. Each job that needs more escalates
@@ -423,16 +419,9 @@ jobs:
           SNAPSHOT_COMMAND: ${{ inputs.snapshot-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Optional named secret passthrough (Story #46).
+          # Migrate secret passthrough (frozen allowlist: TURSO_*).
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
-          SITE_URL: ${{ secrets.SITE_URL }}
 
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -478,16 +467,9 @@ jobs:
           PRE_MIGRATE_ASSERT_COMMAND: ${{ inputs.pre-migrate-assert-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Optional named secret passthrough (Story #46).
+          # Migrate secret passthrough (frozen allowlist: TURSO_*).
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
-          SITE_URL: ${{ secrets.SITE_URL }}
 
       - name: Apply migrations
         shell: bash
@@ -506,16 +488,9 @@ jobs:
           MIGRATE_COMMAND: ${{ inputs.migrate-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Optional named secret passthrough (Story #46).
+          # Migrate secret passthrough (frozen allowlist: TURSO_*).
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
-          SITE_URL: ${{ secrets.SITE_URL }}
 
   # ---------------------------------------------------------------------------
   # 5. Deploy workers
@@ -595,16 +570,10 @@ jobs:
           BUILD_ENV: ${{ inputs.build-env }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Optional named secret passthrough (Story #46).
+          # Frozen allowlist: TURSO_*. Build is now secretless — build secrets
+          # cross the boundary consumer-side via build-artifact, not here.
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
-          SITE_URL: ${{ secrets.SITE_URL }}
 
       - name: Deploy each worker
         id: deploy-step
@@ -615,9 +584,10 @@ jobs:
           # built-in root-level loop errors ("application detection logic has
           # been run in the root of a workspace"). deploy-command lets the
           # consumer publish each worker from its own package dir. It runs once
-          # with WORKERS (the csv) + DEPLOY_ENV + Cloudflare creds + any
-          # forwarded named secrets exported. deployed_workers is set to the
-          # workers input so downstream smoke / rollback targeting keeps working.
+          # with WORKERS (the csv) + DEPLOY_ENV + the frozen {CLOUDFLARE_*,
+          # TURSO_*} secret set exported (no build secrets). deployed_workers is
+          # set to the workers input so downstream smoke / rollback targeting
+          # keeps working.
           if [ -n "$DEPLOY_COMMAND" ]; then
             echo "::group::Running consumer deploy-command"
             export WORKERS="$WORKERS_CSV"
@@ -669,16 +639,9 @@ jobs:
           DEPLOY_COMMAND: ${{ inputs.deploy-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Optional named secret passthrough (Story #46).
+          # Frozen allowlist: TURSO_* (CLOUDFLARE_* above). No build secrets.
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.PUBLIC_CLERK_PUBLISHABLE_KEY }}
-          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          PUBLIC_SENTRY_DSN: ${{ secrets.PUBLIC_SENTRY_DSN }}
-          SITE_URL: ${{ secrets.SITE_URL }}
 
   # ---------------------------------------------------------------------------
   # 6. Boot-smoke + auto-rollback
