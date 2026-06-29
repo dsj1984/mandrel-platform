@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.3...mandrel-platform-v0.2.4) (2026-06-29)
+
+
+### Fixed
+
+* **ci:** revert relative uses: path in pr-quality.yml to absolute cross-repo SHA ([85f77d3](https://github.com/dsj1984/mandrel-platform/commit/85f77d37c3eee5f5e3b3cab8cc3db34ed7a30cbd))
+
 ## [0.2.3](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.2...mandrel-platform-v0.2.3) (2026-06-29)
 
 
