@@ -10,10 +10,13 @@
 #
 # Tokens:
 #   - the pending self-status uses the built-in GITHUB_TOKEN (statuses: write).
-#   - the cross-repo dispatch uses SMOKE_DISPATCH_TOKEN (a fine-grained PAT with
-#     Contents: write on the smoke repo — required by the repository_dispatch
-#     API). The smoke repo's gate posts the final status back using the same
-#     PAT, which therefore also needs Commit statuses: write on THIS repo.
+#   - the cross-repo trigger uses SMOKE_DISPATCH_TOKEN (a fine-grained PAT with
+#     Actions: write on the smoke repo — required by the workflow_dispatch API).
+#     We use workflow_dispatch, NOT repository_dispatch, because gitleaks-action
+#     (inside deploy-cloudflare's secret-isolation-audit) rejects the
+#     repository_dispatch event. The smoke repo's gate posts the final status
+#     back using the same PAT, which therefore also needs Commit statuses: write
+#     on THIS repo.
 name: Dispatch Cross-repo Smoke
 
 on:
@@ -49,13 +52,15 @@ jobs:
             -f description="cross-repo smoke dispatched" >/dev/null
           echo "smoke/cross-repo set pending on ${SHA}"
 
-      - name: Dispatch smoke (PAT)
+      - name: Trigger smoke via workflow_dispatch (PAT)
         env:
           GH_TOKEN: ${{ secrets.SMOKE_DISPATCH_TOKEN }}
           SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          printf '{"event_type":"mandrel-smoke","client_payload":{"sha":"%s"}}' "${SHA}" > payload.json
-          gh api -X POST repos/dsj1984/mandrel-platform-smoke/dispatches --input payload.json >/dev/null
-          echo "Dispatched mandrel-smoke for ${SHA}"
+          gh workflow run smoke.yml \
+            --repo dsj1984/mandrel-platform-smoke \
+            --ref main \
+            -f sha="${SHA}"
+          echo "Triggered smoke (workflow_dispatch) for ${SHA}"
