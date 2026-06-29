@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.5.1...mandrel-platform-v0.6.0) (2026-06-29)
+
+
+### Added
+
+* **ci:** wire cross-repo smoke — dispatch on push + gate release publish (refs [#38](https://github.com/dsj1984/mandrel-platform/issues/38)) ([ea0d791](https://github.com/dsj1984/mandrel-platform/commit/ea0d7911b195c14505cddb1be437d8dc430453d4))
+
+
+### Fixed
+
+* **ci:** trigger smoke via workflow_dispatch, not repository_dispatch (refs [#38](https://github.com/dsj1984/mandrel-platform/issues/38)) ([6328f69](https://github.com/dsj1984/mandrel-platform/commit/6328f69005d039ac0dab6f891fdf09e03bd630b5))
+* **ci:** use built-in token for smoke pending status; PAT only for cross-repo dispatch (refs [#38](https://github.com/dsj1984/mandrel-platform/issues/38)) ([53a1d6b](https://github.com/dsj1984/mandrel-platform/commit/53a1d6bd66c19694c94d68eee8fac3f30abd4072))
+
 ## [0.5.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.5.0...mandrel-platform-v0.5.1) (2026-06-29)
 
 
