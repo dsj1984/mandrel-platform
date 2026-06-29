@@ -15,12 +15,28 @@
 #   1. secret-isolation-audit — scans for plaintext secrets before any code runs.
 #   2. check-env             — validates required env/secrets exist for the target
 #                              environment; blocks deploy if any are absent.
-#   3. pre-migration-snapshot — when migrate:true, snapshots the D1 database
-#                              before any forward-only migration runs.
-#   4. deploy                — deploys each worker in the workers csv list via
-#                              wrangler deploy.
-#   5. boot-smoke            — HTTP health-check against each deployed worker.
-#                              Non-200 fails the run AND triggers wrangler rollback.
+#   3. pre-migration-snapshot — when migrate:true, snapshots the database before
+#                              any forward-only migration runs (D1 by default;
+#                              overridable via snapshot-command for non-D1 engines).
+#   4. migrate               — applies migrations after the snapshot (D1 by
+#                              default; overridable via migrate-command, gated by
+#                              an optional pre-migrate-assert-command host guard).
+#   5. deploy                — optionally runs build-command (with build-env),
+#                              then deploys each worker via wrangler deploy.
+#   6. boot-smoke            — HTTP health-check against each deployed worker, or
+#                              a consumer-supplied smoke-command. Non-200 fails
+#                              the run AND triggers wrangler rollback. The
+#                              workers.dev host is derived from the account
+#                              subdomain slug (never the account ID) and can be
+#                              overridden with smoke_base_url / smoke_paths, or
+#                              disabled entirely with smoke:false.
+#
+# Command seams (Story #41): the D1 export/apply, build, and workers.dev smoke
+# defaults are all overridable so non-D1 / build-step / custom-host consumers can
+# adopt the workflow without losing snapshot, migrate, build-env, or smoke safety
+# nets. With NONE of the seam inputs set, behaviour is identical to the legacy D1
+# path (export/apply + workers.dev smoke) — except the smoke host is now the
+# corrected account subdomain rather than the account ID.
 #
 # SHA-pinned third-party actions per §6.2 of initial-roadmap.md.
 name: Deploy Cloudflare
@@ -41,11 +57,115 @@ on:
         type: string
       migrate:
         description: >
-          Run D1 database migrations. When true, a pre-migration snapshot is
-          taken before any forward-only migration is applied.
+          Run database migrations. When true, a pre-migration snapshot is
+          taken before any forward-only migration is applied. Defaults to the
+          D1 tooling; override migrate-command / snapshot-command for non-D1
+          engines.
         required: false
         type: boolean
         default: false
+      db-engine:
+        description: >
+          Database engine label for the default migrate/snapshot tooling.
+          "d1" (default) uses wrangler d1 export/apply. Any other value (e.g.
+          "turso") requires migrate-command and snapshot-command to be set,
+          since this workflow ships no built-in tooling for non-D1 engines.
+        required: false
+        type: string
+        default: 'd1'
+      snapshot-command:
+        description: >
+          Consumer-supplied pre-migration snapshot command. When set, it
+          replaces the built-in "wrangler d1 export" snapshot so a non-D1
+          consumer (e.g. turso db shell .dump) can take its own recovery
+          point. Runs in the checkout root before migrate. Any *.sql files it
+          writes under temp/ are uploaded as the snapshot artifact.
+        required: false
+        type: string
+        default: ''
+      migrate-command:
+        description: >
+          Consumer-supplied migrate command. When set, it replaces the
+          built-in "wrangler d1 migrations apply" so a non-D1 consumer (e.g.
+          drizzle-kit migrate) can apply its own migrations. Runs after the
+          snapshot and after pre-migrate-assert-command (if set).
+        required: false
+        type: string
+        default: ''
+      pre-migrate-assert-command:
+        description: >
+          Optional host-guard hook command run BEFORE migrate (and before the
+          snapshot is consumed). A non-zero exit aborts the migrate job, so a
+          consumer can refuse to migrate unless the resolved DB host matches an
+          expected pattern (defence-in-depth against migrating the wrong DB).
+        required: false
+        type: string
+        default: ''
+      build-command:
+        description: >
+          Optional build command run in the deploy job BEFORE wrangler deploy
+          (e.g. "pnpm build" or "astro build"). Build-time env from build-env
+          is exported into the shell before this runs, so prerender/astro
+          builds bake the correct build-time values.
+        required: false
+        type: string
+        default: ''
+      build-env:
+        description: >
+          Optional build-time environment passthrough, one KEY=VALUE per line.
+          Each line is exported into the build shell before build-command runs.
+          Use for prerender-only build-time values (e.g. CHAT_DISABLED,
+          PUBLIC_TURNSTILE_SITE_KEY, ENVIRONMENT, SITE_URL). Do NOT put secrets
+          here in plaintext — forward those via secrets:inherit and reference
+          them from build-command instead.
+        required: false
+        type: string
+        default: ''
+      smoke:
+        description: >
+          Run the built-in boot-smoke + auto-rollback job. Default true. Set
+          false to skip the built-in smoke entirely so the caller can run its
+          own post-deploy verification step (auto-rollback is also skipped).
+        required: false
+        type: boolean
+        default: true
+      smoke-command:
+        description: >
+          Consumer-supplied smoke command. When set, it REPLACES the built-in
+          workers.dev probe (covers multi-route / custom-host consumers). It
+          runs once in the checkout root with WORKERS (the deployed csv) and
+          SMOKE_BASE_URL exported; a non-zero exit fails the run and triggers
+          the same wrangler rollback as the built-in probe.
+        required: false
+        type: string
+        default: ''
+      smoke_base_url:
+        description: >
+          Optional base URL for the built-in probe (e.g. https://godomio.com).
+          When set, each smoke path is appended to this base instead of the
+          derived workers.dev host. Also exported to smoke-command as
+          SMOKE_BASE_URL. No trailing slash.
+        required: false
+        type: string
+        default: ''
+      smoke_paths:
+        description: >
+          Comma-separated list of paths the built-in probe requests against
+          each target (e.g. "/,/portal,/api/health"). Defaults to "/health".
+          Each path must start with a leading slash.
+        required: false
+        type: string
+        default: '/health'
+      workers_dev_subdomain:
+        description: >
+          Optional workers.dev account subdomain slug used to build the
+          built-in probe URL (e.g. "dsj1984" → https://<worker>.dsj1984.workers.dev).
+          When empty, it is derived at runtime from "wrangler whoami". NEVER
+          pass the account ID here — workers.dev subdomains are keyed by the
+          account name/slug, not the account UUID.
+        required: false
+        type: string
+        default: ''
     secrets:
       CLOUDFLARE_API_TOKEN:
         description: 'Cloudflare API token with Worker and D1 write permissions'
@@ -116,22 +236,42 @@ jobs:
           check_var "CLOUDFLARE_API_TOKEN"  "$CLOUDFLARE_API_TOKEN"
           check_var "CLOUDFLARE_ACCOUNT_ID" "$CLOUDFLARE_ACCOUNT_ID"
 
+          # Non-D1 engines must supply their own migrate + snapshot commands —
+          # this workflow ships no built-in tooling for them. Fail fast here so
+          # a passing migrate:true never silently skips the real migration.
+          if [ "$MIGRATE" = "true" ] && [ "$DB_ENGINE" != "d1" ]; then
+            if [ -z "$MIGRATE_COMMAND" ]; then
+              echo "::error::db-engine '$DB_ENGINE' requires migrate-command (no built-in tooling for non-D1 engines)."
+              errors=$((errors + 1))
+            fi
+            if [ -z "$SNAPSHOT_COMMAND" ]; then
+              echo "::error::db-engine '$DB_ENGINE' requires snapshot-command (no built-in tooling for non-D1 engines)."
+              errors=$((errors + 1))
+            fi
+          fi
+
           if [ "$errors" -gt 0 ]; then
             echo "::error::$errors required variable(s) missing — aborting deploy."
             exit 1
           fi
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
+          MIGRATE: ${{ inputs.migrate }}
+          DB_ENGINE: ${{ inputs.db-engine }}
+          MIGRATE_COMMAND: ${{ inputs.migrate-command }}
+          SNAPSHOT_COMMAND: ${{ inputs.snapshot-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
   # 3. Pre-migration snapshot
-  #    Only runs when migrate:true. Snapshots the D1 database BEFORE any
+  #    Only runs when migrate:true. Snapshots the database BEFORE any
   #    forward-only migration is applied so a recovery point always exists.
+  #    Defaults to "wrangler d1 export"; a consumer-supplied snapshot-command
+  #    replaces it for non-D1 engines.
   # ---------------------------------------------------------------------------
   pre-migration-snapshot:
-    name: Pre-migration D1 snapshot (${{ inputs.environment }})
+    name: Pre-migration snapshot (${{ inputs.environment }})
     runs-on: ubuntu-latest
     needs: check-env
     if: ${{ inputs.migrate == true }}
@@ -144,45 +284,63 @@ jobs:
         with:
           cache: 'true'
 
-      - name: Export D1 snapshot (backup before migration)
+      - name: Pre-migration snapshot (backup before migration)
         shell: bash
         run: |
-          SNAPSHOT_KEY="pre-migration-${{ inputs.environment }}-$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p temp
+          SNAPSHOT_KEY="pre-migration-${DEPLOY_ENV}-$(date -u +%Y%m%dT%H%M%SZ)"
           echo "SNAPSHOT_KEY=$SNAPSHOT_KEY" >> "$GITHUB_ENV"
+          export SNAPSHOT_KEY
 
-          # Export each database defined for this environment.
-          # Consumers define their D1 binding names in wrangler.toml;
-          # wrangler reads the config and routes to the correct DB UUID.
-          #
-          # Export creates a local SQL dump. In production workflows,
-          # callers should forward the dump to durable storage (R2, GCS, S3)
-          # via an additional step using `secrets: inherit`.
-          pnpx wrangler d1 export --env "${{ inputs.environment }}" \
-            --output "temp/${SNAPSHOT_KEY}.sql" \
-            --yes \
-            || {
-              echo "::warning::D1 export step failed or no D1 binding found." \
-                "Ensure wrangler.toml declares [[d1_databases]] for this environment." \
-                "Continuing with migration — check your wrangler config."
-            }
+          if [ -n "$SNAPSHOT_COMMAND" ]; then
+            # Consumer-supplied snapshot (non-D1). Runs with SNAPSHOT_KEY and
+            # DEPLOY_ENV exported; the consumer is responsible for writing its
+            # dump where it wants (temp/*.sql is uploaded as the artifact).
+            echo "::group::Running consumer snapshot-command"
+            bash -c "$SNAPSHOT_COMMAND"
+            echo "::endgroup::"
+          else
+            # Default D1 export.
+            #
+            # Export each database defined for this environment.
+            # Consumers define their D1 binding names in wrangler.toml;
+            # wrangler reads the config and routes to the correct DB UUID.
+            #
+            # Export creates a local SQL dump. In production workflows,
+            # callers should forward the dump to durable storage (R2, GCS, S3)
+            # via an additional step using `secrets: inherit`.
+            pnpx wrangler d1 export --env "$DEPLOY_ENV" \
+              --output "temp/${SNAPSHOT_KEY}.sql" \
+              --yes \
+              || {
+                echo "::warning::D1 export step failed or no D1 binding found." \
+                  "Ensure wrangler.toml declares [[d1_databases]] for this environment." \
+                  "Continuing with migration — check your wrangler config."
+              }
+          fi
         env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          SNAPSHOT_COMMAND: ${{ inputs.snapshot-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: d1-snapshot-${{ inputs.environment }}-${{ github.run_id }}
+          name: db-snapshot-${{ inputs.environment }}-${{ github.run_id }}
           path: temp/*.sql
           retention-days: 7
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # 4. Migrate
-  #    Applies D1 migrations AFTER the snapshot. Only runs when migrate:true.
+  #    Applies migrations AFTER the snapshot. Only runs when migrate:true.
+  #    Defaults to "wrangler d1 migrations apply"; a consumer-supplied
+  #    migrate-command replaces it for non-D1 engines. An optional
+  #    pre-migrate-assert-command host-guard runs first (non-zero aborts).
   # ---------------------------------------------------------------------------
   migrate:
-    name: D1 migrate (${{ inputs.environment }})
+    name: Migrate (${{ inputs.environment }})
     runs-on: ubuntu-latest
     needs: pre-migration-snapshot
     if: ${{ inputs.migrate == true }}
@@ -195,19 +353,41 @@ jobs:
         with:
           cache: 'true'
 
-      - name: Apply D1 migrations
+      - name: Pre-migrate host-guard assertion
+        if: ${{ inputs.pre-migrate-assert-command != '' }}
         shell: bash
         run: |
-          pnpx wrangler d1 migrations apply \
-            --env "${{ inputs.environment }}" \
-            --yes
+          echo "::group::Running pre-migrate-assert-command host guard"
+          bash -c "$PRE_MIGRATE_ASSERT_COMMAND"
+          echo "::endgroup::"
         env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          PRE_MIGRATE_ASSERT_COMMAND: ${{ inputs.pre-migrate-assert-command }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Apply migrations
+        shell: bash
+        run: |
+          if [ -n "$MIGRATE_COMMAND" ]; then
+            echo "::group::Running consumer migrate-command"
+            bash -c "$MIGRATE_COMMAND"
+            echo "::endgroup::"
+          else
+            pnpx wrangler d1 migrations apply \
+              --env "$DEPLOY_ENV" \
+              --yes
+          fi
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          MIGRATE_COMMAND: ${{ inputs.migrate-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
   # 5. Deploy workers
-  #    Deploys each worker listed in the `workers` csv input.
+  #    Optionally runs build-command (with build-env exported) BEFORE deploy,
+  #    then deploys each worker listed in the `workers` csv input.
   #    Runs after check-env (no-migrate path) or migrate (migrate:true path).
   # ---------------------------------------------------------------------------
   deploy:
@@ -234,20 +414,50 @@ jobs:
         with:
           cache: 'true'
 
+      - name: Build (optional)
+        if: ${{ inputs.build-command != '' }}
+        shell: bash
+        run: |
+          # Export build-time env (one KEY=VALUE per line) before the build so
+          # prerender/astro builds bake the correct build-time values.
+          if [ -n "$BUILD_ENV" ]; then
+            echo "::group::Exporting build-env"
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in
+                \#*) continue ;;  # allow comment lines
+              esac
+              key="${line%%=*}"
+              echo "::notice::build-env: exporting $key"
+              export "$line"
+            done <<< "$BUILD_ENV"
+            echo "::endgroup::"
+          fi
+
+          echo "::group::Running build-command"
+          bash -c "$BUILD_COMMAND"
+          echo "::endgroup::"
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          BUILD_ENV: ${{ inputs.build-env }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Deploy each worker
         id: deploy-step
         shell: bash
         run: |
-          IFS=',' read -ra WORKERS <<< "${{ inputs.workers }}"
+          IFS=',' read -ra WORKERS <<< "$WORKERS_CSV"
           deployed=()
           failed=()
 
           for worker in "${WORKERS[@]}"; do
             worker="$(echo "$worker" | xargs)"  # trim whitespace
-            echo "::group::Deploying $worker to ${{ inputs.environment }}"
+            echo "::group::Deploying $worker to ${DEPLOY_ENV}"
             if pnpx wrangler deploy \
               --name "$worker" \
-              --env "${{ inputs.environment }}" \
+              --env "$DEPLOY_ENV" \
               --compatibility-date "$(date -u +%Y-%m-%d)"; then
               echo "✅ $worker deployed"
               deployed+=("$worker")
@@ -267,20 +477,24 @@ jobs:
             exit 1
           fi
         env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          WORKERS_CSV: ${{ inputs.workers }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
   # 6. Boot-smoke + auto-rollback
-  #    Sends an HTTP request to each deployed worker's health endpoint.
-  #    Non-200 response fails the run AND triggers `wrangler rollback` so
-  #    a bad bundle never keeps serving traffic.
+  #    When smoke:true (default), verifies each deployed worker, then rolls
+  #    back any that fail. The workers.dev host is derived from the account
+  #    SUBDOMAIN SLUG (never the account ID); smoke_base_url / smoke_paths
+  #    override the built-in probe target, and smoke-command replaces the
+  #    probe entirely. smoke:false skips this job so the caller runs its own.
   # ---------------------------------------------------------------------------
   boot-smoke:
     name: Boot smoke + auto-rollback (${{ inputs.environment }})
     runs-on: ubuntu-latest
     needs: deploy
-    if: ${{ needs.deploy.result == 'success' }}
+    if: ${{ needs.deploy.result == 'success' && inputs.smoke == true }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -294,46 +508,109 @@ jobs:
         id: smoke
         shell: bash
         run: |
-          IFS=',' read -ra WORKERS <<< "${{ needs.deploy.outputs.deployed_workers }}"
+          IFS=',' read -ra WORKERS <<< "$DEPLOYED_WORKERS"
+
+          # ----- Consumer-supplied smoke replaces the built-in probe -----
+          if [ -n "$SMOKE_COMMAND" ]; then
+            echo "::group::Running consumer smoke-command"
+            # Export the deployed csv + base url so the consumer command can
+            # build its own multi-route / custom-host probe.
+            export WORKERS="$DEPLOYED_WORKERS"
+            export SMOKE_BASE_URL="$SMOKE_BASE_URL"
+            if bash -c "$SMOKE_COMMAND"; then
+              echo "✅ consumer smoke-command passed"
+            else
+              echo "::error::Consumer smoke-command FAILED. Triggering rollback."
+              printf '%s\n' "${WORKERS[@]}" >> /tmp/smoke-failed-workers.txt
+              echo "smoke_failed=true" >> "$GITHUB_ENV"
+              echo "::endgroup::"
+              exit 1
+            fi
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          # ----- Built-in probe -----
+          # Resolve the workers.dev subdomain slug. NEVER use the account ID
+          # (a UUID) — workers.dev subdomains are keyed by the account
+          # name/slug. Prefer the explicit input, else derive from
+          # `wrangler whoami`, which prints the account's workers.dev subdomain.
+          SUBDOMAIN="$WORKERS_DEV_SUBDOMAIN"
+          if [ -z "$SUBDOMAIN" ] && [ -z "$SMOKE_BASE_URL" ]; then
+            echo "::group::Deriving workers.dev subdomain from wrangler whoami"
+            WHOAMI="$(pnpx wrangler whoami 2>/dev/null || true)"
+            # wrangler whoami prints a table including the account's
+            # workers.dev subdomain; extract the first *.workers.dev token.
+            SUBDOMAIN="$(printf '%s\n' "$WHOAMI" \
+              | grep -oE '[A-Za-z0-9-]+\.workers\.dev' \
+              | head -n1 \
+              | sed 's/\.workers\.dev$//' || true)"
+            if [ -z "$SUBDOMAIN" ]; then
+              echo "::error::Could not derive workers.dev subdomain from 'wrangler whoami'." \
+                "Pass workers_dev_subdomain or smoke_base_url explicitly."
+              exit 1
+            fi
+            echo "::notice::Derived workers.dev subdomain: $SUBDOMAIN"
+            echo "::endgroup::"
+          fi
+
+          # Smoke paths (comma-separated); default "/health".
+          IFS=',' read -ra PATHS <<< "$SMOKE_PATHS"
           failed=()
 
           for worker in "${WORKERS[@]}"; do
             worker="$(echo "$worker" | xargs)"
             [ -z "$worker" ] && continue
 
-            # Construct the worker URL. Consumers can override the base URL
-            # pattern via wrangler.toml routes; this heuristic targets the
-            # default workers.dev subdomain naming convention.
-            #
-            # Pattern: https://<worker>.<account>.workers.dev/health
-            # For custom domains, consumers should add a smoke step after this
-            # job that hits their canonical URL.
-            WORKER_URL="https://${worker}.${{ env.CLOUDFLARE_ACCOUNT_ID }}.workers.dev/health"
-
-            echo "::group::Smoke-testing $worker → $WORKER_URL"
-            HTTP_STATUS=$(curl --silent --output /dev/null \
-              --write-out "%{http_code}" \
-              --max-time 15 \
-              --retry 3 \
-              --retry-delay 5 \
-              "$WORKER_URL" || echo "000")
-            echo "HTTP status: $HTTP_STATUS"
-
-            if [ "$HTTP_STATUS" != "200" ]; then
-              echo "::error::Smoke check FAILED for $worker (HTTP $HTTP_STATUS). Triggering rollback."
-              failed+=("$worker")
+            # Base for this worker: explicit smoke_base_url wins, else the
+            # corrected workers.dev subdomain host.
+            if [ -n "$SMOKE_BASE_URL" ]; then
+              base="${SMOKE_BASE_URL%/}"
             else
-              echo "✅ $worker smoke check passed (HTTP 200)"
+              base="https://${worker}.${SUBDOMAIN}.workers.dev"
             fi
-            echo "::endgroup::"
+
+            for p in "${PATHS[@]}"; do
+              p="$(echo "$p" | xargs)"
+              [ -z "$p" ] && continue
+              case "$p" in
+                /*) : ;;
+                *) p="/$p" ;;
+              esac
+              WORKER_URL="${base}${p}"
+
+              echo "::group::Smoke-testing $worker → $WORKER_URL"
+              HTTP_STATUS=$(curl --silent --output /dev/null \
+                --write-out "%{http_code}" \
+                --max-time 15 \
+                --retry 3 \
+                --retry-delay 5 \
+                "$WORKER_URL" || echo "000")
+              echo "HTTP status: $HTTP_STATUS"
+
+              if [ "$HTTP_STATUS" != "200" ]; then
+                echo "::error::Smoke check FAILED for $worker at $WORKER_URL (HTTP $HTTP_STATUS). Triggering rollback."
+                failed+=("$worker")
+              else
+                echo "✅ $worker smoke check passed at $WORKER_URL (HTTP 200)"
+              fi
+              echo "::endgroup::"
+            done
           done
 
           if [ "${#failed[@]}" -gt 0 ]; then
-            printf '%s\n' "${failed[@]}" >> /tmp/smoke-failed-workers.txt
+            # De-duplicate (a worker may fail multiple paths).
+            printf '%s\n' "${failed[@]}" | sort -u >> /tmp/smoke-failed-workers.txt
             echo "smoke_failed=true" >> "$GITHUB_ENV"
             exit 1
           fi
         env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          DEPLOYED_WORKERS: ${{ needs.deploy.outputs.deployed_workers }}
+          SMOKE_COMMAND: ${{ inputs.smoke-command }}
+          SMOKE_BASE_URL: ${{ inputs.smoke_base_url }}
+          SMOKE_PATHS: ${{ inputs.smoke_paths }}
+          WORKERS_DEV_SUBDOMAIN: ${{ inputs.workers_dev_subdomain }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
@@ -349,7 +626,7 @@ jobs:
             echo "::group::Rolling back $worker"
             pnpx wrangler rollback \
               --name "$worker" \
-              --env "${{ inputs.environment }}" \
+              --env "$DEPLOY_ENV" \
               --message "Auto-rollback: smoke check returned non-200" \
               || echo "::error::wrangler rollback failed for $worker — manual rollback required."
             echo "::endgroup::"
@@ -358,5 +635,6 @@ jobs:
           echo "::error::Deployment rolled back due to failed boot-smoke. See logs above."
           exit 1
         env:
+          DEPLOY_ENV: ${{ inputs.environment }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
