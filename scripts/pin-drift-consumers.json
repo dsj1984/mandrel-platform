@@ -1,5 +1,5 @@
 {
-  "$comment": "Data-driven consumer registry for scripts/check-pin-drift.mjs (Story #67, MP-12). Each entry is one downstream repo that pins mandrel-platform reusable workflows / composite actions via `uses: dsj1984/mandrel-platform/...@<sha>`. Adding a new consumer is a single object here — the drift checker enumerates `.github/workflows/*` (and the optional extra `paths[]`) in each repo over the GitHub API, extracts every mandrel-platform pin, and asserts a single SHA per consumer plus lag vs the latest mandrel-platform release. `branch` is optional (defaults to the repo's default branch).",
+  "$comment": "Data-driven consumer registry for scripts/check-pin-drift.mjs (Story #67, MP-12). Each entry is one downstream repo that pins mandrel-platform reusable workflows / composite actions via `uses: dsj1984/mandrel-platform/...@<sha>`. Adding a new consumer is a single object here — the drift checker enumerates `.github/workflows/*` in each repo over the GitHub API, extracts every mandrel-platform pin, and asserts a single SHA per consumer plus lag vs the latest mandrel-platform release. `branch` is optional (defaults to the repo's default branch).",
   "platformRepo": "dsj1984/mandrel-platform",
   "consumers": [
     {
