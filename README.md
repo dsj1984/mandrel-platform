@@ -117,6 +117,50 @@ is detected by Renovate).
 
 ---
 
+## Renovate preset
+
+The shared Renovate preset (`default.json`, also exposed at
+`config/renovate.json`) is consumed by extending it from a consumer's
+`renovate.json`:
+
+```jsonc
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>dsj1984/mandrel-platform"]
+}
+```
+
+It sets a weekly Monday schedule, a 3-day `minimumReleaseAge`, patch/minor
+auto-merge with major updates gated behind the Dependency Dashboard, and
+grouping rules for the common dependency families (Cloudflare, Sentry, Clerk,
+ESLint, Vitest, Playwright, Astro).
+
+### Auto-bumping `mandrel-platform` `uses:` pins
+
+The preset ships a `github-actions` manager rule that bumps SHA-pinned
+references to this repo's reusable workflows and composite actions —
+`uses: dsj1984/mandrel-platform/...@<sha>` — so consumers stop drifting on
+stale pins (e.g. `pr-quality.yml@v0.3.1` while `deploy-cloudflare.yml@v0.9.0`).
+The bumps are grouped into a single **"mandrel-platform workflows"** PR and
+ride the preset's weekly window + 3-day `minimumReleaseAge`.
+
+**Required:** Renovate only updates a **bare-SHA** pin when the consumer adds a
+version comment after it. Pin with a trailing `# <tag>` comment so Renovate can
+resolve the current release and open the bump PR:
+
+```yaml
+# ✅ Renovate will bump this pin
+- uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe # v0.10.0
+
+# ❌ Bare SHA without a version comment — Renovate leaves it alone
+- uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@869bbbf21faa2cdf6045d64a9c3347b928e196fe
+```
+
+See the [Dependency Update runbook](docs/runbooks/dependency-update.md) for the
+operator-facing review flow.
+
+---
+
 ## Development
 
 ```bash
