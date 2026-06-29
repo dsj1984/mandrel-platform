@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.2...mandrel-platform-v0.2.3) (2026-06-29)
+
+
+### Fixed
+
+* **actions:** correct pnpm-dest default handling and resolve self-referential SHA ([8c13425](https://github.com/dsj1984/mandrel-platform/commit/8c13425ce18508980a553db96ba175dd168b74ba))
+
 ## [0.2.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.2.1...mandrel-platform-v0.2.2) (2026-06-29)
 
 
