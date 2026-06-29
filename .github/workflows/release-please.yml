@@ -39,9 +39,46 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  # Pre-release gate (Story #38): block the publish until the external
+  # cross-repo smoke (dsj1984/mandrel-platform-smoke, fired by
+  # smoke-dispatch.yml on this same push) posts a green `smoke/cross-repo`
+  # commit status on the release commit. A red or absent smoke fails this job
+  # and stops npm-publish. Timeout failure is recoverable by re-running the
+  # workflow once the smoke is green — it never permanently wedges the train.
+  await-smoke:
+    name: Await cross-repo smoke
+    needs: release-please
+    if: ${{ needs.release-please.outputs.root_release_created == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Poll smoke/cross-repo status on the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Waiting for smoke/cross-repo status on ${SHA} …"
+          for i in $(seq 1 60); do
+            state="$(gh api "repos/${REPO}/commits/${SHA}/statuses" \
+              --jq 'map(select(.context=="smoke/cross-repo")) | (first.state // "none")')"
+            echo "  attempt ${i}: smoke/cross-repo=${state}"
+            case "${state}" in
+              success) echo "✅ cross-repo smoke green — release may publish."; exit 0 ;;
+              failure|error) echo "::error::cross-repo smoke ${state} for ${SHA} — blocking release."; exit 1 ;;
+              *) sleep 25 ;;
+            esac
+          done
+          echo "::error::Timed out waiting for cross-repo smoke on ${SHA}. Re-run after the smoke is green."
+          exit 1
+
   npm-publish:
     name: Publish to npm
-    needs: release-please
+    needs: [release-please, await-smoke]
     if: ${{ needs.release-please.outputs.root_release_created == 'true' }}
     runs-on: ubuntu-latest
     permissions:
