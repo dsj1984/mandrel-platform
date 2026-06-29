@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.7.0...mandrel-platform-v0.8.0) (2026-06-29)
+
+
+### Added
+
+* **deploy:** add SENTRY_PROJECT/SENTRY_ORG/PUBLIC_SENTRY_DSN/SITE_URL secret passthrough (refs [#55](https://github.com/dsj1984/mandrel-platform/issues/55)) ([#57](https://github.com/dsj1984/mandrel-platform/issues/57)) ([b8e600c](https://github.com/dsj1984/mandrel-platform/commit/b8e600c3adfa463b5fe0677fbfd74aac6ab87912))
+
 ## [0.7.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.6.0...mandrel-platform-v0.7.0) (2026-06-29)
 
 
