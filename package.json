@@ -24,6 +24,10 @@
     "scripts/",
     "templates/"
   ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "dependencies": {
     "mandrel": "^1.78.0"
   },
