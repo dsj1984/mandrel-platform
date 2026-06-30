@@ -11,6 +11,11 @@
   "exports": {
     "./tsconfig.base.json": "./config/tsconfig.base.json",
     "./biome.base.json": "./config/biome.base.json",
+    "./knip.base.json": "./config/knip.base.json",
+    "./stryker.base.json": "./config/stryker.base.json",
+    "./dependency-cruiser.base.json": "./config/dependency-cruiser.base.json",
+    "./size-limit.base.json": "./config/size-limit.base.json",
+    "./lighthouse.base.json": "./config/lighthouse.base.json",
     "./scripts/*": "./scripts/*"
   },
   "files": [
