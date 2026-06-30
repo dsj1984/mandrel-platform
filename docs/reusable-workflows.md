@@ -75,6 +75,8 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-migration-guard` | boolean | `false`    | **Opt-in.** Set `true` to enable the destructive-migration label guard. See [Destructive-migration guard](#destructive-migration-guard-enable-migration-guard). |
 | `migration-guard-label`  | string  | `'migration:destructive-ok'` | PR label that overrides a destructive-migration finding. Override only when you want a different acknowledgement-label name. |
 | `migration-guard-globs`  | string  | `'**/migrations/**,**/drizzle/**'` | Comma-separated migration path globs the guard scans. A changed file matching one of these (or any `*.sql`) is inspected. |
+| `coverage-threshold` | number | `0`            | Minimum coverage percentage the **unit** job must meet. `0` (default) disables the gate — current behaviour for non-adopters. When `> 0`, the unit job **fails** if measured coverage is below the floor. See [Coverage threshold gate](#coverage-threshold-gate-coverage-threshold). |
+| `coverage-metric`  | string  | `'lines'`        | Which coverage metric the floor asserts: `lines`, `statements`, `functions`, or `branches` (read from `total.<metric>.pct`). Ignored when `coverage-threshold` is `0`. |
 | `enable-security`  | boolean | `true`           | Set `false` to skip the whole security tier (secret scan + SAST). See [Security tier](#security-tier-enable-security--enable-sast).             |
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
 | `semgrep-config`   | string  | `'p/default'`    | Semgrep ruleset for the SAST sub-step. Override with another registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.**   |
@@ -208,6 +210,80 @@ signal on changed files is sufficient for the gate.
 > in-workflow job is the portable implementation of that same contract, so an
 > opt-in consumer needs **no** consumer-side script copy to inherit the gate.
 
+### Coverage threshold gate (`coverage-threshold`)
+
+By default `pr-quality.yml` uploads `**/coverage/` as an artifact but asserts
+**no floor** — a PR can drop coverage and `ci-required` stays green. The
+`coverage-threshold` input is an **opt-in** floor at the workflow layer
+(distinct from the `.agents/` harness's CRAP/MI/coverage ratchet, which is
+unchanged).
+
+- **Off by default.** `coverage-threshold: 0` (the default) is a no-op: the
+  gate step is skipped entirely and behaviour is identical to today. Existing
+  callers need no change.
+- **Load-bearing when set.** With `coverage-threshold > 0`, the **unit** job
+  runs a coverage check after the tests. If measured coverage is below the
+  floor, the unit job **fails** — and the unit job is a `needs:` of
+  [`ci-required`](#the-ci-required-aggregator), so the floor blocks the merge.
+- **No new tooling.** The gate reads the **existing** `**/coverage/`
+  output — specifically `coverage-summary.json` (the standard Istanbul / c8 /
+  vitest `json-summary` reporter). Your test step must already emit that file
+  (the same one uploaded as the unit artifact); no extra dependency or
+  consumer-side script is required.
+- **Fails closed on missing data.** If the floor is set but **no**
+  `coverage-summary.json` is found under any `**/coverage/` directory, the gate
+  **fails** rather than passing silently — a set floor must never be a no-op
+  because coverage wasn't produced.
+- **Metric selectable.** `coverage-metric` (default `lines`) picks which of
+  `lines` / `statements` / `functions` / `branches` the floor asserts, read
+  from `total.<metric>.pct`. The comparison is inclusive — a floor of `80`
+  admits exactly `80%`.
+
+> **Emitting the summary.** Ensure your unit test command writes
+> `coverage/coverage-summary.json`. For vitest: enable
+> `coverage.reporter: ['json-summary', ...]`. For nyc / c8: add
+> `--reporter=json-summary`. The file is what both the artifact upload and this
+> gate consume — no separate run.
+
+#### Example — adopt an 80% lines floor
+
+```yaml
+jobs:
+  pr-quality:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      coverage-threshold: 80
+      # coverage-metric: lines   # default; set to statements/functions/branches to assert another metric
+    secrets: inherit
+```
+
+Leaving `coverage-threshold` unset (or `0`) keeps the current no-floor
+behaviour:
+
+```yaml
+jobs:
+  pr-quality:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    secrets: inherit   # coverage gate is off — artifact still uploaded, no floor asserted
+```
+
+#### Consumer rollout
+
+The platform ships the gate **off by default**, so adopting a floor is a
+per-consumer decision (each repo picks its own floor value — merged vs.
+per-project coverage policy is left to the consumer). Adoption is tracked in
+these consumer tickets:
+
+| Consumer | Adoption ticket |
+| -------- | --------------- |
+| domio    | [dsj1984/domio#1563](https://github.com/dsj1984/domio/issues/1563) |
+| athportal | [dsj1984/athportal#2029](https://github.com/dsj1984/athportal/issues/2029) |
+| swarm-os | [Beestera/swarm-os#158](https://github.com/Beestera/swarm-os/issues/158) |
+
+Each consumer sets `coverage-threshold` (and optionally `coverage-metric`) on
+its `pr-quality.yml` caller and emits a `coverage-summary.json` from its unit
+step. Until a consumer opts in, its CI behaviour is unchanged.
+
 ### Secrets
 
 | Secret        | Required | Purpose                                              |
@@ -243,11 +319,29 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `workflow_call` target. The jobs run in this order:
 
 ```text
-secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke
+secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
 ```
 
 `pre-migration-snapshot` and `migrate` only run when `migrate: true`;
 `boot-smoke` only runs when `smoke: true` (the default).
+
+### Resolved-ref deploy summary (single source of truth)
+
+> Story #110. The final `deploy-summary` job (`if: always()`) emits the
+> **runtime-resolved** ref of this reusable workflow into
+> `GITHUB_STEP_SUMMARY`: `github.job_workflow_sha` (the exact 40-hex commit the
+> caller's `uses: …/deploy-cloudflare.yml@<ref>` pin resolved to) and
+> `github.workflow_ref` (the full ref path). This is the **single source of
+> truth** for the executed pin.
+>
+> Consumers should **read the resolved SHA off this job summary** rather than
+> hand-maintaining a `deploy-cloudflare.yml@<sha>` literal echoed in their own
+> deploy-summary string. A hand-maintained literal drifts independently of the
+> real `uses:` pin and is exactly what the [pin-drift
+> dashboard](runbooks/pin-drift-dashboard.md)'s **stale pin literal** lint now
+> flags (`❌ stale pin literal`) — the resolved-ref summary makes the literal
+> unnecessary, so the lint finding is resolved by adoption, not by re-editing
+> the stale SHA by hand.
 
 ### Minimal caller
 
@@ -606,6 +700,11 @@ The platform stays on `0.x`. The contract guarantees today are:
   workflow `uses:` tag and its `mandrel-platform` npm minor do **not** diverge
   undetected — while treating the transient skew during the Renovate
   **`minimumReleaseAge`** hold (3 days post-release) as expected, not drift.
+- **Stale pin-literal lint** (Story #110) — the same dashboard also flags a
+  platform-ref SHA/tag echoed in a **comment** or a **`run:`/echo string** that
+  drifts from the canonical `uses:` pin (`❌ stale pin literal`), catching the
+  class the `uses:`-only scan missed. Adopt the resolved-ref deploy summary
+  (above) instead of hand-maintaining such a literal.
 
 > **`v1.0` / `@v1` is deferred — not planned.** Cutting a `v1.0` release,
 > publishing a moving `@v1` major tag, and `@v1`-style major-tag pinning are a

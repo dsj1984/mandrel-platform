@@ -1,0 +1,92 @@
+# Scheduled platform-sync repair-PR loop (Story #113, roadmap §4.2).
+#
+# Closes the detect→repair gap. The pin-drift dashboard (pin-drift.yml) only
+# *sees* cross-consumer drift; platform-sync.mjs *fixes* a consumer but was run
+# by hand. This job joins the two: it reads the detector's verdict and, for
+# every consumer carrying repairable drift (split pin / release lag / npm lag /
+# surface skew — NOT a fresh-release Renovate hold), clones the consumer, runs
+# platform-sync, and opens (or updates) a single idempotent repair PR against
+# it.
+#
+# DESIGN DECISION (settled): auto-open repair PRs rather than hard-gate
+# pin-drift. A hard gate red-lines a consumer's `main` for drift caused by a
+# fresh platform release (Renovate just hasn't bumped it yet — not the
+# consumer's fault); a repair PR is self-healing and keeps the signal advisory.
+# pin-drift.yml is UNCHANGED and remains advisory.
+#
+# IDEMPOTENT: one repair PR per consumer, keyed off the stable head branch
+# `mandrel-platform/pin-repair`. A re-run updates the existing PR's branch +
+# body instead of opening a duplicate (scripts/platform-repair.mjs).
+#
+# CROSS-REPO AUTH (least-privilege): opening a PR on a consumer needs write to
+# THAT consumer, which this repo's built-in GITHUB_TOKEN does not grant. The
+# repair step injects a fine-grained PAT / GitHub App token, `PIN_REPAIR_TOKEN`,
+# scoped to **Contents: write + Pull requests: write on the consumer repos
+# ONLY** (domio / athportal / swarm-os). See
+# docs/runbooks/pin-drift-dashboard.md § "Repair loop token". When the secret is
+# absent the run completes READ-ONLY (reports the repairs it would open, exits
+# 0) — it never fails the job and never gates `main`.
+#
+# SHA-pinned third-party actions.
+name: Platform-Sync Repair Loop
+
+on:
+  # Mondays 08:00 UTC — one hour after the pin-drift dashboard's weekly sweep
+  # (07:00), so the repair loop acts on the freshest detection.
+  schedule:
+    - cron: "0 8 * * 1"
+  # On-demand from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Plan only — classify drift and render the repair report, but do not clone, push, or open any PR."
+        type: boolean
+        default: false
+
+# This workflow only READS its own repo; all consumer writes go through the
+# fine-grained PIN_REPAIR_TOKEN, never the workflow token.
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize repair runs so two runs never push the same repair branch /
+  # open duplicate PRs on a consumer.
+  group: platform-sync-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    name: repair
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Run platform-sync repair loop
+        env:
+          # READ token for the detector's cross-repo reads (the dashboard's
+          # existing PAT). Falls back to the built-in token so the workflow is
+          # valid before the secret is provisioned (unreadable consumers then
+          # surface as `error` rows rather than hard-failing).
+          GH_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN || github.token }}
+          # WRITE token for opening repair PRs on the consumers. Least-privilege:
+          # Contents: write + Pull requests: write on the consumer repos ONLY.
+          # Absent → the loop runs read-only and reports would-open repairs.
+          PIN_REPAIR_TOKEN: ${{ secrets.PIN_REPAIR_TOKEN }}
+          DRY_RUN: ${{ inputs.dry-run && '--dry-run' || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # DRY_RUN is either empty or "--dry-run"; pass it only when set so the
+          # empty case adds no argument (shellcheck SC2086-clean under set -u).
+          if [ -n "$DRY_RUN" ]; then
+            node scripts/platform-repair.mjs "$DRY_RUN"
+          else
+            node scripts/platform-repair.mjs
+          fi
