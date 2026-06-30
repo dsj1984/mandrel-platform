@@ -67,6 +67,8 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-unit`      | boolean | `true`           | Set `false` to skip the unit-test tier.                                                                                                        |
 | `enable-contract`  | boolean | `true`           | Set `false` to skip the contract-test tier.                                                                                                    |
 | `enable-e2e`       | boolean | `true`           | Set `false` to skip the e2e / smoke (Playwright) tier.                                                                                          |
+| `coverage-threshold` | number | `0`            | Minimum coverage percentage the **unit** job must meet. `0` (default) disables the gate — current behaviour for non-adopters. When `> 0`, the unit job **fails** if measured coverage is below the floor. See [Coverage threshold gate](#coverage-threshold-gate-coverage-threshold). |
+| `coverage-metric`  | string  | `'lines'`        | Which coverage metric the floor asserts: `lines`, `statements`, `functions`, or `branches` (read from `total.<metric>.pct`). Ignored when `coverage-threshold` is `0`. |
 | `enable-security`  | boolean | `true`           | Set `false` to skip the whole security tier (secret scan + SAST). See [Security tier](#security-tier-enable-security--enable-sast).             |
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
 | `semgrep-config`   | string  | `'p/default'`    | Semgrep ruleset for the SAST sub-step. Override with another registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.**   |
@@ -129,6 +131,63 @@ Toggle matrix:
 > comma-separated — for generated code, build output, or test fixtures you
 > don't want Semgrep to scan (e.g. `'dist coverage tests/fixtures'`). Empty
 > (the default) leaves only the built-in `.agents` exclude in effect.
+
+### Coverage threshold gate (`coverage-threshold`)
+
+By default `pr-quality.yml` uploads `**/coverage/` as an artifact but asserts
+**no floor** — a PR can drop coverage and `ci-required` stays green. The
+`coverage-threshold` input is an **opt-in** floor at the workflow layer
+(distinct from the `.agents/` harness's CRAP/MI/coverage ratchet, which is
+unchanged).
+
+- **Off by default.** `coverage-threshold: 0` (the default) is a no-op: the
+  gate step is skipped entirely and behaviour is identical to today. Existing
+  callers need no change.
+- **Load-bearing when set.** With `coverage-threshold > 0`, the **unit** job
+  runs a coverage check after the tests. If measured coverage is below the
+  floor, the unit job **fails** — and the unit job is a `needs:` of
+  [`ci-required`](#the-ci-required-aggregator), so the floor blocks the merge.
+- **No new tooling.** The gate reads the **existing** `**/coverage/`
+  output — specifically `coverage-summary.json` (the standard Istanbul / c8 /
+  vitest `json-summary` reporter). Your test step must already emit that file
+  (the same one uploaded as the unit artifact); no extra dependency or
+  consumer-side script is required.
+- **Fails closed on missing data.** If the floor is set but **no**
+  `coverage-summary.json` is found under any `**/coverage/` directory, the gate
+  **fails** rather than passing silently — a set floor must never be a no-op
+  because coverage wasn't produced.
+- **Metric selectable.** `coverage-metric` (default `lines`) picks which of
+  `lines` / `statements` / `functions` / `branches` the floor asserts, read
+  from `total.<metric>.pct`. The comparison is inclusive — a floor of `80`
+  admits exactly `80%`.
+
+> **Emitting the summary.** Ensure your unit test command writes
+> `coverage/coverage-summary.json`. For vitest: enable
+> `coverage.reporter: ['json-summary', ...]`. For nyc / c8: add
+> `--reporter=json-summary`. The file is what both the artifact upload and this
+> gate consume — no separate run.
+
+#### Example — adopt an 80% lines floor
+
+```yaml
+jobs:
+  pr-quality:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      coverage-threshold: 80
+      # coverage-metric: lines   # default; set to statements/functions/branches to assert another metric
+    secrets: inherit
+```
+
+Leaving `coverage-threshold` unset (or `0`) keeps the current no-floor
+behaviour:
+
+```yaml
+jobs:
+  pr-quality:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    secrets: inherit   # coverage gate is off — artifact still uploaded, no floor asserted
+```
 
 ### Secrets
 
