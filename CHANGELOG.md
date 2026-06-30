@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.15.0...mandrel-platform-v0.15.1) (2026-06-30)
+
+
+### Fixed
+
+* **ci:** replace bash4+ mapfile with portable read loop in migration-guard (refs [#142](https://github.com/dsj1984/mandrel-platform/issues/142)) ([#143](https://github.com/dsj1984/mandrel-platform/issues/143)) ([67de46d](https://github.com/dsj1984/mandrel-platform/commit/67de46db7f7d26e34aecd554c066ed573b09f039))
+
 ## [0.15.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.14.2...mandrel-platform-v0.15.0) (2026-06-30)
 
 
