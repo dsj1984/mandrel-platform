@@ -11,6 +11,7 @@
     "unit",
     "contract",
     "e2e",
+    "migration-guard",
     "security"
   ],
   "enforceAdmins": false,
