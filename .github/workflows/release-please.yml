@@ -97,7 +97,12 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
-          registry-url: 'https://registry.npmjs.org'
+          # Deliberately NO `registry-url:`. setup-node's registry-url writes an
+          # `.npmrc` with `_authToken=${NODE_AUTH_TOKEN}` and sets NODE_AUTH_TOKEN
+          # to a placeholder (XXXXX-XXXXX-XXXXX-XXXXX); npm then uses that garbage
+          # token and NEVER performs the OIDC trusted-publishing exchange → 404.
+          # Omitting it leaves no token in scope, so npm 11.5.1+ falls through to
+          # OIDC. Default registry is registry.npmjs.org.
 
       # Trusted publishing exchanges the workflow's OIDC token for a
       # short-lived npm credential — no NODE_AUTH_TOKEN / NPM_TOKEN is set.
