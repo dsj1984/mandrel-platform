@@ -33,6 +33,40 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-06-30 — Edge-security middleware ships via the npm package-export channel (two CORS variants)
+
+**Context.** Each consumer hand-rolled the per-env edge-security invariants —
+closed-allowlist CORS (no wildcard-with-credentials), security headers
+(CSP/HSTS/XFO/XCTO/Referrer-Policy), and app-layer rate limiting — re-deriving
+them three times (the `○` rows in the consumer matrix, roadmap §4.5). The work
+needed a distribution channel, and CORS code legitimately differs by
+architecture: domio drives an Astro `(context, next)` middleware while
+athportal/swarm-os use `hono/cors`.
+
+**Decision.** Ship reusable units under `config/edge-security/` (`*.mjs`),
+distributed through the **npm package-export channel** — the same channel as the
+base configs (`config/*.base.json`) and `scripts/*` — exposed at
+`mandrel-platform/edge-security` (barrel) and `mandrel-platform/edge-security/*`
+(per-unit sub-paths). This is the executable-code channel, the right fit here
+(unlike runbooks, which use the copyable-stub channel because they are process
+docs, not code). **Two CORS variants** ship (`cors-astro.mjs`,
+`cors-hono.mjs`), not one flattened form — the architecture-driven divergence is
+preserved. Both share one origin resolver (`allowlist.mjs`) that homes the
+**no-wildcard-with-credentials invariant, enforced by construction**: building
+either CORS unit with `['*']` + `credentials: true` throws at construction
+before a request is served. Headers and rate-limit cores are framework-agnostic
+(`buildSecurityHeaders` → plain object; `createRateLimiter` → `check()` decision
+with a pluggable store) with thin Astro/hono adapters. Units are parameterized
+by a per-env allowlist so one code path covers prod and preview.
+
+**Consequences.** The next consumer inherits the invariant instead of
+re-deriving it, and the existing three converge toward `●` as they adopt. The
+no-wildcard-with-credentials footgun is now structurally impossible to
+mis-configure. Cost: the platform now ships runtime-shaped middleware code (not
+just config/process), so the units carry their own `node:test` suite
+(`scripts/edge-security.test.mjs`, wired into `npm test`) and two CORS surfaces
+to maintain rather than one.
+
 ## 2026-06-29 — `platform-sync` adoption CLI lives in `scripts/`, not the `mandrel` harness
 
 **Context.** Adoption of mandrel-platform was a manual per-repo cutover, which
@@ -107,3 +141,36 @@ guidance (`security-baseline.md`) and CI enforcement (the security tier) are not
 cross-linked. Accepted deliberately — good synergy here is the clean boundary,
 not entanglement. Recorded so the absence of synergy/dogfooding tickets is not
 read as an oversight.
+
+## 2026-06-30 — Ship consumer release automation via release-please, not changesets
+
+**Context.** The platform *runs* release-please for its own release
+([`release-please.yml`](reusable-workflows.md#release-pleaseyml)) but exposed no
+**reusable** release-lifecycle unit, so every consumer hand-rolled its
+version/changelog/tag flow (roadmap §4.6). Shipping a fourth distribution
+channel (alongside `pr-quality.yml`, `deploy-cloudflare.yml`, and the npm config
+package) forced a tool choice — release-please vs. changesets — and a scope
+boundary against the platform-internal publish path.
+
+**Decision.** Ship
+[`release-automation.yml`](reusable-workflows.md#release-automationyml) as a
+`workflow_call` wrapper around **release-please**, not changesets. release-please
+keys off Conventional Commits — the exact convention
+[`git-conventions.md`](../.agents/rules/git-conventions.md) already mandates and
+`release-please-config.json`'s `changelog-sections` already encode — so a
+consumer inherits the same version-bump/changelog mapping the platform uses with
+no new authoring model. changesets would impose a divergent
+per-change-markdown-intent convention that conflicts with the
+commit-message-as-source-of-truth posture. **Scope is version bump + changelog +
+tag + GitHub Release only**; registry publish is out of scope because consumers
+deploy to Cloudflare, not npm. A publishing consumer wires its own job off the
+`release_created` / `tag_name` outputs. This unit is distinct from the
+platform-internal `release-please.yml`, which adds the npm-publish job for the
+`mandrel-platform` package itself.
+
+**Consequences.** Consumers get one shared, SHA-pinned, Renovate-bumped release
+unit with zero new conventions to learn; the conventional-commit contract now
+spans CI, decomposition, and release. Cost: consumers that publish to a registry
+must supply their own publish job (the unit deliberately stops at tag/release),
+and the platform now maintains two release-please surfaces (internal publish +
+reusable consumer unit) that must not drift on the release-please-action pin.

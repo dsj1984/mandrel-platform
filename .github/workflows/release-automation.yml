@@ -1,0 +1,139 @@
+# Reusable consumer release-automation workflow — the release-lifecycle channel.
+#
+# mandrel-platform already runs release-please for its OWN release
+# (release-please.yml), but that file is platform-internal: it is bound to this
+# repo's npm-publish posture and has no `workflow_call` contract. Consumers have
+# had no shared release-automation unit — each consumer's version/changelog/tag
+# lifecycle was hand-rolled. This workflow closes that gap as a fourth
+# distribution channel (alongside pr-quality.yml, deploy-cloudflare.yml, and the
+# npm config package), extending the platform from CI/deploy into the full
+# release lifecycle.
+#
+# WHY release-please (not changesets): the platform already depends on
+# release-please for its own release train and codifies the conventional-commit
+# contract in .agents/rules/git-conventions.md and release-please-config.json's
+# changelog-sections. A consumer adopting this workflow inherits the SAME
+# conventional-commit → version-bump → changelog mapping the platform itself
+# uses, with zero new mental model. changesets would introduce a second,
+# divergent authoring convention (per-change markdown intents) that conflicts
+# with the commit-message-as-source-of-truth posture git-conventions.md already
+# mandates. See docs/reusable-workflows.md § release-automation.yml.
+#
+# SCOPE: version bump + CHANGELOG + git tag + release PR/GitHub Release only.
+# This unit deliberately does NOT publish to any registry — consumers deploy to
+# Cloudflare, not npm, so registry publish is out of scope (Story #117). A
+# consumer that DOES publish wires its own publish job keyed off this workflow's
+# `release_created` / `tag_name` outputs.
+#
+# Consumed as a workflow_call target (see docs/reusable-workflows.md). Minimal
+# caller:
+#   on:
+#     push:
+#       branches: [main]
+#   jobs:
+#     release:
+#       uses: dsj1984/mandrel-platform/.github/workflows/release-automation.yml@<sha> # <tag>
+#       secrets: inherit
+#
+# SHA-pinned third-party actions.
+name: release-automation
+
+on:
+  workflow_call:
+    inputs:
+      target-branch:
+        description: >
+          Branch release-please maintains the release PR against. Defaults to
+          'main'. Set to your release branch if the consumer cuts releases off a
+          branch other than its default.
+        required: false
+        type: string
+        default: 'main'
+      release-type:
+        description: >
+          release-please release strategy. Defaults to 'node' (reads/writes
+          package.json version + CHANGELOG.md). Use 'simple' for a non-Node
+          repo that only needs a version file + changelog, or any other
+          release-please release-type. Ignored when 'config-file' is supplied
+          (the config file owns per-package release-type).
+        required: false
+        type: string
+        default: 'node'
+      config-file:
+        description: >
+          Path to a release-please config JSON. Optional — when omitted the
+          action runs in single-package mode driven by 'release-type' and
+          'package-name'. Supply this for a monorepo or to pin
+          changelog-sections to the platform's git-conventions.md mapping.
+        required: false
+        type: string
+        default: ''
+      manifest-file:
+        description: >
+          Path to a release-please manifest JSON. Required when 'config-file' is
+          set (manifest + config are a matched pair); ignored otherwise.
+        required: false
+        type: string
+        default: ''
+      package-name:
+        description: >
+          Package name release-please uses in the release PR title and tag.
+          Defaults to empty (release-please reads it from package.json for the
+          'node' release-type). Set explicitly for non-Node release-types.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      release-token:
+        description: >
+          PAT or GitHub App installation token used instead of GITHUB_TOKEN.
+          STRONGLY recommended: the default GITHUB_TOKEN does NOT trigger
+          downstream workflows on the release PR it opens (GitHub's
+          anti-recursion safeguard), so that PR never runs the consumer's
+          required CI and cannot auto-merge. A user-scoped PAT acts like a real
+          user, so CI fires. Required scopes: contents:write,
+          pull-requests:write. Falls back to GITHUB_TOKEN when unset.
+        required: false
+    outputs:
+      release_created:
+        description: >
+          'true' when this run cut a release (the release PR merged and a tag
+          was created). Wire a consumer publish/deploy job's `if:` off this.
+        value: ${{ jobs.release-please.outputs.release_created }}
+      tag_name:
+        description: >
+          The created tag name (e.g. 'v1.4.0') when release_created is 'true';
+          empty otherwise.
+        value: ${{ jobs.release-please.outputs.tag_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    name: Run release-please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    # Root/single package emits un-prefixed outputs (`release_created`,
+    # `tag_name`) regardless of single-package vs config-file mode.
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.release-token || github.token }}
+          target-branch: ${{ inputs.target-branch }}
+          # release-type / package-name drive single-package mode; they are
+          # ignored by the action when config-file is supplied (the config owns
+          # per-package release-type). config-file / manifest-file are passed
+          # only when non-empty so single-package callers stay config-free.
+          release-type: ${{ inputs.release-type }}
+          package-name: ${{ inputs.package-name }}
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}

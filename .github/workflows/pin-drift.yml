@@ -3,13 +3,22 @@
 # A scheduled standing check that asserts every mandrel-platform consumer
 # (domio, athportal, swarm-os — data-driven via scripts/pin-drift-consumers.json)
 # pins a SINGLE platform SHA across all of its workflow chains, and flags any
-# consumer lagging behind the latest mandrel-platform release. The split-pin /
-# release-lag state went undetected for releases; this
-# job surfaces it automatically and renders a human-readable dashboard on the
-# job summary.
+# consumer whose workflow `uses:` pin OR its `mandrel-platform` npm devDependency
+# lags the latest mandrel-platform release (or where the two surfaces skew). The
+# split-pin / release-lag / surface-skew state went undetected for releases;
+# this job surfaces it automatically and renders a human-readable dashboard on
+# the job summary.
+#
+# Coupling vs. the supply-chain hold (Story #107): the checker reads the latest
+# release's published_at and SUPPRESSES lag/skew that is fully explained by the
+# Renovate `minimumReleaseAge` hold window (default 3 days, mirrored in
+# scripts/pin-drift-consumers.json) — Renovate has not raised the bump PR yet,
+# so a one-release-behind consumer is reported as `holding`, not drift. A split
+# pin is never suppressed. See docs/runbooks/pin-drift-dashboard.md.
 #
 # The checker (scripts/check-pin-drift.mjs) reads each consumer's
-# `.github/workflows/` over the GitHub API via the `gh` CLI. The built-in
+# `.github/workflows/` AND its package.json over the GitHub API via the `gh`
+# CLI. The built-in
 # GITHUB_TOKEN only grants read access to THIS repo, so reading the private
 # consumer repos requires a fine-grained PAT (PIN_DRIFT_TOKEN) with
 # Contents: read + Metadata: read on each consumer repo. When that secret is
@@ -63,4 +72,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/check-pin-drift.mjs ${STRICT}
+          # STRICT is either empty or "--strict". Pass it only when set so the
+          # empty case adds no argument — shellcheck SC2086-clean and safe under
+          # `set -u` (no array expansion that an empty array would trip on).
+          if [ -n "$STRICT" ]; then
+            node scripts/check-pin-drift.mjs "$STRICT"
+          else
+            node scripts/check-pin-drift.mjs
+          fi

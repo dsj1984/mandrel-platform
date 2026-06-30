@@ -12,13 +12,22 @@ consumer convergence matrix, and the forward roadmap are tracked privately.
 ## Reusable workflows
 
 The shared `workflow_call` workflows — `pr-quality.yml` and
-`deploy-cloudflare.yml` (plus `codeql.yml` and `smoke-dispatch.yml`) — and
-their public input/secret contract are documented in
+`deploy-cloudflare.yml` (plus `secret-scan-push.yml`, `release-automation.yml`,
+`codeql.yml`, and `smoke-dispatch.yml`) — and their public input/secret
+contract are documented in
 **[docs/reusable-workflows.md](docs/reusable-workflows.md)**. Consumers should
 configure their callers from that reference (input types, defaults,
 when-to-override, the frozen `{CLOUDFLARE_*, TURSO_*}` deploy secret allowlist,
 the single `ci-required` aggregator context, and the pin-by-tag/SHA versioning
 model).
+
+`release-automation.yml` extends the platform from CI/deploy into the **full
+release lifecycle**: a thin caller gets conventional-commit-driven version
+bumps, a `CHANGELOG.md`, and tags via release-please — the same convention the
+platform's own release train uses. It does not publish to a registry (consumers
+deploy to Cloudflare, not npm); see its section in the reference for the
+out-of-scope boundary and the `release_created` / `tag_name` outputs a
+publish/deploy job keys off.
 
 ---
 
@@ -88,6 +97,186 @@ and standard formatter defaults (2-space indent, 100-char line width).
   }
 }
 ```
+
+### Code-quality tooling base configs
+
+The package also ships shared base configs for the five code-quality /
+hygiene tools every consumer runs — **Knip**, **Stryker**,
+**dependency-cruiser**, **size-limit**, and **Lighthouse**. Each is the
+best-of-breed union of the consumers' previously hand-maintained configs.
+Adoption is opt-in via `extends` (or a spread / deep-merge where the tool
+has no native `extends`), and every project-specific knob — entrypoints,
+mutate globs, bundle paths, score floors, and budgets — stays
+**consumer-tunable** locally.
+
+#### `knip.base.json`
+
+Shared Knip defaults (`ignoreExportsUsedInFile`, the `mandrel` binary +
+`mandrel-platform` dependency ignores). Knip supports a native `extends`,
+so consumers point at the base and add their own `entry` / `project`
+globs (`knip.json`):
+
+```jsonc
+{
+  "extends": ["mandrel-platform/knip.base.json"],
+  "entry": ["src/index.ts", "scripts/*.ts"],
+  "project": ["src/**", "scripts/**"]
+}
+```
+
+#### `stryker.base.json`
+
+Shared Stryker mutation-testing defaults (pnpm package manager,
+`perTest` coverage analysis, HTML + clear-text + progress reporters,
+`ignoreStatic`, a 60 s timeout, and high/low/break thresholds). Stryker
+supports a native `extends`; the consumer pins its test runner and
+mutate set (`stryker.config.json`):
+
+```jsonc
+{
+  "extends": ["mandrel-platform/stryker.base.json"],
+  "testRunner": "vitest",
+  "mutate": ["src/**/*.ts", "!src/**/*.test.ts"]
+}
+```
+
+#### `dependency-cruiser.base.json`
+
+Shared dependency-cruiser rule set (no-circular, no-orphans,
+not-to-unresolvable, no-non-package-json, not-to-dev-dep,
+no-deprecated-core, and the dep-type hygiene rules) plus resolver
+options. dependency-cruiser supports a native `extends` to a JSON path —
+resolve the package export and add repo-specific rules
+(`.dependency-cruiser.json`):
+
+```jsonc
+{
+  "extends": "mandrel-platform/dependency-cruiser.base.json",
+  "forbidden": [
+    // repo-specific layering rules only
+  ]
+}
+```
+
+#### `size-limit.base.json`
+
+size-limit's own config is a per-entry **array** whose paths and limits
+are inherently repo-specific, so the base ships the shared *check
+options* (gzip sizing, `running: false`). Spread it into each entry of
+your `.size-limit.json`:
+
+```jsonc
+// .size-limit.js — spread the base into each entry
+import base from "mandrel-platform/size-limit.base.json" with { type: "json" };
+
+export default [
+  { ...base, path: "dist/index.js", limit: "10 kB" },
+  { ...base, path: "dist/cli.js", limit: "25 kB" }
+];
+```
+
+#### `lighthouse.base.json`
+
+Lighthouse's `lighthouserc.json` has no whole-file `extends`, so the
+base ships the shared `ci` block — collect settings plus the four
+category assertions on the `lighthouse:recommended` preset. Deep-merge
+it and add your repo-specific `ci.collect.url` /
+`ci.collect.staticDistDir`:
+
+```jsonc
+// lighthouserc.js — deep-merge the base, add repo-specific collect targets
+import base from "mandrel-platform/lighthouse.base.json" with { type: "json" };
+
+export default {
+  ci: {
+    ...base.ci,
+    collect: {
+      ...base.ci.collect,
+      staticDistDir: "./dist"
+    }
+  }
+};
+```
+
+> **Budgets stay consumer-tunable.** These bases standardize *which*
+> tools run and their shared defaults — not *what each tool gates on*
+> per consumer. Override any threshold, score floor, or budget locally;
+> the base provides the floor, the consumer sets the ceiling.
+
+### Edge-security middleware units
+
+The package ships reusable **per-env edge-security middleware** so the next
+consumer inherits the closed-allowlist CORS, security-header, and app-layer
+rate-limit invariants instead of re-deriving them. They are distributed through
+the **npm package-export channel** (the same channel as the base configs and
+`scripts/*`), under `mandrel-platform/edge-security`:
+
+| Sub-path                                              | Unit                                                                 |
+| ----------------------------------------------------- | -------------------------------------------------------------------- |
+| `mandrel-platform/edge-security`                      | Barrel — re-exports every unit below.                                |
+| `mandrel-platform/edge-security/cors-astro.mjs`       | `createAstroCors()` — closed-allowlist CORS as Astro middleware.     |
+| `mandrel-platform/edge-security/cors-hono.mjs`        | `createHonoCorsOptions()` — closed-allowlist options for `hono/cors`.|
+| `mandrel-platform/edge-security/security-headers.mjs` | `buildSecurityHeaders()` / `applySecurityHeaders()` — CSP/HSTS/XFO/XCTO/Referrer-Policy. |
+| `mandrel-platform/edge-security/rate-limit.mjs`       | `createRateLimiter()` + Astro/hono adapters — fixed-window app-layer limiter. |
+| `mandrel-platform/edge-security/allowlist.mjs`        | `createAllowlist()` — the shared closed-allowlist origin resolver.   |
+
+**Two CORS variants, by design.** CORS code legitimately differs by
+architecture: domio drives an Astro `(context, next)` middleware, while
+athportal / swarm-os use `hono/cors`. Both variants ship — the divergence is
+preserved, not flattened into one form. Both inherit the same closed allowlist
+and the **no-wildcard-with-credentials invariant, enforced by construction**:
+building either unit with `['*']` + `credentials: true` throws at construction
+time (before a request is ever served), so a consumer cannot mis-configure the
+forbidden `Access-Control-Allow-Origin: *` + `Access-Control-Allow-Credentials: true`
+shape.
+
+**Per-env allowlist.** Each unit takes the allowed-origin set for the current
+deployment environment, so the same code path applies in production and preview:
+
+```ts
+// Astro — src/middleware.ts
+import { defineMiddleware, sequence } from "astro:middleware";
+import { createAstroCors } from "mandrel-platform/edge-security/cors-astro.mjs";
+import { applySecurityHeaders } from "mandrel-platform/edge-security/security-headers.mjs";
+import { createAstroRateLimit } from "mandrel-platform/edge-security/rate-limit.mjs";
+
+const cors = createAstroCors({
+  allowedOrigins: import.meta.env.PROD ? ["https://godomio.com"] : ["http://localhost:4321"],
+  credentials: true,
+});
+const rateLimit = createAstroRateLimit({ limit: 100, windowMs: 60_000 });
+
+export const onRequest = sequence(
+  defineMiddleware(cors),
+  defineMiddleware(rateLimit),
+  defineMiddleware(async (_ctx, next) => {
+    const res = await next();
+    applySecurityHeaders(res.headers);
+    return res;
+  }),
+);
+```
+
+```ts
+// hono — app entry
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { createHonoCorsOptions } from "mandrel-platform/edge-security/cors-hono.mjs";
+import { createHonoRateLimit } from "mandrel-platform/edge-security/rate-limit.mjs";
+
+const app = new Hono();
+app.use("*", cors(createHonoCorsOptions({ allowedOrigins: ["https://athportal.com"], credentials: true })));
+app.use("*", createHonoRateLimit({ limit: 100, windowMs: 60_000 }));
+```
+
+> **Headers / rate-limit are framework-agnostic.** `buildSecurityHeaders()`
+> returns a plain `Record<string,string>` you can spread onto any response, and
+> `createRateLimiter()` exposes a `check(request)` decision function with a
+> pluggable store (swap the default in-memory store for a Cloudflare KV /
+> Durable Object store in production). The Astro/hono adapters are thin wrappers
+> over those cores.
+
+---
 
 ### `scripts/audit-check.mjs`
 
@@ -235,8 +424,15 @@ pnpm run bootstrap
 
 ## Package exports
 
-| Export                                | Path                        |
-| ------------------------------------- | --------------------------- |
-| `mandrel-platform/tsconfig.base.json` | `config/tsconfig.base.json` |
-| `mandrel-platform/biome.base.json`    | `config/biome.base.json`    |
-| `mandrel-platform/scripts/*`          | `scripts/*`                 |
+| Export                                          | Path                                  |
+| ----------------------------------------------- | ------------------------------------- |
+| `mandrel-platform/tsconfig.base.json`           | `config/tsconfig.base.json`           |
+| `mandrel-platform/biome.base.json`              | `config/biome.base.json`              |
+| `mandrel-platform/knip.base.json`               | `config/knip.base.json`               |
+| `mandrel-platform/stryker.base.json`            | `config/stryker.base.json`            |
+| `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
+| `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
+| `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
+| `mandrel-platform/edge-security`                | `config/edge-security/index.mjs`      |
+| `mandrel-platform/edge-security/*`              | `config/edge-security/*`              |
+| `mandrel-platform/scripts/*`                    | `scripts/*`                           |
