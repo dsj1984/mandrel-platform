@@ -89,6 +89,111 @@ and standard formatter defaults (2-space indent, 100-char line width).
 }
 ```
 
+### Code-quality tooling base configs
+
+The package also ships shared base configs for the five code-quality /
+hygiene tools every consumer runs — **Knip**, **Stryker**,
+**dependency-cruiser**, **size-limit**, and **Lighthouse**. Each is the
+best-of-breed union of the consumers' previously hand-maintained configs.
+Adoption is opt-in via `extends` (or a spread / deep-merge where the tool
+has no native `extends`), and every project-specific knob — entrypoints,
+mutate globs, bundle paths, score floors, and budgets — stays
+**consumer-tunable** locally.
+
+#### `knip.base.json`
+
+Shared Knip defaults (`ignoreExportsUsedInFile`, the `mandrel` binary +
+`mandrel-platform` dependency ignores). Knip supports a native `extends`,
+so consumers point at the base and add their own `entry` / `project`
+globs (`knip.json`):
+
+```jsonc
+{
+  "extends": ["mandrel-platform/knip.base.json"],
+  "entry": ["src/index.ts", "scripts/*.ts"],
+  "project": ["src/**", "scripts/**"]
+}
+```
+
+#### `stryker.base.json`
+
+Shared Stryker mutation-testing defaults (pnpm package manager,
+`perTest` coverage analysis, HTML + clear-text + progress reporters,
+`ignoreStatic`, a 60 s timeout, and high/low/break thresholds). Stryker
+supports a native `extends`; the consumer pins its test runner and
+mutate set (`stryker.config.json`):
+
+```jsonc
+{
+  "extends": ["mandrel-platform/stryker.base.json"],
+  "testRunner": "vitest",
+  "mutate": ["src/**/*.ts", "!src/**/*.test.ts"]
+}
+```
+
+#### `dependency-cruiser.base.json`
+
+Shared dependency-cruiser rule set (no-circular, no-orphans,
+not-to-unresolvable, no-non-package-json, not-to-dev-dep,
+no-deprecated-core, and the dep-type hygiene rules) plus resolver
+options. dependency-cruiser supports a native `extends` to a JSON path —
+resolve the package export and add repo-specific rules
+(`.dependency-cruiser.json`):
+
+```jsonc
+{
+  "extends": "mandrel-platform/dependency-cruiser.base.json",
+  "forbidden": [
+    // repo-specific layering rules only
+  ]
+}
+```
+
+#### `size-limit.base.json`
+
+size-limit's own config is a per-entry **array** whose paths and limits
+are inherently repo-specific, so the base ships the shared *check
+options* (gzip sizing, `running: false`). Spread it into each entry of
+your `.size-limit.json`:
+
+```jsonc
+// .size-limit.js — spread the base into each entry
+import base from "mandrel-platform/size-limit.base.json" with { type: "json" };
+
+export default [
+  { ...base, path: "dist/index.js", limit: "10 kB" },
+  { ...base, path: "dist/cli.js", limit: "25 kB" }
+];
+```
+
+#### `lighthouse.base.json`
+
+Lighthouse's `lighthouserc.json` has no whole-file `extends`, so the
+base ships the shared `ci` block — collect settings plus the four
+category assertions on the `lighthouse:recommended` preset. Deep-merge
+it and add your repo-specific `ci.collect.url` /
+`ci.collect.staticDistDir`:
+
+```jsonc
+// lighthouserc.js — deep-merge the base, add repo-specific collect targets
+import base from "mandrel-platform/lighthouse.base.json" with { type: "json" };
+
+export default {
+  ci: {
+    ...base.ci,
+    collect: {
+      ...base.ci.collect,
+      staticDistDir: "./dist"
+    }
+  }
+};
+```
+
+> **Budgets stay consumer-tunable.** These bases standardize *which*
+> tools run and their shared defaults — not *what each tool gates on*
+> per consumer. Override any threshold, score floor, or budget locally;
+> the base provides the floor, the consumer sets the ceiling.
+
 ### `scripts/audit-check.mjs`
 
 CVE gate script. Runs `pnpm audit --prod` and blocks on any **unsuppressed**
@@ -235,8 +340,13 @@ pnpm run bootstrap
 
 ## Package exports
 
-| Export                                | Path                        |
-| ------------------------------------- | --------------------------- |
-| `mandrel-platform/tsconfig.base.json` | `config/tsconfig.base.json` |
-| `mandrel-platform/biome.base.json`    | `config/biome.base.json`    |
-| `mandrel-platform/scripts/*`          | `scripts/*`                 |
+| Export                                          | Path                                  |
+| ----------------------------------------------- | ------------------------------------- |
+| `mandrel-platform/tsconfig.base.json`           | `config/tsconfig.base.json`           |
+| `mandrel-platform/biome.base.json`              | `config/biome.base.json`              |
+| `mandrel-platform/knip.base.json`               | `config/knip.base.json`               |
+| `mandrel-platform/stryker.base.json`            | `config/stryker.base.json`            |
+| `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
+| `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
+| `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
+| `mandrel-platform/scripts/*`                    | `scripts/*`                           |
