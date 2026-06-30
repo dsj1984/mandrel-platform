@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.14.0...mandrel-platform-v0.14.1) (2026-06-30)
+
+
+### Fixed
+
+* **release:** drop setup-node registry-url so OIDC trusted publishing works ([#134](https://github.com/dsj1984/mandrel-platform/issues/134)) ([eb08bb5](https://github.com/dsj1984/mandrel-platform/commit/eb08bb588379e1416c47e84f311e3ddb634c7f81))
+
 ## [0.14.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.13.0...mandrel-platform-v0.14.0) (2026-06-30)
 
 
