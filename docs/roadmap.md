@@ -238,7 +238,7 @@ and §4.4 carry the evidence each Story closes.
 | MP-10 — private-repo-capable security tier in shared workflows | [#65](https://github.com/dsj1984/mandrel-platform/issues/65) | — | 🔴 HIGH / M |
 | MP-11 — Renovate rule to auto-bump consumer `uses:` pins | [#66](https://github.com/dsj1984/mandrel-platform/issues/66) | — | 🟠 MED / S |
 | MP-12 — cross-consumer pin-drift dashboard | [#67](https://github.com/dsj1984/mandrel-platform/issues/67) | — | 🟡 LOW / S |
-| MP-13 — v1.0 stabilization (public input contract + `@v1`) | [#68](https://github.com/dsj1984/mandrel-platform/issues/68) | MP-10, MP-11, MP-12 | 🟠 MED / M |
+| MP-13 — document the reusable-workflow input/secret contract | [#68](https://github.com/dsj1984/mandrel-platform/issues/68) | — (deps closed) | 🟡 LOW / S |
 | MP-14 — `platform sync` scaffold/adoption CLI | [#69](https://github.com/dsj1984/mandrel-platform/issues/69) | — | ⚪ opt / L |
 
 **Consumers — same Story per repo** (native `blocked_by` shown):
@@ -253,14 +253,16 @@ and §4.4 carry the evidence each Story closes.
 ```text
 WAVE 1  Close the HIGH    MP-10 (#65) ─▶ H3·domio (#1550), H3·athportal (#2021), H3·swarm-os (#128)
 WAVE 2  Stop the drift    MP-11 (#66) + MP-12 (#67) ─▶ G1·domio (#1551), G1·athportal (#2022), G1·swarm-os (#127)
-WAVE 3  Stabilize         MP-13 (#68, after MP-10/11/12) ; MP-14 (#69)
+WAVE 3  Document + tooling MP-13 (#68, doc: input/secret contract) ; MP-14 (#69, platform-sync CLI)
 ```
 
 **Critical path:** `MP-10 → H3 (×3)` is the only live-exposure track and starts
 now (no upstream dependency). `MP-11`/`MP-12` are independent of MP-10 and run in
-parallel; their consumer `G1` adoption follows. `MP-13` gates on the three earlier
-producer Stories so v1.0 freezes a contract with the gaps already closed. `MP-14`
-is optional and unblocked. Within each consumer Story, sub-items with no producer
+parallel; their consumer `G1` adoption follows. `MP-13` is now a **documentation**
+Story (its former blockers MP-10/11/12 are all closed) — it documents the current
+reusable-workflow input/secret contract; **cutting v1.0 + `@v1` pinning is
+explicitly deferred** (not planned soon — see §4.4). `MP-14` is optional and
+unblocked. Within each consumer Story, sub-items with no producer
 dependency (domio's `hono/cors`, athportal's AE/Logpush, the runbook references)
 may start before the gating producer Story lands.
 
@@ -303,8 +305,8 @@ neither on the current v0.10.0, with no automated bump or drift detection. This 
 universal (not athportal-specific) and silent.
 - **Fix:** add a Renovate rule (github-actions manager) to bump the `uses:` SHAs,
   and a scheduled cross-consumer drift check (MP-12, #67) that flags lag and split
-  pins. A v1.0 contract freeze with `@v1` pinning (MP-13, #68) would largely
-  dissolve this class.
+  pins — these are the immediate, sufficient fix. (A future `@v1` contract could
+  reduce it further, but cutting v1.0 is deferred — see §4.4 / MP-13.)
 
 **🟠 MEDIUM · G1·domio (#1551) — domio lacks a `hono/cors` per-env origin
 allowlist.** It relies on
@@ -350,13 +352,17 @@ re-implementations instead. (domio cross-references the shared set.)
   extends. Would have prevented the SHA split, domio's un-simplified Renovate, and
   the local-copy runbooks — turning one-time manual cutovers into a repeatable
   command.
-- **MP-13 (#68) — v1.0 stabilization milestone.** Document the public
-  `workflow_call` input/secret contract and a deprecation policy, then let
-  consumers pin `@v1` instead of raw SHAs — directly reducing the drift class
-  above.
+- **MP-13 (#68) — Document the reusable-workflow input/secret contract.** A single
+  reference for the public `workflow_call` inputs + secrets of `pr-quality.yml` /
+  `deploy-cloudflare.yml` (incl. the security-tier toggles), so consumers configure
+  callers from docs, not by reading YAML. **Deferred (not planned now or soon):**
+  cutting **v1.0**, a moving **`@v1`** tag, and a SemVer deprecation policy —
+  consumers keep pinning by release tag/SHA (Renovate-bumped via MP-11). `@v1`
+  remains a possible future step, explicitly out of scope for #68.
 - **Onboard additional repos** *(future direction — not yet ticketed).* The
   ownership boundary was designed so any repo (AI-driven or not) can adopt the
   platform without touching `mandrel`. With three real consumers and a live smoke
   gate, the marginal cost of a fourth is low and validates the distribution model;
-  it is a natural follow-on once MP-13/MP-14 make adoption a pinned `@v1` + a
-  `platform sync` command.
+  it is a natural follow-on once MP-14's `platform sync` command makes adoption a
+  single repeatable step (pinning a release tag/SHA; a stable `@v1` is deferred —
+  see MP-13).
