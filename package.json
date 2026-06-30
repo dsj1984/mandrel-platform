@@ -24,6 +24,7 @@
     "./dependency-cruiser.base.json": "./config/dependency-cruiser.base.json",
     "./size-limit.base.json": "./config/size-limit.base.json",
     "./lighthouse.base.json": "./config/lighthouse.base.json",
+    "./pnpm-workspace.supply-chain.yaml": "./config/pnpm-workspace.supply-chain.yaml",
     "./edge-security": "./config/edge-security/index.mjs",
     "./edge-security/*": "./config/edge-security/*",
     "./scripts/*": "./scripts/*"

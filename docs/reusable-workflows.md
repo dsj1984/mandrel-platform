@@ -149,6 +149,55 @@ Toggle matrix:
 > don't want Semgrep to scan (e.g. `'dist coverage tests/fixtures'`). Empty
 > (the default) leaves only the built-in `.agents` exclude in effect.
 
+### pnpm supply-chain config vs. Renovate `minimumReleaseAge`
+
+Semgrep's `p/default` registry ruleset (consumed by the SAST sub-step above)
+flags pnpm workspaces that don't set the pnpm-native supply-chain guards —
+`blockExoticSubdeps`, `trustPolicy`, and `minimumReleaseAge` — with a rule
+floor of **10080 minutes (7 days)** for the latter. These are legitimate
+hardening: the [egress audit](#egress-audit-enable-harden-runner) blocklist
+below literally names the `shai-hulud` npm worm as a threat class this class
+of rule defends against.
+
+The platform ships a canonical block at
+[`config/pnpm-workspace.supply-chain.yaml`](../config/pnpm-workspace.supply-chain.yaml),
+exported as `mandrel-platform/pnpm-workspace.supply-chain.yaml` (see
+[README — Package exports](../README.md#package-exports) and
+[README — pnpm supply-chain config](../README.md#pnpm-supply-chain-config)
+for the copy-merge usage, mirroring how `tsconfig.base.json` / `biome.base.json`
+are distributed):
+
+```yaml
+blockExoticSubdeps: true
+trustPolicy: no-downgrade
+minimumReleaseAge: 10080
+```
+
+**Policy reconciliation.** The platform's pre-existing supply-chain gate is
+the Renovate preset's `minimumReleaseAge: "3 days"` (4320 minutes, see
+`default.json` and [Renovate preset](../README.md#renovate-preset) above).
+The pnpm-native rule's floor is 7 days (10080 minutes). These two settings
+are **not duplicates** and are **not reconciled to a single number** — they
+govern different lifecycle moments:
+
+| Setting                              | Governs                                                  | Value             |
+| ------------------------------------- | --------------------------------------------------------- | ----------------- |
+| Renovate `minimumReleaseAge`          | When a dependency-bump **PR** is raised                   | 3 days (4320 min) |
+| pnpm `minimumReleaseAge`              | When `pnpm install` will **resolve** a version at all     | 7 days (10080 min)|
+
+The canonical fleet value for the pnpm-side setting is the **7-day floor**
+(adopt, don't lower it) — a `pnpm install` resolving a version sooner than
+Renovate would even propose bumping to it is not a meaningful protection gap,
+but lowering pnpm's gate below the Semgrep rule's floor leaves the SAST
+finding perpetually red. If a future change wants the two values converged
+to one number, that is a Renovate preset cadence change tracked separately
+(see `config/renovate.json` / `default.json`), not a pnpm-config change.
+
+**Enforcement.** The pnpm supply-chain rules stay active in the Semgrep
+ruleset consumed by the SAST sub-step above — see the SAST ruleset
+pinning/vendoring work tracked in Story #132, which keeps these rules
+enforced deliberately rather than relying on registry drift.
+
 ### Egress audit (`enable-harden-runner`)
 
 `pr-quality.yml` runs [`step-security/harden-runner`](https://github.com/step-security/harden-runner)

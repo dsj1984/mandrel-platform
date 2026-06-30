@@ -1,0 +1,31 @@
+# Shared pnpm-native supply-chain hardening block for mandrel-platform
+# consumers. `pnpm-workspace.yaml` has no whole-file `extends`, so this ships
+# as a fragment: copy these three keys into your consumer's
+# `pnpm-workspace.yaml` (merge alongside any existing `packages:`/catalog
+# entries — do not replace the whole file). See README.md "Package exports"
+# and docs/reusable-workflows.md for the policy rationale and the
+# `minimumReleaseAge` reconciliation against the platform's 3-day Renovate
+# gate.
+#
+# - blockExoticSubdeps: refuses installs that pull in dependencies via
+#   "exotic" specifiers (git/tarball/local-path) buried in subdependencies,
+#   closing a supply-chain injection vector outside the registry's audit
+#   trail.
+# - trustPolicy: no-downgrade refuses an install that would silently
+#   downgrade a previously-resolved package version (protects against a
+#   compromised/republished lower version shadowing a trusted one).
+# - minimumReleaseAge: 10080 (7 days, in minutes) holds every dependency
+#   bump for a cooldown window before pnpm will resolve it, giving the
+#   ecosystem time to catch and yank a malicious release (e.g. the
+#   shai-hulud npm worm class) before it reaches a consumer install. This is
+#   INTENTIONALLY stricter than the platform's existing Renovate
+#   `minimumReleaseAge` gate (3 days / 4320 min, see default.json) — Renovate
+#   governs when a *bump PR* is raised, while this governs when `pnpm
+#   install` will *resolve* a version at all. The 7-day floor is also the
+#   Semgrep p/default rule's enforced minimum; setting pnpm below it leaves
+#   the rule perpetually red. Do not lower this value to "fix" a Semgrep
+#   finding — raise the Renovate-side PR cadence discussion instead if the
+#   two ever need to converge.
+blockExoticSubdeps: true
+trustPolicy: no-downgrade
+minimumReleaseAge: 10080

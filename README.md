@@ -367,6 +367,38 @@ operator-facing review flow.
 
 ---
 
+## pnpm supply-chain config
+
+`config/pnpm-workspace.supply-chain.yaml` is the canonical pnpm-native
+supply-chain hardening block: `blockExoticSubdeps`, `trustPolicy`, and
+`minimumReleaseAge`. Unlike the JSON config bases above, `pnpm-workspace.yaml`
+has no whole-file `extends`, so this ships as a copy-merge fragment rather
+than an importable module — merge its three keys into your consumer's
+`pnpm-workspace.yaml` alongside any existing `packages:`/catalog entries:
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Merged from mandrel-platform/pnpm-workspace.supply-chain.yaml
+blockExoticSubdeps: true
+trustPolicy: no-downgrade
+minimumReleaseAge: 10080
+```
+
+`minimumReleaseAge` here is **7 days (10080 minutes)** — intentionally
+stricter than the platform's 3-day Renovate `minimumReleaseAge` gate (see
+[Renovate preset](#renovate-preset) above). Renovate's value governs when a
+bump *PR* is raised; pnpm's value governs when `pnpm install` will *resolve*
+a version at all, and 7 days is also the floor the Semgrep `p/default`
+ruleset enforces. See
+[`docs/reusable-workflows.md`](docs/reusable-workflows.md#pnpm-supply-chain-config-vs-renovate-minimumreleaseage)
+for the full reconciliation rationale.
+
+---
+
 ## Adoption CLI (`platform-sync`)
 
 `scripts/platform-sync.mjs` is the operator-facing analogue of `mandrel sync`:
@@ -433,6 +465,7 @@ pnpm run bootstrap
 | `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
 | `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
 | `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
+| `mandrel-platform/pnpm-workspace.supply-chain.yaml` | `config/pnpm-workspace.supply-chain.yaml` |
 | `mandrel-platform/edge-security`                | `config/edge-security/index.mjs`      |
 | `mandrel-platform/edge-security/*`              | `config/edge-security/*`              |
 | `mandrel-platform/scripts/*`                    | `scripts/*`                           |
