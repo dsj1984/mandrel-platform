@@ -5,6 +5,19 @@ Renovate preset, and operator runbook templates for the Mandrel platform.
 
 ---
 
+## Reusable workflows
+
+The shared `workflow_call` workflows — `pr-quality.yml` and
+`deploy-cloudflare.yml` (plus `codeql.yml` and `smoke-dispatch.yml`) — and
+their public input/secret contract are documented in
+**[docs/reusable-workflows.md](docs/reusable-workflows.md)**. Consumers should
+configure their callers from that reference (input types, defaults,
+when-to-override, the frozen `{CLOUDFLARE_*, TURSO_*}` deploy secret allowlist,
+the single `ci-required` aggregator context, and the pin-by-tag/SHA versioning
+model).
+
+---
+
 ## Shared Composite Actions
 
 ### `setup-toolchain`
@@ -173,14 +186,14 @@ local-copy runbooks, un-simplified config). Run it from the consumer repo root:
 node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref mandrel-platform-v0.10.0
 
 # Preview the plan without touching disk
-node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref v1 --dry-run
+node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref mandrel-platform-v0.10.0 --dry-run
 ```
 
 What it does (each step is idempotent — a re-run on an already-synced repo
 reports `already in sync`):
 
-1. **Pins workflow SHAs.** Resolves `--ref` (a release tag, branch, or the
-   floating `@v1` tag once MP-13 ships it) to its commit SHA via
+1. **Pins workflow SHAs.** Resolves `--ref` (a release tag or branch) to its
+   commit SHA via
    `git ls-remote`, then rewrites every
    `uses: dsj1984/mandrel-platform/...@<sha>` reference in the consumer's
    `.github/workflows/` and `.github/actions/` to that single SHA. External
