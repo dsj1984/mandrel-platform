@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.14.1...mandrel-platform-v0.14.2) (2026-06-30)
+
+
+### Fixed
+
+* **release:** add repository/homepage/bugs to package.json for provenance ([#136](https://github.com/dsj1984/mandrel-platform/issues/136)) ([965239e](https://github.com/dsj1984/mandrel-platform/commit/965239e28540c850988a54f1480b26a5d63e68bf))
+
 ## [0.14.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.14.0...mandrel-platform-v0.14.1) (2026-06-30)
 
 
