@@ -349,6 +349,50 @@ write on this repo).
 
 ---
 
+## `release-please.yml`
+
+Platform-internal. On every push to `main` it runs
+[release-please](https://github.com/googleapis/release-please-action) to
+maintain the release PR and, once that PR merges and a release is cut,
+publishes the `mandrel-platform` npm config package. It has **no
+`workflow_call` contract** — it is triggered by `push` to `main` and
+`workflow_dispatch` only.
+
+### npm publish posture — provenance + OIDC trusted publishing
+
+The `npm-publish` job publishes with **npm OIDC trusted publishing** and
+**build provenance**, not a long-lived token:
+
+- **No `NPM_TOKEN`.** The job sets no `NODE_AUTH_TOKEN` / `NPM_TOKEN`. Its
+  `id-token: write` permission mints a short-lived GitHub OIDC token that the
+  npm CLI exchanges for a per-run publish credential. Trusted publishing
+  needs npm ≥ 11.5.1 and Node ≥ 22.14.0; the `.nvmrc` Node (24.16.0) clears
+  the Node floor, and the publish step relies on Actions' npm being at or
+  above the CLI floor (Setup Node's runner image ships a current npm). The
+  standing `NPM_TOKEN` repo/org secret has been retired; nothing in the
+  publish path reads it.
+- **Provenance attestation.** `npm publish --provenance` (reinforced by
+  `publishConfig.provenance: true` in `package.json`) emits a
+  [provenance attestation](https://docs.npmjs.com/generating-provenance-statements)
+  tying each release back to its source commit and the workflow run that
+  built it. The package's npm page shows a **Provenance** badge linking the
+  published tarball to this repo + run.
+- **One-time trusted-publisher setup.** OIDC publishing requires a **trusted
+  publisher** to be registered once on the
+  [`mandrel-platform` npm package settings](https://www.npmjs.com/package/mandrel-platform/access)
+  page, naming this repo (`dsj1984/mandrel-platform`), the workflow filename
+  (`release-please.yml`), and the job environment. Without that registration
+  the OIDC token exchange 403s and the publish fails closed — it never falls
+  back to a token. If the publisher is ever reconfigured (repo rename,
+  workflow move), update it there; there is no secret to rotate.
+
+This converts the previously-orphaned `id-token: write` permission into the
+load-bearing root of the publish credential and removes the standing
+long-lived secret that three downstream repos (`domio`, `athportal`,
+`swarm-os`) depend on.
+
+---
+
 ## Versioning & compatibility
 
 **Pin by release tag or SHA.** Consumers reference these workflows by a

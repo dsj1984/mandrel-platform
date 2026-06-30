@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/api/schema/stryker-core.json",
+  "_comment": "Shared Stryker base for mandrel-platform consumers. Consumers extend via stryker.config.json's `extends` (string or array): { \"extends\": [\"mandrel-platform/stryker.base.json\"], \"testRunner\": \"vitest\", \"mutate\": [\"src/**/*.ts\"] }. testRunner, mutate, and per-repo thresholds stay consumer-tunable.",
+  "packageManager": "pnpm",
+  "reporters": ["html", "clear-text", "progress"],
+  "coverageAnalysis": "perTest",
+  "ignoreStatic": true,
+  "cleanTempDir": true,
+  "timeoutMS": 60000,
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": 50
+  }
+}

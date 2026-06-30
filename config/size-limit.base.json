@@ -1,0 +1,6 @@
+{
+  "_comment": "Shared size-limit check defaults for mandrel-platform consumers. size-limit's own config is a per-entry array whose paths/limits are inherently repo-specific, so this base ships the *shared check options* (gzip sizing, time budget off, import-cost mode) rather than entry paths. Consumers spread it into each entry of their `.size-limit.json` array: `[{ ...base, \"path\": \"dist/index.js\", \"limit\": \"10 kB\" }]` (see README). `path` and `limit` stay consumer-tunable.",
+  "gzip": true,
+  "brotli": false,
+  "running": false
+}
