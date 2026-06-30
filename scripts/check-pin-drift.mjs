@@ -24,6 +24,15 @@
  *      commit. A consumer is `current` when its single pin equals the latest
  *      release SHA, `lagging` when it pins an older release/SHA, and
  *      `unknown` when the pinned SHA can't be matched to a release.
+ *   5. Reads the consumer's `package.json` and extracts its
+ *      `mandrel-platform` npm dependency version (the platform also ships as
+ *      an npm config package: tsconfig.base.json, biome.base.json, the
+ *      Renovate preset). It compares that version to the latest release's
+ *      version and flags an `npm` verdict (`current` / `lagging` / `ahead` /
+ *      `absent` / `unknown`), plus a **surface skew** when the npm pin and the
+ *      workflow `uses:` pin disagree about being current — the exact
+ *      split-pin class the `uses:`-only check missed (npm lagged at 0.11.3
+ *      while the workflows tracked v0.11.6).
  *
  * Data-driven: a new consumer is one object in pin-drift-consumers.json.
  *
@@ -196,6 +205,135 @@ export function classifyConsumer(pins, latestReleaseSha) {
 }
 
 /**
+ * Extract a comparable `x.y.z` semver core from a release tag or version spec.
+ * The platform tags releases as `mandrel-platform-v<semver>`; consumer specs
+ * may carry a range prefix (`^0.11.3`, `~0.11.3`). Returns the dotted triple
+ * or null when no numeric semver core is present (`workspace:*`, `latest`, a
+ * git URL).
+ *
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function parseSemver(value) {
+  if (typeof value !== "string") return null;
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(value);
+  return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
+}
+
+/**
+ * Compare two `x.y.z` semver cores. Returns -1 when a < b, 0 when equal, 1
+ * when a > b. Inputs MUST already be normalized dotted triples (see
+ * `parseSemver`).
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {-1 | 0 | 1}
+ */
+export function compareSemver(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Extract the consumer's `mandrel-platform` npm dependency spec from a
+ * package.json text blob. Scans `dependencies`, `devDependencies`,
+ * `optionalDependencies`, and `peerDependencies` in that order. Returns the
+ * raw spec string (e.g. `"0.11.3"`, `"^0.11.7"`, `"workspace:*"`) or null when
+ * the package isn't depended on (or the JSON is unreadable).
+ *
+ * @param {string} text       package.json contents.
+ * @param {string} [pkgName]  Dependency name to look for.
+ * @returns {string | null}
+ */
+export function extractNpmPlatformVersion(text, pkgName = "mandrel-platform") {
+  let pkg;
+  try {
+    pkg = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!pkg || typeof pkg !== "object") return null;
+  const fields = [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+  ];
+  for (const field of fields) {
+    const deps = pkg[field];
+    if (deps && typeof deps === "object" && typeof deps[pkgName] === "string") {
+      return deps[pkgName];
+    }
+  }
+  return null;
+}
+
+/**
+ * Classify the consumer's npm pin against the latest platform release version.
+ *
+ * @param {string | null} spec           Raw `mandrel-platform` dependency spec, or null if absent.
+ * @param {string | null} latestVersion  Latest release version (`x.y.z`), or null if unknown.
+ * @returns {{
+ *   rawSpec: string | null,
+ *   version: string | null,
+ *   npmState: 'absent' | 'current' | 'lagging' | 'ahead' | 'unknown',
+ * }}
+ */
+export function classifyNpmPin(spec, latestVersion) {
+  if (spec === null || spec === undefined) {
+    return { rawSpec: null, version: null, npmState: "absent" };
+  }
+  const version = parseSemver(spec);
+  if (version === null) {
+    // Non-numeric spec (workspace:*, dist-tag, git URL) — can't compare by SHA.
+    return { rawSpec: spec, version: null, npmState: "unknown" };
+  }
+  const latest = parseSemver(latestVersion);
+  if (latest === null) {
+    return { rawSpec: spec, version, npmState: "unknown" };
+  }
+  const cmp = compareSemver(version, latest);
+  const npmState = cmp === 0 ? "current" : cmp < 0 ? "lagging" : "ahead";
+  return { rawSpec: spec, version, npmState };
+}
+
+/**
+ * Detect a surface skew: the npm pin and the workflow `uses:` pin disagree
+ * about being current. This is the split-pin class the `uses:`-only check
+ * missed — e.g. workflows on the latest release while the npm config package
+ * lags an older one (or vice versa). Only meaningful when BOTH surfaces
+ * resolve to a comparable currency state.
+ *
+ * @param {'current' | 'lagging' | 'unknown' | 'no-pins'} usesLagState
+ * @param {'absent' | 'current' | 'lagging' | 'ahead' | 'unknown'} npmState
+ * @returns {boolean}
+ */
+export function detectSurfaceSkew(usesLagState, npmState) {
+  const usesKnown = usesLagState === "current" || usesLagState === "lagging";
+  const npmKnown = npmState === "current" || npmState === "lagging";
+  if (!usesKnown || !npmKnown) return false;
+  return (usesLagState === "current") !== (npmState === "current");
+}
+
+/**
+ * Combine the workflow-pin verdict, the npm verdict, and the surface-skew flag
+ * into a single per-consumer drift boolean. `npm ahead` and `npm absent` are
+ * informational, not drift; `npm lagging` and any surface skew are.
+ *
+ * @param {{ drift: boolean }} verdict
+ * @param {{ npmState: string }} npm
+ * @param {boolean} surfaceSkew
+ * @returns {boolean}
+ */
+export function combineDrift(verdict, npm, surfaceSkew) {
+  return verdict.drift || npm.npmState === "lagging" || surfaceSkew;
+}
+
+/**
  * Render the human-readable dashboard report.
  *
  * @param {{
@@ -208,12 +346,16 @@ export function classifyConsumer(pins, latestReleaseSha) {
  *     error?: string,
  *     pins: Array<{ file: string, line: number, target: string, ref: string | null }>,
  *     verdict: ReturnType<typeof classifyConsumer>,
+ *     npm?: ReturnType<typeof classifyNpmPin>,
+ *     surfaceSkew?: boolean,
+ *     drift?: boolean,
  *   }>,
  * }} report
  * @returns {string}
  */
 export function renderReport(report) {
   const { platformRepo, latestRelease, results } = report;
+  const latestVersion = parseSemver(latestRelease.tag);
   const out = [];
   out.push("## Cross-consumer pin-drift dashboard");
   out.push("");
@@ -224,17 +366,19 @@ export function renderReport(report) {
       : "unknown";
   out.push(`Latest release: ${relLabel}`);
   out.push("");
-  out.push("| Consumer | Pins | Pinned SHA | Lag | Status |");
-  out.push("| -------- | ---- | ---------- | --- | ------ |");
+  out.push("| Consumer | Pins | uses SHA | uses lag | npm pin | npm lag | Status |");
+  out.push("| -------- | ---- | -------- | -------- | ------- | ------- | ------ |");
 
   const driftLines = [];
   for (const r of results) {
     if (r.error) {
-      out.push(`| \`${r.name}\` | — | — | — | ⚠️ error |`);
+      out.push(`| \`${r.name}\` | — | — | — | — | — | ⚠️ error |`);
       driftLines.push(`- \`${r.name}\` (${r.repo}): error — ${r.error}`);
       continue;
     }
     const v = r.verdict;
+    const npm = r.npm ?? { rawSpec: null, version: null, npmState: "absent" };
+    const surfaceSkew = r.surfaceSkew === true;
     const shaLabel = v.pinnedSha
       ? `\`${v.pinnedSha.slice(0, 7)}\``
       : v.splitPinned
@@ -250,14 +394,27 @@ export function renderReport(report) {
           : v.lagState === "no-pins"
             ? "no pins"
             : "unknown";
+    const npmLabel = npm.version
+      ? `\`${npm.version}\``
+      : npm.rawSpec
+        ? `\`${npm.rawSpec}\``
+        : "—";
+    const npmLagLabel = npm.npmState === "absent" ? "—" : npm.npmState;
     let status;
-    if (v.lagState === "no-pins") status = "➖ no platform pins";
+    if (v.lagState === "no-pins" && npm.npmState === "absent")
+      status = "➖ no platform refs";
     else if (v.splitPinned) status = "❌ split pin";
-    else if (v.lagState === "lagging") status = "⚠️ lagging";
-    else if (v.lagState === "current") status = "✅ current";
+    else if (surfaceSkew) status = "❌ npm/uses skew";
+    else if (v.lagState === "lagging" || npm.npmState === "lagging")
+      status = "⚠️ lagging";
+    else if (
+      (v.lagState === "current" || v.lagState === "no-pins") &&
+      (npm.npmState === "current" || npm.npmState === "absent")
+    )
+      status = "✅ current";
     else status = "❔ unknown";
     out.push(
-      `| \`${r.name}\` | ${v.pinCount} | ${shaLabel} | ${lagLabel} | ${status} |`,
+      `| \`${r.name}\` | ${v.pinCount} | ${shaLabel} | ${lagLabel} | ${npmLabel} | ${npmLagLabel} | ${status} |`,
     );
 
     if (v.splitPinned) {
@@ -279,6 +436,16 @@ export function renderReport(report) {
         `- \`${r.name}\` (${r.repo}): LAGGING — pins \`${v.pinnedSha.slice(0, 7)}\`, latest release is \`${(latestRelease.sha || "?").slice(0, 7)}\` (${latestRelease.tag || "?"}).`,
       );
     }
+
+    if (surfaceSkew) {
+      driftLines.push(
+        `- \`${r.name}\` (${r.repo}): SURFACE SKEW — workflow \`uses:\` pins are ${lagLabel} but the npm \`mandrel-platform\` dependency (\`${npm.version ?? npm.rawSpec}\`) is ${npm.npmState}. The npm config package and the workflow pins are on different releases.`,
+      );
+    } else if (npm.npmState === "lagging") {
+      driftLines.push(
+        `- \`${r.name}\` (${r.repo}): NPM LAGGING — depends on \`mandrel-platform@${npm.version}\`, latest release is \`${latestVersion ?? "?"}\` (${latestRelease.tag || "?"}).`,
+      );
+    }
   }
 
   out.push("");
@@ -290,7 +457,7 @@ export function renderReport(report) {
     out.push("### ✅ No drift");
     out.push("");
     out.push(
-      "Every consumer pins a single platform SHA on the latest release.",
+      "Every consumer pins a single platform SHA on the latest release, and its npm `mandrel-platform` dependency is on the matching version.",
     );
   }
   out.push("");
@@ -406,6 +573,34 @@ export function fetchConsumerWorkflows(repo, branch, runGh) {
 }
 
 /**
+ * Fetch a consumer's root `package.json` text over the GitHub contents API.
+ * Returns null when the file is absent or unreadable (a consumer that adopts
+ * the platform workflows but not the npm config package legitimately has no
+ * `mandrel-platform` dependency). The existing `Contents: read` token scope
+ * already covers this — no additional permission is required.
+ *
+ * @param {string} repo    "owner/name".
+ * @param {string} branch  Branch / ref to read.
+ * @param {(args: string[]) => string} runGh
+ * @returns {string | null}
+ */
+export function fetchConsumerPackageJson(repo, branch, runGh) {
+  let obj;
+  try {
+    obj = ghApiJson(
+      `repos/${repo}/contents/package.json?ref=${encodeURIComponent(branch)}`,
+      runGh,
+    );
+  } catch {
+    return null;
+  }
+  if (obj && obj.encoding === "base64" && typeof obj.content === "string") {
+    return Buffer.from(obj.content, "base64").toString("utf-8");
+  }
+  return null;
+}
+
+/**
  * Resolve a consumer's effective branch: the entry's `branch` if set, else the
  * repo's default branch.
  *
@@ -436,7 +631,9 @@ export function resolveBranch(consumer, runGh) {
  */
 export function buildReport(config, runGh) {
   const platformRepo = config.platformRepo;
+  const platformPkg = config.platformPackage || "mandrel-platform";
   const latestRelease = resolveLatestRelease(platformRepo, runGh);
+  const latestVersion = parseSemver(latestRelease.tag);
   const results = [];
   for (const consumer of config.consumers) {
     try {
@@ -447,19 +644,38 @@ export function buildReport(config, runGh) {
         pins.push(...extractPlatformPins(f.path, f.text, platformRepo));
       }
       const verdict = classifyConsumer(pins, latestRelease.sha);
-      results.push({ name: consumer.name, repo: consumer.repo, branch, pins, verdict });
+      const pkgText = fetchConsumerPackageJson(consumer.repo, branch, runGh);
+      const npmSpec =
+        pkgText === null ? null : extractNpmPlatformVersion(pkgText, platformPkg);
+      const npm = classifyNpmPin(npmSpec, latestVersion);
+      const surfaceSkew = detectSurfaceSkew(verdict.lagState, npm.npmState);
+      results.push({
+        name: consumer.name,
+        repo: consumer.repo,
+        branch,
+        pins,
+        verdict,
+        npm,
+        surfaceSkew,
+        drift: combineDrift(verdict, npm, surfaceSkew),
+      });
     } catch (err) {
+      const verdict = classifyConsumer([], latestRelease.sha);
+      const npm = classifyNpmPin(null, latestVersion);
       results.push({
         name: consumer.name,
         repo: consumer.repo,
         branch: consumer.branch || "?",
         error: err instanceof Error ? err.message : String(err),
         pins: [],
-        verdict: classifyConsumer([], latestRelease.sha),
+        verdict,
+        npm,
+        surfaceSkew: false,
+        drift: false,
       });
     }
   }
-  return { platformRepo, latestRelease, results };
+  return { platformRepo, latestRelease, latestVersion, results };
 }
 
 /**
@@ -467,7 +683,7 @@ export function buildReport(config, runGh) {
  * @returns {boolean} true when any consumer has drift or an error.
  */
 export function hasDrift(report) {
-  return report.results.some((r) => r.error || r.verdict.drift);
+  return report.results.some((r) => r.error || r.drift);
 }
 
 // ---------------------------------------------------------------------------
