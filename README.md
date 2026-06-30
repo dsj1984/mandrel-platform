@@ -203,6 +203,81 @@ export default {
 > per consumer. Override any threshold, score floor, or budget locally;
 > the base provides the floor, the consumer sets the ceiling.
 
+### Edge-security middleware units
+
+The package ships reusable **per-env edge-security middleware** so the next
+consumer inherits the closed-allowlist CORS, security-header, and app-layer
+rate-limit invariants instead of re-deriving them. They are distributed through
+the **npm package-export channel** (the same channel as the base configs and
+`scripts/*`), under `mandrel-platform/edge-security`:
+
+| Sub-path                                              | Unit                                                                 |
+| ----------------------------------------------------- | -------------------------------------------------------------------- |
+| `mandrel-platform/edge-security`                      | Barrel — re-exports every unit below.                                |
+| `mandrel-platform/edge-security/cors-astro.mjs`       | `createAstroCors()` — closed-allowlist CORS as Astro middleware.     |
+| `mandrel-platform/edge-security/cors-hono.mjs`        | `createHonoCorsOptions()` — closed-allowlist options for `hono/cors`.|
+| `mandrel-platform/edge-security/security-headers.mjs` | `buildSecurityHeaders()` / `applySecurityHeaders()` — CSP/HSTS/XFO/XCTO/Referrer-Policy. |
+| `mandrel-platform/edge-security/rate-limit.mjs`       | `createRateLimiter()` + Astro/hono adapters — fixed-window app-layer limiter. |
+| `mandrel-platform/edge-security/allowlist.mjs`        | `createAllowlist()` — the shared closed-allowlist origin resolver.   |
+
+**Two CORS variants, by design.** CORS code legitimately differs by
+architecture: domio drives an Astro `(context, next)` middleware, while
+athportal / swarm-os use `hono/cors`. Both variants ship — the divergence is
+preserved, not flattened into one form. Both inherit the same closed allowlist
+and the **no-wildcard-with-credentials invariant, enforced by construction**:
+building either unit with `['*']` + `credentials: true` throws at construction
+time (before a request is ever served), so a consumer cannot mis-configure the
+forbidden `Access-Control-Allow-Origin: *` + `Access-Control-Allow-Credentials: true`
+shape.
+
+**Per-env allowlist.** Each unit takes the allowed-origin set for the current
+deployment environment, so the same code path applies in production and preview:
+
+```ts
+// Astro — src/middleware.ts
+import { defineMiddleware, sequence } from "astro:middleware";
+import { createAstroCors } from "mandrel-platform/edge-security/cors-astro.mjs";
+import { applySecurityHeaders } from "mandrel-platform/edge-security/security-headers.mjs";
+import { createAstroRateLimit } from "mandrel-platform/edge-security/rate-limit.mjs";
+
+const cors = createAstroCors({
+  allowedOrigins: import.meta.env.PROD ? ["https://godomio.com"] : ["http://localhost:4321"],
+  credentials: true,
+});
+const rateLimit = createAstroRateLimit({ limit: 100, windowMs: 60_000 });
+
+export const onRequest = sequence(
+  defineMiddleware(cors),
+  defineMiddleware(rateLimit),
+  defineMiddleware(async (_ctx, next) => {
+    const res = await next();
+    applySecurityHeaders(res.headers);
+    return res;
+  }),
+);
+```
+
+```ts
+// hono — app entry
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { createHonoCorsOptions } from "mandrel-platform/edge-security/cors-hono.mjs";
+import { createHonoRateLimit } from "mandrel-platform/edge-security/rate-limit.mjs";
+
+const app = new Hono();
+app.use("*", cors(createHonoCorsOptions({ allowedOrigins: ["https://athportal.com"], credentials: true })));
+app.use("*", createHonoRateLimit({ limit: 100, windowMs: 60_000 }));
+```
+
+> **Headers / rate-limit are framework-agnostic.** `buildSecurityHeaders()`
+> returns a plain `Record<string,string>` you can spread onto any response, and
+> `createRateLimiter()` exposes a `check(request)` decision function with a
+> pluggable store (swap the default in-memory store for a Cloudflare KV /
+> Durable Object store in production). The Astro/hono adapters are thin wrappers
+> over those cores.
+
+---
+
 ### `scripts/audit-check.mjs`
 
 CVE gate script. Runs `pnpm audit --prod` and blocks on any **unsuppressed**
@@ -358,4 +433,6 @@ pnpm run bootstrap
 | `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
 | `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
 | `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
+| `mandrel-platform/edge-security`                | `config/edge-security/index.mjs`      |
+| `mandrel-platform/edge-security/*`              | `config/edge-security/*`              |
 | `mandrel-platform/scripts/*`                    | `scripts/*`                           |

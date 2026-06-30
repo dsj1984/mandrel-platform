@@ -33,6 +33,20 @@
  *      workflow `uses:` pin disagree about being current — the exact
  *      split-pin class the `uses:`-only check missed (npm lagged at 0.11.3
  *      while the workflows tracked v0.11.6).
+ *   6. Couples the two surfaces against the supply-chain hold (Story #107).
+ *      Renovate's shared preset gates every bump behind a `minimumReleaseAge`
+ *      (3 days). For the first ~3 days after a platform release, EVERY consumer
+ *      legitimately lags the new tag — Renovate has not raised the bump PR yet.
+ *      Flagging that transient window as drift would page on every release, so
+ *      the checker reads the latest release's `published_at`, compares it to the
+ *      `minimumReleaseAge` window (configurable in pin-drift-consumers.json,
+ *      default `3 days`), and **suppresses lag/skew that is fully explained by
+ *      the hold**: a consumer whose only deviation is "not yet on a release
+ *      younger than the window" is reported as `holding` (informational), not
+ *      `drift`. Lag against a release OLDER than the window — or a split pin —
+ *      still drifts. This is the permanent close of the swarm-os three-way
+ *      split: npm `0.11.3` / workflows `@v0.11.6` / latest `v0.11.7` could not
+ *      be distinguished from a fresh-release hold before this coupling existed.
  *
  * Data-driven: a new consumer is one object in pin-drift-consumers.json.
  *
@@ -239,6 +253,72 @@ export function compareSemver(a, b) {
 }
 
 /**
+ * Parse a Renovate-style `minimumReleaseAge` duration into milliseconds. The
+ * preset uses human strings like `"3 days"`, `"36 hours"`, `"1 week"`; this
+ * accepts an integer (or float) count followed by a unit (the same units
+ * Renovate's `ms`-backed parser accepts). Returns null for an unparseable or
+ * non-positive value so the caller can fall back to "no hold window".
+ *
+ * @param {unknown} value
+ * @returns {number | null}  Window length in ms, or null.
+ */
+export function parseDurationMs(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    // Bare number is interpreted as days (the preset's unit of record).
+    return value * 24 * 60 * 60 * 1000;
+  }
+  if (typeof value !== "string") return null;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*([a-z]+)\s*$/i.exec(value.trim());
+  if (!m) return null;
+  const count = Number.parseFloat(m[1]);
+  if (!Number.isFinite(count) || count <= 0) return null;
+  const unit = m[2].toLowerCase();
+  const units = {
+    minute: 60 * 1000,
+    minutes: 60 * 1000,
+    min: 60 * 1000,
+    mins: 60 * 1000,
+    hour: 60 * 60 * 1000,
+    hours: 60 * 60 * 1000,
+    hr: 60 * 60 * 1000,
+    hrs: 60 * 60 * 1000,
+    day: 24 * 60 * 60 * 1000,
+    days: 24 * 60 * 60 * 1000,
+    week: 7 * 24 * 60 * 60 * 1000,
+    weeks: 7 * 24 * 60 * 60 * 1000,
+  };
+  const factor = units[unit];
+  return factor ? count * factor : null;
+}
+
+/**
+ * Is the latest platform release still inside the `minimumReleaseAge` hold
+ * window? During this window Renovate has not yet raised the bump PR, so EVERY
+ * consumer legitimately lags the new tag — that transient lag must NOT be
+ * scored as drift (Story #107). Returns false (the safe default — "treat lag as
+ * real drift") whenever the window or the publish timestamp can't be resolved.
+ *
+ * @param {string | null} publishedAt   Latest release `published_at` (ISO 8601), or null.
+ * @param {number | null} windowMs       `minimumReleaseAge` in ms (see parseDurationMs), or null.
+ * @param {number} [nowMs]               Current epoch ms (injectable for tests).
+ * @returns {boolean}
+ */
+export function isWithinReleaseAgeWindow(
+  publishedAt,
+  windowMs,
+  nowMs = Date.now(),
+) {
+  if (!publishedAt || typeof windowMs !== "number" || windowMs <= 0) {
+    return false;
+  }
+  const publishedMs = Date.parse(publishedAt);
+  if (Number.isNaN(publishedMs)) return false;
+  const ageMs = nowMs - publishedMs;
+  // A negative age (clock skew / future-dated release) counts as "fresh".
+  return ageMs < windowMs;
+}
+
+/**
  * Extract the consumer's `mandrel-platform` npm dependency spec from a
  * package.json text blob. Scans `dependencies`, `devDependencies`,
  * `optionalDependencies`, and `peerDependencies` in that order. Returns the
@@ -324,13 +404,49 @@ export function detectSurfaceSkew(usesLagState, npmState) {
  * into a single per-consumer drift boolean. `npm ahead` and `npm absent` are
  * informational, not drift; `npm lagging` and any surface skew are.
  *
- * @param {{ drift: boolean }} verdict
+ * When `holding` is true (the latest release is still inside the
+ * `minimumReleaseAge` hold window — Story #107), lag/skew that is fully
+ * explained by the hold is suppressed: Renovate has not raised the bump PR yet,
+ * so a one-release-behind consumer is **expected**, not drift. A **split pin**
+ * is a real configuration error regardless of the window, so it is never
+ * suppressed by the hold.
+ *
+ * @param {{ drift: boolean, splitPinned?: boolean }} verdict
  * @param {{ npmState: string }} npm
  * @param {boolean} surfaceSkew
+ * @param {boolean} [holding]  Latest release is inside the minimumReleaseAge window.
  * @returns {boolean}
  */
-export function combineDrift(verdict, npm, surfaceSkew) {
-  return verdict.drift || npm.npmState === "lagging" || surfaceSkew;
+export function combineDrift(verdict, npm, surfaceSkew, holding = false) {
+  const rawDrift =
+    verdict.drift || npm.npmState === "lagging" || surfaceSkew;
+  if (!rawDrift) return false;
+  if (holding && !verdict.splitPinned) {
+    // The only deviation is lag/skew against a release younger than the hold
+    // window — transient and expected. Not drift.
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Decide whether a consumer's lag/skew is being SUPPRESSED by the
+ * `minimumReleaseAge` hold (i.e. it would otherwise drift, but the latest
+ * release is too young for Renovate to have bumped it yet). Drives the
+ * `holding` status in the dashboard so the suppression is visible rather than
+ * silent (Story #107). A split pin is never "holding" — it is a real error.
+ *
+ * @param {{ drift: boolean, splitPinned?: boolean }} verdict
+ * @param {{ npmState: string }} npm
+ * @param {boolean} surfaceSkew
+ * @param {boolean} withinWindow  Latest release is inside the minimumReleaseAge window.
+ * @returns {boolean}
+ */
+export function isHolding(verdict, npm, surfaceSkew, withinWindow) {
+  if (!withinWindow || verdict.splitPinned) return false;
+  const wouldDrift =
+    verdict.drift || npm.npmState === "lagging" || surfaceSkew;
+  return wouldDrift;
 }
 
 /**
@@ -338,7 +454,8 @@ export function combineDrift(verdict, npm, surfaceSkew) {
  *
  * @param {{
  *   platformRepo: string,
- *   latestRelease: { tag: string | null, sha: string | null },
+ *   latestRelease: { tag: string | null, sha: string | null, publishedAt?: string | null },
+ *   releaseAge?: { windowMs: number | null, withinWindow: boolean },
  *   results: Array<{
  *     name: string,
  *     repo: string,
@@ -348,6 +465,7 @@ export function combineDrift(verdict, npm, surfaceSkew) {
  *     verdict: ReturnType<typeof classifyConsumer>,
  *     npm?: ReturnType<typeof classifyNpmPin>,
  *     surfaceSkew?: boolean,
+ *     holding?: boolean,
  *     drift?: boolean,
  *   }>,
  * }} report
@@ -355,6 +473,7 @@ export function combineDrift(verdict, npm, surfaceSkew) {
  */
 export function renderReport(report) {
   const { platformRepo, latestRelease, results } = report;
+  const releaseAge = report.releaseAge ?? { windowMs: null, withinWindow: false };
   const latestVersion = parseSemver(latestRelease.tag);
   const out = [];
   out.push("## Cross-consumer pin-drift dashboard");
@@ -365,11 +484,21 @@ export function renderReport(report) {
       ? `\`${latestRelease.tag}\` (\`${latestRelease.sha.slice(0, 7)}\`)`
       : "unknown";
   out.push(`Latest release: ${relLabel}`);
+  if (releaseAge.withinWindow) {
+    out.push("");
+    out.push(
+      "> ⏳ **Renovate `minimumReleaseAge` hold active.** The latest release is " +
+        "younger than the supply-chain hold window, so consumers that lag it by " +
+        "one release are **expected** — Renovate has not raised the bump PR yet. " +
+        "These are reported as `holding`, not drift.",
+    );
+  }
   out.push("");
   out.push("| Consumer | Pins | uses SHA | uses lag | npm pin | npm lag | Status |");
   out.push("| -------- | ---- | -------- | -------- | ------- | ------- | ------ |");
 
   const driftLines = [];
+  const holdingLines = [];
   for (const r of results) {
     if (r.error) {
       out.push(`| \`${r.name}\` | — | — | — | — | — | ⚠️ error |`);
@@ -379,6 +508,7 @@ export function renderReport(report) {
     const v = r.verdict;
     const npm = r.npm ?? { rawSpec: null, version: null, npmState: "absent" };
     const surfaceSkew = r.surfaceSkew === true;
+    const holding = r.holding === true;
     const shaLabel = v.pinnedSha
       ? `\`${v.pinnedSha.slice(0, 7)}\``
       : v.splitPinned
@@ -404,6 +534,7 @@ export function renderReport(report) {
     if (v.lagState === "no-pins" && npm.npmState === "absent")
       status = "➖ no platform refs";
     else if (v.splitPinned) status = "❌ split pin";
+    else if (holding) status = "⏳ holding";
     else if (surfaceSkew) status = "❌ npm/uses skew";
     else if (v.lagState === "lagging" || npm.npmState === "lagging")
       status = "⚠️ lagging";
@@ -416,6 +547,15 @@ export function renderReport(report) {
     out.push(
       `| \`${r.name}\` | ${v.pinCount} | ${shaLabel} | ${lagLabel} | ${npmLabel} | ${npmLagLabel} | ${status} |`,
     );
+
+    // A held consumer's lag/skew is suppressed by the minimumReleaseAge window
+    // (Story #107): record it under "holding" (informational), never "drift".
+    if (holding) {
+      holdingLines.push(
+        `- \`${r.name}\` (${r.repo}): HOLDING — lags the latest release, but it is younger than the \`minimumReleaseAge\` hold window. Renovate has not raised the bump PR yet; this is expected, not drift.`,
+      );
+      continue;
+    }
 
     if (v.splitPinned) {
       const refList = v.distinctRefs
@@ -460,6 +600,19 @@ export function renderReport(report) {
       "Every consumer pins a single platform SHA on the latest release, and its npm `mandrel-platform` dependency is on the matching version.",
     );
   }
+
+  if (holdingLines.length > 0) {
+    out.push("");
+    out.push("### ⏳ Holding (minimumReleaseAge)");
+    out.push("");
+    out.push(
+      "These consumers lag the latest release but it is younger than the " +
+        "`minimumReleaseAge` hold window — Renovate has not bumped them yet. " +
+        "Expected, not drift; they should converge once the hold expires.",
+    );
+    out.push("");
+    out.push(...holdingLines);
+  }
   out.push("");
   return out.join("\n");
 }
@@ -493,23 +646,29 @@ export function defaultGhRunner(args) {
 }
 
 /**
- * Resolve the latest platform release tag + the commit SHA that tag points at.
- * Falls back gracefully to { tag: null, sha: null } when the platform has no
+ * Resolve the latest platform release tag, the commit SHA that tag points at,
+ * and the release `published_at` timestamp (used to evaluate the
+ * `minimumReleaseAge` hold window — Story #107). Falls back gracefully to
+ * { tag: null, sha: null, publishedAt: null } when the platform has no
  * published release.
  *
  * @param {string} platformRepo
  * @param {(args: string[]) => string} runGh
- * @returns {{ tag: string | null, sha: string | null }}
+ * @returns {{ tag: string | null, sha: string | null, publishedAt: string | null }}
  */
 export function resolveLatestRelease(platformRepo, runGh) {
   let release;
   try {
     release = ghApiJson(`repos/${platformRepo}/releases/latest`, runGh);
   } catch {
-    return { tag: null, sha: null };
+    return { tag: null, sha: null, publishedAt: null };
   }
   const tag = release && typeof release.tag_name === "string" ? release.tag_name : null;
-  if (!tag) return { tag: null, sha: null };
+  const publishedAt =
+    release && typeof release.published_at === "string"
+      ? release.published_at
+      : null;
+  if (!tag) return { tag: null, sha: null, publishedAt };
   // Resolve the tag to its commit SHA. Tags may be lightweight (object is the
   // commit) or annotated (object is the tag, deref to .object.sha).
   try {
@@ -522,9 +681,9 @@ export function resolveLatestRelease(platformRepo, runGh) {
       const tagObj = ghApiJson(`repos/${platformRepo}/git/tags/${sha}`, runGh);
       sha = tagObj?.object?.sha ?? sha;
     }
-    return { tag, sha: sha ? sha.toLowerCase() : null };
+    return { tag, sha: sha ? sha.toLowerCase() : null, publishedAt };
   } catch {
-    return { tag, sha: null };
+    return { tag, sha: null, publishedAt };
   }
 }
 
@@ -625,15 +784,29 @@ export function resolveBranch(consumer, runGh) {
 /**
  * Build the full drift report for the configured consumers.
  *
- * @param {{ platformRepo: string, consumers: Array<{ name: string, repo: string, branch?: string }> }} config
+ * @param {{
+ *   platformRepo: string,
+ *   consumers: Array<{ name: string, repo: string, branch?: string }>,
+ *   minimumReleaseAge?: string | number,
+ * }} config
  * @param {(args: string[]) => string} runGh
+ * @param {number} [nowMs]  Injectable current epoch ms (for tests).
  * @returns {ReturnType<typeof renderReport> extends string ? object : never}
  */
-export function buildReport(config, runGh) {
+export function buildReport(config, runGh, nowMs = Date.now()) {
   const platformRepo = config.platformRepo;
   const platformPkg = config.platformPackage || "mandrel-platform";
   const latestRelease = resolveLatestRelease(platformRepo, runGh);
   const latestVersion = parseSemver(latestRelease.tag);
+  // The hold window defaults to the shared Renovate preset's `3 days`
+  // (default.json) so the dashboard's notion of "transient" matches the gate
+  // that actually defers the bump. Overridable per-config.
+  const windowMs = parseDurationMs(config.minimumReleaseAge ?? "3 days");
+  const withinWindow = isWithinReleaseAgeWindow(
+    latestRelease.publishedAt,
+    windowMs,
+    nowMs,
+  );
   const results = [];
   for (const consumer of config.consumers) {
     try {
@@ -649,6 +822,7 @@ export function buildReport(config, runGh) {
         pkgText === null ? null : extractNpmPlatformVersion(pkgText, platformPkg);
       const npm = classifyNpmPin(npmSpec, latestVersion);
       const surfaceSkew = detectSurfaceSkew(verdict.lagState, npm.npmState);
+      const holding = isHolding(verdict, npm, surfaceSkew, withinWindow);
       results.push({
         name: consumer.name,
         repo: consumer.repo,
@@ -657,7 +831,8 @@ export function buildReport(config, runGh) {
         verdict,
         npm,
         surfaceSkew,
-        drift: combineDrift(verdict, npm, surfaceSkew),
+        holding,
+        drift: combineDrift(verdict, npm, surfaceSkew, withinWindow),
       });
     } catch (err) {
       const verdict = classifyConsumer([], latestRelease.sha);
@@ -671,11 +846,18 @@ export function buildReport(config, runGh) {
         verdict,
         npm,
         surfaceSkew: false,
+        holding: false,
         drift: false,
       });
     }
   }
-  return { platformRepo, latestRelease, latestVersion, results };
+  return {
+    platformRepo,
+    latestRelease,
+    latestVersion,
+    releaseAge: { windowMs, withinWindow },
+    results,
+  };
 }
 
 /**
@@ -698,6 +880,7 @@ export function hasDrift(report) {
  *   stderr?: { write: (s: string) => void },
  *   runGh?: (args: string[]) => string,
  *   summaryPath?: string | undefined,
+ *   nowMs?: number,
  * }} [opts]
  * @returns {number} exit code
  */
@@ -708,6 +891,7 @@ export function runCli({
   stderr = process.stderr,
   runGh = defaultGhRunner,
   summaryPath = process.env.GITHUB_STEP_SUMMARY,
+  nowMs = Date.now(),
 } = {}) {
   const { config: configRel, json, strict } = parseArgv(argv);
   const configPath = resolve(cwd, configRel);
@@ -728,7 +912,7 @@ export function runCli({
     return 1;
   }
 
-  const report = buildReport(config, runGh);
+  const report = buildReport(config, runGh, nowMs);
   const drift = hasDrift(report);
 
   if (json) {
