@@ -343,6 +343,24 @@ on:
         type: string
         default: '2.4.0'
 
+      # Per-finding suppression/allow-list for the OSV-scan tier (Story #145).
+      # Optional consumer-supplied JSON file keyed by OSV/GHSA id; matched
+      # findings are reported as SUPPRESSED instead of gating ci-required. A
+      # consumer with no file at this path sees byte-for-byte identical
+      # gating behaviour to today (the file is read with a missing-file
+      # fallback to "no suppressions"). See docs/reusable-workflows.md.
+      osv-allowlist-path:
+        description: >
+          Path (relative to the consumer repo root) to an optional OSV
+          allow-list JSON file. Each entry requires id, reason, and
+          revisitBy; optionally package/ecosystem to scope the match.
+          Entries past revisitBy re-gate as blocking. Missing file is a
+          no-op (identical to having no allow-list). Default
+          '.osv-allowlist.json'.
+        required: false
+        type: string
+        default: '.osv-allowlist.json'
+
     secrets:
       # Turbo remote cache credentials (athportal pattern).
       TURBO_TOKEN:
@@ -1317,6 +1335,7 @@ jobs:
         env:
           OSV_VERSION: ${{ inputs.osv-scanner-version }}
           OSV_FAIL_ON: ${{ inputs.osv-fail-on-severity }}
+          OSV_ALLOWLIST_PATH: ${{ inputs.osv-allowlist-path }}
         run: |
           set -euo pipefail
 
@@ -1391,12 +1410,15 @@ jobs:
             exit 0
           fi
 
-          # Severity-band gate. Parse the JSON, bucket each advisory by its
-          # group `max_severity` (CVSS base score string), and fail only when a
-          # finding lands at or above OSV_FAIL_ON. Inlined as a dependency-free
-          # Node script so a consumer needs NO extra file in its checkout.
+          # Severity-band gate with optional per-finding suppression
+          # (Story #145). Parse the JSON, bucket each advisory by its group
+          # `max_severity` (CVSS base score string), then resolve each
+          # finding against an optional consumer-supplied allow-list before
+          # deciding pass/fail. Inlined as a dependency-free Node script so a
+          # consumer needs NO extra file in its checkout beyond the optional
+          # allow-list itself.
           OSV_REPORT="${report}" node --input-type=module - <<'NODE'
-          import { readFileSync } from "node:fs";
+          import { readFileSync, existsSync } from "node:fs";
 
           const failOn = (process.env.OSV_FAIL_ON || "high").trim().toLowerCase();
           const BANDS = ["none", "low", "medium", "high", "critical"];
@@ -1436,14 +1458,14 @@ jobs:
               for (const group of pkg.groups || []) {
                 const score = Number.parseFloat(group.max_severity ?? "");
                 const band = bandOf(score);
-                const ids = (group.ids || []).join(", ");
+                const ids = group.ids || [];
                 rows.push({ source, name, version, ecosystem, band, score, ids });
               }
               // Defensive: an advisory not surfaced via a group still counts as
               // an unscored ("none") finding so it cannot silently vanish.
               if ((pkg.groups || []).length === 0) {
                 for (const v of pkg.vulnerabilities || []) {
-                  rows.push({ source, name, version, ecosystem, band: "none", score: NaN, ids: v.id || "(unknown)" });
+                  rows.push({ source, name, version, ecosystem, band: "none", score: NaN, ids: [v.id || "(unknown)"] });
                 }
               }
             }
@@ -1460,34 +1482,178 @@ jobs:
             process.exit(0);
           }
 
+          // ── Load + validate the optional allow-list ──────────────────────
+          // Missing file → empty allow-list → behaviour is byte-for-byte
+          // identical to pre-suppression gating (backwards compatibility
+          // acceptance criterion). A PRESENT but malformed file is a hard
+          // error (fail loud, not silent-match-everything).
+          const allowlistPath = (process.env.OSV_ALLOWLIST_PATH || ".osv-allowlist.json").trim();
+          const today = new Date(); today.setHours(0, 0, 0, 0);
+          const isValidDate = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
+
+          let allowlist = [];
+          if (allowlistPath && existsSync(allowlistPath)) {
+            let raw;
+            try {
+              raw = JSON.parse(readFileSync(allowlistPath, "utf8"));
+            } catch (e) {
+              console.error(`::error::Could not parse OSV allow-list "${allowlistPath}": ${e.message}`);
+              process.exit(1);
+            }
+            const entries = Array.isArray(raw) ? raw : Array.isArray(raw?.suppressions) ? raw.suppressions : null;
+            if (entries === null) {
+              console.error(
+                `::error::OSV allow-list "${allowlistPath}" must be a JSON array of entries, or an object with a ` +
+                `"suppressions" array. See docs/reusable-workflows.md.`,
+              );
+              process.exit(1);
+            }
+            entries.forEach((entry, i) => {
+              const where = `${allowlistPath}[${i}]`;
+              if (!entry || typeof entry !== "object") {
+                console.error(`::error::${where}: entry must be an object.`);
+                process.exit(1);
+              }
+              if (typeof entry.id !== "string" || entry.id.trim() === "") {
+                console.error(`::error::${where}: missing required string field "id" (OSV/GHSA id).`);
+                process.exit(1);
+              }
+              if (typeof entry.reason !== "string" || entry.reason.trim() === "") {
+                console.error(`::error::${where} (id=${entry.id}): missing required string field "reason".`);
+                process.exit(1);
+              }
+              if (!isValidDate(entry.revisitBy)) {
+                console.error(
+                  `::error::${where} (id=${entry.id}): missing or invalid required field "revisitBy" ` +
+                  `(expected "YYYY-MM-DD").`,
+                );
+                process.exit(1);
+              }
+              if (entry.package !== undefined && typeof entry.package !== "string") {
+                console.error(`::error::${where} (id=${entry.id}): "package" must be a string when present.`);
+                process.exit(1);
+              }
+              if (entry.ecosystem !== undefined && typeof entry.ecosystem !== "string") {
+                console.error(`::error::${where} (id=${entry.id}): "ecosystem" must be a string when present.`);
+                process.exit(1);
+              }
+              allowlist.push(entry);
+            });
+          }
+
+          // Match a finding row against an allow-list entry: id must hit one
+          // of the row's aliased OSV ids; package/ecosystem (if present on
+          // the entry) further scope the match.
+          const matchEntry = (row) =>
+            allowlist.find((e) => {
+              if (!row.ids.includes(e.id)) return false;
+              if (e.package !== undefined && e.package !== row.name) return false;
+              if (e.ecosystem !== undefined && e.ecosystem !== row.ecosystem) return false;
+              return true;
+            });
+
           // Sort most-severe first for the table.
           rows.sort((a, b) => rank(b.band) - rank(a.band) || (b.score || 0) - (a.score || 0));
 
-          const blocking = rows.filter((r) => rank(r.band) >= rank(failOn));
-          const warning = rows.filter((r) => rank(r.band) < rank(failOn));
+          const blocking = [];
+          const warning = [];
+          const suppressed = [];
+          const expired = [];
+
+          for (const r of rows) {
+            const wouldBlock = rank(r.band) >= rank(failOn);
+            const entry = wouldBlock ? matchEntry(r) : undefined;
+            if (!wouldBlock) {
+              warning.push(r);
+              continue;
+            }
+            if (!entry) {
+              blocking.push(r);
+              continue;
+            }
+            // Entries past revisitBy re-gate as if unsuppressed — a stale
+            // suppression must not silently shield a finding forever.
+            const revisitDate = new Date(entry.revisitBy); revisitDate.setHours(0, 0, 0, 0);
+            if (revisitDate.getTime() < today.getTime()) {
+              expired.push({ ...r, entry });
+              blocking.push(r);
+            } else {
+              suppressed.push({ ...r, entry });
+            }
+          }
+
+          const fmtRow = (r) => {
+            const score = Number.isFinite(r.score) ? r.score.toFixed(1) : "—";
+            const pkg = r.ecosystem ? `${r.ecosystem}:${r.name}` : r.name;
+            return `| ${r.band} | ${score} | ${r.ids.join(", ")} | ${pkg} | ${r.version} | ${r.source} |`;
+          };
+          const tableHeader = [
+            "| Severity | Score | Advisory | Package | Version | Source |",
+            "| -------- | ----- | -------- | ------- | ------- | ------ |",
+          ];
 
           const verdict = blocking.length > 0 ? "❌ BLOCKED" : "⚠️ advisories found (below gate)";
           emit(`### OSV advisory scan — ${verdict}`);
           emit("");
-          emit(`Gate: fail on **${failOn}** or above. ${blocking.length} blocking, ${warning.length} below-gate (warn).`);
+          emit(
+            `Gate: fail on **${failOn}** or above. ${blocking.length} blocking, ${warning.length} below-gate ` +
+            `(warn), ${suppressed.length} suppressed via allow-list.`,
+          );
           emit("");
-          emit("| Severity | Score | Advisory | Package | Version | Source |");
-          emit("| -------- | ----- | -------- | ------- | ------- | ------ |");
-          for (const r of rows) {
-            const score = Number.isFinite(r.score) ? r.score.toFixed(1) : "—";
-            const pkg = r.ecosystem ? `${r.ecosystem}:${r.name}` : r.name;
-            emit(`| ${r.band} | ${score} | ${r.ids} | ${pkg} | ${r.version} | ${r.source} |`);
+
+          if (expired.length > 0) {
+            emit(`#### ⚠️ ${expired.length} suppression(s) past \`revisitBy\` — re-gated as blocking`);
+            emit("");
+            emit("| Severity | Score | Advisory | Package | Version | Source | revisitBy | reason |");
+            emit("| -------- | ----- | -------- | ------- | ------- | ------ | --------- | ------ |");
+            for (const r of expired) {
+              const score = Number.isFinite(r.score) ? r.score.toFixed(1) : "—";
+              const pkg = r.ecosystem ? `${r.ecosystem}:${r.name}` : r.name;
+              emit(`| ${r.band} | ${score} | ${r.ids.join(", ")} | ${pkg} | ${r.version} | ${r.source} | ${r.entry.revisitBy} | ${r.entry.reason} |`);
+            }
+            emit("");
           }
-          emit("");
+
+          if (blocking.length > 0) {
+            emit(`#### ❌ Blocking (${blocking.length})`);
+            emit("");
+            for (const h of tableHeader) emit(h);
+            for (const r of blocking) emit(fmtRow(r));
+            emit("");
+          }
+
+          if (warning.length > 0) {
+            emit(`#### ⚠️ Warning — below gate (${warning.length})`);
+            emit("");
+            for (const h of tableHeader) emit(h);
+            for (const r of warning) emit(fmtRow(r));
+            emit("");
+          }
+
+          if (suppressed.length > 0) {
+            emit(`#### 🔕 Suppressed via allow-list (${suppressed.length})`);
+            emit("");
+            emit("| Severity | Score | Advisory | Package | Version | Source | revisitBy | reason |");
+            emit("| -------- | ----- | -------- | ------- | ------- | ------ | --------- | ------ |");
+            for (const r of suppressed) {
+              const score = Number.isFinite(r.score) ? r.score.toFixed(1) : "—";
+              const pkg = r.ecosystem ? `${r.ecosystem}:${r.name}` : r.name;
+              emit(`| ${r.band} | ${score} | ${r.ids.join(", ")} | ${pkg} | ${r.version} | ${r.source} | ${r.entry.revisitBy} | ${r.entry.reason} |`);
+            }
+            emit("");
+          }
 
           if (blocking.length > 0) {
             console.error(
-              `::error::OSV advisory scan: ${blocking.length} finding(s) at or above the '${failOn}' gate. ` +
-              `See the job summary for the advisory table.`,
+              `::error::OSV advisory scan: ${blocking.length} finding(s) at or above the '${failOn}' gate ` +
+              `(${expired.length} via expired suppression). See the job summary for the advisory table.`,
             );
             process.exit(1);
           }
-          emit(`✅ No advisory at or above the '${failOn}' gate. ${warning.length} below-gate finding(s) reported as warnings.`);
+          emit(
+            `✅ No advisory at or above the '${failOn}' gate. ${warning.length} below-gate finding(s) reported ` +
+            `as warnings; ${suppressed.length} suppressed via allow-list.`,
+          );
           process.exit(0);
           NODE
 
