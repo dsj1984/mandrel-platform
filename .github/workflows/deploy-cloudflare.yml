@@ -864,6 +864,12 @@ jobs:
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
-          JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
+          # `job_workflow_sha` is the resolved 40-hex commit of THIS reusable
+          # workflow (the value the caller's `@<ref>` pin resolved to). It is a
+          # valid runtime github-context field, but actionlint's pinned context
+          # type model does not list it, so it is read through the
+          # `fromJSON(toJSON(github))` escape hatch (typed `any`) to keep the
+          # workflow lint-clean without dropping the resolved-SHA source of truth.
+          JOB_WORKFLOW_SHA: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           SMOKE_RESULT: ${{ needs.boot-smoke.result }}
