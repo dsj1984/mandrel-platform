@@ -247,6 +247,29 @@ on:
         type: string
         default: ''
 
+      # Egress audit (Story #112). Adds step-security/harden-runner in
+      # `egress-policy: audit` mode as the FIRST step of every tier job, so each
+      # consumer inherits a zero-risk network-egress baseline on every PR run.
+      # Audit mode only REPORTS outbound traffic (it never blocks), so adopting
+      # it cannot break a build; it can later be tightened to `block` with an
+      # allowlist (see docs/reusable-workflows.md). Runner-aware: the step is
+      # gated to GitHub-hosted ubuntu-latest, the only runner where the action
+      # installs the monitor. On self-hosted runners (a JSON-array `runner`
+      # string such as the domio/athportal labels) it is a NO-OP — harden-runner
+      # deploys its agent via the runner image there, with no workflow step, so
+      # running the action would be redundant at best. Default true: every
+      # default ubuntu-latest consumer inherits the baseline automatically.
+      enable-harden-runner:
+        description: >
+          Enable the step-security/harden-runner egress audit (audit mode,
+          non-blocking) as the first step of each tier job. Effective only on
+          the GitHub-hosted ubuntu-latest runner; a no-op on self-hosted runners
+          (where harden-runner's agent ships in the runner image, not the
+          workflow). Default true.
+        required: false
+        type: boolean
+        default: true
+
     secrets:
       # Turbo remote cache credentials (athportal pattern).
       TURBO_TOKEN:
@@ -274,6 +297,16 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
+      # Egress audit baseline (Story #112). Audit mode reports — never blocks —
+      # outbound network traffic. Gated to GitHub-hosted ubuntu-latest; a no-op
+      # on self-hosted runners (harden-runner ships its agent in the runner
+      # image there). MUST be the first step so it monitors all that follow.
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -304,6 +337,12 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -330,6 +369,12 @@ jobs:
       matrix:
         shard: ${{ fromJson(inputs.shard-matrix) }}
     steps:
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -458,6 +503,12 @@ jobs:
       matrix:
         shard: ${{ fromJson(inputs.shard-matrix) }}
     steps:
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -492,6 +543,12 @@ jobs:
       matrix:
         shard: ${{ fromJson(inputs.shard-matrix) }}
     steps:
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -575,6 +632,12 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -780,6 +843,12 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

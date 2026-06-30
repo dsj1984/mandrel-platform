@@ -49,6 +49,11 @@ is **opt-in** — default off). A single aggregator job,
 [`ci-required`](#the-ci-required-aggregator), is the only branch-protection
 context a consumer needs to register.
 
+Independently of the tiers, every job starts with a non-blocking
+[**egress audit**](#egress-audit-enable-harden-runner) step
+(`step-security/harden-runner`, audit mode) on GitHub-hosted runners, so each
+consumer inherits a network-egress baseline for free.
+
 ### Minimal caller
 
 ```yaml
@@ -84,6 +89,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `gitleaks-version` | string  | `'8.30.1'`       | Pinned gitleaks release version (no leading `v`) for the secret scan. Bump deliberately; the per-platform asset checksum is pinned to match.    |
 | `toolchain-cache`  | string  | `'true'`         | Passed through to `setup-toolchain`'s `cache` input. Set `'false'` on self-hosted runners with a warm pnpm store.                              |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
+| `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest`; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
 
 > **Sharding contract.** `shards` and `shard-matrix` must agree. `shards` sets
 > the denominator passed to the test runner (`--shard=<n>/<shards>`);
@@ -139,6 +145,107 @@ Toggle matrix:
 > comma-separated — for generated code, build output, or test fixtures you
 > don't want Semgrep to scan (e.g. `'dist coverage tests/fixtures'`). Empty
 > (the default) leaves only the built-in `.agents` exclude in effect.
+
+### Egress audit (`enable-harden-runner`)
+
+`pr-quality.yml` runs [`step-security/harden-runner`](https://github.com/step-security/harden-runner)
+in **`egress-policy: audit`** mode as the **first step of every tier job**, so
+every consumer inherits a network-**egress baseline** on each PR run with zero
+configuration. It is on by default (`enable-harden-runner: true`).
+
+**Audit mode only reports — it never blocks.** harden-runner records the
+outbound network connections each job makes and surfaces them in the run's
+job summary (and the StepSecurity dashboard). It does **not** deny any
+traffic, so adopting it **cannot break a build**. The value is the baseline:
+once you have reviewed what each job legitimately talks to, you can tighten to
+`block` mode with an explicit allowlist (see
+[Tightening from audit to block](#tightening-from-audit-to-block) below).
+
+> **Why audit, not lint-only.** Manually SHA-pinning third-party actions
+> (enforced by the [action-pin ratchet](#the-action-pin-ratchet)) closes the
+> *tag-mutation* hole, but it leaves the *runtime-egress* blind spot open: a
+> pinned-but-compromised action (or a compromised transitive dependency it
+> pulls at run time) can still exfiltrate to an unexpected host. Audit mode is
+> the zero-risk first half of closing that blind spot — it gives every
+> consumer a free egress baseline without changing any build outcome.
+
+**Runner-aware (self-hosted no-op).** The harden-runner step is gated to the
+GitHub-hosted `ubuntu-latest` runner — the only environment where the action
+itself installs the monitor. On **self-hosted runners** (when `runner` is a
+JSON-array label string such as `'["self-hosted","domio-runner"]'`) the step is
+**skipped entirely**: harden-runner supports self-hosted runners by shipping
+its agent **in the runner image**, with **no workflow step required**, so
+running the action there would be redundant. This keeps the
+`domio-runner` / `athportal-runner` self-hosted callers fully supported with no
+change to their YAML. To get egress monitoring on a self-hosted runner, install
+the agent on the runner host per the
+[harden-runner self-hosted docs](https://docs.stepsecurity.io/harden-runner) —
+it is independent of this input.
+
+The action is itself **SHA-pinned** (`step-security/harden-runner@9af89fc…`
+`# v2.19.4`), so it is subject to the same pin discipline the
+[action-pin ratchet](#the-action-pin-ratchet) enforces on every other
+third-party action.
+
+#### Tightening from audit to block
+
+Audit mode is the safe default; **block mode** is a later, deliberate step
+taken **per consumer** once its baselines have been reviewed. The migration is
+intentionally NOT automatic — flipping the shared workflow to `block` would
+break every consumer whose baseline you have not yet vetted. The path:
+
+1. **Collect a baseline.** Let `pr-quality.yml` run in audit mode for a few
+   PRs. Open each run's **harden-runner job summary** (or the StepSecurity
+   dashboard) and note every outbound host each job legitimately contacts
+   (npm registry, Turbo remote cache, GitHub API, your deploy target, …).
+2. **Build the allowlist** from those hosts.
+3. **Flip to block at the *caller*,** not by editing the shared workflow. A
+   consumer pins its own caller to a harden-runner block step ahead of the
+   reusable call, or — once this input grows a block toggle in a future
+   release — sets it at the call site. The reference block-mode shape is:
+
+   ```yaml
+   - uses: step-security/harden-runner@<sha> # <tag>
+     with:
+       egress-policy: block
+       allowed-endpoints: >
+         registry.npmjs.org:443
+         api.github.com:443
+         # …one host:port per line, from your reviewed baseline
+   ```
+
+4. **Roll out one consumer at a time.** Because each repo's legitimate egress
+   set differs, block mode is a **per-consumer** decision (mirroring the
+   `enable-migration-guard` opt-in model), never a single platform-wide flip.
+
+> **Out of scope for this release.** Flipping harden-runner to `block` in the
+> shared workflow and shipping per-consumer egress allowlists are deliberately
+> deferred — this release establishes the audit baseline only. See Story #112.
+
+#### The action-pin ratchet
+
+The egress audit closes the *runtime* half of the supply-chain threat; a
+**static action-pin ratchet** closes the *tag-mutation* half. It is not a
+`pr-quality.yml` input — it is a gate in **mandrel-platform's own** CI
+(`ci.yml`, a `needs:` of that repo's `ci-required`): on every PR it walks every
+workflow and composite `action.yml` and **fails if any third-party `uses:` is
+pinned to anything other than a full 40-character commit SHA**. A mutable tag
+(`@v4`) can be force-moved to a malicious commit after review; the ratchet
+makes that un-mergeable. First-party `dsj1984/mandrel-platform/*` self-refs are
+exempt (they are governed by the portability lint's pin-lag guard). Because the
+shared workflows ship from this repo, **consumers inherit fully SHA-pinned
+workflows automatically** — no per-repo ticket. A consumer that wants the same
+guard on *its own* workflows copies `scripts/check-action-pins.mjs` into its
+`scripts/` and runs it in CI:
+
+```yaml
+- name: Lint third-party action pins
+  run: node scripts/check-action-pins.mjs --first-party-owner <owner/repo>
+```
+
+The exact classification (third-party vs first-party vs local vs `docker://`)
+and the 40-char-SHA assertion are unit-tested in
+`scripts/check-action-pins.{mjs,test.mjs}` on the platform repo.
 
 ### Destructive-migration guard (`enable-migration-guard`)
 
