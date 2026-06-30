@@ -106,6 +106,66 @@ class could not be enforced without false positives. Keep the
 | Checker | [`scripts/check-pin-drift.mjs`](../../scripts/check-pin-drift.mjs) | Resolves the latest release, fetches each consumer's workflows **and `package.json`**, classifies `uses:` + npm drift, renders the report. |
 | Tests | [`scripts/check-pin-drift.test.mjs`](../../scripts/check-pin-drift.test.mjs) | `node:test` suite exercising the pure classifiers and the full pipeline with an injected `gh` runner (offline). Wired into `npm test`. |
 | Scheduled workflow | [`.github/workflows/pin-drift.yml`](../../.github/workflows/pin-drift.yml) | Runs the checker weekly (Mondays 07:00 UTC) and on demand; renders the report to the job summary. |
+| Repair loop | [`scripts/platform-repair.mjs`](../../scripts/platform-repair.mjs) | Reads the detector's verdict and, per consumer with **repairable** drift, clones it, runs `platform-sync`, and opens/updates an idempotent repair PR. |
+| Repair tests | [`scripts/platform-repair.test.mjs`](../../scripts/platform-repair.test.mjs) | `node:test` suite exercising repairability classification, PR-body rendering, idempotency, and the full pipeline with injected `git`/`gh`/`sync` seams (offline). Wired into `npm test`. |
+| Repair workflow | [`.github/workflows/platform-sync-repair.yml`](../../.github/workflows/platform-sync-repair.yml) | Runs the repair loop weekly (Mondays 08:00 UTC, one hour after detection) and on demand. |
+
+## The repair loop — detect → repair (Story #113)
+
+The dashboard *detects* drift; on its own it never *fixes* anything. The
+**repair loop** closes that gap. It reuses the checker as its single source of
+truth for drift classification, then for every consumer carrying **repairable**
+drift it clones the consumer, runs
+[`platform-sync`](../../scripts/platform-sync.mjs), and opens (or updates) one
+**repair PR** against that consumer.
+
+**Why repair PRs, not a hard gate (settled decision):** escalating pin-drift to
+a hard gate would red-line a consumer's `main` for drift caused by a *fresh
+platform release* — the consumer's Renovate hold simply hasn't fired yet, which
+is not the consumer's fault. A repair PR is self-healing and keeps the signal
+advisory. `pin-drift.yml` is therefore **unchanged and stays advisory** — the
+repair loop is an additive, separate workflow.
+
+**What is repairable vs. deferred:**
+
+- **Repairable** → `❌ split pin`, `⚠️ lagging` (`uses:` or npm), `❌ npm/uses
+  skew`. `platform-sync --ref <latest>` deterministically rewrites every
+  first-party `uses:` pin to the single latest release SHA and reconciles the
+  `extends` / runbook surfaces.
+- **Deferred / skipped** → `⏳ holding` (inside the `minimumReleaseAge` window —
+  repairing now races Renovate and would be reverted), `⚠️ error` (the detector
+  could not read the repo), `✅ current` (nothing to do), and a floating-tag-only
+  `❔ unknown` pin (no deterministic SHA target — flagged for manual handling,
+  never auto-PR'd).
+
+**Idempotency:** one repair PR per consumer, keyed off the stable head branch
+`mandrel-platform/pin-repair`. A re-run finds the existing open repair PR by
+head branch and **updates** its branch + body instead of opening a duplicate;
+when the repaired tree matches the existing repair branch, nothing is pushed.
+
+**PR body:** every repair PR explains exactly what drifted (split pin / release
+lag / npm lag / surface skew) and links the pin-drift dashboard run that
+detected it, so the consumer reviewer has the full provenance inline.
+
+**Not auto-merged.** The repair loop *opens* the PR; it does not merge it. Each
+repair PR still flows through the consumer's own `ci-required` checks and is
+merged by the consumer's normal process.
+
+### Running the repair loop locally
+
+```bash
+# Plan only — classify drift, render the repair report, mutate nothing:
+node scripts/platform-repair.mjs --dry-run
+
+# Live (requires PIN_REPAIR_TOKEN in the environment for the consumer writes):
+PIN_REPAIR_TOKEN=<fine-grained-pat> node scripts/platform-repair.mjs
+
+# Machine-readable envelope:
+node scripts/platform-repair.mjs --json
+```
+
+Without `PIN_REPAIR_TOKEN` the loop runs **read-only**: it reports the repairs
+it *would* open and exits 0. It never gates and never fails on a missing token.
 
 ## Adding a consumer
 
@@ -136,15 +196,56 @@ node scripts/check-pin-drift.mjs --strict
 The checker uses the `gh` CLI, so it inherits your local `gh auth` (or a
 `GH_TOKEN`/`GITHUB_TOKEN` in the environment).
 
-## Token provisioning (cross-repo reads)
+## Token provisioning (cross-repo auth)
 
-The scheduled workflow's built-in `GITHUB_TOKEN` only grants read access to
-**this** repo. Reading private consumer repos requires a fine-grained PAT
-stored as the **`PIN_DRIFT_TOKEN`** repository secret, with **Contents: read**
-and **Metadata: read** on each consumer repo. The same **Contents: read** scope
+Two cross-repo tokens are in play. Both are **least-privilege, consumer-scoped**
+fine-grained PATs (or GitHub App installation tokens) — neither grants anything
+on `dsj1984/mandrel-platform` itself, and the dashboard/repair workflows use
+this repo's built-in `GITHUB_TOKEN` only for reading their own checkout.
+
+### `PIN_DRIFT_TOKEN` — read (detection)
+
+The scheduled dashboard's built-in `GITHUB_TOKEN` only grants read access to
+**this** repo. Reading private consumer repos requires a fine-grained PAT stored
+as the **`PIN_DRIFT_TOKEN`** repository secret, with **Contents: read** and
+**Metadata: read** on each consumer repo. The same **Contents: read** scope
 covers the `package.json` read added for the npm dimension — no new permission
-is required. When the secret is absent the run
-still completes — consumers it cannot read are reported as `⚠️ error` rows
-rather than failing the job. The dashboard is **informational by default**: the
-scheduled run does not gate `main`. Use the `workflow_dispatch` `strict` input
-to fail the run on drift for a one-off enforcement check.
+is required. When the secret is absent the run still completes — consumers it
+cannot read are reported as `⚠️ error` rows rather than failing the job. The
+dashboard is **informational by default**: the scheduled run does not gate
+`main`. Use the `workflow_dispatch` `strict` input to fail the run on drift for a
+one-off enforcement check.
+
+The repair loop reuses `PIN_DRIFT_TOKEN` (as `GH_TOKEN`) for its own
+detection-phase reads — it does not need a second read token.
+
+### `PIN_REPAIR_TOKEN` — write (repair PRs)
+
+Opening a repair PR on a consumer requires **write** access to that consumer,
+which neither this repo's `GITHUB_TOKEN` nor the read-only `PIN_DRIFT_TOKEN`
+grants. The repair loop
+([`platform-sync-repair.yml`](../../.github/workflows/platform-sync-repair.yml))
+injects a separate fine-grained PAT / GitHub App installation token stored as
+the **`PIN_REPAIR_TOKEN`** repository secret.
+
+**Least-privilege scope** — grant on the consumer repos
+(`dsj1984/domio`, `dsj1984/athportal`, `Beestera/swarm-os`) **only**, nothing on
+`mandrel-platform`:
+
+| Permission | Level | Why |
+| ---------- | ----- | --- |
+| Contents | **write** | Push the `mandrel-platform/pin-repair` branch with the synced pins. |
+| Pull requests | **write** | Open / update the repair PR. |
+| Metadata | read | Implicitly required by GitHub for any fine-grained PAT. |
+
+Deliberately **not** granted: `Administration`, `Workflows`, `Actions`,
+`Secrets`, or write on any other resource. The token cannot merge the PR
+(consumer branch protection + `ci-required` own that), cannot touch
+`mandrel-platform`, and cannot modify consumer CI. A GitHub App installation
+token scoped to the same two permissions on the consumer installations is the
+preferred production posture (auto-expiring, attributable to the app).
+
+When `PIN_REPAIR_TOKEN` is **absent** the repair loop runs **read-only**: it
+classifies drift and reports the repairs it *would* open, then exits 0. It never
+fails the job and never gates `main` — consistent with the advisory posture of
+the whole pin-drift surface.

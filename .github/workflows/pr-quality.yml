@@ -86,6 +86,37 @@ on:
         type: boolean
         default: true
 
+      # Optional coverage floor (Story #109). Off by default (0) so
+      # non-adopters keep today's behaviour: pr-quality.yml already uploads
+      # `**/coverage/` as an artifact, but no job asserts a floor, so a PR can
+      # drop coverage while ci-required stays green. Set this to a percent and
+      # the unit job fails when measured coverage falls below it — and the unit
+      # job is a `needs:` of ci-required, so the floor is load-bearing. Coverage
+      # is read from the EXISTING `**/coverage/coverage-summary.json` output
+      # (json-summary reporter); no new tooling is required of consumers.
+      coverage-threshold:
+        description: >
+          Minimum coverage percentage the unit job must meet. 0 (default)
+          disables the gate, preserving current behaviour. When > 0, the unit
+          job fails if measured coverage (read from the existing
+          **/coverage/coverage-summary.json) is below this floor. The unit job
+          is a needs: of ci-required, so the floor blocks the merge.
+        required: false
+        type: number
+        default: 0
+
+      # Which coverage metric the floor asserts when coverage-threshold > 0.
+      # One of: lines | statements | functions | branches. Default 'lines'.
+      coverage-metric:
+        description: >
+          Coverage metric the coverage-threshold floor asserts: 'lines',
+          'statements', 'functions', or 'branches'. Read from total.<metric>.pct
+          in coverage-summary.json. Default 'lines'. Ignored when
+          coverage-threshold is 0.
+        required: false
+        type: string
+        default: 'lines'
+
       # Security tier (Story #65 / MP-10). Private-repo-capable: the secret
       # scan and SAST sub-steps run a pinned binary directly and assert on its
       # exit code, so they BLOCK on a finding even on a private repo with no
@@ -272,6 +303,98 @@ jobs:
         env:
           TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
           TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      # ── Optional coverage floor (Story #109) ──────────────────────────────
+      #
+      # Off by default: when `coverage-threshold` is 0 the step prints a skip
+      # note and exits 0, so non-adopters keep today's behaviour. When set, it
+      # reads the EXISTING `**/coverage/coverage-summary.json` (the same
+      # json-summary output uploaded below) and FAILS the unit job — which is a
+      # `needs:` of ci-required — when measured `total.<metric>.pct` is below the
+      # floor. A set floor with NO coverage summary also fails (never a silent
+      # pass on missing data). The logic is inlined as a dependency-free Node
+      # script so a consumer needs NO extra file in its checkout; the platform's
+      # own scripts/check-coverage-threshold.{mjs,test.mjs} are the
+      # self-test of the identical algorithm.
+      - name: Coverage threshold gate
+        if: ${{ inputs.coverage-threshold != 0 }}
+        shell: bash
+        env:
+          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+          COVERAGE_METRIC: ${{ inputs.coverage-metric }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { readFileSync, readdirSync, existsSync } from "node:fs";
+          import { join, resolve } from "node:path";
+
+          const threshold = Number(process.env.COVERAGE_THRESHOLD || "0");
+          const metric = (process.env.COVERAGE_METRIC || "lines").trim().toLowerCase();
+          const VALID = ["lines", "statements", "functions", "branches"];
+          if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+            console.error(`[coverage-threshold] ❌ invalid threshold "${process.env.COVERAGE_THRESHOLD}"`);
+            process.exit(1);
+          }
+          if (!VALID.includes(metric)) {
+            console.error(`[coverage-threshold] ❌ invalid metric "${metric}" (expected: ${VALID.join(", ")})`);
+            process.exit(1);
+          }
+
+          // Auto-scan for **/coverage/coverage-summary.json, pruning
+          // node_modules + dotted dirs (.git, .agents, …).
+          function find(root) {
+            const out = [];
+            const walk = (dir) => {
+              let entries;
+              try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+              for (const e of entries) {
+                if (!e.isDirectory()) continue;
+                if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+                const full = join(dir, e.name);
+                if (e.name === "coverage") {
+                  const f = join(full, "coverage-summary.json");
+                  if (existsSync(f)) out.push(f);
+                }
+                walk(full);
+              }
+            };
+            walk(resolve(root));
+            return out;
+          }
+
+          const files = find(process.cwd());
+          if (files.length === 0) {
+            console.error(
+              "[coverage-threshold] ❌ threshold is set but no coverage-summary.json " +
+              "was found under any **/coverage/ — ensure the test step emits a " +
+              "json-summary reporter (a set floor must not pass on missing data)."
+            );
+            process.exit(1);
+          }
+
+          let failed = false;
+          for (const file of files) {
+            let pct = null;
+            try {
+              const total = JSON.parse(readFileSync(file, "utf8"))?.total;
+              const entry = total && total[metric];
+              if (entry && typeof entry.pct === "number" && Number.isFinite(entry.pct)) pct = entry.pct;
+            } catch { /* unreadable → treated as a failure below */ }
+            if (pct === null) {
+              console.error(`[coverage-threshold] ❌ ${file}: no "${metric}" total.pct in summary`);
+              failed = true;
+            } else if (pct >= threshold) {
+              console.log(`[coverage-threshold] ✅ ${file}: ${metric} ${pct}% (floor ${threshold}%)`);
+            } else {
+              console.error(`[coverage-threshold] ❌ ${file}: ${metric} ${pct}% < floor ${threshold}%`);
+              failed = true;
+            }
+          }
+          if (failed) {
+            console.error(`[coverage-threshold] ❌ ${metric} coverage is below the ${threshold}% floor.`);
+            process.exit(1);
+          }
+          console.log(`[coverage-threshold] ✅ ${metric} coverage meets the ${threshold}% floor.`);
+          NODE
 
       - name: Upload test results
         if: always()
