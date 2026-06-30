@@ -107,3 +107,36 @@ guidance (`security-baseline.md`) and CI enforcement (the security tier) are not
 cross-linked. Accepted deliberately — good synergy here is the clean boundary,
 not entanglement. Recorded so the absence of synergy/dogfooding tickets is not
 read as an oversight.
+
+## 2026-06-30 — Ship consumer release automation via release-please, not changesets
+
+**Context.** The platform *runs* release-please for its own release
+([`release-please.yml`](reusable-workflows.md#release-pleaseyml)) but exposed no
+**reusable** release-lifecycle unit, so every consumer hand-rolled its
+version/changelog/tag flow (roadmap §4.6). Shipping a fourth distribution
+channel (alongside `pr-quality.yml`, `deploy-cloudflare.yml`, and the npm config
+package) forced a tool choice — release-please vs. changesets — and a scope
+boundary against the platform-internal publish path.
+
+**Decision.** Ship
+[`release-automation.yml`](reusable-workflows.md#release-automationyml) as a
+`workflow_call` wrapper around **release-please**, not changesets. release-please
+keys off Conventional Commits — the exact convention
+[`git-conventions.md`](../.agents/rules/git-conventions.md) already mandates and
+`release-please-config.json`'s `changelog-sections` already encode — so a
+consumer inherits the same version-bump/changelog mapping the platform uses with
+no new authoring model. changesets would impose a divergent
+per-change-markdown-intent convention that conflicts with the
+commit-message-as-source-of-truth posture. **Scope is version bump + changelog +
+tag + GitHub Release only**; registry publish is out of scope because consumers
+deploy to Cloudflare, not npm. A publishing consumer wires its own job off the
+`release_created` / `tag_name` outputs. This unit is distinct from the
+platform-internal `release-please.yml`, which adds the npm-publish job for the
+`mandrel-platform` package itself.
+
+**Consequences.** Consumers get one shared, SHA-pinned, Renovate-bumped release
+unit with zero new conventions to learn; the conventional-commit contract now
+spans CI, decomposition, and release. Cost: consumers that publish to a registry
+must supply their own publish job (the unit deliberately stops at tag/release),
+and the platform now maintains two release-please surfaces (internal publish +
+reusable consumer unit) that must not drift on the release-please-action pin.

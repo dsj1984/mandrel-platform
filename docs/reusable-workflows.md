@@ -10,11 +10,14 @@ Two workflows carry a stable public contract:
 - [`deploy-cloudflare.yml`](#deploy-cloudflareyml) — the defence-in-depth
   Cloudflare deploy.
 
-Three more are consumable but have a much smaller surface, covered briefly at
+Four more are consumable but have a much smaller surface, covered briefly at
 the end:
 
 - [`secret-scan-push.yml`](#secret-scan-pushyml) — full-history secret-scan
   signal on push to the default branch.
+- [`release-automation.yml`](#release-automationyml) — conventional-commit
+  release lifecycle (version bump + changelog + tag) on push to the default
+  branch.
 - [`codeql.yml`](#codeqlyml) — CodeQL SAST analysis.
 - [`smoke-dispatch.yml`](#smoke-dispatchyml) — cross-repo smoke trigger
   (platform-internal).
@@ -310,6 +313,113 @@ It carries **no secrets contract** (`secrets: inherit` is harmless; the scan
 needs none) and does **not** replace the blocking PR-time scan — keep
 `enable-security: true` on `pr-quality.yml`. This is defence-in-depth on top of
 it.
+
+---
+
+## `release-automation.yml`
+
+The consumer **release-lifecycle** channel: a `workflow_call` wrapper around
+[release-please](https://github.com/googleapis/release-please-action) that
+maintains a release PR off the consumer's default branch and, when that PR
+merges, cuts a conventional-commit-driven **version bump + `CHANGELOG.md` + git
+tag + GitHub Release**. It is the fourth distribution channel alongside
+`pr-quality.yml`, `deploy-cloudflare.yml`, and the npm config package, extending
+the platform from CI/deploy into the full release lifecycle.
+
+> **Why release-please, not changesets.** The platform already runs
+> release-please for its own release train (the platform-internal
+> [`release-please.yml`](#release-pleaseyml)) and codifies the conventional-commit
+> contract in [`git-conventions.md`](../.agents/rules/git-conventions.md) plus
+> `release-please-config.json`'s `changelog-sections`. A consumer adopting this
+> workflow inherits the **same** conventional-commit → version-bump → changelog
+> mapping the platform itself uses, with no new authoring model. changesets
+> would add a second, divergent convention (per-change markdown intents) that
+> conflicts with the commit-message-as-source-of-truth posture
+> `git-conventions.md` mandates.
+
+> **Scope — version/changelog/tag, not publish.** This unit produces the
+> version bump, changelog, tag, and GitHub Release **only**. It does **not**
+> publish to any registry: consumers deploy to Cloudflare (via
+> [`deploy-cloudflare.yml`](#deploy-cloudflareyml)), not npm, so registry
+> publish is out of scope. A consumer that *does* publish wires its own publish
+> job keyed off the `release_created` / `tag_name` outputs (see below). This is
+> the deliberate boundary with the platform-internal `release-please.yml`, which
+> adds an npm-publish job for the `mandrel-platform` package itself.
+
+### Minimal caller
+
+```yaml
+on:
+  push:
+    branches: [main]
+
+# release-please needs write access to open the release PR, tag, and cut the
+# release. Grant these at the caller (a reusable workflow cannot widen the
+# caller's token scope).
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release:
+    uses: dsj1984/mandrel-platform/.github/workflows/release-automation.yml@<sha> # <tag>
+    secrets: inherit
+```
+
+`secrets: inherit` forwards the optional `release-token` (see Secrets). The
+default single-package `node` caller above needs no further inputs — it reads
+the version from `package.json` and writes `CHANGELOG.md`.
+
+### Inputs
+
+| Input           | Type   | Default  | When to override                                                                                                                                              |
+| --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `target-branch` | string | `'main'` | Branch release-please maintains the release PR against. Set to your release branch if you cut releases off a branch other than the default.                   |
+| `release-type`  | string | `'node'` | release-please strategy. `'node'` reads/writes `package.json` + `CHANGELOG.md`. Use `'simple'` for a non-Node version file, etc. Ignored when `config-file` is set. |
+| `config-file`   | string | `''`     | Path to a release-please config JSON. Omit for single-package mode; supply for a monorepo or to pin `changelog-sections` to the platform's `git-conventions.md` mapping. |
+| `manifest-file` | string | `''`     | Path to the release-please manifest JSON. Required when `config-file` is set (config + manifest are a matched pair); ignored otherwise.                       |
+| `package-name`  | string | `''`     | Package name used in the release PR title and tag. Defaults to empty (the `node` type reads it from `package.json`); set explicitly for non-Node types.       |
+
+### Secrets
+
+| Secret          | Required | When to set                                                                                                                                                  |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `release-token` | No       | A PAT or GitHub App installation token (`contents:write`, `pull-requests:write`) used **instead of** `GITHUB_TOKEN`. Falls back to `GITHUB_TOKEN` when unset. |
+
+> **Strongly recommend a `release-token`.** The default `GITHUB_TOKEN` does
+> **not** trigger downstream workflows on the release PR it opens (GitHub's
+> anti-recursion safeguard), so that PR never runs your required CI and cannot
+> auto-merge. A user-scoped PAT acts like a real user, so CI fires normally —
+> the same posture the platform-internal `release-please.yml` documents for its
+> `RELEASE_PLEASE_TOKEN`.
+
+### Outputs
+
+| Output            | Description                                                                                                       |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `release_created` | `'true'` when this run cut a release (the release PR merged and a tag was created). Gate a publish/deploy job on it. |
+| `tag_name`        | The created tag (e.g. `v1.4.0`) when `release_created` is `'true'`; empty otherwise.                              |
+
+A consumer that publishes or deploys on release keys a downstream job off these
+outputs:
+
+```yaml
+jobs:
+  release:
+    uses: dsj1984/mandrel-platform/.github/workflows/release-automation.yml@<sha> # <tag>
+    secrets: inherit
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+  publish:
+    needs: release
+    if: ${{ needs.release.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Cut ${{ needs.release.outputs.tag_name }} — run deploy/publish here."
+```
 
 ---
 
