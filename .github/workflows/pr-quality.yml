@@ -1,7 +1,8 @@
 # Shared PR-quality reusable workflow (Story #4).
 #
 # Consumable as a `workflow_call` target by any consumer repo. Tiers:
-#   lint + format-check → typecheck → unit → contract → e2e/smoke
+#   lint + format-check → typecheck → unit → contract → e2e/smoke →
+#   migration-guard → security → osv-scan
 #
 # Each tier is independently enable-toggled via inputs so repos can opt out of
 # tiers they haven't built yet. The aggregator job (`ci-required`) is the only
@@ -269,6 +270,62 @@ on:
         required: false
         type: boolean
         default: true
+
+      # OSV-scanner advisory tier (Story #114). Renovate *bumps* dependency
+      # versions but never alerts on advisories for versions sitting un-bumped
+      # (inside `minimumReleaseAge` or major-gated), leaving a window with no
+      # live CVE signal. This tier closes it: a pinned OSV-scanner binary scans
+      # the lockfile/manifest tree for known advisories. Like the secret/SAST
+      # tiers it runs a PINNED, checksum-verified binary directly and asserts on
+      # findings via the run log / job summary — NO SARIF / GHAS dependency — so
+      # it is load-bearing on a PRIVATE repo with no GitHub Advanced Security
+      # (the same constraint that made gitleaks/Semgrep the chosen gates over
+      # CodeQL). Default ON: every consumer inherits the advisory signal on pin
+      # bump. When enabled it is a `needs:` of `ci-required`, so the gate is
+      # branch-protection-load-bearing through the single aggregator context.
+      enable-osv-scan:
+        description: >
+          Enable the OSV-scanner advisory tier (scans the lockfile/manifest tree
+          for known dependency advisories via a pinned, checksum-verified
+          binary; findings surface in the run log + job summary, no SARIF/GHAS).
+          Default true.
+        required: false
+        type: boolean
+        default: true
+
+      # Severity-to-gate threshold for the OSV-scan tier. OSV-scanner's own exit
+      # code is non-zero on ANY advisory regardless of severity; this input lets
+      # a consumer decide which CVSS band fails `ci-required` vs only warns. Each
+      # advisory's CVSS base score (the group's `max_severity` in OSV's JSON) is
+      # bucketed into critical (≥9.0) / high (≥7.0) / medium (≥4.0) / low (>0) /
+      # none (unscored). A finding at or above the configured band BLOCKS the
+      # job (and therefore the merge); findings below it are reported as a
+      # WARNING in the job summary without failing. Set 'critical' to gate on
+      # criticals only, or 'none' to fail on ANY advisory including unscored
+      # ones (strictest). Default 'high'.
+      osv-fail-on-severity:
+        description: >
+          Lowest CVSS severity band that FAILS the OSV-scan tier (and therefore
+          ci-required): 'critical' (>=9.0), 'high' (>=7.0), 'medium' (>=4.0),
+          'low' (>0), or 'none' (any advisory, including unscored). Advisories
+          below the band are reported as warnings without blocking. Default
+          'high'.
+        required: false
+        type: string
+        default: 'high'
+
+      # Pinned OSV-scanner version for the advisory tier. The per-platform asset
+      # (darwin/linux × amd64/arm64) is verified against a pinned SHA-256 before
+      # execution, mirroring the gitleaks secret-scan posture. Bump alongside
+      # the checksum map in the osv-scan job when this pin moves.
+      osv-scanner-version:
+        description: >
+          Pinned OSV-scanner release version (without the leading 'v') for the
+          advisory tier. Default 2.4.0. Bump alongside the per-platform SHA-256
+          map in the osv-scan job.
+        required: false
+        type: string
+        default: '2.4.0'
 
     secrets:
       # Turbo remote cache credentials (athportal pattern).
@@ -1122,6 +1179,238 @@ jobs:
           fi
           echo "✅ Semgrep found no blocking findings."
 
+  # ── Tier 7: OSV-scanner advisory scan ─────────────────────────────────────
+  #
+  # Dependency-advisory tier (Story #114). Renovate bumps versions but never
+  # alerts on advisories for versions sitting un-bumped (inside
+  # `minimumReleaseAge` or major-gated), so there is a window with no live CVE
+  # signal. This tier closes it: a PINNED, checksum-verified OSV-scanner binary
+  # scans the lockfile/manifest tree (`scan source -r .`) against the OSV
+  # database and reports known advisories. Like the secret/SAST tiers it runs
+  # the binary directly and asserts on findings via the run log / job summary —
+  # NO SARIF / Code Scanning upload — so the gate is load-bearing on a PRIVATE
+  # repo with NO GitHub Advanced Security (the same constraint that made
+  # gitleaks/Semgrep the chosen gates over CodeQL). Default ON
+  # (`enable-osv-scan`), so every consumer inherits the advisory signal on pin
+  # bump. When enabled it is a `needs:` of `ci-required` (below), so it is
+  # branch-protection-load-bearing through the single aggregator context.
+  #
+  # Severity-to-gate (documented in docs/reusable-workflows.md):
+  #   • OSV-scanner's own exit code is non-zero on ANY advisory regardless of
+  #     severity. We do NOT rely on it for the gate decision; instead we emit
+  #     JSON, bucket each advisory's CVSS base score (the group's
+  #     `max_severity`) into critical (≥9.0) / high (≥7.0) / medium (≥4.0) /
+  #     low (>0) / none (unscored), and FAIL the job only when a finding lands
+  #     at or above `osv-fail-on-severity` (default 'high'). Findings below the
+  #     band are reported as a WARNING in the job summary without blocking.
+  #   • A human-readable table is always written to $GITHUB_STEP_SUMMARY and
+  #     the run log, so findings surface with no GHAS dependency.
+  #
+  # Cross-platform: the asset selector resolves the right binary for self-hosted
+  # darwin/linux runners AND ubuntu-latest, each verified against a pinned
+  # SHA-256 before execution (mirroring the gitleaks secret-scan tier).
+  osv-scan:
+    name: OSV advisory scan
+    if: ${{ inputs.enable-osv-scan }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (egress audit)
+        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Download + verify a PINNED OSV-scanner binary. Cross-platform asset
+      # selector: maps runner.os/runner.arch → the release asset, then verifies
+      # it against a pinned SHA-256 before execution. Supports self-hosted
+      # darwin/linux (arm64 + x64) and ubuntu-latest. Pinning the binary (not an
+      # action) keeps the gate SHA-action-ratchet-exempt and GHAS-free, exactly
+      # like the gitleaks secret-scan step.
+      - name: OSV advisory scan (pinned binary)
+        shell: bash
+        env:
+          OSV_VERSION: ${{ inputs.osv-scanner-version }}
+          OSV_FAIL_ON: ${{ inputs.osv-fail-on-severity }}
+        run: |
+          set -euo pipefail
+
+          # Cross-platform asset selector: runner.os/arch → OSV-scanner asset
+          # slug. OSV-scanner ships bare per-platform executables (no archive).
+          os="$(uname -s)"
+          arch="$(uname -m)"
+          case "$os" in
+            Darwin) osv_os="darwin" ;;
+            Linux)  osv_os="linux" ;;
+            *) echo "::error::Unsupported OS for OSV-scanner asset selector: $os"; exit 1 ;;
+          esac
+          case "$arch" in
+            arm64|aarch64) osv_arch="arm64" ;;
+            x86_64|amd64)  osv_arch="amd64" ;;
+            *) echo "::error::Unsupported arch for OSV-scanner asset selector: $arch"; exit 1 ;;
+          esac
+
+          # Pinned SHA-256 checksums for OSV-scanner 2.4.0 release binaries.
+          # Bump alongside inputs.osv-scanner-version when the pin moves. Uses a
+          # case statement (not declare -A) to remain compatible with bash 3.2
+          # (the system shell on macOS self-hosted runners).
+          slug="${OSV_VERSION}_${osv_os}_${osv_arch}"
+          case "$slug" in
+            "2.4.0_darwin_amd64") expected="088119325156321c34c456ac3703d6013538fd71cbac82b891ab34db491e4d66" ;;
+            "2.4.0_darwin_arm64") expected="9ca3185ad63e9ab54f7cb90f46a7362be02d80e37f0123d095a54355ea202f5d" ;;
+            "2.4.0_linux_amd64")  expected="15314940c10d26af9c6649f150b8a47c1262e8fc7e17b1d1029b0e479e8ed8a0" ;;
+            "2.4.0_linux_arm64")  expected="44e580752910f0ff36ec99aff59af20f65df1e859aa31e5605a8f0d055b496e9" ;;
+            *) expected="" ;;
+          esac
+          if [ -z "$expected" ]; then
+            echo "::error::No pinned checksum for OSV-scanner $slug — update the SHA256 map for this version/platform."
+            exit 1
+          fi
+
+          asset="osv-scanner_${osv_os}_${osv_arch}"
+          url="https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/${asset}"
+          tmp="$(mktemp -d)"
+          echo "Downloading pinned OSV-scanner: ${url}"
+          curl -fsSL "$url" -o "${tmp}/osv-scanner"
+
+          # Verify the pinned SHA-256 before trusting the binary.
+          actual="$(shasum -a 256 "${tmp}/osv-scanner" | awk '{print $1}')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::OSV-scanner checksum mismatch for ${asset}: expected ${expected}, got ${actual}"
+            exit 1
+          fi
+          echo "✅ OSV-scanner ${asset} checksum verified."
+          chmod +x "${tmp}/osv-scanner"
+          "${tmp}/osv-scanner" --version
+
+          # Scan the lockfile/manifest tree recursively. OSV-scanner exits
+          # non-zero on ANY finding (and exit 128 on no scannable target); we
+          # capture exit code + JSON and decide the gate ourselves from the
+          # severity band, so `|| true` here is intentional — the JSON gate
+          # below owns pass/fail, not OSV-scanner's coarse exit code.
+          report="${tmp}/osv-report.json"
+          echo "Running: osv-scanner scan source -r . --format json"
+          "${tmp}/osv-scanner" scan source -r . --format json --output-file "${report}" || scan_rc=$?
+          scan_rc="${scan_rc:-0}"
+          echo "OSV-scanner raw exit code: ${scan_rc}"
+
+          # Exit 127/128 (no scannable target) is treated as a clean pass: a
+          # repo with no recognized lockfile/manifest has nothing to advise on.
+          if [ ! -s "${report}" ]; then
+            echo "No OSV JSON report produced (no scannable lockfile/manifest) — advisory scan is a no-op pass."
+            {
+              echo "### OSV advisory scan — no scannable target"
+              echo ""
+              echo "OSV-scanner found no recognized lockfile/manifest to scan; nothing to advise on."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Severity-band gate. Parse the JSON, bucket each advisory by its
+          # group `max_severity` (CVSS base score string), and fail only when a
+          # finding lands at or above OSV_FAIL_ON. Inlined as a dependency-free
+          # Node script so a consumer needs NO extra file in its checkout.
+          OSV_REPORT="${report}" node --input-type=module - <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const failOn = (process.env.OSV_FAIL_ON || "high").trim().toLowerCase();
+          const BANDS = ["none", "low", "medium", "high", "critical"];
+          if (!BANDS.includes(failOn)) {
+            console.error(`::error::Invalid osv-fail-on-severity "${failOn}" (expected: ${BANDS.join(", ")}).`);
+            process.exit(1);
+          }
+          // Rank: a finding blocks when its band rank >= the threshold rank.
+          const rank = (b) => BANDS.indexOf(b);
+
+          // CVSS base score → severity band.
+          const bandOf = (score) => {
+            if (!Number.isFinite(score) || score <= 0) return "none";
+            if (score >= 9.0) return "critical";
+            if (score >= 7.0) return "high";
+            if (score >= 4.0) return "medium";
+            return "low";
+          };
+
+          let report;
+          try {
+            report = JSON.parse(readFileSync(process.env.OSV_REPORT, "utf8"));
+          } catch (e) {
+            console.error(`::error::Could not parse OSV JSON report: ${e.message}`);
+            process.exit(1);
+          }
+
+          const rows = [];
+          for (const res of report.results || []) {
+            const source = res.source?.path || "(unknown source)";
+            for (const pkg of res.packages || []) {
+              const name = pkg.package?.name || "(unknown)";
+              const version = pkg.package?.version || "?";
+              const ecosystem = pkg.package?.ecosystem || "";
+              // Each group bundles aliased advisories with a single
+              // `max_severity` CVSS base score string; ids are the OSV ids.
+              for (const group of pkg.groups || []) {
+                const score = Number.parseFloat(group.max_severity ?? "");
+                const band = bandOf(score);
+                const ids = (group.ids || []).join(", ");
+                rows.push({ source, name, version, ecosystem, band, score, ids });
+              }
+              // Defensive: an advisory not surfaced via a group still counts as
+              // an unscored ("none") finding so it cannot silently vanish.
+              if ((pkg.groups || []).length === 0) {
+                for (const v of pkg.vulnerabilities || []) {
+                  rows.push({ source, name, version, ecosystem, band: "none", score: NaN, ids: v.id || "(unknown)" });
+                }
+              }
+            }
+          }
+
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          const fs = await import("node:fs");
+          const emit = (line) => { if (summaryPath) fs.appendFileSync(summaryPath, line + "\n"); console.log(line); };
+
+          if (rows.length === 0) {
+            emit("### ✅ OSV advisory scan — no known advisories");
+            emit("");
+            emit("OSV-scanner found no known advisories in the lockfile/manifest tree.");
+            process.exit(0);
+          }
+
+          // Sort most-severe first for the table.
+          rows.sort((a, b) => rank(b.band) - rank(a.band) || (b.score || 0) - (a.score || 0));
+
+          const blocking = rows.filter((r) => rank(r.band) >= rank(failOn));
+          const warning = rows.filter((r) => rank(r.band) < rank(failOn));
+
+          const verdict = blocking.length > 0 ? "❌ BLOCKED" : "⚠️ advisories found (below gate)";
+          emit(`### OSV advisory scan — ${verdict}`);
+          emit("");
+          emit(`Gate: fail on **${failOn}** or above. ${blocking.length} blocking, ${warning.length} below-gate (warn).`);
+          emit("");
+          emit("| Severity | Score | Advisory | Package | Version | Source |");
+          emit("| -------- | ----- | -------- | ------- | ------- | ------ |");
+          for (const r of rows) {
+            const score = Number.isFinite(r.score) ? r.score.toFixed(1) : "—";
+            const pkg = r.ecosystem ? `${r.ecosystem}:${r.name}` : r.name;
+            emit(`| ${r.band} | ${score} | ${r.ids} | ${pkg} | ${r.version} | ${r.source} |`);
+          }
+          emit("");
+
+          if (blocking.length > 0) {
+            console.error(
+              `::error::OSV advisory scan: ${blocking.length} finding(s) at or above the '${failOn}' gate. ` +
+              `See the job summary for the advisory table.`,
+            );
+            process.exit(1);
+          }
+          emit(`✅ No advisory at or above the '${failOn}' gate. ${warning.length} below-gate finding(s) reported as warnings.`);
+          process.exit(0);
+          NODE
+
   # ── Aggregator: single required branch-protection context ─────────────────
   #
   # `ci-required` is the ONLY context consumers should register in their
@@ -1141,6 +1430,7 @@ jobs:
       - e2e
       - migration-guard
       - security
+      - osv-scan
     steps:
       - name: Check all tier results
         shell: bash
@@ -1152,6 +1442,7 @@ jobs:
           E2E_RESULT: ${{ needs.e2e.result }}
           MIGRATION_GUARD_RESULT: ${{ needs.migration-guard.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
+          OSV_SCAN_RESULT: ${{ needs.osv-scan.result }}
         run: |
           failed=()
           for tier_result in \
@@ -1161,7 +1452,8 @@ jobs:
             "contract:${CONTRACT_RESULT}" \
             "e2e:${E2E_RESULT}" \
             "migration-guard:${MIGRATION_GUARD_RESULT}" \
-            "security:${SECURITY_RESULT}"; do
+            "security:${SECURITY_RESULT}" \
+            "osv-scan:${OSV_SCAN_RESULT}"; do
             tier="${tier_result%%:*}"
             result="${tier_result##*:}"
             if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
