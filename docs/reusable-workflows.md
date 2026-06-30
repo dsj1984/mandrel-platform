@@ -189,6 +189,23 @@ jobs:
     secrets: inherit   # coverage gate is off — artifact still uploaded, no floor asserted
 ```
 
+#### Consumer rollout
+
+The platform ships the gate **off by default**, so adopting a floor is a
+per-consumer decision (each repo picks its own floor value — merged vs.
+per-project coverage policy is left to the consumer). Adoption is tracked in
+these consumer tickets:
+
+| Consumer | Adoption ticket |
+| -------- | --------------- |
+| domio    | [dsj1984/domio#1563](https://github.com/dsj1984/domio/issues/1563) |
+| athportal | [dsj1984/athportal#2029](https://github.com/dsj1984/athportal/issues/2029) |
+| swarm-os | [Beestera/swarm-os#158](https://github.com/Beestera/swarm-os/issues/158) |
+
+Each consumer sets `coverage-threshold` (and optionally `coverage-metric`) on
+its `pr-quality.yml` caller and emits a `coverage-summary.json` from its unit
+step. Until a consumer opts in, its CI behaviour is unchanged.
+
 ### Secrets
 
 | Secret        | Required | Purpose                                              |
