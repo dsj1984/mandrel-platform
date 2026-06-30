@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.7...mandrel-platform-v0.12.0) (2026-06-30)
+
+
+### Added
+
+* **pin-drift:** detect npm-package lag and surface skew, not just uses: pins ([#100](https://github.com/dsj1984/mandrel-platform/issues/100)) ([e985780](https://github.com/dsj1984/mandrel-platform/commit/e985780e70f2b3c2aebde9e7c8d9db83456f724a))
+
 ## [0.11.7](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.6...mandrel-platform-v0.11.7) (2026-06-30)
 
 
