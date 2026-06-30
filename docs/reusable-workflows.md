@@ -10,9 +10,11 @@ Two workflows carry a stable public contract:
 - [`deploy-cloudflare.yml`](#deploy-cloudflareyml) — the defence-in-depth
   Cloudflare deploy.
 
-Two more are consumable but have a much smaller surface, covered briefly at
+Three more are consumable but have a much smaller surface, covered briefly at
 the end:
 
+- [`secret-scan-push.yml`](#secret-scan-pushyml) — full-history secret-scan
+  signal on push to the default branch.
 - [`codeql.yml`](#codeqlyml) — CodeQL SAST analysis.
 - [`smoke-dispatch.yml`](#smoke-dispatchyml) — cross-repo smoke trigger
   (platform-internal).
@@ -259,6 +261,55 @@ secrets live in a GitHub Environment of that name (the recommended isolation
 pattern). When set, `check-env`, `pre-migration-snapshot`, `migrate`,
 `deploy`, and `boot-smoke` all run under that GitHub Environment, picking up
 its environment-scoped secrets and any required reviewers / wait timers.
+
+---
+
+## `secret-scan-push.yml`
+
+A full-history secret-scan **signal** on push to the default branch. The
+`pr-quality.yml` security tier blocks on the **PR diff** (merge-base..head);
+this workflow scans the **full git history** (`fetch-depth: 0`) so secrets that
+predate the gate, or that land via a path bypassing a PR (force-push,
+fork-merge), still surface. It is a **signal, not a gate** — it is
+`continue-on-error` and never fails the push (an already-merged commit cannot be
+retro-blocked).
+
+### Minimal caller
+
+```yaml
+on:
+  push:
+    branches: [main]
+jobs:
+  secret-scan:
+    uses: dsj1984/mandrel-platform/.github/workflows/secret-scan-push.yml@<sha> # <tag>
+    secrets: inherit
+```
+
+### Inputs
+
+| Input              | Type   | Default          | When to override                                                                 |
+| ------------------ | ------ | ---------------- | ------------------------------------------------------------------------------- |
+| `runner`           | string | `'ubuntu-latest'`| Runs-on label. The post-merge scan does not need the consumer's PR runner — `ubuntu-latest` is recommended even for self-hosted consumers. |
+| `gitleaks-version` | string | `'8.30.1'`       | Pinned gitleaks release (no leading `v`). Must have a matching SHA-256 in the workflow's checksum map. |
+
+### Where findings surface
+
+The same pinned, checksum-verified gitleaks binary as the `pr-quality` security
+tier scans the whole history. Findings surface three ways, in order of
+applicability:
+
+1. **`gitleaks-history-sarif` build artifact** — uploaded on every run, so
+   findings are retrievable on a **private repo with no GHAS**.
+2. **Job summary** — a finding count with remediation guidance.
+3. **Code Scanning upload** — only on **public / GHAS** repos
+   (`repository.visibility == 'public'`); skipped on private so the signal
+   workflow stays green.
+
+It carries **no secrets contract** (`secrets: inherit` is harmless; the scan
+needs none) and does **not** replace the blocking PR-time scan — keep
+`enable-security: true` on `pr-quality.yml`. This is defence-in-depth on top of
+it.
 
 ---
 
