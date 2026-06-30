@@ -63,4 +63,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/check-pin-drift.mjs ${STRICT}
+          # STRICT is either empty or "--strict". Pass it only when set so the
+          # empty case adds no argument — shellcheck SC2086-clean and safe under
+          # `set -u` (no array expansion that an empty array would trip on).
+          if [ -n "$STRICT" ]; then
+            node scripts/check-pin-drift.mjs "$STRICT"
+          else
+            node scripts/check-pin-drift.mjs
+          fi
