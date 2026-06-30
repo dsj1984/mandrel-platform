@@ -1,0 +1,121 @@
+{
+  "$schema": "https://raw.githubusercontent.com/sverweij/dependency-cruiser/main/src/schema/configuration.schema.json",
+  "forbidden": [
+    {
+      "name": "no-circular",
+      "comment": "Circular dependencies make code hard to reason about and refactor. Break the cycle by extracting the shared part, or invert a dependency.",
+      "severity": "error",
+      "from": {},
+      "to": { "circular": true }
+    },
+    {
+      "name": "no-orphans",
+      "comment": "Orphan modules (imported by nothing, importing nothing relevant) are usually dead code. Remove them, or add to the ignore list if intentional.",
+      "severity": "warn",
+      "from": {
+        "orphan": true,
+        "pathNot": [
+          "(^|/)\\.[^/]+\\.(js|cjs|mjs|ts|cts|mts|json)$",
+          "\\.d\\.ts$",
+          "(^|/)tsconfig\\.json$",
+          "(^|/)(babel|webpack)\\.config\\.(js|cjs|mjs|ts|json)$"
+        ]
+      },
+      "to": {}
+    },
+    {
+      "name": "no-deprecated-core",
+      "comment": "Deprecated Node core modules will be removed in a future Node release. Migrate to the documented replacement.",
+      "severity": "error",
+      "from": {},
+      "to": {
+        "dependencyTypes": ["core"],
+        "path": ["^v8/tools/codemap$", "^node-inspect/lib/_inspect$", "^punycode$", "^domain$", "^constants$", "^sys$", "^_linklist$", "^_stream_wrap$"]
+      }
+    },
+    {
+      "name": "not-to-deprecated",
+      "comment": "This module uses a (version of an) npm module marked as deprecated. Upgrade to a non-deprecated version.",
+      "severity": "warn",
+      "from": {},
+      "to": { "dependencyTypes": ["deprecated"] }
+    },
+    {
+      "name": "no-non-package-json",
+      "comment": "This module depends on an npm package not in package.json. Add it as a dependency to keep installs reproducible.",
+      "severity": "error",
+      "from": {},
+      "to": {
+        "dependencyTypes": ["npm-no-pkg", "npm-unknown"]
+      }
+    },
+    {
+      "name": "not-to-unresolvable",
+      "comment": "This module depends on something that cannot be resolved on disk. Fix the import path or install the missing dependency.",
+      "severity": "error",
+      "from": {},
+      "to": { "couldNotResolve": true }
+    },
+    {
+      "name": "no-duplicate-dep-types",
+      "comment": "A module is in more than one dependency-type bucket (e.g. both dependencies and devDependencies). Consolidate to a single bucket.",
+      "severity": "warn",
+      "from": {},
+      "to": {
+        "moreThanOneDependencyType": true,
+        "dependencyTypesNot": ["type-only"]
+      }
+    },
+    {
+      "name": "not-to-dev-dep",
+      "comment": "Production code must not depend on a devDependency. Move the package to dependencies, or move the importing code into a non-shipped path.",
+      "severity": "error",
+      "from": {
+        "path": "^(src)",
+        "pathNot": "\\.(spec|test)\\.(js|mjs|cjs|ts|mts|cts)$"
+      },
+      "to": {
+        "dependencyTypes": ["npm-dev"],
+        "dependencyTypesNot": ["type-only"],
+        "pathNot": ["node_modules/@types/"]
+      }
+    },
+    {
+      "name": "optional-deps-used",
+      "comment": "An optionalDependency is required without a guarded fallback. Either make the require optional or promote it to a regular dependency.",
+      "severity": "info",
+      "from": {},
+      "to": {
+        "dependencyTypes": ["npm-optional"]
+      }
+    },
+    {
+      "name": "peer-deps-used",
+      "comment": "This module depends on a peerDependency, which is brittle. Inject it as a parameter instead.",
+      "severity": "warn",
+      "from": {},
+      "to": {
+        "dependencyTypes": ["npm-peer"]
+      }
+    }
+  ],
+  "options": {
+    "doNotFollow": {
+      "path": ["node_modules"]
+    },
+    "tsConfig": {
+      "fileName": "tsconfig.json"
+    },
+    "tsPreCompilationDeps": true,
+    "enhancedResolveOptions": {
+      "exportsFields": ["exports"],
+      "conditionNames": ["import", "require", "node", "default", "types"],
+      "mainFields": ["module", "main", "types", "typings"]
+    },
+    "reporterOptions": {
+      "text": {
+        "highlightFocused": true
+      }
+    }
+  }
+}
