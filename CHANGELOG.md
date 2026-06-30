@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.14.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.13.0...mandrel-platform-v0.14.0) (2026-06-30)
+
+
+### Added
+
+* **ci:** action-pin ratchet + harden-runner egress audit in shared workflows (refs [#112](https://github.com/dsj1984/mandrel-platform/issues/112)) ([#130](https://github.com/dsj1984/mandrel-platform/issues/130)) ([2726753](https://github.com/dsj1984/mandrel-platform/commit/2726753ea610c2dc73aae6bc7e3229843a4fde70))
+* **ci:** couple npm config-package version to workflow uses: pin with minimumReleaseAge awareness (refs [#107](https://github.com/dsj1984/mandrel-platform/issues/107)) ([#122](https://github.com/dsj1984/mandrel-platform/issues/122)) ([0558c4a](https://github.com/dsj1984/mandrel-platform/commit/0558c4acc88d164615879c97c96e674418940037))
+* **ci:** lint stale platform-ref pin literals beyond uses: lines (refs [#110](https://github.com/dsj1984/mandrel-platform/issues/110)) ([#127](https://github.com/dsj1984/mandrel-platform/issues/127)) ([abbf023](https://github.com/dsj1984/mandrel-platform/commit/abbf02347e66efdb2fa3e253c174ffe60836ca6b))
+* **ci:** optional coverage-threshold gate in pr-quality.yml ([#109](https://github.com/dsj1984/mandrel-platform/issues/109)) ([#125](https://github.com/dsj1984/mandrel-platform/issues/125)) ([75aa291](https://github.com/dsj1984/mandrel-platform/commit/75aa2913f06d0538c30fc7e16d056f0bea59519d))
+* **ci:** platformize the destructive-migration label guard as a reusable unit (refs [#111](https://github.com/dsj1984/mandrel-platform/issues/111)) ([#129](https://github.com/dsj1984/mandrel-platform/issues/129)) ([3a435a6](https://github.com/dsj1984/mandrel-platform/commit/3a435a678237cc4fce281e04b8403be206b0829c))
+* **ci:** scheduled platform-sync repair-PR loop (close detect→repair) (refs [#113](https://github.com/dsj1984/mandrel-platform/issues/113)) ([#126](https://github.com/dsj1984/mandrel-platform/issues/126)) ([5f2a4cb](https://github.com/dsj1984/mandrel-platform/commit/5f2a4cb83fc0be4cffea8b53ab4c89aee15a521b))
+* **config:** ship shared code-quality tooling base configs (refs [#115](https://github.com/dsj1984/mandrel-platform/issues/115)) ([#118](https://github.com/dsj1984/mandrel-platform/issues/118)) ([4de2046](https://github.com/dsj1984/mandrel-platform/commit/4de204678e8a336aa80c8cb582b7a2bbd1021553))
+* **release:** add reusable consumer release-automation workflow (refs [#117](https://github.com/dsj1984/mandrel-platform/issues/117)) ([#124](https://github.com/dsj1984/mandrel-platform/issues/124)) ([72d1cc1](https://github.com/dsj1984/mandrel-platform/commit/72d1cc1b44b403930283b3d92ee61008ac4ddaf8))
+* **release:** npm provenance + OIDC trusted publishing (refs [#106](https://github.com/dsj1984/mandrel-platform/issues/106)) ([#120](https://github.com/dsj1984/mandrel-platform/issues/120)) ([e85b998](https://github.com/dsj1984/mandrel-platform/commit/e85b9985cd0d74032a8f4949371f906166155f93))
+* **security:** add OSV-scanner advisory tier to pr-quality.yml (refs [#114](https://github.com/dsj1984/mandrel-platform/issues/114)) ([#131](https://github.com/dsj1984/mandrel-platform/issues/131)) ([163a021](https://github.com/dsj1984/mandrel-platform/commit/163a0211691f1a6b585d1908f63c82fabc22009b))
+* **security:** reusable edge-security middleware units (refs [#116](https://github.com/dsj1984/mandrel-platform/issues/116)) ([#123](https://github.com/dsj1984/mandrel-platform/issues/123)) ([c63b608](https://github.com/dsj1984/mandrel-platform/commit/c63b608ea8bb1af22d3e684d1751b09997803e6f))
+
 ## [0.13.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.12.0...mandrel-platform-v0.13.0) (2026-06-30)
 
 
