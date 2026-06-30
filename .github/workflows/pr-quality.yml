@@ -737,7 +737,14 @@ jobs:
 
           # `--diff-filter` keeps Added/Copied/Modified/Renamed/Deleted; a
           # DELETED migration is itself a destructive signal, so we keep D.
-          mapfile -t changed < <(git diff --name-only --diff-filter=ACMRD "${BASE_SHA}" "${HEAD_SHA}")
+          # `mapfile` is a bash4+ builtin; self-hosted macOS runners ship
+          # Apple's frozen bash 3.2, so build the array with a portable
+          # `while read -r` loop instead (same pattern as the prior bash-3.2
+          # compatibility fixes for the Semgrep SAST tier).
+          changed=()
+          while IFS= read -r line; do
+            changed+=("$line")
+          done < <(git diff --name-only --diff-filter=ACMRD "${BASE_SHA}" "${HEAD_SHA}")
 
           # Build a regex of `migration-guard-globs` (comma-separated), where
           # `**`→`.*` and `*`→`[^/]*`, plus an always-on `\.sql$` tail. Only
