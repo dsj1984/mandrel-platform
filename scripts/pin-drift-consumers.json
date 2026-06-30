@@ -1,6 +1,8 @@
 {
   "$comment": "Data-driven consumer registry for scripts/check-pin-drift.mjs (Story #67, MP-12). Each entry is one downstream repo that pins mandrel-platform reusable workflows / composite actions via `uses: dsj1984/mandrel-platform/...@<sha>`. Adding a new consumer is a single object here — the drift checker enumerates `.github/workflows/*` and reads `package.json` in each repo over the GitHub API, extracts every mandrel-platform `uses:` pin plus the `mandrel-platform` npm dependency version, and asserts a single SHA per consumer plus lag (and surface skew between the workflow and npm surfaces) vs the latest mandrel-platform release. `branch` is optional (defaults to the repo's default branch).",
+  "$comment_minimumReleaseAge": "Renovate supply-chain hold window (Story #107). For this many time after a platform release, EVERY consumer legitimately lags the new tag because Renovate has not raised the bump PR yet. The checker suppresses lag/skew that is fully explained by this hold (reported as `holding`, not drift) so a fresh release does not page on every consumer. Keep this in lockstep with `minimumReleaseAge` in the shared Renovate preset (default.json) — currently `3 days`. A split pin is a real error and is NEVER suppressed by the hold.",
   "platformRepo": "dsj1984/mandrel-platform",
+  "minimumReleaseAge": "3 days",
   "consumers": [
     {
       "name": "domio",
