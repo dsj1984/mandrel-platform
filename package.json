@@ -3,6 +3,14 @@
   "version": "0.14.1",
   "description": "Shared CI/deploy workflows, composite toolchain action, npm config package, Renovate preset, and operator runbook templates.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dsj1984/mandrel-platform.git"
+  },
+  "homepage": "https://github.com/dsj1984/mandrel-platform#readme",
+  "bugs": {
+    "url": "https://github.com/dsj1984/mandrel-platform/issues"
+  },
   "packageManager": "pnpm@11.5.2",
   "engines": {
     "node": "24.16.0",
