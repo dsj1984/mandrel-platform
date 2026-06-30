@@ -3,6 +3,10 @@
 Shared CI/deploy workflows, composite toolchain action, npm config package,
 Renovate preset, and operator runbook templates for the Mandrel platform.
 
+**Docs:** [reusable-workflows.md](docs/reusable-workflows.md) (the `workflow_call`
+contract) · [decisions.md](docs/decisions.md) (decision log). Status, the
+consumer convergence matrix, and the forward roadmap are tracked privately.
+
 ---
 
 ## Reusable workflows

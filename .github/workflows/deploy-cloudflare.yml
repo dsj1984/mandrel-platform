@@ -49,7 +49,7 @@
 # the build-artifact input (Story #56), so no build secret reaches this workflow.
 # build-command stays (now secretless; build-env carries plaintext public values).
 #
-# SHA-pinned third-party actions per roadmap.md.
+# SHA-pinned third-party actions.
 name: Deploy Cloudflare
 
 on:

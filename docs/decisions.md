@@ -58,3 +58,52 @@ repo, AI-driven or not. Consumers get drift-repair as one command instead of a
 manual checklist. Cost: the CLI must track the `uses:` slug and the SSOT
 extends-targets, which are now asserted by `scripts/platform-sync.test.mjs`
 (wired into `npm test`).
+
+## 2026-06-29 — Defer v1.0 and the `@v1` floating tag indefinitely
+
+**Context.** MP-13 ([#68](https://github.com/dsj1984/mandrel-platform/issues/68))
+was originally framed as "v1.0 stabilization": freeze the public `workflow_call`
+input/secret contract, cut a v1.0 release, publish a floating `@v1` tag, and
+commit to a SemVer deprecation policy so consumers could pin `@v1` instead of
+raw SHAs. The contract was still actively growing through v0.11.x (the SAST
+tier added inputs across the #76–#97 hardening track), so freezing it would have
+locked in a contract that was mid-change.
+
+**Decision.** Re-scope MP-13 to **documentation only**
+([`reusable-workflows.md`](reusable-workflows.md)) and **defer the v1.0 cut,
+the `@v1` tag, and the deprecation policy indefinitely**. The platform stays on
+`0.x`. Consumers pin per-release SHAs, auto-bumped by Renovate (MP-11) and
+tracked by the pin-drift dashboard (MP-12). Re-evaluate only when the trip-wire
+fires: a 4th, non-co-evolved consumer onboards cleanly against the documented
+contract.
+
+**Consequences.** Freedom to evolve the contract without a deprecation
+obligation; no churn from a premature freeze. Cost: consumers manage per-release
+pins rather than a stable floating ref, and the SemVer-stability signal is
+deferred. Recorded here because the prior v1.0 framing kept resurfacing in
+planning docs; this entry is the durable record.
+
+## 2026-06-29 — Keep `mandrel` and `mandrel-platform` separate (no CI coupling)
+
+**Context.** The two siblings are conceptually paired — `mandrel` (the `.agents/`
+AI-harness) governs *agent behaviour*, `mandrel-platform` governs *delivery* —
+and mandrel-platform is itself a mandrel consumer (it vendors a pinned `.agents/`
+tree). A natural-looking "synergy" step would be to make the framework dogfood
+the platform's reusable workflows (e.g. its security tier) and to converge the
+two `sync`/`update` CLIs onto shared conventions. The question was whether to
+pursue that coupling.
+
+**Decision.** **Keep them separate.** The framework's CI evolves independently
+and is **not** asked to adopt mandrel-platform's reusable workflows, share its
+`platform-sync` CLI conventions, or cross-wire enforcement. The only seam is the
+existing one-directional, bootstrap-aware consumption: mandrel-platform vendors a
+pinned `.agents/` tree and always excludes it from the shared SAST
+([#93](https://github.com/dsj1984/mandrel-platform/issues/93)).
+
+**Consequences.** Zero coupling between the two release streams and blast radii;
+each project stays independently consumable and independently releasable. Cost:
+the platform's most credible dogfood target never exercises it, and policy
+guidance (`security-baseline.md`) and CI enforcement (the security tier) are not
+cross-linked. Accepted deliberately — good synergy here is the clean boundary,
+not entanglement. Recorded so the absence of synergy/dogfooding tickets is not
+read as an oversight.
