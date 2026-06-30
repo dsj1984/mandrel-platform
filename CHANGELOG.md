@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.7](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.6...mandrel-platform-v0.11.7) (2026-06-30)
+
+
+### Fixed
+
+* **security:** make SAST Semgrep pip fallback hermetic via ephemeral venv (refs [#92](https://github.com/dsj1984/mandrel-platform/issues/92)) ([#97](https://github.com/dsj1984/mandrel-platform/issues/97)) ([fe69815](https://github.com/dsj1984/mandrel-platform/commit/fe6981596b8214eec2b066bc1962558fd83d08e9))
+
 ## [0.11.6](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.5...mandrel-platform-v0.11.6) (2026-06-30)
 
 
