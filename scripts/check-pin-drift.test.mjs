@@ -28,6 +28,9 @@ import {
   extractNpmPlatformVersion,
   fetchConsumerPackageJson,
   hasDrift,
+  isHolding,
+  isWithinReleaseAgeWindow,
+  parseDurationMs,
   parseSemver,
   renderReport,
   runCli,
@@ -170,6 +173,100 @@ test("combineDrift folds uses-drift, npm-lag, and surface-skew", () => {
   assert.equal(combineDrift({ drift: true }, { npmState: "current" }, false), true);
 });
 
+test("combineDrift suppresses lag/skew during the minimumReleaseAge hold", () => {
+  const lagging = { drift: true, splitPinned: false };
+  // Without the hold flag, lag is drift.
+  assert.equal(combineDrift(lagging, { npmState: "lagging" }, false, false), true);
+  // Within the hold window, the same lag/skew is suppressed.
+  assert.equal(combineDrift(lagging, { npmState: "lagging" }, false, true), false);
+  assert.equal(
+    combineDrift({ drift: false, splitPinned: false }, { npmState: "current" }, true, true),
+    false,
+  );
+});
+
+test("combineDrift never suppresses a split pin, even within the hold window", () => {
+  const split = { drift: true, splitPinned: true };
+  assert.equal(combineDrift(split, { npmState: "current" }, false, true), true);
+});
+
+// ---------------------------------------------------------------------------
+// parseDurationMs — Renovate-style minimumReleaseAge strings (Story #107)
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+test("parseDurationMs parses days / hours / weeks / minutes", () => {
+  assert.equal(parseDurationMs("3 days"), 3 * DAY_MS);
+  assert.equal(parseDurationMs("1 day"), DAY_MS);
+  assert.equal(parseDurationMs("36 hours"), 36 * 60 * 60 * 1000);
+  assert.equal(parseDurationMs("1 week"), 7 * DAY_MS);
+  assert.equal(parseDurationMs("90 minutes"), 90 * 60 * 1000);
+});
+
+test("parseDurationMs treats a bare number as days and rejects junk", () => {
+  assert.equal(parseDurationMs(3), 3 * DAY_MS);
+  assert.equal(parseDurationMs("0 days"), null);
+  assert.equal(parseDurationMs("-2 days"), null);
+  assert.equal(parseDurationMs("soon"), null);
+  assert.equal(parseDurationMs(""), null);
+  assert.equal(parseDurationMs(null), null);
+  assert.equal(parseDurationMs("5 fortnights"), null);
+});
+
+// ---------------------------------------------------------------------------
+// isWithinReleaseAgeWindow
+// ---------------------------------------------------------------------------
+
+test("isWithinReleaseAgeWindow is true for a release younger than the window", () => {
+  const now = Date.parse("2026-06-30T00:00:00Z");
+  const oneDayAgo = "2026-06-29T00:00:00Z";
+  assert.equal(isWithinReleaseAgeWindow(oneDayAgo, 3 * DAY_MS, now), true);
+});
+
+test("isWithinReleaseAgeWindow is false once the release ages past the window", () => {
+  const now = Date.parse("2026-06-30T00:00:00Z");
+  const fourDaysAgo = "2026-06-26T00:00:00Z";
+  assert.equal(isWithinReleaseAgeWindow(fourDaysAgo, 3 * DAY_MS, now), false);
+});
+
+test("isWithinReleaseAgeWindow fails safe (false) on missing inputs", () => {
+  const now = Date.parse("2026-06-30T00:00:00Z");
+  assert.equal(isWithinReleaseAgeWindow(null, 3 * DAY_MS, now), false);
+  assert.equal(isWithinReleaseAgeWindow("2026-06-29T00:00:00Z", null, now), false);
+  assert.equal(isWithinReleaseAgeWindow("not-a-date", 3 * DAY_MS, now), false);
+  assert.equal(isWithinReleaseAgeWindow("2026-06-29T00:00:00Z", 0, now), false);
+});
+
+// ---------------------------------------------------------------------------
+// isHolding
+// ---------------------------------------------------------------------------
+
+test("isHolding is true when lag would drift but the release is inside the window", () => {
+  assert.equal(
+    isHolding({ drift: true, splitPinned: false }, { npmState: "lagging" }, true, true),
+    true,
+  );
+});
+
+test("isHolding is false outside the window, for a clean consumer, or a split pin", () => {
+  // Outside the window — the lag is real drift, not a hold.
+  assert.equal(
+    isHolding({ drift: true, splitPinned: false }, { npmState: "lagging" }, false, false),
+    false,
+  );
+  // No deviation to suppress.
+  assert.equal(
+    isHolding({ drift: false, splitPinned: false }, { npmState: "current" }, false, true),
+    false,
+  );
+  // A split pin is a real error regardless of the hold.
+  assert.equal(
+    isHolding({ drift: true, splitPinned: true }, { npmState: "current" }, false, true),
+    false,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Integration: buildReport + renderReport with an injected gh runner
 // ---------------------------------------------------------------------------
@@ -203,7 +300,10 @@ function makeRunGh(fixtures) {
   return (args) => {
     const path = args[1];
     if (path === `repos/${PLATFORM}/releases/latest`) {
-      return JSON.stringify({ tag_name: TAG });
+      // `publishedAt` is opt-in: existing fixtures omit it (so the
+      // minimumReleaseAge window resolves to "not within", preserving legacy
+      // behaviour); the hold-window tests pass it explicitly.
+      return JSON.stringify({ tag_name: TAG, published_at: fixtures.__publishedAt });
     }
     if (path === `repos/${PLATFORM}/git/ref/tags/${TAG}`) {
       return JSON.stringify({ object: { sha: LATEST_SHA, type: "commit" } });
@@ -362,6 +462,108 @@ test("runCli --strict exits 1 when drift is present", () => {
       stdout: capture(),
       stderr: capture(),
       summaryPath: undefined,
+    });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// minimumReleaseAge hold window — the false-positive guard (Story #107)
+// ---------------------------------------------------------------------------
+
+// A fresh release: the `skew` and `both-lag` consumers lag it, but the release
+// is younger than the 3-day hold window, so Renovate has not bumped them yet.
+const FRESH_RELEASE_AT = "2026-06-29T00:00:00Z"; // 1 day before NOW
+const AGED_RELEASE_AT = "2026-06-25T00:00:00Z"; // 5 days before NOW
+const NOW = Date.parse("2026-06-30T00:00:00Z");
+
+const HOLD_CONFIG = { ...CONFIG, minimumReleaseAge: "3 days" };
+
+test("buildReport: lag against a release inside the hold window is holding, not drift", () => {
+  const runGh = makeRunGh({ ...FIXTURES, __publishedAt: FRESH_RELEASE_AT });
+  const report = buildReport(HOLD_CONFIG, runGh, NOW);
+  assert.equal(report.releaseAge.withinWindow, true);
+
+  // npm lags but workflows are current → would be a surface skew, suppressed.
+  const skew = byName(report, "skew");
+  assert.equal(skew.surfaceSkew, true);
+  assert.equal(skew.holding, true);
+  assert.equal(skew.drift, false);
+
+  // Both surfaces lag → would be drift, suppressed during the hold.
+  const both = byName(report, "both-lag");
+  assert.equal(both.holding, true);
+  assert.equal(both.drift, false);
+
+  // The aligned consumer is genuinely current — not holding.
+  const aligned = byName(report, "aligned");
+  assert.equal(aligned.holding, false);
+  assert.equal(aligned.drift, false);
+
+  // No consumer drifts during the hold → the dashboard does not page.
+  assert.equal(hasDrift(report), false);
+});
+
+test("buildReport: the same lag against an aged release is real drift again", () => {
+  const runGh = makeRunGh({ ...FIXTURES, __publishedAt: AGED_RELEASE_AT });
+  const report = buildReport(HOLD_CONFIG, runGh, NOW);
+  assert.equal(report.releaseAge.withinWindow, false);
+
+  const skew = byName(report, "skew");
+  assert.equal(skew.holding, false);
+  assert.equal(skew.drift, true);
+
+  const both = byName(report, "both-lag");
+  assert.equal(both.holding, false);
+  assert.equal(both.drift, true);
+
+  assert.equal(hasDrift(report), true);
+});
+
+test("renderReport surfaces the holding banner + section during the hold", () => {
+  const runGh = makeRunGh({ ...FIXTURES, __publishedAt: FRESH_RELEASE_AT });
+  const report = buildReport(HOLD_CONFIG, runGh, NOW);
+  const text = renderReport(report);
+  assert.match(text, /minimumReleaseAge` hold active/);
+  assert.match(text, /⏳ holding/);
+  assert.match(text, /Holding \(minimumReleaseAge\)/);
+  // Held consumers must NOT appear in a "Drift detected" section.
+  assert.doesNotMatch(text, /Drift detected/);
+});
+
+test("runCli --strict does NOT exit 1 when the only deviation is a hold", () => {
+  cfgDir = mkdtempSync(join(tmpdir(), "pin-drift-hold-"));
+  const p = join(cfgDir, "consumers.json");
+  writeFileSync(p, JSON.stringify(HOLD_CONFIG));
+  try {
+    const code = runCli({
+      argv: ["--config", p, "--strict"],
+      runGh: makeRunGh({ ...FIXTURES, __publishedAt: FRESH_RELEASE_AT }),
+      stdout: capture(),
+      stderr: capture(),
+      summaryPath: undefined,
+      nowMs: NOW, // release is 1 day old → inside the 3-day hold window.
+    });
+    assert.equal(code, 0);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
+test("runCli --strict DOES exit 1 once the held release ages out", () => {
+  cfgDir = mkdtempSync(join(tmpdir(), "pin-drift-aged-"));
+  const p = join(cfgDir, "consumers.json");
+  writeFileSync(p, JSON.stringify(HOLD_CONFIG));
+  try {
+    const code = runCli({
+      argv: ["--config", p, "--strict"],
+      runGh: makeRunGh({ ...FIXTURES, __publishedAt: AGED_RELEASE_AT }),
+      stdout: capture(),
+      stderr: capture(),
+      summaryPath: undefined,
+      nowMs: NOW, // release is 5 days old → past the 3-day hold window.
     });
     assert.equal(code, 1);
   } finally {

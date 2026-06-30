@@ -370,6 +370,13 @@ The platform stays on `0.x`. The contract guarantees today are:
 - **Portability lint** — `scripts/check-workflow-portability.mjs` guards the
   cross-repo references so a pin can never land on a commit whose manifest
   carries a `${{ }}` expression footgun.
+- **Two-surface drift coupling** — the platform also ships as an npm config
+  package (`mandrel-platform` in `package.json`: `tsconfig.base.json`,
+  `biome.base.json`, the Renovate preset). The standing
+  [pin-drift dashboard](runbooks/pin-drift-dashboard.md) asserts a consumer's
+  workflow `uses:` tag and its `mandrel-platform` npm minor do **not** diverge
+  undetected — while treating the transient skew during the Renovate
+  **`minimumReleaseAge`** hold (3 days post-release) as expected, not drift.
 
 > **`v1.0` / `@v1` is deferred — not planned.** Cutting a `v1.0` release,
 > publishing a moving `@v1` major tag, and `@v1`-style major-tag pinning are a
