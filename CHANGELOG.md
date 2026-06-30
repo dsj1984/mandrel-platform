@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.6](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.5...mandrel-platform-v0.11.6) (2026-06-30)
+
+
+### Fixed
+
+* **security:** exclude vendored .agents/ from the shared SAST (refs [#93](https://github.com/dsj1984/mandrel-platform/issues/93)) ([#94](https://github.com/dsj1984/mandrel-platform/issues/94)) ([53f76eb](https://github.com/dsj1984/mandrel-platform/commit/53f76eb98318c0ded84d8746882096e6c8c625d9))
+
 ## [0.11.5](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.4...mandrel-platform-v0.11.5) (2026-06-29)
 
 
