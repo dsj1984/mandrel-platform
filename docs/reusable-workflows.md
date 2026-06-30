@@ -40,7 +40,7 @@ A tiered PR-quality pipeline, consumable as a `workflow_call` target by any
 consumer repo. Tiers run in this order:
 
 ```text
-lint + format-check → typecheck → unit → contract → e2e/smoke → migration-guard → security
+lint + format-check → typecheck → unit → contract → e2e/smoke → migration-guard → security → osv-scan
 ```
 
 Every tier is independently enable-toggled, so a repo can opt out of tiers it
@@ -90,6 +90,9 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `toolchain-cache`  | string  | `'true'`         | Passed through to `setup-toolchain`'s `cache` input. Set `'false'` on self-hosted runners with a warm pnpm store.                              |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
 | `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest`; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
+| `enable-osv-scan`  | boolean | `true`           | Enable the OSV-scanner advisory tier (scans the lockfile/manifest tree for known dependency advisories via a pinned, checksum-verified binary; no SARIF/GHAS). Set `false` to skip. See [OSV advisory tier](#osv-advisory-tier-enable-osv-scan).                                  |
+| `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
+| `osv-scanner-version` | string | `'2.4.0'`     | Pinned OSV-scanner release version (no leading `v`) for the advisory tier. Bump deliberately; the per-platform asset checksum is pinned to match.                                                                                                                              |
 
 > **Sharding contract.** `shards` and `shard-matrix` must agree. `shards` sets
 > the denominator passed to the test runner (`--shard=<n>/<shards>`);
@@ -246,6 +249,77 @@ guard on *its own* workflows copies `scripts/check-action-pins.mjs` into its
 The exact classification (third-party vs first-party vs local vs `docker://`)
 and the 40-char-SHA assertion are unit-tested in
 `scripts/check-action-pins.{mjs,test.mjs}` on the platform repo.
+
+### OSV advisory tier (`enable-osv-scan`)
+
+A **dependency-advisory tier** that scans the lockfile/manifest tree for known
+advisories and gates the PR on findings at or above a configurable severity.
+
+**Why it exists.** Renovate *bumps* dependency versions but never alerts on
+advisories for versions sitting **un-bumped** — inside its `minimumReleaseAge`
+hold or behind a major-version gate — leaving a window with **no live CVE
+signal**. This tier closes that window. It is the **third security signal**
+alongside the [secret scan and SAST](#security-tier-enable-security--enable-sast)
+sub-steps of the security tier.
+
+**Private-repo-capable, no GHAS.** Like the secret/SAST tiers, the OSV-scan job
+runs a **pinned, checksum-verified binary** directly (`osv-scanner scan source
+-r .`) and surfaces findings in the **run log + job summary** — **no SARIF /
+Code Scanning upload**, so the gate is load-bearing on a **private repo with no
+GitHub Advanced Security**. (This is the same constraint that made gitleaks and
+Semgrep the chosen gates over CodeQL.) The per-platform asset (darwin/linux ×
+amd64/arm64) is verified against a **pinned SHA-256** before execution.
+
+It is **on by default** (`enable-osv-scan: true`). When enabled, the `osv-scan`
+job is a [`needs:` of `ci-required`](#the-ci-required-aggregator), so it is
+**branch-protection-load-bearing** through the single aggregator context — no
+new required check to register.
+
+#### Severity-to-gate behaviour (`osv-fail-on-severity`)
+
+OSV-scanner's own exit code is non-zero on **any** advisory regardless of
+severity. This tier does **not** gate on that coarse exit code — instead it
+emits JSON, buckets each advisory's **CVSS base score** (the OSV group's
+`max_severity`) into a severity band, and decides the gate from
+`osv-fail-on-severity` (default **`high`**):
+
+| Band       | CVSS base score | Fails the tier when `osv-fail-on-severity` is… |
+| ---------- | --------------- | ---------------------------------------------- |
+| `critical` | ≥ 9.0           | `critical`, `high`, `medium`, `low`, `none`    |
+| `high`     | ≥ 7.0           | `high`, `medium`, `low`, `none`                |
+| `medium`   | ≥ 4.0           | `medium`, `low`, `none`                        |
+| `low`      | > 0             | `low`, `none`                                  |
+| `none`     | unscored        | `none` only                                    |
+
+- A finding **at or above** the configured band **fails the `osv-scan` job**
+  (and therefore `ci-required`, blocking the merge).
+- A finding **below** the band is reported as a **warning** in the job summary
+  — it never blocks.
+- Set `osv-fail-on-severity: critical` to gate on criticals only; set `none` to
+  fail on **any** advisory including unscored ones (strictest).
+- A repo with **no recognized lockfile/manifest** is a **no-op pass** (nothing
+  to advise on).
+
+Every run writes a markdown advisory table (severity, CVSS score, advisory id,
+package, version, source) to the **job summary** and the run log, so findings
+are visible with no GHAS dependency.
+
+> **Out of scope.** This tier does **not** auto-remediate advisories — Renovate
+> already owns version bumping. It is the *signal*; the *fix* is a Renovate (or
+> manual) bump. A `dependabot.yml` template is **not** shipped (OSV is
+> vendor-neutral and works on private-no-GHAS repos, the deciding constraint).
+
+> **Minimal opt-out / tuning caller.**
+>
+> ```yaml
+> jobs:
+>   pr-quality:
+>     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+>     with:
+>       # osv-fail-on-severity: critical   # gate on criticals only (default: high)
+>       # enable-osv-scan: false           # opt out of the advisory tier entirely
+>     secrets: inherit
+> ```
 
 ### Destructive-migration guard (`enable-migration-guard`)
 
