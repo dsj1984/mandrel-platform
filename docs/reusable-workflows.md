@@ -168,11 +168,29 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `workflow_call` target. The jobs run in this order:
 
 ```text
-secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke
+secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
 ```
 
 `pre-migration-snapshot` and `migrate` only run when `migrate: true`;
 `boot-smoke` only runs when `smoke: true` (the default).
+
+### Resolved-ref deploy summary (single source of truth)
+
+> Story #110. The final `deploy-summary` job (`if: always()`) emits the
+> **runtime-resolved** ref of this reusable workflow into
+> `GITHUB_STEP_SUMMARY`: `github.job_workflow_sha` (the exact 40-hex commit the
+> caller's `uses: …/deploy-cloudflare.yml@<ref>` pin resolved to) and
+> `github.workflow_ref` (the full ref path). This is the **single source of
+> truth** for the executed pin.
+>
+> Consumers should **read the resolved SHA off this job summary** rather than
+> hand-maintaining a `deploy-cloudflare.yml@<sha>` literal echoed in their own
+> deploy-summary string. A hand-maintained literal drifts independently of the
+> real `uses:` pin and is exactly what the [pin-drift
+> dashboard](runbooks/pin-drift-dashboard.md)'s **stale pin literal** lint now
+> flags (`❌ stale pin literal`) — the resolved-ref summary makes the literal
+> unnecessary, so the lint finding is resolved by adoption, not by re-editing
+> the stale SHA by hand.
 
 ### Minimal caller
 
@@ -531,6 +549,11 @@ The platform stays on `0.x`. The contract guarantees today are:
   workflow `uses:` tag and its `mandrel-platform` npm minor do **not** diverge
   undetected — while treating the transient skew during the Renovate
   **`minimumReleaseAge`** hold (3 days post-release) as expected, not drift.
+- **Stale pin-literal lint** (Story #110) — the same dashboard also flags a
+  platform-ref SHA/tag echoed in a **comment** or a **`run:`/echo string** that
+  drifts from the canonical `uses:` pin (`❌ stale pin literal`), catching the
+  class the `uses:`-only scan missed. Adopt the resolved-ref deploy summary
+  (above) instead of hand-maintaining such a literal.
 
 > **`v1.0` / `@v1` is deferred — not planned.** Cutting a `v1.0` release,
 > publishing a moving `@v1` major tag, and `@v1`-style major-tag pinning are a

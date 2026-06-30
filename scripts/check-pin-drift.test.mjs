@@ -22,10 +22,12 @@ import { test } from "node:test";
 import {
   buildReport,
   classifyNpmPin,
+  classifyStaleLiterals,
   combineDrift,
   compareSemver,
   detectSurfaceSkew,
   extractNpmPlatformVersion,
+  extractStaleLiterals,
   fetchConsumerPackageJson,
   hasDrift,
   isHolding,
@@ -160,6 +162,82 @@ test("detectSurfaceSkew is false when either surface is not comparable", () => {
 });
 
 // ---------------------------------------------------------------------------
+// extractStaleLiterals / classifyStaleLiterals (Story #110)
+// ---------------------------------------------------------------------------
+
+const PLAT = "dsj1984/mandrel-platform";
+
+test("extractStaleLiterals finds platform refs in comments and run/echo strings", () => {
+  const text = [
+    "jobs:",
+    "  deploy:",
+    "    steps:",
+    `      # pinned via ${PLAT}/.github/workflows/deploy-cloudflare.yml@${"c".repeat(40)}`,
+    "      - name: summary",
+    "        run: |",
+    `          echo "deployed with ${PLAT}/.github/workflows/deploy-cloudflare.yml@v0.11.6"`,
+  ].join("\n");
+  const lits = extractStaleLiterals("ci.yml", text, PLAT);
+  assert.equal(lits.length, 2);
+  assert.equal(lits[0].kind, "comment");
+  assert.equal(lits[0].ref, "c".repeat(40));
+  assert.equal(lits[1].kind, "run");
+  assert.equal(lits[1].ref, "v0.11.6");
+});
+
+test("extractStaleLiterals ignores uses: lines (owned by extractPlatformPins)", () => {
+  const text = [
+    "jobs:",
+    "  q:",
+    `    uses: ${PLAT}/.github/workflows/pr-quality.yml@${"a".repeat(40)}`,
+    `    # uses: ${PLAT}/.github/workflows/pr-quality.yml@${"a".repeat(40)}`,
+  ].join("\n");
+  const lits = extractStaleLiterals("ci.yml", text, PLAT);
+  // The bare `uses:` line is skipped; the commented `# uses:` line is a comment
+  // literal (it is NOT a live uses directive), so it IS captured.
+  assert.equal(lits.length, 1);
+  assert.equal(lits[0].kind, "comment");
+});
+
+test("extractStaleLiterals returns nothing when no platform refs are present", () => {
+  const text = "jobs:\n  q:\n    run: echo hello\n    # owner/other-repo/x.yml@abc";
+  assert.deepEqual(extractStaleLiterals("ci.yml", text, PLAT), []);
+});
+
+test("classifyStaleLiterals flags a literal that drifts from the canonical pin", () => {
+  const canonicalSha = "a".repeat(40);
+  const staleSha = "c".repeat(40);
+  const literals = [
+    { file: "ci.yml", line: 9, target: PLAT, ref: staleSha, kind: "run" },
+    { file: "ci.yml", line: 4, target: PLAT, ref: canonicalSha, kind: "comment" },
+  ];
+  const out = classifyStaleLiterals(literals, [canonicalSha]);
+  assert.equal(out.hasStaleLiteral, true);
+  assert.equal(out.staleLiterals.length, 1);
+  assert.equal(out.staleLiterals[0].ref, staleSha);
+  assert.equal(out.staleLiterals[0].reason, "stale");
+});
+
+test("classifyStaleLiterals matches the canonical pin case-insensitively", () => {
+  const sha = "abc123" + "0".repeat(34);
+  const literals = [
+    { file: "ci.yml", line: 9, target: PLAT, ref: sha.toUpperCase(), kind: "run" },
+  ];
+  const out = classifyStaleLiterals(literals, [sha]);
+  assert.equal(out.hasStaleLiteral, false);
+  assert.equal(out.staleLiterals.length, 0);
+});
+
+test("classifyStaleLiterals reports an orphan literal when there is no canonical pin", () => {
+  const literals = [
+    { file: "ci.yml", line: 9, target: PLAT, ref: "v0.11.6", kind: "run" },
+  ];
+  const out = classifyStaleLiterals(literals, []);
+  assert.equal(out.hasStaleLiteral, true);
+  assert.equal(out.staleLiterals[0].reason, "orphan");
+});
+
+// ---------------------------------------------------------------------------
 // combineDrift
 // ---------------------------------------------------------------------------
 
@@ -188,6 +266,20 @@ test("combineDrift suppresses lag/skew during the minimumReleaseAge hold", () =>
 test("combineDrift never suppresses a split pin, even within the hold window", () => {
   const split = { drift: true, splitPinned: true };
   assert.equal(combineDrift(split, { npmState: "current" }, false, true), true);
+});
+
+test("combineDrift flags a stale literal even inside the hold window (Story #110)", () => {
+  const clean = { drift: false, splitPinned: false };
+  // No other deviation, but a stale literal is present → drift, hold or not.
+  assert.equal(
+    combineDrift(clean, { npmState: "current" }, false, true, true),
+    true,
+  );
+  // No stale literal and otherwise clean → not drift.
+  assert.equal(
+    combineDrift(clean, { npmState: "current" }, false, true, false),
+    false,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -405,6 +497,55 @@ test("renderReport surfaces the npm columns and drift lines", () => {
   assert.match(text, /npm\/uses skew/);
   // The aligned consumer renders its npm version in the table.
   assert.match(text, /`1\.4\.0`/);
+});
+
+test("buildReport: a stale pin literal beyond uses: is drift (Story #110)", () => {
+  const canonical = "a".repeat(40); // == LATEST_SHA, so uses: is current
+  const stale = "c".repeat(40);
+  const yaml = [
+    "jobs:",
+    "  deploy:",
+    `    uses: ${PLATFORM}/.github/workflows/deploy-cloudflare.yml@${canonical}`,
+    "  summary:",
+    "    steps:",
+    `      # legacy pin note: ${PLATFORM}/.github/workflows/deploy-cloudflare.yml@${stale}`,
+    "      - run: |",
+    `          echo "deployed ${PLATFORM}/.github/workflows/deploy-cloudflare.yml@${stale}"`,
+  ].join("\n");
+  const runGh = (args) => {
+    const path = args[1];
+    if (path === `repos/${PLATFORM}/releases/latest`) {
+      return JSON.stringify({ tag_name: TAG });
+    }
+    if (path === `repos/${PLATFORM}/git/ref/tags/${TAG}`) {
+      return JSON.stringify({ object: { sha: LATEST_SHA, type: "commit" } });
+    }
+    if (path === "repos/o/lit/contents/.github/workflows?ref=main") {
+      return JSON.stringify([
+        { type: "file", name: "ci.yml", encoding: "base64", content: b64(yaml) },
+      ]);
+    }
+    if (path === "repos/o/lit/contents/package.json?ref=main") {
+      return JSON.stringify({ encoding: "base64", content: b64(pkgJson("1.4.0")) });
+    }
+    throw new Error(`unexpected gh api path: ${path}`);
+  };
+  const report = buildReport(
+    { platformRepo: PLATFORM, consumers: [{ name: "lit", repo: "o/lit", branch: "main" }] },
+    runGh,
+  );
+  const r = byName(report, "lit");
+  // The uses: pin and npm dep are both current — the ONLY deviation is the
+  // stale echoed literal, which the uses:-only check would have missed.
+  assert.equal(r.verdict.lagState, "current");
+  assert.equal(r.npm.npmState, "current");
+  assert.equal(r.hasStaleLiteral, true);
+  assert.equal(r.staleLiterals.length, 2); // comment + echo, same stale SHA
+  assert.equal(r.staleLiterals.every((l) => l.reason === "stale"), true);
+  assert.equal(r.drift, true);
+  const text = renderReport(report);
+  assert.match(text, /stale pin literal/);
+  assert.match(text, /STALE PIN LITERAL/);
 });
 
 test("fetchConsumerPackageJson returns null when the file is missing", () => {
