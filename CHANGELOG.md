@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.14.2...mandrel-platform-v0.15.0) (2026-06-30)
+
+
+### Added
+
+* **security:** canonical pnpm supply-chain config for the fleet (refs [#133](https://github.com/dsj1984/mandrel-platform/issues/133)) ([#138](https://github.com/dsj1984/mandrel-platform/issues/138)) ([74d2080](https://github.com/dsj1984/mandrel-platform/commit/74d2080c89cd2f0348b9542fc96a75bbffd57201))
+* **security:** pin/vendor the Semgrep SAST ruleset (refs [#132](https://github.com/dsj1984/mandrel-platform/issues/132)) ([#140](https://github.com/dsj1984/mandrel-platform/issues/140)) ([ff4f995](https://github.com/dsj1984/mandrel-platform/commit/ff4f99515a53a8b79ffed0f203c0a934a8fc52dd))
+
 ## [0.14.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.14.1...mandrel-platform-v0.14.2) (2026-06-30)
 
 
