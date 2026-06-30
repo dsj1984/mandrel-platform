@@ -8,7 +8,7 @@
  * athportal, swarm-os) went undetected and undocumented: every consumer
  * pinned `pr-quality.yml@<shaA>` and `deploy-cloudflare.yml@<shaB>` — two
  * different release SHAs per repo, neither on the current platform release,
- * with no automated drift detection (roadmap.md §4.2 / §4.3). This script is
+ * with no automated drift detection. This script is
  * the standing check that surfaces it automatically.
  *
  * For each consumer in `scripts/pin-drift-consumers.json` it:

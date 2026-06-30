@@ -3,8 +3,8 @@
 > Story #67 / MP-12. A standing check that surfaces the split-pin /
 > release-lag state across mandrel-platform consumers automatically — across
 > both the workflow `uses:` pins **and** the `mandrel-platform` npm dependency
-> — so the drift that went undetected for several releases (roadmap.md
-> §4.2/§4.3) is caught the next time it happens.
+> — so the drift that went undetected for several releases is caught the next
+> time it happens.
 
 ## What it does
 

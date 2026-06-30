@@ -4,7 +4,7 @@
 # (domio, athportal, swarm-os — data-driven via scripts/pin-drift-consumers.json)
 # pins a SINGLE platform SHA across all of its workflow chains, and flags any
 # consumer lagging behind the latest mandrel-platform release. The split-pin /
-# release-lag state (roadmap.md §4.2/§4.3) went undetected for releases; this
+# release-lag state went undetected for releases; this
 # job surfaces it automatically and renders a human-readable dashboard on the
 # job summary.
 #
@@ -17,7 +17,7 @@
 # `⚠️ error` rows rather than failing the job (the dashboard is informational
 # by default; it does not gate).
 #
-# SHA-pinned third-party actions per roadmap.md.
+# SHA-pinned third-party actions.
 name: Pin Drift Dashboard
 
 on:

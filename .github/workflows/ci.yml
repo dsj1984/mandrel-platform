@@ -26,7 +26,7 @@
 #
 #   See docs/runbooks/branch-protection-setup.md for the full setup guide.
 #
-# SHA-pinned third-party actions per roadmap.md.
+# SHA-pinned third-party actions.
 name: CI
 
 on:
