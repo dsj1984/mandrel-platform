@@ -48,6 +48,19 @@
  *      split: npm `0.11.3` / workflows `@v0.11.6` / latest `v0.11.7` could not
  *      be distinguished from a fresh-release hold before this coupling existed.
  *
+ *   7. Lints **stale pin literals beyond `uses:` lines** (Story #110). A
+ *      platform-ref SHA/tag can live in a **comment** or a **`run:`/echo step
+ *      string** (e.g. a deploy-summary line that echoes a hand-maintained
+ *      `deploy-cloudflare.yml@<sha>` literal) and drift independently of the
+ *      real `uses:` pin — the `uses:`-only scan never saw it. The checker now
+ *      also extracts every loose platform-ref literal and flags any whose ref
+ *      no longer matches the consumer's canonical `uses:` pin (`stale`), or
+ *      that has no canonical pin to track at all (`orphan`). A stale literal is
+ *      a real configuration error and is never suppressed by the
+ *      `minimumReleaseAge` hold. The fix is to adopt the resolved-ref step
+ *      summary `deploy-cloudflare.yml` now emits (its `github.job_workflow_sha`
+ *      single source of truth) rather than maintaining the literal by hand.
+ *
  * Data-driven: a new consumer is one object in pin-drift-consumers.json.
  *
  * GitHub access is via the `gh` CLI (`gh api`), so the script inherits the
@@ -147,6 +160,93 @@ export function extractPlatformPins(file, text, platformRepo) {
     pins.push({ file, line: i + 1, target, ref });
   }
   return pins;
+}
+
+/**
+ * Extract every **non-`uses:`** platform-repo ref literal from one workflow
+ * file's text (Story #110). The `uses:`-only extractor above misses a stale
+ * SHA/tag that lives in a **comment** or a **`run:`/echo step string** — e.g. a
+ * deploy-summary line that echoes a hand-maintained
+ * `deploy-cloudflare.yml@<sha>` literal. Those literals drift independently of
+ * the real `uses:` pin and the `uses:`-only check never sees them.
+ *
+ * This scans every line, matches any `<platformRepo>/<subpath>@<ref>` token
+ * (with `ref` a 40-hex SHA or a non-whitespace tag), and SKIPS lines that are a
+ * `uses:` directive (those are owned by `extractPlatformPins`). The result is
+ * the set of "loose" platform-ref literals a consumer carries outside its
+ * canonical pin surface.
+ *
+ * @param {string} file       Display label for the file (path in the repo).
+ * @param {string} text       File contents.
+ * @param {string} platformRepo  e.g. "dsj1984/mandrel-platform".
+ * @returns {Array<{ file: string, line: number, target: string, ref: string, kind: 'comment' | 'run' }>}
+ */
+export function extractStaleLiterals(file, text, platformRepo) {
+  const literals = [];
+  const lines = text.split(/\r?\n/);
+  // `<platformRepo>/<subpath>@<ref>` where ref is a 40-hex SHA or a tag token.
+  // The subpath is required (a bare `<repo>@<ref>` is not a workflow/action
+  // literal we care about here) and the ref stops at whitespace/quote/comment.
+  const escapedRepo = platformRepo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const litRe = new RegExp(
+    `${escapedRepo}/[^\\s'"@]+@([0-9a-fA-F]{40}|[A-Za-z0-9._/-]+)`,
+    "g",
+  );
+  const usesRe = /^\s*(?:-\s*)?uses:\s*/;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    // `uses:` lines are owned by extractPlatformPins — never double-count them.
+    if (usesRe.test(line)) continue;
+    const commentIndex = line.indexOf("#");
+    let match;
+    litRe.lastIndex = 0;
+    while ((match = litRe.exec(line)) !== null) {
+      const ref = match[1];
+      const col = match.index;
+      // A literal inside a `#` comment is a comment-kind literal; otherwise it
+      // lives in a run:/echo/string body.
+      const kind =
+        commentIndex !== -1 && col > commentIndex ? "comment" : "run";
+      literals.push({ file, line: i + 1, target: platformRepo, ref, kind });
+    }
+  }
+  return literals;
+}
+
+/**
+ * Classify a consumer's loose platform-ref literals against its canonical
+ * `uses:` pin (Story #110). A literal is **stale** when it pins a ref the
+ * canonical `uses:` surface no longer pins — most commonly a hand-maintained
+ * echoed SHA in a deploy-summary string that lags the real pin. The canonical
+ * set is the consumer's distinct `uses:` refs (SHAs and tags); a literal whose
+ * ref is absent from that set is flagged.
+ *
+ * When the consumer has no canonical `uses:` pin to compare against (no
+ * platform `uses:` at all), every loose literal is reported as `orphan` — a
+ * platform-ref literal with no owning pin is itself a maintenance hazard.
+ *
+ * @param {Array<{ file: string, line: number, target: string, ref: string, kind: string }>} literals
+ * @param {string[]} canonicalRefs  Distinct refs from the consumer's `uses:` pins.
+ * @returns {{
+ *   staleLiterals: Array<{ file: string, line: number, ref: string, kind: string, reason: 'stale' | 'orphan' }>,
+ *   hasStaleLiteral: boolean,
+ * }}
+ */
+export function classifyStaleLiterals(literals, canonicalRefs) {
+  const canonical = new Set(canonicalRefs.map((r) => r.toLowerCase()));
+  const staleLiterals = [];
+  for (const lit of literals) {
+    const refLower = lit.ref.toLowerCase();
+    if (canonical.has(refLower)) continue; // matches the live pin — fine.
+    staleLiterals.push({
+      file: lit.file,
+      line: lit.line,
+      ref: lit.ref,
+      kind: lit.kind,
+      reason: canonical.size === 0 ? "orphan" : "stale",
+    });
+  }
+  return { staleLiterals, hasStaleLiteral: staleLiterals.length > 0 };
 }
 
 /**
@@ -411,13 +511,28 @@ export function detectSurfaceSkew(usesLagState, npmState) {
  * is a real configuration error regardless of the window, so it is never
  * suppressed by the hold.
  *
+ * A **stale pin literal** (Story #110) — a platform-ref SHA/tag echoed in a
+ * comment or `run:`/echo string that no longer matches the canonical `uses:`
+ * pin — is a real configuration error like a split pin: it is **never**
+ * suppressed by the `minimumReleaseAge` hold, because the literal lags the
+ * consumer's OWN pin, not the platform release.
+ *
  * @param {{ drift: boolean, splitPinned?: boolean }} verdict
  * @param {{ npmState: string }} npm
  * @param {boolean} surfaceSkew
  * @param {boolean} [holding]  Latest release is inside the minimumReleaseAge window.
+ * @param {boolean} [hasStaleLiteral]  A platform-ref literal lags the canonical pin.
  * @returns {boolean}
  */
-export function combineDrift(verdict, npm, surfaceSkew, holding = false) {
+export function combineDrift(
+  verdict,
+  npm,
+  surfaceSkew,
+  holding = false,
+  hasStaleLiteral = false,
+) {
+  // A stale pin literal is its own configuration error — never hold-suppressed.
+  if (hasStaleLiteral) return true;
   const rawDrift =
     verdict.drift || npm.npmState === "lagging" || surfaceSkew;
   if (!rawDrift) return false;
@@ -509,6 +624,8 @@ export function renderReport(report) {
     const npm = r.npm ?? { rawSpec: null, version: null, npmState: "absent" };
     const surfaceSkew = r.surfaceSkew === true;
     const holding = r.holding === true;
+    const staleLiterals = Array.isArray(r.staleLiterals) ? r.staleLiterals : [];
+    const hasStaleLiteral = r.hasStaleLiteral === true;
     const shaLabel = v.pinnedSha
       ? `\`${v.pinnedSha.slice(0, 7)}\``
       : v.splitPinned
@@ -531,9 +648,14 @@ export function renderReport(report) {
         : "—";
     const npmLagLabel = npm.npmState === "absent" ? "—" : npm.npmState;
     let status;
-    if (v.lagState === "no-pins" && npm.npmState === "absent")
+    if (
+      v.lagState === "no-pins" &&
+      npm.npmState === "absent" &&
+      !hasStaleLiteral
+    )
       status = "➖ no platform refs";
     else if (v.splitPinned) status = "❌ split pin";
+    else if (hasStaleLiteral) status = "❌ stale pin literal";
     else if (holding) status = "⏳ holding";
     else if (surfaceSkew) status = "❌ npm/uses skew";
     else if (v.lagState === "lagging" || npm.npmState === "lagging")
@@ -574,6 +696,22 @@ export function renderReport(report) {
     } else if (v.lagState === "lagging") {
       driftLines.push(
         `- \`${r.name}\` (${r.repo}): LAGGING — pins \`${v.pinnedSha.slice(0, 7)}\`, latest release is \`${(latestRelease.sha || "?").slice(0, 7)}\` (${latestRelease.tag || "?"}).`,
+      );
+    }
+
+    if (hasStaleLiteral) {
+      const litList = staleLiterals
+        .map((lit) => {
+          const short = isFullSha(lit.ref) ? lit.ref.slice(0, 7) : lit.ref;
+          const why =
+            lit.reason === "orphan"
+              ? "no canonical `uses:` pin to track"
+              : "does not match the canonical `uses:` pin";
+          return `    - \`${short}\` ← ${lit.file}:${lit.line} (${lit.kind}; ${why})`;
+        })
+        .join("\n");
+      driftLines.push(
+        `- \`${r.name}\` (${r.repo}): STALE PIN LITERAL — ${staleLiterals.length} platform-ref literal(s) outside \`uses:\` (comment / \`run:\` / echo string) drift from the canonical pin:\n${litList}`,
       );
     }
 
@@ -813,16 +951,28 @@ export function buildReport(config, runGh, nowMs = Date.now()) {
       const branch = resolveBranch(consumer, runGh);
       const files = fetchConsumerWorkflows(consumer.repo, branch, runGh);
       const pins = [];
+      const looseLiterals = [];
       for (const f of files) {
         pins.push(...extractPlatformPins(f.path, f.text, platformRepo));
+        looseLiterals.push(
+          ...extractStaleLiterals(f.path, f.text, platformRepo),
+        );
       }
       const verdict = classifyConsumer(pins, latestRelease.sha);
+      const literalVerdict = classifyStaleLiterals(
+        looseLiterals,
+        verdict.distinctRefs,
+      );
       const pkgText = fetchConsumerPackageJson(consumer.repo, branch, runGh);
       const npmSpec =
         pkgText === null ? null : extractNpmPlatformVersion(pkgText, platformPkg);
       const npm = classifyNpmPin(npmSpec, latestVersion);
       const surfaceSkew = detectSurfaceSkew(verdict.lagState, npm.npmState);
-      const holding = isHolding(verdict, npm, surfaceSkew, withinWindow);
+      // A stale literal is a real error, so a consumer carrying one is never
+      // "holding" — surface it as drift even inside the release-age window.
+      const holding =
+        !literalVerdict.hasStaleLiteral &&
+        isHolding(verdict, npm, surfaceSkew, withinWindow);
       results.push({
         name: consumer.name,
         repo: consumer.repo,
@@ -831,8 +981,16 @@ export function buildReport(config, runGh, nowMs = Date.now()) {
         verdict,
         npm,
         surfaceSkew,
+        staleLiterals: literalVerdict.staleLiterals,
+        hasStaleLiteral: literalVerdict.hasStaleLiteral,
         holding,
-        drift: combineDrift(verdict, npm, surfaceSkew, withinWindow),
+        drift: combineDrift(
+          verdict,
+          npm,
+          surfaceSkew,
+          withinWindow,
+          literalVerdict.hasStaleLiteral,
+        ),
       });
     } catch (err) {
       const verdict = classifyConsumer([], latestRelease.sha);
@@ -846,6 +1004,8 @@ export function buildReport(config, runGh, nowMs = Date.now()) {
         verdict,
         npm,
         surfaceSkew: false,
+        staleLiterals: [],
+        hasStaleLiteral: false,
         holding: false,
         drift: false,
       });

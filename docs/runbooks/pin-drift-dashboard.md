@@ -34,14 +34,31 @@ accumulate silently:
    being current (one is on the latest release, the other lags). This is the
    class the original `uses:`-only check missed: swarm-os ran npm `0.11.3`
    while its workflows tracked `v0.11.6` while the latest was `v0.11.7`.
+5. **Stale pin literal** (Story #110) — a platform-ref SHA/tag echoed in a
+   **comment** or a **`run:`/echo step string** drifts away from the consumer's
+   canonical `uses:` pin. The `uses:`-only scan never saw these, so a
+   hand-maintained `deploy-cloudflare.yml@<sha>` echoed in a deploy-summary
+   string could lag the real pin indefinitely. The checker now also extracts
+   every loose platform-ref literal and flags any whose ref no longer matches
+   the canonical `uses:` pin (`stale`) — or that has no canonical pin to track
+   at all (`orphan`).
 
 The dashboard reads each consumer's `.github/workflows/` **and** its
 `package.json` over the GitHub API, extracts every platform `uses:` ref across
 all chains plus the `mandrel-platform` npm version, and reports a per-consumer
 verdict: `✅ current`, `⚠️ lagging`, `❌ split pin`, `❌ npm/uses skew`,
-`⏳ holding` (see below), or `❔ unknown` (floating tags / unresolved SHA). A
-consumer that adopts the workflows but not the npm config package reports its
-npm column as `absent` — informational, not drift.
+`❌ stale pin literal`, `⏳ holding` (see below), or `❔ unknown` (floating
+tags / unresolved SHA). A consumer that adopts the workflows but not the npm
+config package reports its npm column as `absent` — informational, not drift.
+
+A **stale pin literal** is never suppressed by the `minimumReleaseAge` hold
+(below) — it lags the consumer's *own* `uses:` pin, not the platform release,
+so the hold window is irrelevant. The fix is to **adopt the resolved-ref step
+summary** `deploy-cloudflare.yml` now emits: its final `deploy-summary` job
+echoes the runtime-resolved `github.job_workflow_sha` (and
+`github.workflow_ref`) into `GITHUB_STEP_SUMMARY` as the single source of
+truth, so a consumer reads the resolved pin off the job summary instead of
+hand-maintaining a `deploy-cloudflare.yml@<sha>` literal that then drifts.
 
 ## The `minimumReleaseAge` coupling — why a fresh release does not page
 

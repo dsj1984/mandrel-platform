@@ -815,3 +815,55 @@ jobs:
           DEPLOY_ENV: ${{ inputs.environment }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ---------------------------------------------------------------------------
+  # 7. Deploy summary (resolved-ref single source of truth)
+  #    Emits the RESOLVED ref of THIS reusable workflow into the job summary
+  #    (Story #110). `github.job_workflow_sha` is the exact commit SHA GitHub
+  #    resolved the caller's `uses: …/deploy-cloudflare.yml@<ref>` pin to, and
+  #    `github.workflow_ref` is the full ref path. Echoing the runtime-resolved
+  #    values — rather than a hand-maintained literal in a consumer's
+  #    deploy-summary string — makes the resolved ref the single source of
+  #    truth: a consumer can read it off the job summary instead of carrying a
+  #    stale `deploy-cloudflare.yml@<sha>` literal that the pin-drift lint then
+  #    has to flag (the athportal stale-literal residual). Runs on every deploy
+  #    outcome so the resolved ref is always recorded.
+  # ---------------------------------------------------------------------------
+  deploy-summary:
+    name: Deploy summary (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs:
+      - deploy
+      - boot-smoke
+    if: ${{ always() }}
+    steps:
+      - name: Emit resolved platform-ref summary
+        shell: bash
+        run: |
+          # The reusable workflow's own resolved ref, straight from the runtime
+          # github context — never a hand-edited literal. job_workflow_sha is the
+          # 40-hex commit the caller's `@<ref>` pin resolved to; workflow_ref is
+          # the full `owner/repo/.github/workflows/deploy-cloudflare.yml@<ref>`
+          # path. Consumers should read THIS value rather than maintaining their
+          # own echoed `deploy-cloudflare.yml@<sha>` string.
+          {
+            echo "## Deploy summary — ${DEPLOY_ENV}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| ----- | ----- |"
+            echo "| Resolved workflow ref | \`${WORKFLOW_REF}\` |"
+            echo "| Resolved workflow SHA | \`${JOB_WORKFLOW_SHA}\` |"
+            echo "| Deploy result | \`${DEPLOY_RESULT}\` |"
+            echo "| Smoke result | \`${SMOKE_RESULT}\` |"
+            echo ""
+            echo "> The **Resolved workflow SHA** above is the single source of truth"
+            echo "> for the \`deploy-cloudflare.yml\` pin this run executed. Read it"
+            echo "> here instead of hand-maintaining a \`deploy-cloudflare.yml@<sha>\`"
+            echo "> literal in a consumer-side deploy-summary string."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          SMOKE_RESULT: ${{ needs.boot-smoke.result }}
