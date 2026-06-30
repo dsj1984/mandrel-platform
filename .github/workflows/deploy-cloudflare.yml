@@ -264,6 +264,15 @@ on:
       TURSO_AUTH_TOKEN:
         description: 'Optional Turso auth token for non-D1 snapshot/migrate seam commands.'
         required: false
+      # Scanner-only optional secret — NOT part of the frozen deploy/seam
+      # passthrough set above (it is never mapped into a deploy or seam `env:`).
+      # Consumed solely by the gitleaks-action in the secret-isolation-audit
+      # job; only meaningful for orgs with a gitleaks GHAS licence. Declaring it
+      # here makes the `${{ secrets.GITLEAKS_LICENSE }}` reference valid for
+      # consumers using an explicit `secrets:` map rather than `secrets: inherit`.
+      GITLEAKS_LICENSE:
+        description: 'Optional gitleaks org/enterprise licence key for the secret-isolation audit.'
+        required: false
 
 # Least-privilege: content-read only. Each job that needs more escalates
 # individually (wrangler deploy needs no additional GH permissions).
@@ -555,8 +564,9 @@ jobs:
                 \#*) continue ;;  # allow comment lines
               esac
               key="${line%%=*}"
+              value="${line#*=}"
               echo "::notice::build-env: exporting $key"
-              export "$line"
+              export "${key}=${value}"
             done <<< "$BUILD_ENV"
             echo "::endgroup::"
           fi
@@ -672,7 +682,10 @@ jobs:
         id: smoke
         shell: bash
         run: |
-          IFS=',' read -ra WORKERS <<< "$DEPLOYED_WORKERS"
+          # Parse the deployed CSV into an array (WORKER_LIST). Kept distinct
+          # from the exported scalar WORKERS below so the consumer-facing env
+          # export never clobbers the array used for the rollback list.
+          IFS=',' read -ra WORKER_LIST <<< "$DEPLOYED_WORKERS"
 
           # ----- Consumer-supplied smoke replaces the built-in probe -----
           if [ -n "$SMOKE_COMMAND" ]; then
@@ -685,7 +698,7 @@ jobs:
               echo "✅ consumer smoke-command passed"
             else
               echo "::error::Consumer smoke-command FAILED. Triggering rollback."
-              printf '%s\n' "${WORKERS[@]}" >> /tmp/smoke-failed-workers.txt
+              printf '%s\n' "${WORKER_LIST[@]}" >> /tmp/smoke-failed-workers.txt
               echo "smoke_failed=true" >> "$GITHUB_ENV"
               echo "::endgroup::"
               exit 1
@@ -722,7 +735,7 @@ jobs:
           IFS=',' read -ra PATHS <<< "$SMOKE_PATHS"
           failed=()
 
-          for worker in "${WORKERS[@]}"; do
+          for worker in "${WORKER_LIST[@]}"; do
             worker="$(echo "$worker" | xargs)"
             [ -z "$worker" ] && continue
 

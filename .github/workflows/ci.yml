@@ -99,6 +99,63 @@ jobs:
       - name: Lint workflow portability
         run: node scripts/check-workflow-portability.mjs
 
+  # ── Workflow lint (actionlint + embedded shellcheck) ──────────────────────
+  #
+  # The reusable workflows ARE the product, yet their YAML was historically
+  # validated only by a full cross-repo smoke round-trip — expensive, late
+  # feedback. The entire SAST-track shell-bug class (#81/#82/#85/#86/#92)
+  # surfaced only at smoke time; actionlint catches that class statically.
+  # This job shifts that validation left into the platform's own ci-required
+  # (Story #108). It complements — does not replace — the cross-repo smoke gate.
+  #
+  # actionlint's embedded shellcheck lints every `run:` block, which is what
+  # catches the shell-bug class. shellcheck ships preinstalled on the
+  # ubuntu-latest image, so no extra install step is needed for it.
+  #
+  # PIN HYGIENE: actionlint is pinned to a release version and the linux_amd64
+  # release archive is verified against its pinned SHA-256 before extraction —
+  # the same download-and-verify posture this repo uses for the pinned gitleaks
+  # binary in secret-scan-push.yml. Bump ACTIONLINT_VERSION and ACTIONLINT_SHA256
+  # in lockstep (checksums:
+  # https://github.com/rhysd/actionlint/releases/download/v<version>/actionlint_<version>_checksums.txt).
+  actionlint:
+    name: Lint workflows (actionlint + shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ACTIONLINT_VERSION: '1.7.12'
+      ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Download + verify a PINNED actionlint binary, then lint every workflow
+      # under .github/workflows/. actionlint auto-discovers `.github/workflows/`
+      # when invoked with no path args, so pr-quality.yml, deploy-cloudflare.yml,
+      # secret-scan-push.yml and the rest are all covered. shellcheck is on
+      # PATH (ubuntu-latest), so actionlint runs it on every `run:` block.
+      - name: Install pinned actionlint and lint workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${asset}"
+          tmp="$(mktemp -d)"
+          echo "Downloading pinned actionlint: ${url}"
+          curl -fsSL "$url" -o "${tmp}/${asset}"
+          actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
+          if [ "$actual" != "$ACTIONLINT_SHA256" ]; then
+            echo "::error::actionlint checksum mismatch for ${asset}: expected ${ACTIONLINT_SHA256}, got ${actual}"
+            exit 1
+          fi
+          echo "✅ actionlint ${asset} checksum verified."
+          tar -xzf "${tmp}/${asset}" -C "${tmp}" actionlint
+          chmod +x "${tmp}/actionlint"
+          "${tmp}/actionlint" -version
+          # No path args → actionlint discovers and lints all .github/workflows/*.
+          # -color forces the annotated output even though stdout is not a TTY.
+          "${tmp}/actionlint" -color
+
   # ── Aggregator: single required branch-protection context ─────────────────
   #
   # Mirrors the ci-required pattern from pr-quality.yml: a single stable
@@ -112,17 +169,20 @@ jobs:
     needs:
       - check-required-contexts
       - check-workflow-portability
+      - actionlint
     steps:
       - name: Check all job results
         shell: bash
         env:
           CTX_RESULT: ${{ needs.check-required-contexts.result }}
           PORT_RESULT: ${{ needs.check-workflow-portability.result }}
+          ACTIONLINT_RESULT: ${{ needs.actionlint.result }}
         run: |
           failed=()
           for job_result in \
             "check-required-contexts:${CTX_RESULT}" \
-            "check-workflow-portability:${PORT_RESULT}"; do
+            "check-workflow-portability:${PORT_RESULT}" \
+            "actionlint:${ACTIONLINT_RESULT}"; do
             job="${job_result%%:*}"
             result="${job_result##*:}"
             if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
