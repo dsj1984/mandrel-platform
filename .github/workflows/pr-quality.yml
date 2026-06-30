@@ -127,6 +127,22 @@ on:
         type: string
         default: 'p/default'
 
+      # Additional SAST exclude globs, APPENDED to the built-in `.agents`
+      # exclude (the vendored framework tree a consumer cannot edit). The
+      # security tier always passes `--exclude '.agents'`; this input lets a
+      # consumer also drop its own generated code / test fixtures from the SAST
+      # target set without forking the workflow. Space- or comma-separated; each
+      # token becomes its own `--exclude <glob>` arg. Empty (default) → only the
+      # built-in `.agents` exclude applies.
+      sast-exclude:
+        description: >
+          Extra Semgrep `--exclude` globs, appended to the built-in `.agents`
+          exclude. Space- or comma-separated (e.g. 'dist coverage tests/fixtures').
+          Default '' (only the vendored `.agents` framework tree is excluded).
+        required: false
+        type: string
+        default: ''
+
       # Pinned gitleaks version for the secret-scan sub-step. The asset is
       # selected per-platform (darwin/linux x amd64/arm64) and verified
       # against a pinned SHA-256 before execution.
@@ -378,6 +394,13 @@ jobs:
   #                   scoped to the PR diff via `--baseline-commit <base.sha>`
   #                   (mirroring the secret scan), so only findings INTRODUCED
   #                   by the PR block; on push / schedule it scans the full tree.
+  #                   The vendored framework tree `.agents/` is ALWAYS excluded
+  #                   (`--exclude '.agents'`): it is materialized from the pinned
+  #                   `mandrel` package and a consumer cannot edit it, so gating
+  #                   `ci-required` on the framework's own findings is a false
+  #                   block (Story #93). Consumers can drop their own generated
+  #                   code / fixtures too via the `sast-exclude` input, which is
+  #                   APPENDED to the built-in `.agents` exclude.
   #
   # GHAS path (alternative, documented per AC): repos that DO have GitHub
   # Advanced Security can instead run CodeQL (codeql.yml) and flip its
@@ -544,6 +567,9 @@ jobs:
           # PR merge base on pull_request events, empty otherwise. When set,
           # `--baseline-commit` scopes findings to those introduced by the PR.
           BASELINE: ${{ steps.sast-baseline.outputs.baseline }}
+          # Extra exclude globs appended to the built-in `.agents` exclude.
+          # Space- or comma-separated; empty by default.
+          SAST_EXCLUDE: ${{ inputs.sast-exclude }}
         run: |
           set -euo pipefail
           # Pinned Semgrep release from PyPI. `semgrep scan --error` exits
@@ -565,6 +591,26 @@ jobs:
           #     also needs no tool cache and installs into the user site dir.
           SEMGREP_PIN='semgrep==1.97.0'
 
+          # Build the `--exclude` argument list. The vendored framework tree
+          # `.agents/` is ALWAYS excluded: it is materialized from the pinned
+          # `mandrel` package and a consumer cannot edit it, so gating on its
+          # findings is a false block (Story #93). Semgrep's `--exclude` takes a
+          # pattern matched against path components, so `--exclude '.agents'`
+          # drops the whole `.agents/**` subtree from the target set (mirroring
+          # how it ignores `node_modules` by default). Any extra globs from the
+          # `sast-exclude` input are APPENDED, each as its own `--exclude` arg.
+          EXCLUDE_ARGS=(--exclude '.agents')
+          if [ -n "${SAST_EXCLUDE:-}" ]; then
+            # Split on whitespace AND commas so 'dist,coverage tests/fixtures'
+            # all work. Empty tokens (e.g. from a trailing comma) are skipped.
+            old_ifs="$IFS"
+            IFS=', '
+            for glob in ${SAST_EXCLUDE}; do
+              [ -n "$glob" ] && EXCLUDE_ARGS+=(--exclude "$glob")
+            done
+            IFS="$old_ifs"
+          fi
+
           run_semgrep() {
             echo "Running $(semgrep --version 2>/dev/null) (config: ${SEMGREP_CONFIG})"
             if [ -n "${BASELINE:-}" ]; then
@@ -572,11 +618,16 @@ jobs:
             else
               echo "Full-tree SAST (no baseline)."
             fi
+            echo "SAST excludes: ${EXCLUDE_ARGS[*]}"
             # `${BASELINE:+--baseline-commit "$BASELINE"}` expands to the flag
             # pair only when BASELINE is non-empty; on push/schedule it vanishes
-            # and Semgrep scans the full tree.
+            # and Semgrep scans the full tree. `"${EXCLUDE_ARGS[@]}"` always
+            # carries at least `--exclude '.agents'` (Story #93), plus any globs
+            # from the `sast-exclude` input, on BOTH the baseline and full-tree
+            # paths since both flow through this one invocation.
             semgrep scan \
               --config "${SEMGREP_CONFIG}" \
+              "${EXCLUDE_ARGS[@]}" \
               ${BASELINE:+--baseline-commit "$BASELINE"} \
               --error \
               --disable-version-check \
