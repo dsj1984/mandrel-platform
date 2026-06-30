@@ -587,8 +587,24 @@ jobs:
           #     system site-packages. We `--system-site-packages` so the venv
           #     can see a system `setuptools`, then `pipx inject` a pinned one
           #     as a belt-and-suspenders guarantee for `pkg_resources`.
-          #   • Otherwise fall back to `python3 -m pip install --user`, which
-          #     also needs no tool cache and installs into the user site dir.
+          #   • Otherwise fall back to an EPHEMERAL `python3 -m venv` (Story
+          #     #92). We deliberately do NOT use `pip install --user`: `--user`
+          #     installs into the runner's SHARED, MUTABLE user site-packages
+          #     (`~/Library/Python/X.Y/lib/python/site-packages` on macOS). On
+          #     a self-hosted host whose user-site already holds a compiled
+          #     native extension built for a DIFFERENT arch (e.g. a prior
+          #     native-arm64 Python left an arm64 `rpds.cpython-39-darwin.so`),
+          #     a later x86_64/Rosetta run REUSES that stale `.so` instead of
+          #     rebuilding it, and Semgrep dies at IMPORT before it scans:
+          #       `mach-o file, but is an incompatible architecture
+          #        (have 'arm64', need 'x86_64')`.
+          #     A venv disables user-site by default (PEP 370) and rebuilds
+          #     native deps for the venv interpreter's own arch, so the install
+          #     is hermetic and arch-correct on a vanilla, possibly-dirty
+          #     self-hosted runner — no per-runner `rpds` purge needed
+          #     (athportal #2021 / PR #2023). The venv lives under a `mktemp -d`
+          #     dir, so it is per-run and never reads/writes the shared user
+          #     site. No `pipx` dependency.
           SEMGREP_PIN='semgrep==1.97.0'
 
           # Build the `--exclude` argument list. The vendored framework tree
@@ -650,12 +666,23 @@ jobs:
             export PATH
             run_semgrep
           else
-            echo "pipx not found; installing ${SEMGREP_PIN} via python3 -m pip install --user."
-            python3 -m pip install --user --quiet --disable-pip-version-check \
+            echo "pipx not found; installing ${SEMGREP_PIN} into an ephemeral python3 venv (hermetic, arch-correct)."
+            # Ephemeral, per-run venv under a fresh mktemp dir. venvs disable
+            # user-site by default (PEP 370), so a stale / foreign-arch native
+            # extension in the runner's shared user site-packages (the Story #92
+            # rpds arm64-vs-x86_64 failure) is NOT read — pip rebuilds native
+            # deps for THIS interpreter's arch into the isolated venv. No
+            # reliance on the shared `--user` site.
+            venv_dir="$(mktemp -d)/semgrep-venv"
+            python3 -m venv "${venv_dir}"
+            # Use the venv's own python/pip directly (no `activate` needed; the
+            # venv interpreter resolves its own isolated site-packages). Pin
+            # `setuptools` alongside semgrep for the `pkg_resources` guarantee.
+            "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
               setuptools "${SEMGREP_PIN}"
-            # `pip install --user` drops console scripts in the user-base bin
-            # dir, which is not always on PATH on a fresh runner — add it.
-            PATH="$(python3 -m site --user-base)/bin:${PATH}"
+            # Put the venv's bin dir first so the `semgrep` resolved by
+            # `run_semgrep` is the hermetic one, not any shared/user-site copy.
+            PATH="${venv_dir}/bin:${PATH}"
             export PATH
             run_semgrep
           fi
