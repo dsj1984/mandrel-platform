@@ -86,6 +86,47 @@ on:
         type: boolean
         default: true
 
+      # Destructive-migration guard (Story #111). Platformizes the guard domio
+      # and athportal each hand-rolled and swarm-os lacked. OPT-IN (default
+      # false) because not every consumer ships DB migrations; repos with a
+      # migration tree set this true to inherit the same PR-time invariant.
+      # When enabled it becomes a `needs:` of `ci-required`, so it is
+      # branch-protection-load-bearing through the single aggregator context.
+      enable-migration-guard:
+        description: >
+          Enable the destructive-migration label guard. Scans CHANGED migration
+          files for a destructive SQL/drizzle signal (DROP / ALTER … DROP /
+          TRUNCATE / drizzle drop-ops) and BLOCKS the PR unless the override
+          label (migration-guard-label) is applied. Opt-in: default false.
+        required: false
+        type: boolean
+        default: false
+
+      # The override acknowledgement label. A reviewer applies this label to a
+      # PR to consciously allow a detected destructive migration. The name is
+      # part of the documented contract (docs/reusable-workflows.md).
+      migration-guard-label:
+        description: >
+          PR label that overrides a destructive-migration finding. When this
+          label is on the PR, the guard reports the finding but does NOT block.
+          Default 'migration:destructive-ok'.
+        required: false
+        type: string
+        default: 'migration:destructive-ok'
+
+      # Comma-separated migration path globs the guard scans. A changed file
+      # must match one of these (or end in `.sql`) to be inspected, so an
+      # unrelated source file mentioning DROP never trips the guard.
+      migration-guard-globs:
+        description: >
+          Comma-separated migration path globs scanned by the destructive
+          guard. A changed file matching one of these (or any `*.sql`) is
+          inspected for a destructive signal. Default
+          '**/migrations/**,**/drizzle/**'.
+        required: false
+        type: string
+        default: '**/migrations/**,**/drizzle/**'
+
       # Optional coverage floor (Story #109). Off by default (0) so
       # non-adopters keep today's behaviour: pr-quality.yml already uploads
       # `**/coverage/` as an artifact, but no job asserts a floor, so a PR can
@@ -500,6 +541,207 @@ jobs:
             **/test-results/
           retention-days: 14
 
+  # ── Destructive-migration label guard (Story #111) ───────────────────────
+  #
+  # Platformizes the destructive-migration guard domio and athportal each
+  # hand-rolled and swarm-os was missing. OPT-IN via `enable-migration-guard`.
+  # When enabled it is a `needs:` of `ci-required` (below), so it is
+  # branch-protection-load-bearing through the single aggregator context.
+  #
+  # Contract (documented in docs/reusable-workflows.md):
+  #   • Detects a destructive signal in CHANGED migration files only — DROP /
+  #     ALTER … DROP / TRUNCATE / drizzle drop-ops. Comment-only mentions are
+  #     stripped before matching, so a `-- DROP TABLE …` note never trips it.
+  #   • A changed file is "a migration" when its path matches one of
+  #     `migration-guard-globs` OR ends in `.sql`.
+  #   • The override is an explicit PR label (`migration-guard-label`,
+  #     default `migration:destructive-ok`). With the label present the guard
+  #     reports the finding but does NOT block; absent, a finding fails the job.
+  #
+  # STATIC, PR-time signal only (per the Story's Out of Scope): it inspects
+  # changed migration files, it does NOT introspect a live database, and it
+  # does not touch the snapshot/rollback flow in deploy-cloudflare.yml.
+  #
+  # The detection signal set is the same union codified — and unit-tested —
+  # in scripts/check-destructive-migration.mjs /
+  # scripts/check-destructive-migration.test.mjs on the platform repo; this job
+  # is the portable in-workflow implementation so a consumer needs no
+  # consumer-side script copy to inherit the gate.
+  migration-guard:
+    name: Destructive-migration guard
+    if: ${{ inputs.enable-migration-guard }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Full history so the merge-base diff resolves the PR's changed set.
+          fetch-depth: 0
+
+      # Resolve the changed migration files for this PR. On pull_request events
+      # we diff merge-base..head (the commits the PR introduces); on other
+      # events the guard has no PR context and is a no-op pass.
+      - name: Resolve changed migration files
+        id: changed
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GLOBS: ${{ inputs.migration-guard-globs }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
+            echo "No pull_request context — destructive-migration guard is a no-op."
+            echo "migration_files=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `--diff-filter` keeps Added/Copied/Modified/Renamed/Deleted; a
+          # DELETED migration is itself a destructive signal, so we keep D.
+          mapfile -t changed < <(git diff --name-only --diff-filter=ACMRD "${BASE_SHA}" "${HEAD_SHA}")
+
+          # Build a regex of `migration-guard-globs` (comma-separated), where
+          # `**`→`.*` and `*`→`[^/]*`, plus an always-on `\.sql$` tail. Only
+          # paths matching are inspected.
+          glob_to_re() {
+            local g="$1" out="" i c
+            for (( i=0; i<${#g}; i++ )); do
+              c="${g:$i:1}"
+              if [ "$c" = "*" ]; then
+                if [ "${g:$((i+1)):1}" = "*" ]; then
+                  out+=".*"; i=$((i+1))
+                  [ "${g:$((i+1)):1}" = "/" ] && i=$((i+1))
+                else
+                  out+="[^/]*"
+                fi
+              elif [[ "$c" =~ [.+^\$\(\)\|\[\]\\] ]]; then
+                out+="\\$c"
+              else
+                out+="$c"
+              fi
+            done
+            printf '^%s$' "$out"
+          }
+
+          migration_files=()
+          IFS=',' read -ra glob_arr <<< "${GLOBS}"
+          for f in "${changed[@]}"; do
+            [ -z "$f" ] && continue
+            keep=""
+            if [[ "$f" =~ \.sql$ ]]; then keep="yes"; fi
+            if [ -z "$keep" ]; then
+              for g in "${glob_arr[@]}"; do
+                g="$(echo "$g" | xargs)"   # trim
+                [ -z "$g" ] && continue
+                re="$(glob_to_re "$g")"
+                if [[ "$f" =~ $re ]]; then keep="yes"; break; fi
+              done
+            fi
+            [ -n "$keep" ] && migration_files+=("$f")
+          done
+
+          if [ ${#migration_files[@]} -eq 0 ]; then
+            echo "No changed migration files in this PR — guard passes."
+            echo "migration_files=" >> "$GITHUB_OUTPUT"
+          else
+            printf 'Changed migration files:\n'
+            printf '  %s\n' "${migration_files[@]}"
+            # Newline-join into a heredoc-delimited multiline output.
+            {
+              echo "migration_files<<__MIGEOF__"
+              printf '%s\n' "${migration_files[@]}"
+              echo "__MIGEOF__"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # Scan the changed migration files for a destructive signal. The signal
+      # set mirrors scripts/check-destructive-migration.mjs (DROP / ALTER … DROP
+      # / TRUNCATE / drizzle drop-ops), with SQL/JS comments stripped first so a
+      # commented-out DROP does not trip the guard. The override label, when
+      # present on the PR, downgrades a finding from a block to a warning.
+      - name: Scan for destructive migrations
+        if: ${{ steps.changed.outputs.migration_files != '' }}
+        shell: bash
+        env:
+          MIGRATION_FILES: ${{ steps.changed.outputs.migration_files }}
+          OVERRIDE_LABEL: ${{ inputs.migration-guard-label }}
+          # PR labels as a JSON array string. We parse + match exactly with jq
+          # (jq ships on ubuntu-latest and the self-hosted runners), avoiding
+          # both substring-collision false positives from a `contains()` match
+          # and the YAML fragility of an embedded-newline join.
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+
+          # Strip `--`, `//`, and inline `/* */` comments from a line.
+          strip_comments() {
+            sed -E 's:/\*.*\*/: :g; s:--.*$::; s://.*$::'
+          }
+
+          findings=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ ! -f "$f" ]; then
+              # Deleted migration file — destructive by itself.
+              findings+="  • ${f} → deleted migration file"$'\n'
+              continue
+            fi
+            sigs=""
+            stripped="$(strip_comments < "$f")"
+            echo "$stripped" | grep -qiE '\bALTER[[:space:]]+TABLE\b.*\bDROP\b'              && sigs+="ALTER TABLE … DROP; "
+            echo "$stripped" | grep -qiE '\bDROP[[:space:]]+(TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|DATABASE|TYPE|SEQUENCE|TRIGGER|FUNCTION)\b' && sigs+="DROP statement; "
+            echo "$stripped" | grep -qiE '\bTRUNCATE\b'                                      && sigs+="TRUNCATE; "
+            echo "$stripped" | grep -qE  '\.(dropTable|dropColumn|dropIndex|dropConstraint|dropForeignKey|dropPrimaryKey|dropUnique)[[:space:]]*\(' && sigs+="drizzle destructive op; "
+            [ -n "$sigs" ] && findings+="  • ${f} → ${sigs%; }"$'\n'
+          done <<< "${MIGRATION_FILES}"
+
+          if [ -z "$findings" ]; then
+            echo "✅ No destructive migration detected in the changed files."
+            exit 0
+          fi
+
+          # A destructive signal is present. Honour the override label: exact
+          # match of OVERRIDE_LABEL against the PR's label-name array.
+          if printf '%s' "${PR_LABELS_JSON}" \
+            | jq -e --arg l "${OVERRIDE_LABEL}" 'any(.[]?; . == $l)' >/dev/null 2>&1; then
+            label_present="yes"
+          else
+            label_present="no"
+          fi
+
+          echo "Destructive migration signal(s):"
+          printf '%s' "$findings"
+
+          if [ "$label_present" = "yes" ]; then
+            echo "⚠️ Override label '${OVERRIDE_LABEL}' is applied — allowing the destructive migration."
+            {
+              echo "### Destructive-migration guard — ALLOWED via override"
+              echo ""
+              echo "Override label \`${OVERRIDE_LABEL}\` is present. Findings:"
+              echo ""
+              printf '%s' "$findings"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### ❌ Destructive-migration guard — BLOCKED"
+            echo ""
+            echo "A destructive migration was detected and the override label"
+            echo "\`${OVERRIDE_LABEL}\` is NOT applied. Findings:"
+            echo ""
+            printf '%s' "$findings"
+            echo ""
+            echo "A reviewer must apply the \`${OVERRIDE_LABEL}\` label to"
+            echo "acknowledge the destructive change, then re-run this check."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::Destructive migration detected without the '${OVERRIDE_LABEL}' override label." >&2
+          exit 1
+
   # ── Tier 6: Security (PR-diff secret scan + SAST) ─────────────────────────
   #
   # Private-repo-capable security tier (Story #65 / MP-10). Both sub-steps run
@@ -828,6 +1070,7 @@ jobs:
       - unit
       - contract
       - e2e
+      - migration-guard
       - security
     steps:
       - name: Check all tier results
@@ -838,6 +1081,7 @@ jobs:
           UNIT_RESULT: ${{ needs.unit.result }}
           CONTRACT_RESULT: ${{ needs.contract.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
+          MIGRATION_GUARD_RESULT: ${{ needs.migration-guard.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
         run: |
           failed=()
@@ -847,6 +1091,7 @@ jobs:
             "unit:${UNIT_RESULT}" \
             "contract:${CONTRACT_RESULT}" \
             "e2e:${E2E_RESULT}" \
+            "migration-guard:${MIGRATION_GUARD_RESULT}" \
             "security:${SECURITY_RESULT}"; do
             tier="${tier_result%%:*}"
             result="${tier_result##*:}"

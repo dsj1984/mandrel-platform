@@ -40,12 +40,14 @@ A tiered PR-quality pipeline, consumable as a `workflow_call` target by any
 consumer repo. Tiers run in this order:
 
 ```text
-lint + format-check → typecheck → unit → contract → e2e/smoke → security
+lint + format-check → typecheck → unit → contract → e2e/smoke → migration-guard → security
 ```
 
 Every tier is independently enable-toggled, so a repo can opt out of tiers it
-has not built yet. A single aggregator job, [`ci-required`](#the-ci-required-aggregator),
-is the only branch-protection context a consumer needs to register.
+has not built yet (the [destructive-migration guard](#destructive-migration-guard-enable-migration-guard)
+is **opt-in** — default off). A single aggregator job,
+[`ci-required`](#the-ci-required-aggregator), is the only branch-protection
+context a consumer needs to register.
 
 ### Minimal caller
 
@@ -70,6 +72,9 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-unit`      | boolean | `true`           | Set `false` to skip the unit-test tier.                                                                                                        |
 | `enable-contract`  | boolean | `true`           | Set `false` to skip the contract-test tier.                                                                                                    |
 | `enable-e2e`       | boolean | `true`           | Set `false` to skip the e2e / smoke (Playwright) tier.                                                                                          |
+| `enable-migration-guard` | boolean | `false`    | **Opt-in.** Set `true` to enable the destructive-migration label guard. See [Destructive-migration guard](#destructive-migration-guard-enable-migration-guard). |
+| `migration-guard-label`  | string  | `'migration:destructive-ok'` | PR label that overrides a destructive-migration finding. Override only when you want a different acknowledgement-label name. |
+| `migration-guard-globs`  | string  | `'**/migrations/**,**/drizzle/**'` | Comma-separated migration path globs the guard scans. A changed file matching one of these (or any `*.sql`) is inspected. |
 | `coverage-threshold` | number | `0`            | Minimum coverage percentage the **unit** job must meet. `0` (default) disables the gate — current behaviour for non-adopters. When `> 0`, the unit job **fails** if measured coverage is below the floor. See [Coverage threshold gate](#coverage-threshold-gate-coverage-threshold). |
 | `coverage-metric`  | string  | `'lines'`        | Which coverage metric the floor asserts: `lines`, `statements`, `functions`, or `branches` (read from `total.<metric>.pct`). Ignored when `coverage-threshold` is `0`. |
 | `enable-security`  | boolean | `true`           | Set `false` to skip the whole security tier (secret scan + SAST). See [Security tier](#security-tier-enable-security--enable-sast).             |
@@ -134,6 +139,76 @@ Toggle matrix:
 > comma-separated — for generated code, build output, or test fixtures you
 > don't want Semgrep to scan (e.g. `'dist coverage tests/fixtures'`). Empty
 > (the default) leaves only the built-in `.agents` exclude in effect.
+
+### Destructive-migration guard (`enable-migration-guard`)
+
+A **PR-time label guard** that blocks a pull request introducing a
+**destructive database migration** unless a reviewer applies an explicit
+acknowledgement label. It platformizes the guard `domio` and `athportal` each
+hand-rolled and that `swarm-os` was missing — every consumer that opts in
+inherits the same invariant.
+
+It is **opt-in** (`enable-migration-guard: false` by default) because not
+every consumer ships DB migrations. When enabled, the `migration-guard` job is
+a [`needs:` of `ci-required`](#the-ci-required-aggregator), so it is
+**branch-protection-load-bearing** through the single aggregator context — no
+new required check to register.
+
+**What it detects.** The guard inspects only the **changed migration files** of
+a PR (`pull_request` events; it is a no-op on other events). A changed file is
+treated as a migration when its path matches one of `migration-guard-globs`
+(default `**/migrations/**,**/drizzle/**`) **or** ends in `.sql`. Within those
+files it scans for a destructive signal — the best-of-breed **union** of the
+two local guards it replaces:
+
+| Signal                | Example                                        |
+| --------------------- | ---------------------------------------------- |
+| `DROP` statement      | `DROP TABLE users;` / `DROP COLUMN email`      |
+| `ALTER TABLE … DROP`  | `ALTER TABLE users DROP COLUMN legacy_id;`     |
+| `TRUNCATE`            | `TRUNCATE audit_log;`                          |
+| drizzle destructive op| `.dropColumn(…)` / `.dropConstraint(…)`        |
+| deleted migration file| a migration file removed by the PR             |
+
+SQL/JS comments (`--`, `//`, inline `/* … */`) are stripped before matching, so
+a `DROP` that appears only in a comment never trips the guard. A non-migration
+source file mentioning `DROP` in a string is ignored — only the migration
+globs / `.sql` files are scanned.
+
+**The override label.** The override is an **explicit PR label**
+(`migration-guard-label`, default **`migration:destructive-ok`**). With the
+label present, the guard still reports the finding (job summary) but **does not
+block**; absent, a finding **fails the job** and therefore `ci-required`. This
+keeps a destructive change shippable — but only with a deliberate, on-the-record
+acknowledgement.
+
+**Scope.** This is the **static, PR-time** half of the migration story: it
+inspects changed migration files, it does **not** introspect a live database,
+and it does **not** touch the snapshot/rollback flow in
+[`deploy-cloudflare.yml`](#deploy-cloudflareyml) (that ships separately). Static
+signal on changed files is sufficient for the gate.
+
+> **Minimal opt-in caller.**
+>
+> ```yaml
+> jobs:
+>   pr-quality:
+>     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+>     with:
+>       enable-migration-guard: true
+>     secrets: inherit
+> ```
+>
+> Register `migration:destructive-ok` as a PR label in the consumer repo so a
+> reviewer can apply it. Override `migration-guard-label` /
+> `migration-guard-globs` only when your repo uses a different label name or
+> migration directory layout.
+
+> **Reference detection contract.** The exact destructive-signal set is
+> codified and unit-tested in
+> `scripts/check-destructive-migration.mjs` /
+> `scripts/check-destructive-migration.test.mjs` on the platform repo. The
+> in-workflow job is the portable implementation of that same contract, so an
+> opt-in consumer needs **no** consumer-side script copy to inherit the gate.
 
 ### Coverage threshold gate (`coverage-threshold`)
 
