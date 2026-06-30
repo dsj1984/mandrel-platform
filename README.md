@@ -12,13 +12,22 @@ consumer convergence matrix, and the forward roadmap are tracked privately.
 ## Reusable workflows
 
 The shared `workflow_call` workflows — `pr-quality.yml` and
-`deploy-cloudflare.yml` (plus `codeql.yml` and `smoke-dispatch.yml`) — and
-their public input/secret contract are documented in
+`deploy-cloudflare.yml` (plus `secret-scan-push.yml`, `release-automation.yml`,
+`codeql.yml`, and `smoke-dispatch.yml`) — and their public input/secret
+contract are documented in
 **[docs/reusable-workflows.md](docs/reusable-workflows.md)**. Consumers should
 configure their callers from that reference (input types, defaults,
 when-to-override, the frozen `{CLOUDFLARE_*, TURSO_*}` deploy secret allowlist,
 the single `ci-required` aggregator context, and the pin-by-tag/SHA versioning
 model).
+
+`release-automation.yml` extends the platform from CI/deploy into the **full
+release lifecycle**: a thin caller gets conventional-commit-driven version
+bumps, a `CHANGELOG.md`, and tags via release-please — the same convention the
+platform's own release train uses. It does not publish to a registry (consumers
+deploy to Cloudflare, not npm); see its section in the reference for the
+out-of-scope boundary and the `release_created` / `tag_name` outputs a
+publish/deploy job keys off.
 
 ---
 
