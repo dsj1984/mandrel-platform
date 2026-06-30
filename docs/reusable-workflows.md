@@ -84,7 +84,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `coverage-metric`  | string  | `'lines'`        | Which coverage metric the floor asserts: `lines`, `statements`, `functions`, or `branches` (read from `total.<metric>.pct`). Ignored when `coverage-threshold` is `0`. |
 | `enable-security`  | boolean | `true`           | Set `false` to skip the whole security tier (secret scan + SAST). See [Security tier](#security-tier-enable-security--enable-sast).             |
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
-| `semgrep-config`   | string  | `'p/default'`    | Semgrep ruleset for the SAST sub-step. Override with another registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.**   |
+| `semgrep-config`   | string  | `'vendored'`     | Semgrep ruleset for the SAST sub-step. Default `'vendored'` resolves to this reusable workflow's own checked-out, platform-controlled snapshot at `.semgrep/rules.json` (see [SAST ruleset provenance](#sast-ruleset-provenance-and-update-process)) — NOT the live registry. Override with a registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.** |
 | `sast-exclude`     | string  | `''`             | Extra Semgrep `--exclude` globs, space- or comma-separated (e.g. `'dist coverage tests/fixtures'`), **appended** to the built-in `.agents` exclude. Set to drop generated code / fixtures from the SAST target set. |
 | `gitleaks-version` | string  | `'8.30.1'`       | Pinned gitleaks release version (no leading `v`) for the secret scan. Bump deliberately; the per-platform asset checksum is pinned to match.    |
 | `toolchain-cache`  | string  | `'true'`         | Passed through to `setup-toolchain`'s `cache` input. Set `'false'` on self-hosted runners with a warm pnpm store.                              |
@@ -129,12 +129,16 @@ Toggle matrix:
 | Secret scan only — SAST runs elsewhere (CodeQL / GHAS)  | `true`            | `false`       |
 | No security tier at all                                 | `false`           | (ignored)     |
 
-> **`semgrep-config` constraints.** The default `'p/default'` is a broad OSS
-> ruleset that needs no Semgrep AppSec Platform login. You may override with
-> another concrete registry ref or a path. Do **not** pass `'auto'`: it
-> requires Semgrep metrics to be on (it contacts `semgrep.dev` to tailor the
-> ruleset), which is incompatible with the step's `--metrics=off` privacy
-> posture.
+> **`semgrep-config` constraints.** The default `'vendored'` resolves to this
+> reusable workflow's own checked-out, platform-controlled ruleset snapshot
+> (see [SAST ruleset provenance](#sast-ruleset-provenance-and-update-process)
+> below) — no Semgrep AppSec Platform login required, and no live registry
+> call at scan time. You may override with a concrete registry ref (e.g.
+> `'p/security-audit'`) or your own path, which **opts back into** registry
+> drift for that input — a deliberate per-caller choice, not the platform
+> default. Do **not** pass `'auto'`: it requires Semgrep metrics to be on (it
+> contacts `semgrep.dev` to tailor the ruleset), which is incompatible with
+> the step's `--metrics=off` privacy posture.
 
 > **GHAS alternative.** Repos that *do* have GitHub Advanced Security can run
 > CodeQL (see [`codeql.yml`](#codeqlyml)) for blocking Code Scanning instead of
@@ -143,11 +147,107 @@ Toggle matrix:
 > consumer inherits an effective gate regardless of plan.
 
 > **Excluding paths from SAST (`sast-exclude`).** The SAST sub-step always
-> excludes the vendored `.agents` framework tree (a consumer cannot edit it).
-> Use `sast-exclude` to **append** further `--exclude` globs — space- or
-> comma-separated — for generated code, build output, or test fixtures you
-> don't want Semgrep to scan (e.g. `'dist coverage tests/fixtures'`). Empty
-> (the default) leaves only the built-in `.agents` exclude in effect.
+> excludes the vendored `.agents` framework tree (a consumer cannot edit it)
+> and, when `semgrep-config` is `'vendored'`, the `_mandrel-platform-sast`
+> side-checkout directory that carries the ruleset snapshot (mandrel-platform's
+> own source tree — never the caller's code, so it must never enter the
+> caller's finding set). Use `sast-exclude` to **append** further `--exclude`
+> globs — space- or comma-separated — for generated code, build output, or
+> test fixtures you don't want Semgrep to scan (e.g.
+> `'dist coverage tests/fixtures'`). Empty (the default) leaves only the
+> built-in excludes in effect.
+
+#### SAST ruleset provenance and update process
+
+**The incident.** The 0.14.0 release was blocked when the live registry alias
+`'p/default'` silently grew a family of pnpm supply-chain rules
+(`pnpm-block-exotic-sub-dependencies`, `pnpm-trust-policy`,
+`pnpm-minimum-release-age`) plus `secrets-inherit`. The security tier already
+pinned the Semgrep **binary** (`1.97.0`), but `--config p/default` still
+pulled **live, unpinned rules** from the registry — so a full-tree (non-PR)
+scan turned red with **zero code change** on our side. The Semgrep binary pin
+alone was not the deterministic-input guarantee it looked like.
+
+**The fix.** `semgrep-config` defaults to `'vendored'` (Story #132), which
+resolves to a **committed snapshot** of the registry ruleset at
+[`.semgrep/rules.json`](../.semgrep/rules.json) — not the live alias. The
+snapshot is the FULL `p/default` rule set resolved once against the pinned
+Semgrep `1.97.0` binary, then **filtered to the languages this platform's
+reusable workflows and consumer trees actually scan**: `js`, `ts`,
+`typescript`, `yaml`, `json`, `bash`, `dockerfile`, `generic`, and `regex`.
+Full `p/default` ships 1074 rules across every language Semgrep supports
+(Python, Java, Go, Ruby, HCL, PHP, Solidity, Scala, C#, …); none of those
+non-JS/TS language packs can ever fire in a TypeScript/JavaScript platform
+tree, so keeping them would only bloat the committed file and scan time for
+no signal. The filtered snapshot keeps 313 of the 1074 rules — including, by
+design, **every** `yaml`-language rule (where `secrets-inherit` and the pnpm
+supply-chain rules live) and every `js`/`ts`/`generic` rule (eval, command
+injection, taint flows — the vuln classes that made `p/default` the chosen
+default over the narrower `p/ci`).
+
+> **One rule dropped for a reason other than language scope.**
+> `generic.secrets.security.detected-slack-webhook` is excluded from the
+> snapshot, not because its language is out of scope, but because its own
+> rule body embeds a credential-shaped placeholder literal (an inert
+> `pattern-not` example, not a live secret) that GitHub push protection's
+> secret scanner flags on every `git push` regardless of context. We did
+> **not** rewrite or obfuscate that literal to evade the scanner — weakening
+> one security control to satisfy another is out of bounds. Dropping the
+> single rule (named, with rationale, in `update-semgrep-rules.mjs`'s
+> `EXCLUDED_RULE_IDS`) is the transparent fix: it costs one detection rule
+> out of 313, and the gitleaks sub-step in the same security tier already
+> covers Slack-webhook-shaped credential findings via a dedicated,
+> purpose-built secret scanner.
+
+A consumer's `pr-quality.yml@<ref>` call gets the ruleset snapshot that
+shipped with the **exact resolved commit** its pin points to: the SAST job
+checks out `dsj1984/mandrel-platform` a second time (sparse, `.semgrep/`
+only) at `github.job_workflow_sha` — the same resolved-ref
+single-source-of-truth primitive already used by `deploy-cloudflare.yml`'s
+`deploy-summary` job (Story #110) — so "which workflow ran" and "which
+ruleset it scanned with" can never drift apart.
+
+**Bumping the ruleset is a reviewable PR**, mirroring the
+[action-pin ratchet](#the-action-pin-ratchet)'s "bump is a PR" discipline and
+the [OSV-scanner version pin](#osv-advisory-tier-enable-osv-scan):
+
+```bash
+node scripts/update-semgrep-rules.mjs
+git diff .semgrep/rules.json
+```
+
+The script re-resolves `p/default` against the pinned Semgrep version
+(`--semgrep-pin` to override; keep it in lockstep with the SAST step's own
+`SEMGREP_PIN` literal), re-applies the language filter, and rewrites
+`.semgrep/rules.json` deterministically (rules sorted by `id`, so a re-run
+with no upstream changes produces a byte-identical file and a re-run with
+upstream changes produces a reviewable, rule-level diff). Commit the result
+as a deliberate `chore(security):` ruleset bump — a new rule lands because a
+human reviewed and merged it, never because the registry changed underneath
+a running gate.
+
+**`secrets-inherit` disposition (AC).** The `secrets-inherit` rule
+(`yaml.github-actions.security.secrets-inherit.secrets-inherit`) is **kept in
+the curated set**, not excluded. `secrets: inherit` is this platform's
+**documented consumer deploy-caller pattern** — every "minimal caller"
+snippet in this doc (`pr-quality.yml`, `deploy-cloudflare.yml`,
+`release-automation.yml`) shows a consumer's own workflow forwarding its
+secrets to the reusable call with `secrets: inherit`, scoped to the frozen
+`{CLOUDFLARE_*, TURSO_*}` surface those reusable workflows actually consume
+(see [Secrets](#secrets)). mandrel-platform's **own** workflows never use a
+live `secrets: inherit` line — every occurrence in this repo's `.yml` files
+is inside a documentation comment showing the caller-side pattern — so the
+rule is a structural no-op against this repo's own tree and exists purely to
+flag the pattern for **consumer** repos that copy it verbatim without
+realizing the scope it forwards. A consumer that intentionally adopts the
+documented pattern suppresses the finding with an inline
+`# nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit`
+comment on the `secrets: inherit` line, with a comment citing this section as
+the rationale — not a blanket per-repo exemption. We deliberately did **not**
+migrate every caller to an explicit secret map: the frozen,
+documented-surface model in [Secrets](#secrets) already gives a reviewer the
+same auditability an explicit map would, without the per-input duplication
+tax across three consumer repos.
 
 ### pnpm supply-chain config vs. Renovate `minimumReleaseAge`
 

@@ -182,23 +182,39 @@ on:
         type: boolean
         default: true
 
-      # Semgrep ruleset config for the SAST sub-step. Defaults to the broad
-      # registry ruleset 'p/default', which catches real vuln classes
-      # (eval, command injection, taint flows). NOTE: 'p/ci' was rejected as
-      # the default — it is too narrow (0 findings on eval()/command-injection
-      # fixtures). Do NOT use 'auto' here either — `auto` requires metrics ON
-      # (it phones semgrep.dev to tailor the rule set), incompatible with the
-      # `--metrics=off` privacy posture of the SAST step. Override with another
-      # registry ref (e.g. 'p/security-audit') or a path at the call site.
+      # Semgrep ruleset config for the SAST sub-step. Defaults to 'vendored',
+      # a sentinel (NOT a literal semgrep --config value) that the SAST step
+      # resolves to the path of this reusable workflow's OWN checked-out copy
+      # of `.semgrep/rules.json` (Story #132) — a deterministic,
+      # platform-controlled snapshot of the registry ruleset 'p/default',
+      # filtered to the languages this platform's reusable workflows and
+      # consumer trees actually scan (js/ts/yaml/json/bash/dockerfile/
+      # generic/regex). It is NOT the live registry alias: that bit us on the
+      # 0.14.0 release when 'p/default' silently grew the pnpm supply-chain
+      # rules + `secrets-inherit`, redding a full-tree scan with zero code
+      # change on our side. See docs/reusable-workflows.md's "SAST ruleset
+      # provenance" section for the bump process
+      # (`scripts/update-semgrep-rules.mjs`). NOTE: 'p/ci' was rejected as an
+      # alternative default — it is too narrow (0 findings on
+      # eval()/command-injection fixtures). Do NOT use 'auto' here either —
+      # `auto` requires metrics ON (it phones semgrep.dev to tailor the rule
+      # set), incompatible with the `--metrics=off` privacy posture of the
+      # SAST step. A caller MAY still override with a live registry ref (e.g.
+      # 'p/security-audit') or a path of their own — that reintroduces
+      # registry drift for that input, a deliberate per-caller opt-out, not
+      # the platform default.
       semgrep-config:
         description: >
-          Semgrep config passed to `semgrep scan --config`. Default 'p/default'
-          (broad OSS ruleset; no Semgrep AppSec Platform login required). Must
-          be a concrete ruleset/path — 'auto' is unsupported because the step
-          runs with --metrics=off.
+          Semgrep config passed to `semgrep scan --config`. Default
+          'vendored' resolves to this reusable workflow's own checked-out,
+          platform-controlled ruleset snapshot at `.semgrep/rules.json` (see
+          docs/reusable-workflows.md) — NOT the live registry. Pass a
+          registry ref (e.g. 'p/security-audit') or a path to opt back into a
+          different ruleset; 'auto' is unsupported because the step runs with
+          --metrics=off.
         required: false
         type: string
-        default: 'p/default'
+        default: 'vendored'
 
       # Additional SAST exclude globs, APPENDED to the built-in `.agents`
       # exclude (the vendored framework tree a consumer cannot edit). The
@@ -1015,6 +1031,37 @@ jobs:
           fi
           echo "✅ No secrets detected."
 
+      # Check out THIS reusable workflow's own repo (mandrel-platform) at the
+      # exact SHA the caller's `uses: …/pr-quality.yml@<ref>` pin resolved to
+      # (`github.job_workflow_sha` — the same resolved-ref single-source-of-
+      # truth primitive `deploy-summary` echoes in deploy-cloudflare.yml,
+      # Story #110), into a side directory `_mandrel-platform-sast/`. The
+      # caller's own checkout (above) never contains `.semgrep/rules.json` —
+      # that file lives in THIS repo, not the consumer's — so the vendored
+      # ruleset has to come from a second, explicit checkout rather than the
+      # primary one. Resolving via `job_workflow_sha` (not a hand-maintained
+      # ref literal) means a consumer always gets the ruleset snapshot that
+      # shipped with the exact pr-quality.yml version it pinned — no drift
+      # between "which workflow ran" and "which ruleset it scanned with".
+      - name: Checkout vendored SAST ruleset (mandrel-platform@resolved-sha)
+        if: ${{ inputs.enable-sast && inputs.semgrep-config == 'vendored' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is the resolved 40-hex commit of THIS reusable
+          # workflow (the value the caller's `@<ref>` pin resolved to). It is
+          # a valid runtime github-context field, but actionlint's pinned
+          # context type model does not list it, so it is read through the
+          # `fromJSON(toJSON(github))` escape hatch (typed `any`) to keep the
+          # workflow lint-clean — same pattern as deploy-summary in
+          # deploy-cloudflare.yml (Story #110).
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            .semgrep
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-sast
+          persist-credentials: false
+
       # Resolve the Semgrep SAST baseline, mirroring the gitleaks PR-diff
       # scoping above. On pull_request events the baseline is the PR's merge
       # base (`base.sha`), so `--baseline-commit` makes Semgrep report only
@@ -1063,9 +1110,27 @@ jobs:
           SAST_EXCLUDE: ${{ inputs.sast-exclude }}
         run: |
           set -euo pipefail
+
+          # Resolve the 'vendored' sentinel (Story #132) to the path of the
+          # side-checked-out platform ruleset from the step above; any other
+          # value (a registry ref like 'p/security-audit' or a caller-owned
+          # path) passes through unchanged — that is the deliberate
+          # per-caller opt-out of the platform-controlled default.
+          if [ "${SEMGREP_CONFIG}" = "vendored" ]; then
+            SEMGREP_CONFIG="${GITHUB_WORKSPACE}/_mandrel-platform-sast/.semgrep/rules.json"
+            if [ ! -f "${SEMGREP_CONFIG}" ]; then
+              echo "::error::Vendored ruleset not found at ${SEMGREP_CONFIG} — the 'Checkout vendored SAST ruleset' step must run before this one when semgrep-config is 'vendored'."
+              exit 1
+            fi
+          fi
+
           # Pinned Semgrep release from PyPI. `semgrep scan --error` exits
-          # non-zero on any finding; `--config` selects the ruleset (default
-          # OSS 'p/default'). Bump this pin deliberately.
+          # non-zero on any finding; `--config` selects the ruleset (default:
+          # this reusable workflow's own vendored `.semgrep/rules.json`, a
+          # deterministic snapshot — NOT the live registry alias
+          # 'p/default'). Bump the ruleset deliberately via
+          # `scripts/update-semgrep-rules.mjs` (see
+          # docs/reusable-workflows.md).
           #
           # `setuptools` provides `pkg_resources`, which semgrep's transitive
           # opentelemetry dependency imports but does not declare — absent by
@@ -1104,9 +1169,17 @@ jobs:
           # findings is a false block (Story #93). Semgrep's `--exclude` takes a
           # pattern matched against path components, so `--exclude '.agents'`
           # drops the whole `.agents/**` subtree from the target set (mirroring
-          # how it ignores `node_modules` by default). Any extra globs from the
-          # `sast-exclude` input are APPENDED, each as its own `--exclude` arg.
-          EXCLUDE_ARGS=(--exclude '.agents')
+          # how it ignores `node_modules` by default). `_mandrel-platform-sast`
+          # is the side-checkout directory the 'vendored' ruleset resolution
+          # step (above) materializes to carry `.semgrep/rules.json` — it is
+          # mandrel-platform's OWN source tree, not the caller's, and must
+          # never enter this caller's finding set regardless of which
+          # `semgrep-config` value is in effect (the directory only exists
+          # when `semgrep-config == 'vendored'`, but excluding it
+          # unconditionally is harmless and keeps this list static). Any
+          # extra globs from the `sast-exclude` input are APPENDED, each as
+          # its own `--exclude` arg.
+          EXCLUDE_ARGS=(--exclude '.agents' --exclude '_mandrel-platform-sast')
           if [ -n "${SAST_EXCLUDE:-}" ]; then
             # Split on whitespace AND commas so 'dist,coverage tests/fixtures'
             # all work. Empty tokens (e.g. from a trailing comma) are skipped.
