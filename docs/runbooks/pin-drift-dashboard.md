@@ -33,21 +33,59 @@ accumulate silently:
 4. **Surface skew** — the npm pin and the workflow `uses:` pins disagree about
    being current (one is on the latest release, the other lags). This is the
    class the original `uses:`-only check missed: swarm-os ran npm `0.11.3`
-   while its workflows tracked `v0.11.6`.
+   while its workflows tracked `v0.11.6` while the latest was `v0.11.7`.
 
 The dashboard reads each consumer's `.github/workflows/` **and** its
 `package.json` over the GitHub API, extracts every platform `uses:` ref across
 all chains plus the `mandrel-platform` npm version, and reports a per-consumer
-verdict: `✅ current`, `⚠️ lagging`, `❌ split pin`, `❌ npm/uses skew`, or
-`❔ unknown` (floating tags / unresolved SHA). A consumer that adopts the
-workflows but not the npm config package reports its npm column as `absent` —
-informational, not drift.
+verdict: `✅ current`, `⚠️ lagging`, `❌ split pin`, `❌ npm/uses skew`,
+`⏳ holding` (see below), or `❔ unknown` (floating tags / unresolved SHA). A
+consumer that adopts the workflows but not the npm config package reports its
+npm column as `absent` — informational, not drift.
+
+## The `minimumReleaseAge` coupling — why a fresh release does not page
+
+> **Invariant (Story #107):** a consumer's pinned reusable-workflow tag and its
+> `mandrel-platform` npm devDependency minor must not drift apart **undetected**
+> — but the **transient skew during a Renovate `minimumReleaseAge` hold is not
+> drift**.
+
+The shared Renovate preset ([`default.json`](../../default.json)) gates every
+bump behind a **3-day `minimumReleaseAge`** supply-chain hold. For the first
+~3 days after a platform release, **every** consumer legitimately lags the new
+tag — Renovate has not raised the grouped *"mandrel-platform workflows"* /
+npm-bump PR yet. If the dashboard scored that window as drift it would fire a
+false positive on **every** release, training operators to ignore it.
+
+So the checker reads the latest release's `published_at`, compares it against
+the `minimumReleaseAge` window (configurable via the top-level
+`minimumReleaseAge` key in
+[`pin-drift-consumers.json`](../../scripts/pin-drift-consumers.json), default
+`3 days` to mirror the preset), and **suppresses lag/skew that is fully
+explained by the hold**:
+
+- A consumer whose **only** deviation is "not yet on a release younger than the
+  hold window" is reported as **`⏳ holding`** — informational, listed under a
+  separate **Holding** section, and **does not** count toward `--strict` drift.
+- Lag against a release **older** than the window is real **drift** again
+  (`⚠️ lagging` / `❌ npm/uses skew`), because the hold has expired and Renovate
+  *should* have bumped the consumer by now.
+- A **`❌ split pin`** is a real configuration error and is **never** suppressed
+  by the hold — a consumer pinning two platform SHAs at once is wrong
+  regardless of release age.
+
+This is the permanent close of the swarm-os three-way split (npm `0.11.3` /
+workflows `@v0.11.6` / latest `v0.11.7`): before the coupling existed, a genuine
+two-surface divergence was indistinguishable from a fresh-release hold, so the
+class could not be enforced without false positives. Keep the
+`minimumReleaseAge` in `pin-drift-consumers.json` in lockstep with the value in
+`default.json`.
 
 ## Components
 
 | Component | Path | Role |
 | --------- | ---- | ---- |
-| Consumer registry | [`scripts/pin-drift-consumers.json`](../../scripts/pin-drift-consumers.json) | Data-driven list of consumers. **Adding a consumer is one object here.** |
+| Consumer registry | [`scripts/pin-drift-consumers.json`](../../scripts/pin-drift-consumers.json) | Data-driven list of consumers + the `minimumReleaseAge` hold window. **Adding a consumer is one object here.** |
 | Checker | [`scripts/check-pin-drift.mjs`](../../scripts/check-pin-drift.mjs) | Resolves the latest release, fetches each consumer's workflows **and `package.json`**, classifies `uses:` + npm drift, renders the report. |
 | Tests | [`scripts/check-pin-drift.test.mjs`](../../scripts/check-pin-drift.test.mjs) | `node:test` suite exercising the pure classifiers and the full pipeline with an injected `gh` runner (offline). Wired into `npm test`. |
 | Scheduled workflow | [`.github/workflows/pin-drift.yml`](../../.github/workflows/pin-drift.yml) | Runs the checker weekly (Mondays 07:00 UTC) and on demand; renders the report to the job summary. |
@@ -73,7 +111,8 @@ node scripts/check-pin-drift.mjs
 # Machine-readable envelope:
 node scripts/check-pin-drift.mjs --json
 
-# Fail (exit 1) when any consumer is split-pinned or lagging:
+# Fail (exit 1) when any consumer is split-pinned or lagging
+# (consumers within the minimumReleaseAge hold window are `holding`, not drift):
 node scripts/check-pin-drift.mjs --strict
 ```
 
