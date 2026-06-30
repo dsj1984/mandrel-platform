@@ -179,6 +179,23 @@ Append one object to the `consumers` array in
 `branch` is optional (defaults to the repo's default branch). No code change is
 required — the checker enumerates the new repo on the next run.
 
+### pnpm-native supply-chain rollout tracking (Story #133)
+
+The three fleet consumers (`domio`, `athportal`, `swarm-os` — same registry as
+above) are the rollout targets for the canonical pnpm supply-chain block
+(`config/pnpm-workspace.supply-chain.yaml` —
+[README — pnpm supply-chain config](../../README.md#pnpm-supply-chain-config),
+[reusable-workflows.md reconciliation](../reusable-workflows.md#pnpm-supply-chain-config-vs-renovate-minimumreleaseage)).
+Story #133 ships and documents the canonical block on the platform side only;
+per-consumer adoption (merging the fragment into each repo's
+`pnpm-workspace.yaml`) is tracked per-consumer, not by this dashboard's
+pin-drift check (the block has no `uses:`/npm-version pin shape this checker
+understands). Each consumer's own repo-ops tracking doc
+(`mandrel-platform-consumers.md`, where present) should gain a row noting
+adoption status once that consumer's `pnpm-workspace.yaml` carries the block —
+this repo has no equivalent file today since pin-drift tracking lives in
+`scripts/pin-drift-consumers.json` above instead.
+
 ## Running it locally
 
 ```bash
