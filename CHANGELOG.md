@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.12.0...mandrel-platform-v0.13.0) (2026-06-30)
+
+
+### Added
+
+* **security:** add reusable secret-scan-push.yml full-history scan (refs [#103](https://github.com/dsj1984/mandrel-platform/issues/103)) ([#104](https://github.com/dsj1984/mandrel-platform/issues/104)) ([dcfaaf1](https://github.com/dsj1984/mandrel-platform/commit/dcfaaf16aae9425b2cc4c3a8c63accfca5a00675))
+
 ## [0.12.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.11.7...mandrel-platform-v0.12.0) (2026-06-30)
 
 
