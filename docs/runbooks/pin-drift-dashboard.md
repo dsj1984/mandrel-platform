@@ -196,6 +196,19 @@ adoption status once that consumer's `pnpm-workspace.yaml` carries the block —
 this repo has no equivalent file today since pin-drift tracking lives in
 `scripts/pin-drift-consumers.json` above instead.
 
+### `biome.base.json` Biome v2 rollout tracking (Story #153)
+
+Story #153 reauthors `config/biome.base.json` to the **Biome v2 schema**
+(see [README — `biome.base.json`](../../README.md#biomebasejson)). Consumers
+still on Biome 1.x cannot `extends` the reauthored base — the v2 config
+shape is a hard configuration error on Biome 1.x — so adoption requires the
+consumer to bump to Biome 2.x first. Like the pnpm-native rollout above,
+per-consumer adoption is tracked in each consumer's own
+`mandrel-platform-consumers.md` (where present), not by this dashboard: the
+pin-drift check only understands `uses:`/npm-version pin shapes, and a
+Biome-major bump has neither. This repo has no equivalent file today since
+pin-drift tracking lives in `scripts/pin-drift-consumers.json` above instead.
+
 ## Running it locally
 
 ```bash
