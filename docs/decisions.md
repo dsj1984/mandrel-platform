@@ -33,6 +33,42 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-01 — Opt-in verify-commit-sha: boot-smoke asserts the deployed SHA
+
+**Context.** `GIT_COMMIT_SHA` injection at deploy is `◐` (roadmap §2a.2):
+each consumer injects the SHA in its own build step (the build-split model),
+but nothing verified it survived to the running Worker. The shared
+`deploy-cloudflare.yml` workflow already knows the expected SHA
+(`github.sha`) and already runs a boot-smoke probe against a `version`-
+reporting health endpoint (`docs/runbooks/post-deploy-smoke.md` §3); the gap
+was that the probe checked HTTP status only, never the reported version.
+
+**Decision.** Add an opt-in `verify-commit-sha` boolean input (default
+`false`) to `deploy-cloudflare.yml`. When `true`, the built-in boot-smoke
+probe parses the health response's `version` field and asserts it equals
+`github.sha`; a missing/unparsable field or a mismatch fails smoke and takes
+the **same auto-rollback path** as an HTTP-status failure. The check is
+ignored when `smoke-command` is set (a consumer-supplied probe owns its own
+verification) and defaults to `false` so existing consumers are unaffected
+until they wire `GIT_COMMIT_SHA` through to their health endpoint and opt
+in (Story #176; consumer opt-in itself rides with the per-consumer
+deploy-guard adoption stories, out of scope here). Contract docs
+(`docs/reusable-workflows.md`, `docs/runbooks/post-deploy-smoke.md`) were
+updated with the endpoint expectation and the new input.
+
+**Consequences.** A consumer that wires `GIT_COMMIT_SHA` into its health
+endpoint and sets `verify-commit-sha: true` gets an exact, deploy-time
+rollback-verification invariant instead of an HTTP-200-only smoke check —
+"the Worker is up" now also means "the Worker is running the commit we just
+deployed". The repo-ops consumers matrix §2 "GIT_COMMIT_SHA injected at
+deploy" row flip (`◐` → `●`) is tracked in the sibling `repo-ops` planning
+repo (`mandrel-platform-consumers.md`), not in this repo — same pattern as
+the 2026-07-01 repo-settings decision above: that repo is a separate git
+remote (`dsj1984/repo-ops`) outside this Story's PR boundary. The flip
+should be applied there once this Story (mandrel-platform#176) merges,
+citing this decision entry and the shipped `verify-commit-sha` input as the
+now-existing contract the row can point to.
+
 ## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
 
 **Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix

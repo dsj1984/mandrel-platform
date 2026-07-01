@@ -929,6 +929,33 @@ other on the caller's upstream CI conclusion — and `secret-isolation-audit`
 only proceeds once both have cleared (`needs: [environments-isolation-audit,
 require-ci-green]`).
 
+### Commit-SHA verification (opt-in)
+
+> Story #176. `GIT_COMMIT_SHA` injection at deploy is per-consumer
+> (build-split model: each consumer injects the SHA in its own build step),
+> and nothing previously verified it survived to the running Worker. When
+> `verify-commit-sha: true`, the built-in boot-smoke probe additionally
+> asserts that each deployed worker's health response reports the SHA this
+> run is deploying (`github.sha`), turning the release-tagging convention
+> into a deploy-time invariant.
+
+The probe reuses the existing [health endpoint
+contract](runbooks/post-deploy-smoke.md#3-health-endpoint-contract): the
+worker's health handler must return a JSON body with a `version` field set
+to the deployed commit SHA, e.g.:
+
+```typescript
+app.get('/health', (c) => c.json({ status: 'ok', version: c.env.GIT_COMMIT_SHA ?? 'unknown' }));
+```
+
+- A missing or unparsable `version` field, or a `version` that does not
+  match `github.sha`, fails the smoke check for that worker and takes the
+  **same auto-rollback path** as an HTTP-status failure.
+- Ignored when `smoke-command` is set — a consumer-supplied probe owns its
+  own verification.
+- Defaults to `false` (opt-in) so existing consumers are unaffected until
+  they wire `GIT_COMMIT_SHA` through to their health endpoint and opt in.
+
 ### Resolved-ref deploy summary (single source of truth)
 
 > Story #110. The final `deploy-summary` job (`if: always()`) emits the
@@ -982,6 +1009,7 @@ jobs:
 | `smoke_base_url`             | string  | `''`        | Base URL for the built-in probe (e.g. `https://godomio.com`). Each smoke path is appended to this base instead of the derived workers.dev host. No trailing slash. |
 | `smoke_paths`                | string  | `'/health'` | Comma-separated paths the built-in probe requests against each target (e.g. `"/,/portal,/api/health"`). Each must start with a leading slash.                |
 | `workers_dev_subdomain`      | string  | `''`        | workers.dev account **subdomain slug** (e.g. `"dsj1984"`) used to build the probe URL. Empty derives it from `wrangler whoami`. **Never** pass the account ID. |
+| `verify-commit-sha`          | boolean | `false`     | Opt-in (Story #176). When `true`, the built-in probe additionally asserts the health response's `version` field equals `github.sha`. A mismatch fails smoke and triggers rollback. Ignored when `smoke-command` is set. See [Commit-SHA verification](#commit-sha-verification-opt-in) below. |
 
 > **Command seams.** `snapshot-command`, `migrate-command`, `build-command`,
 > `deploy-command`, and `smoke-command` are override seams: with **none** set,
