@@ -1347,6 +1347,72 @@ jobs:
       - run: echo "Cut ${{ needs.release.outputs.tag_name }} — run deploy/publish here."
 ```
 
+### Excluding the generated `CHANGELOG.md` from markdownlint
+
+Every consumer that runs a markdown linter (e.g. `markdownlint-cli2`) in its
+own `pr-quality.yml`-style CI **must** exclude the `CHANGELOG.md` this
+workflow generates. release-please writes it as flat, unwrapped Markdown, and
+independently reflows on every release — it will not conform to a
+line-length, heading-increment, or blank-line ruleset tuned for hand-authored
+docs, and re-linting a generated file only produces noise the consumer cannot
+fix by editing prose. Three independent adopters hit this same red CI run
+before wiring the exclusion (Story #174); bake it into the caller's lint
+config **before** the first release-please run, not after the first red PR:
+
+```jsonc
+// .markdownlint-cli2.jsonc (or the ignores block of your existing config)
+{
+  "ignores": ["CHANGELOG.md"]
+}
+```
+
+Or, for the plain `.markdownlintignore` file some linters read instead:
+
+```text
+CHANGELOG.md
+```
+
+If `config-file` points at a monorepo manifest with multiple packages, each
+package's `changelog-path` needs its own exclusion entry (e.g.
+`packages/*/CHANGELOG.md`).
+
+### Pre-1.0 versioning and `Release-As`
+
+While a consumer's `package.json` version stays on `0.x`, release-please
+treats `feat:` commits as **minor** bumps and `fix:` commits as **patch**
+bumps under its default `bump-minor-pre-major: false` /
+`bump-patch-for-minor-pre-major: false` posture — it does **not** promote a
+`feat:` to a `1.0.0` major bump on its own. This mirrors
+[SemVer's pre-1.0 carve-out](https://semver.org/#spec-item-4) (anything under
+`1.0.0` is initial development; breaking changes may ship in a `0.x.0` minor)
+and matches how mandrel-platform versions itself
+(`release-please-config.json` in this repo). A consumer that instead wants
+`feat:` to bump the minor and `fix:` to bump the patch **while still on
+`0.x`** — i.e. behave like a post-1.0 repo before actually cutting `1.0.0` —
+sets `bump-minor-pre-major: true` (and optionally
+`bump-patch-for-minor-pre-major: true`) in its own `config-file`; the
+`release-type`/`package-name` single-package inputs on this workflow don't
+expose those flags directly, so a consumer that needs them supplies
+`config-file` + `manifest-file` instead of the bare `release-type` default.
+
+To force a specific version — cutting the actual `1.0.0`, or landing a
+one-off major/minor bump outside what Conventional Commits would infer — add
+a `Release-As: x.y.z` footer (own paragraph, exact casing) to any commit
+message on a PR merging to `target-branch`. release-please reads the footer
+on the next run and pins the release PR's version to it, regardless of the
+commit types accumulated since the last release:
+
+```text
+feat: add the widget importer
+
+Release-As: 1.0.0
+```
+
+This is the same mechanism release-please.yml documents implicitly through
+its own conventional-commit posture; the platform has not needed a
+`Release-As` footer for its own `0.x` train, so the flag is undocumented
+until wired here.
+
 ---
 
 ## `codeql.yml`

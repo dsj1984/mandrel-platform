@@ -123,6 +123,27 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      # Token preflight (Story #174): three independently-adopting consumers
+      # each rediscovered the anti-recursion trap the Secrets table below
+      # already documents — the default GITHUB_TOKEN silently degrades the
+      # release PR (opens fine, but never runs required CI and never
+      # auto-merges) instead of failing loudly. A `workflow_call` cannot
+      # inspect the caller's secrets store directly, so this step checks
+      # whether `release-token` resolved to a non-empty value and prints an
+      # actionable `::warning::` when it did not — non-blocking, because
+      # GITHUB_TOKEN is a legitimate (if degraded) configuration for a
+      # consumer that manually merges release PRs. See docs/reusable-workflows.md
+      # § release-automation.yml → Secrets for the wiring fix.
+      - name: Warn when release-token is unset
+        if: ${{ secrets.release-token == '' }}
+        shell: bash
+        run: |
+          echo "::warning::release-automation.yml: 'release-token' secret is unset — falling back to the default GITHUB_TOKEN. \
+          GitHub's anti-recursion safeguard means PRs opened with GITHUB_TOKEN do NOT trigger downstream workflows, so the \
+          release PR release-please just opened will never run your required CI and can never auto-merge. Wire a PAT or \
+          GitHub App installation token (scopes: contents:write, pull-requests:write) as this caller's 'release-token' \
+          secret. See docs/reusable-workflows.md § release-automation.yml → Secrets."
+
       - name: Run release-please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
