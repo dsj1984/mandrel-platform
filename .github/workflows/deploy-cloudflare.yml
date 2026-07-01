@@ -266,12 +266,14 @@ on:
         required: false
       # Scanner-only optional secret — NOT part of the frozen deploy/seam
       # passthrough set above (it is never mapped into a deploy or seam `env:`).
-      # Consumed solely by the gitleaks-action in the secret-isolation-audit
-      # job; only meaningful for orgs with a gitleaks GHAS licence. Declaring it
-      # here makes the `${{ secrets.GITLEAKS_LICENSE }}` reference valid for
-      # consumers using an explicit `secrets:` map rather than `secrets: inherit`.
+      # VESTIGIAL since the gitleaks-CLI migration: the secret-isolation-audit
+      # job now runs the event-agnostic gitleaks CLI (not gitleaks-action), which
+      # does not consume a licence. The declaration is retained so consumers that
+      # still pass it via an explicit `secrets:` map do not error; it is no longer
+      # referenced anywhere in this file and can be dropped in a future breaking
+      # release.
       GITLEAKS_LICENSE:
-        description: 'Optional gitleaks org/enterprise licence key for the secret-isolation audit.'
+        description: 'Deprecated/unused: retained for back-compat with callers that still pass it.'
         required: false
 
 # Least-privilege: content-read only. Each job that needs more escalates
@@ -300,11 +302,31 @@ jobs:
           fetch-depth: 0
 
       - name: Run Gitleaks secret scan
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        # The gitleaks-action rejects the `workflow_run` event ("The
+        # [workflow_run] event is not yet supported"), which breaks any deploy
+        # gated on CI-green via a `workflow_run` trigger (swarm-os is the first
+        # consumer to exercise the shared deploy that way). Invoke the gitleaks
+        # CLI directly instead — it is event-agnostic and preserves the
+        # secret-in-tree guarantee on every trigger (push / PR / workflow_run /
+        # dispatch / schedule). Pinned by version + SHA-256 for supply-chain
+        # safety; `dir` scans the checked-out tree, matching this job's intent.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-          GITLEAKS_ENABLE_COMMENTS: false
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+        run: |
+          set -euo pipefail
+          # runs-on: ubuntu-latest, so the linux_x64 asset is the only target.
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          tmp="$(mktemp -d)"
+          curl -fsSL "$url" -o "${tmp}/${asset}"
+          echo "${GITLEAKS_SHA256}  ${tmp}/${asset}" | sha256sum -c -
+          tar -xzf "${tmp}/${asset}" -C "${tmp}" gitleaks
+          chmod +x "${tmp}/gitleaks"
+          "${tmp}/gitleaks" version
+          # Blocking scan of the checked-out tree (`dir`); a non-zero exit fails
+          # this job and, via the downstream `needs:`, the whole deploy.
+          "${tmp}/gitleaks" dir --no-banner --redact=100 --exit-code 1 .
 
   # ---------------------------------------------------------------------------
   # 2. Environment gate
