@@ -56,9 +56,25 @@ consumer inherits a network-egress baseline for free.
 
 ### Minimal caller
 
+> **File and job naming.** Name the caller workflow file `ci.yml`, its display
+> `name:` `CI`, and the job that wraps this call `ci` — the canonical triplet
+> (see [Canonical caller naming](#canonical-caller-naming-the-ciyml--ci--ci-triplet)
+> below) that keeps the required-context string `ci / ci-required` stable and
+> onboarding-friendly across the fleet. New consumers should start from this
+> shape rather than an ad hoc file/job name.
+
 ```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
 jobs:
-  pr-quality:
+  ci:
     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
     secrets: inherit
 ```
@@ -784,6 +800,60 @@ Do **not** register the individual tier jobs (`Lint & format`, `Typecheck`,
 `Unit (1/3)`, …) as required — their names change with shard count and toggle
 state, which is exactly the drift `ci-required` exists to absorb.
 
+### Canonical caller naming (the `ci.yml` / `CI` / `ci` triplet)
+
+`ci-required` fixes the required-**check** name, but it does not fix the
+**caller** naming three layers up the stack: the consumer workflow *file* that
+calls `pr-quality.yml`, that workflow's display `name:`, and the caller
+*job id* that wraps the `pr-quality` call. Three fleet consumers converged on
+three different spellings for the same shared workflow (validated 2026-07-01):
+
+| Consumer   | Caller file    | Display `name:` | Caller job id | Required context      |
+| ---------- | -------------- | ---------------- | ------------- | ---------------------- |
+| domio      | `ci-pr.yml`    | `CI (PR)`         | —             | `ci-required`           |
+| athportal  | `quality.yml`  | `quality`         | —             | `pr-quality / ci-required` |
+| swarm-os   | `ci.yml`       | `CI`              | —             | `quality / ci-required` |
+
+Same shared `pr-quality.yml`, three spellings — a papercut for onboarding, for
+org-level rulesets that name a required context by string, and for every doc
+that has to describe "the CI workflow" generically across the fleet.
+
+**Operator decision (2026-07-01, D2 — canonical triplet):**
+
+| Layer                 | Canonical value      |
+| ---------------------- | -------------------- |
+| Caller file             | `ci.yml`              |
+| Display `name:`         | `CI`                  |
+| Caller job id           | `ci`                  |
+| Required context (full) | `ci / ci-required`    |
+
+See the [Minimal caller](#minimal-caller) snippet above for the canonical
+`ci.yml` shape. With that shape, the branch-protection required context reads
+**`ci / ci-required`** (`<caller job id> / <aggregator job id>`) — the same
+`<job id> / <job id>` composition GitHub always uses for a `workflow_call`
+target's status context, just anchored on the canonical `ci` job id instead of
+each consumer's own ad hoc name.
+
+> **Renaming an existing caller is a per-consumer story, not this one.** This
+> section documents the target shape; it does **not** rename `domio`'s
+> `ci-pr.yml`, `athportal`'s `quality.yml`, or `swarm-os`'s `ci.yml`/`quality`
+> job id. Each consumer rename lands atomically with its own branch-protection
+> ruleset context update (old context removed, `ci / ci-required` added) in a
+> dedicated Story — renaming the file/job id without also flipping the
+> ruleset's registered context reintroduces the exact "phantom required
+> check" failure mode [`check-required-contexts.mjs`](#the-ci-required-aggregator)
+> guards against on the platform's own CI, this time on the consumer side.
+> **Note on mandrel-platform's own CI:** this repo's `ci.yml` (file) / `CI`
+> (display name) already matches the canonical file and display-name layers,
+> but mandrel-platform is not itself a `pr-quality.yml` **consumer** — its
+> `ci.yml` self-tests the platform's own scripts/workflows (`check-required-
+> contexts`, `check-workflow-portability`, `check-action-pins`, `actionlint`)
+> and has no `ci` caller job wrapping a `pr-quality.yml` call, so the `ci /
+> ci-required` required-context shape does not apply to it. The canonical
+> triplet targets **consumer** repos that call `pr-quality.yml` — see
+> [the action-pin ratchet](#the-action-pin-ratchet) for mandrel-platform's own,
+> unrelated `ci-required` aggregator.
+
 ---
 
 ## `deploy-cloudflare.yml`
@@ -792,7 +862,7 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `workflow_call` target. The jobs run in this order:
 
 ```text
-environments-isolation-audit → secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
+(environments-isolation-audit, require-ci-green) → secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
 ```
 
 `environments-isolation-audit` only runs when
@@ -825,6 +895,39 @@ environments-isolation-audit → secret-isolation-audit → check-env → pre-mi
 | `enable-environments-isolation-audit`   | boolean | `false` | Set `true` once every environment you list has the canonical branch policy applied. |
 | `environments-to-audit`                 | string  | `''`    | Additional environment names to audit beyond `gh-environment` (comma-separated, deduplicated). Set this when `gh-environment` is empty or you want to audit an environment the deploy itself doesn't attach to. |
 | `isolation-audit-branch`                | string  | `'main'`| The single branch each audited environment must restrict deploys to. |
+
+### CI-green guard (`require-ci-green`)
+
+> Story #175 (operator decision 2026-07-01, D4: one paved road — every
+> consumer converges on `workflow_run` for staging).
+
+`github.event` inside a reusable workflow is the **caller's** event, so this
+workflow can own the CI-green guard even though it cannot own the caller's
+`on:` block. The first job, `require-ci-green`, evaluates that event:
+
+- **`workflow_run` events** — skip-with-notice (every downstream job reports
+  `skipped`) unless `github.event.workflow_run.conclusion == 'success'`.
+  `workflow_run` fires on **both** a successful and a failed upstream run, so
+  this guard is load-bearing: without it, a red CI run on `main` would still
+  trigger a deploy.
+- **Every other event** (`workflow_dispatch`, `push`, `pull_request`, …) —
+  passes through unconditionally. These triggers are operator- or
+  branch-protection-intentional and carry no upstream conclusion to gate on.
+
+Before this guard existed, every consumer gating staging on CI hand-copied the
+same caller-side `preflight` job to re-implement this exact check (see
+athportal's / swarm-os's `deploy-staging.yml` history). A `workflow_run`
+caller now needs **no caller-side preflight guard at all** — see the
+canonical [`templates/workflows/deploy-staging.yml`](https://github.com/dsj1984/mandrel-platform/blob/main/templates/workflows/deploy-staging.yml)
+caller template, which `platform-sync` materializes into a consumer's
+`.github/workflows/` (link-don't-copy, same semantics as the runbook stubs —
+see [`scripts/platform-sync.mjs`](../README.md#adoption-cli-platform-sync)).
+
+`environments-isolation-audit` and `require-ci-green` run as independent
+sibling jobs — one gates on GitHub Environments branch-policy hygiene, the
+other on the caller's upstream CI conclusion — and `secret-isolation-audit`
+only proceeds once both have cleared (`needs: [environments-isolation-audit,
+require-ci-green]`).
 
 ### Resolved-ref deploy summary (single source of truth)
 
