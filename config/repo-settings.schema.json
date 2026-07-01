@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/dsj1984/mandrel-platform/blob/main/config/repo-settings.schema.json",
+  "title": "Repository Settings Baseline Contract",
+  "description": "Defines the GitHub-side repository settings baseline (merge methods, squash-commit source, auto-merge, Actions default token permissions, PR-approval-by-Actions) the fleet must converge on. Validated by scripts/check-repo-settings.mjs against each consumer's live settings (gh api repos/{owner}/{repo}); applied where safe by scripts/platform-sync.mjs --apply-settings. Non-blocking by design (standing decision #10) — drift is reported, never a hard gate on a consumer's main.",
+  "type": "object",
+  "required": [
+    "allowSquashMerge",
+    "allowMergeCommit",
+    "allowRebaseMerge",
+    "squashMergeCommitTitle",
+    "squashMergeCommitMessage",
+    "deleteBranchOnMerge",
+    "allowAutoMerge",
+    "actionsDefaultWorkflowPermissions",
+    "actionsCanApprovePullRequestReviews"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference."
+    },
+    "allowSquashMerge": {
+      "type": "boolean",
+      "description": "Whether squash merging is allowed. The fleet baseline requires this true (squash-only).",
+      "default": true
+    },
+    "allowMergeCommit": {
+      "type": "boolean",
+      "description": "Whether merge commits are allowed. The fleet baseline requires this false (squash-only).",
+      "default": false
+    },
+    "allowRebaseMerge": {
+      "type": "boolean",
+      "description": "Whether rebase merging is allowed. The fleet baseline requires this false (squash-only).",
+      "default": false
+    },
+    "squashMergeCommitTitle": {
+      "type": "string",
+      "description": "Source of the squash-commit title.",
+      "enum": ["PR_TITLE", "COMMIT_OR_PR_TITLE"],
+      "default": "PR_TITLE"
+    },
+    "squashMergeCommitMessage": {
+      "type": "string",
+      "description": "Source of the squash-commit message body. The fleet baseline requires PR_BODY — commits landing on main feed release-please + commitlint, so the PR body becomes the literal commit body and must stay commit-body-safe (see the _note below and docs/runbooks/repo-settings.md).",
+      "enum": ["PR_BODY", "COMMIT_MESSAGES", "BLANK"],
+      "default": "PR_BODY"
+    },
+    "deleteBranchOnMerge": {
+      "type": "boolean",
+      "description": "Whether head branches are auto-deleted after a merge.",
+      "default": true
+    },
+    "allowAutoMerge": {
+      "type": "boolean",
+      "description": "Whether GitHub's native auto-merge feature is enabled for the repo.",
+      "default": true
+    },
+    "actionsDefaultWorkflowPermissions": {
+      "type": "string",
+      "description": "Default GITHUB_TOKEN permissions granted to Actions workflows. The fleet baseline requires 'read' (least-privilege) — a workflow that needs write scopes requests it explicitly via a `permissions:` block.",
+      "enum": ["read", "write"],
+      "default": "read"
+    },
+    "actionsCanApprovePullRequestReviews": {
+      "type": "boolean",
+      "description": "Whether GitHub Actions workflows are permitted to approve pull requests. The fleet baseline requires this false — an automated actor approving its own (or any) PR is a bypass of human review, not a feature.",
+      "default": false
+    },
+    "_note": {
+      "type": "string",
+      "description": "Human-readable note for maintainers."
+    }
+  },
+  "_note": "PR templates must stay commit-body-safe: with squashMergeCommitMessage=PR_BODY, the full PR description becomes the literal squash-commit body on main, which release-please and commitlint then parse. A PR template that injects checklist boilerplate, HTML comments, or non-conventional-commit prose into that body will land in the commit history and can break release-please's changelog generation or commitlint's body-line rules. Keep PR templates short, commit-message-safe prose, or move checklists into template sections that authors delete before merge."
+}

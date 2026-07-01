@@ -33,6 +33,55 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
+
+**Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix
+§3a, roadmap §2.1) found real GitHub-side settings divergence the platform
+shipped no contract for: domio's Actions default workflow token permissions
+were `write` (others `read`); athportal allowed merge-commit + rebase merges
+(others squash-only); squash-commit sources differed (domio `PR_TITLE`/
+`PR_BODY` vs commit-message fallback elsewhere — and those commits feed
+release-please + commitlint on `main`); `can_approve_pull_request_reviews` was
+enabled everywhere. Unlike the workflow-`uses:` pin surface (`check-pin-drift.mjs`)
+and the config-package `extends` surface (`platform-sync.mjs`'s existing file
+sync), these are GitHub API-level repo settings with no local-checkout
+artifact to diff.
+
+**Decision.** Fleet baseline: **squash-only merges · squash source
+`PR_TITLE`/`PR_BODY` · auto-merge + delete-branch-on-merge on · Actions
+default token permissions `read` · `can_approve_pull_request_reviews` off**.
+Ship it as `config/repo-settings.schema.json` (sibling to
+`main-protection.schema.json`, same draft-07 + `additionalProperties: false`
+shape) with the decided values in `docs/runbooks/repo-settings.json` (the
+copy-to-consumer contract file, same pairing as `main-protection.json`).
+`scripts/check-repo-settings.mjs` is the GitHub-side drift dashboard — same
+shape as `check-pin-drift.mjs` (data-driven consumer registry, reusing
+`scripts/pin-drift-consumers.json` rather than a second registry; injectable
+`gh` runner; `--json`/`--strict`). `scripts/platform-sync.mjs` gained a
+`--check-settings`/`--apply-settings` mode (`--consumer-repo owner/repo`) for
+the per-consumer read and safe-apply flow. **Non-blocking by design** (the
+same standing posture as the pin-drift dashboard and the planned
+`check-ruleset.mjs`): drift is reported, never a hard gate that could
+red-line a consumer's `main`. `--apply-settings` PATCHes only an explicit
+allow-list of same-repo settings toggles with no destructive blast radius —
+branch-protection rulesets are a companion `check-ruleset.mjs` story, out of
+scope here.
+
+**Consequences.** A consumer's repo-settings state is now check-able and
+(optionally) auto-correctable in one command instead of a manual GitHub UI
+audit. Because `squashMergeCommitMessage` is `PR_BODY`, PR body content
+becomes the literal squash-commit body feeding release-please/commitlint on
+`main` — the contract documents that PR templates must stay
+commit-message-safe (short prose, no checklist boilerplate the author
+forgets to delete). Cost: a second GitHub-API surface
+(`repos/{owner}/{repo}` + `repos/{owner}/{repo}/actions/permissions/workflow`)
+alongside the existing workflow-contents/package.json reads `check-pin-drift.mjs`
+already makes, and a second `PIN_REPAIR_TOKEN`-shaped write credential
+question for any future auto-repair-PR wiring of `--apply-settings` (deferred;
+today it's an operator-invoked command, not a scheduled workflow). The
+repo-ops consumers matrix §3a Platform column flip (○ → ●) is tracked in the
+sibling `repo-ops` planning repo, not in this repo.
+
 ## 2026-06-30 — Edge-security middleware ships via the npm package-export channel (two CORS variants)
 
 **Context.** Each consumer hand-rolled the per-env edge-security invariants —

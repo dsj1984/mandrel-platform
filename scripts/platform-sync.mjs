@@ -82,6 +82,15 @@ const opts = {
   templates: null,
   repo: "dsj1984/mandrel-platform",
   json: false,
+  // GitHub-side repo-settings check/apply mode (Story #171). This is a
+  // distinct mode from the local-checkout file sync above — it operates over
+  // the GitHub API against a `--consumer-repo owner/repo` slug rather than a
+  // local `--consumer <dir>` checkout, so it short-circuits main() below
+  // rather than composing with the pin/runbook/extends reconciliation.
+  checkSettings: false,
+  applySettings: false,
+  consumerRepo: null,
+  baseline: null,
 };
 
 for (let i = 0; i < args.length; i++) {
@@ -93,6 +102,10 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--templates" && args[i + 1]) opts.templates = resolve(args[++i]);
   else if (a === "--repo" && args[i + 1]) opts.repo = args[++i];
   else if (a === "--json") opts.json = true;
+  else if (a === "--check-settings") opts.checkSettings = true;
+  else if (a === "--apply-settings") opts.applySettings = true;
+  else if (a === "--consumer-repo" && args[i + 1]) opts.consumerRepo = args[++i];
+  else if (a === "--baseline" && args[i + 1]) opts.baseline = resolve(args[++i]);
   else if (a === "--help" || a === "-h") {
     printHelp();
     process.exit(0);
@@ -111,13 +124,24 @@ function printHelp() {
       "  node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref <ref> [--dry-run]",
       "",
       "Flags:",
-      "  --ref <ref>          (required) release tag / branch / floating tag to pin to.",
-      "  --dry-run            plan only; no disk writes.",
+      "  --ref <ref>          (required unless --check-settings/--apply-settings) release",
+      "                        tag / branch / floating tag to pin to.",
+      "  --dry-run            plan only; no disk writes / no GitHub-side mutation.",
       "  --sha <40-hex>       skip ref->SHA resolution; pin to this SHA (offline mode).",
       "  --consumer <dir>     consumer repo root (default: cwd).",
       "  --templates <dir>    mandrel-platform templates/ dir (default: resolved from script).",
       "  --repo <owner/repo>  first-party slug to pin (default: dsj1984/mandrel-platform).",
       "  --json               emit the result envelope as JSON.",
+      "",
+      "GitHub-side repo-settings check/apply (Story #171):",
+      "  --check-settings          read a consumer's LIVE repo settings via `gh api` and",
+      "                            report drift against the baseline (never blocks; report only).",
+      "  --apply-settings          same read, then PATCH the drifted fields to match the",
+      "                            baseline (safe subset only — see README). Implies --check-settings.",
+      "  --consumer-repo <owner/repo>  (required with --check-settings/--apply-settings) the",
+      "                            consumer repo to read/patch over the GitHub API.",
+      "  --baseline <path>         path to the repo-settings baseline JSON",
+      "                            (default: docs/runbooks/repo-settings.json next to this script's package).",
       "",
     ].join("\n")
   );
@@ -140,9 +164,20 @@ function log(msg) {
 // Defaults requiring resolution
 // ---------------------------------------------------------------------------
 
-if (!opts.ref) fail("--ref <release-tag|branch|floating-tag> is required.");
-if (opts.sha && !/^[0-9a-fA-F]{40}$/.test(opts.sha)) {
-  fail(`--sha must be a 40-character hex commit SHA (got: ${opts.sha}).`);
+const settingsMode = opts.checkSettings || opts.applySettings;
+
+if (settingsMode) {
+  if (!opts.consumerRepo) {
+    fail("--consumer-repo <owner/repo> is required with --check-settings/--apply-settings.");
+  }
+  if (!opts.baseline) {
+    opts.baseline = resolve(__dirname, "..", "docs", "runbooks", "repo-settings.json");
+  }
+} else {
+  if (!opts.ref) fail("--ref <release-tag|branch|floating-tag> is required.");
+  if (opts.sha && !/^[0-9a-fA-F]{40}$/.test(opts.sha)) {
+    fail(`--sha must be a 40-character hex commit SHA (got: ${opts.sha}).`);
+  }
 }
 
 // templates/ defaults to the dir adjacent to this script's package root.
@@ -370,6 +405,177 @@ function reconcileTsconfig() {
 }
 
 // ---------------------------------------------------------------------------
+// 5. GitHub-side repo-settings check/apply (Story #171)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields safe to PATCH automatically. Deliberately excludes nothing today —
+ * every dimension the baseline governs (merge methods, squash source,
+ * auto-merge, delete-branch-on-merge, Actions default token permissions,
+ * Actions PR-approval) is a same-repo settings toggle with no destructive
+ * blast radius, unlike e.g. branch-protection rulesets (out of scope — see
+ * the companion check-ruleset.mjs story) or anything that could strand
+ * in-flight PRs. Kept as an explicit allow-list (not "patch every mismatch")
+ * so a future baseline addition must be deliberately added here before
+ * --apply-settings will touch it.
+ */
+const SETTINGS_PATCHABLE_FIELDS = new Set([
+  "allowSquashMerge",
+  "allowMergeCommit",
+  "allowRebaseMerge",
+  "squashMergeCommitTitle",
+  "squashMergeCommitMessage",
+  "deleteBranchOnMerge",
+  "allowAutoMerge",
+]);
+const SETTINGS_ACTIONS_FIELDS = new Set([
+  "actionsDefaultWorkflowPermissions",
+  "actionsCanApprovePullRequestReviews",
+]);
+
+const REPO_FIELD_TO_API_KEY = {
+  allowSquashMerge: "allow_squash_merge",
+  allowMergeCommit: "allow_merge_commit",
+  allowRebaseMerge: "allow_rebase_merge",
+  squashMergeCommitTitle: "squash_merge_commit_title",
+  squashMergeCommitMessage: "squash_merge_commit_message",
+  deleteBranchOnMerge: "delete_branch_on_merge",
+  allowAutoMerge: "allow_auto_merge",
+};
+const ACTIONS_FIELD_TO_API_KEY = {
+  actionsDefaultWorkflowPermissions: "default_workflow_permissions",
+  actionsCanApprovePullRequestReviews: "can_approve_pull_request_reviews",
+};
+
+function ghApiJson(apiPath) {
+  const raw = execFileSync("gh", ["api", apiPath, "-H", "Accept: application/vnd.github+json"], {
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  return JSON.parse(raw);
+}
+
+function ghApiPatch(apiPath, fields) {
+  const args = ["api", "-X", "PATCH", apiPath, "-H", "Accept: application/vnd.github+json"];
+  for (const [key, value] of Object.entries(fields)) {
+    // -f serializes as a string field; -F lets gh infer type (bool/number)
+    // from the literal, which is what PATCH /repos and the Actions
+    // permissions endpoint both expect for boolean fields.
+    args.push("-F", `${key}=${value}`);
+  }
+  execFileSync("gh", args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+}
+
+/** Read a consumer's live settings across both endpoints, mapped to the baseline's camelCase field shape. */
+function fetchLiveSettings(repo) {
+  const repoPayload = ghApiJson(`repos/${repo}`);
+  const actionsPayload = ghApiJson(`repos/${repo}/actions/permissions/workflow`);
+  const live = {};
+  for (const field of SETTINGS_PATCHABLE_FIELDS) live[field] = repoPayload[REPO_FIELD_TO_API_KEY[field]];
+  for (const field of SETTINGS_ACTIONS_FIELDS) live[field] = actionsPayload[ACTIONS_FIELD_TO_API_KEY[field]];
+  return live;
+}
+
+/** Diff `live` against `baseline` for every baseline-declared field. Unknown/extra baseline keys are ignored. */
+function diffSettings(live, baseline) {
+  const mismatches = [];
+  for (const field of [...SETTINGS_PATCHABLE_FIELDS, ...SETTINGS_ACTIONS_FIELDS]) {
+    if (!(field in baseline)) continue;
+    if (live[field] !== baseline[field]) {
+      mismatches.push({ field, expected: baseline[field], actual: live[field] });
+    }
+  }
+  return mismatches;
+}
+
+/**
+ * Apply the drifted fields to the consumer repo via two PATCH calls (one per
+ * endpoint — GitHub does not expose a combined settings write surface).
+ * Never touches a field absent from `mismatches`.
+ */
+function applySettings(repo, mismatches) {
+  const repoPatch = {};
+  const actionsPatch = {};
+  for (const { field, expected } of mismatches) {
+    if (SETTINGS_PATCHABLE_FIELDS.has(field)) repoPatch[REPO_FIELD_TO_API_KEY[field]] = expected;
+    else if (SETTINGS_ACTIONS_FIELDS.has(field)) actionsPatch[ACTIONS_FIELD_TO_API_KEY[field]] = expected;
+  }
+  if (Object.keys(repoPatch).length > 0) ghApiPatch(`repos/${repo}`, repoPatch);
+  if (Object.keys(actionsPatch).length > 0) ghApiPatch(`repos/${repo}/actions/permissions/workflow`, actionsPatch);
+}
+
+function runSettingsMode() {
+  let baseline;
+  try {
+    baseline = JSON.parse(readFileSync(opts.baseline, "utf8"));
+  } catch (err) {
+    fail(`could not read baseline at ${opts.baseline}: ${err.message}`);
+  }
+
+  log(`▶ platform-sync — repo-settings ${opts.applySettings ? "check+apply" : "check"} for ${opts.consumerRepo}`);
+  log("  (non-blocking: drift is reported, never a hard gate — standing decision #10)");
+
+  let live;
+  let mismatches;
+  let error = null;
+  try {
+    live = fetchLiveSettings(opts.consumerRepo);
+    mismatches = diffSettings(live, baseline);
+  } catch (err) {
+    error = err.message;
+    live = null;
+    mismatches = [];
+  }
+
+  let applied = false;
+  if (opts.applySettings && mismatches.length > 0 && !error) {
+    if (opts.dryRun) {
+      log(`  (dry-run: would PATCH ${mismatches.length} field(s) on ${opts.consumerRepo})`);
+    } else {
+      applySettings(opts.consumerRepo, mismatches);
+      applied = true;
+    }
+  }
+
+  log("");
+  if (error) {
+    log(`  ⚠️ error reading ${opts.consumerRepo}: ${error}`);
+  } else if (mismatches.length === 0) {
+    log(`  ✅ ${opts.consumerRepo} matches the repo-settings baseline — no drift.`);
+  } else {
+    log(`  ❌ drift on ${opts.consumerRepo}:`);
+    for (const m of mismatches) {
+      log(`     - ${m.field}: expected ${JSON.stringify(m.expected)}, got ${JSON.stringify(m.actual)}`);
+    }
+    if (applied) log(`  ✅ applied: ${mismatches.length} field(s) patched to match the baseline.`);
+  }
+
+  if (opts.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          mode: opts.applySettings ? "apply-settings" : "check-settings",
+          consumerRepo: opts.consumerRepo,
+          baseline,
+          live,
+          drift: mismatches.length > 0,
+          mismatches,
+          applied,
+          dryRun: opts.dryRun,
+          error,
+        },
+        null,
+        2
+      )}\n`
+    );
+  }
+
+  // Report-only by design (standing decision #10): drift never fails this
+  // command's exit code. A hard error reading the consumer IS fatal.
+  if (error) process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -382,6 +588,11 @@ function rel(p) {
 // ---------------------------------------------------------------------------
 
 function main() {
+  if (settingsMode) {
+    runSettingsMode();
+    return;
+  }
+
   if (!existsSync(opts.consumer)) {
     fail(`consumer dir not found: ${opts.consumer}`);
   }

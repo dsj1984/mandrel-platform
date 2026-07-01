@@ -138,3 +138,265 @@ test("an existing reference stub is skipped idempotently", () => {
   assert.ok(out.runbooks.skipped.length >= 8, "already-present stubs are skipped, not re-created");
   assert.equal(out.runbooks.created.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// --check-settings / --apply-settings (Story #171)
+//
+// platform-sync.mjs shells out to the real `gh` CLI for the GitHub-side
+// settings mode (no dependency-injection seam like check-pin-drift.mjs), so
+// these tests stub `gh` as a fake executable on PATH and drive the CLI
+// end-to-end. The pure diff/classification logic itself is unit-tested in
+// check-repo-settings.test.mjs; this suite exercises platform-sync's own
+// argument wiring, PATCH-call shape, and non-blocking exit-code contract.
+// ---------------------------------------------------------------------------
+
+let settingsDir;
+let fakeGhDir;
+let fakeGhLogPath;
+
+/**
+ * Write a fake `gh` shell script onto a scratch PATH dir that:
+ *   - responds to `gh api repos/<repo>` and `gh api repos/<repo>/actions/permissions/workflow`
+ *     with the JSON bodies given in `responses` (keyed by the API path),
+ *   - logs every invocation's args (one JSON line per call) to `fakeGhLogPath`
+ *     so PATCH calls can be asserted on,
+ *   - exits 0 for any recognized `gh api ...` / `gh api -X PATCH ...` call.
+ */
+function writeFakeGh(responses) {
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(fakeGhLogPath)}, JSON.stringify(args) + "\\n");
+const responses = ${JSON.stringify(responses)};
+if (args[0] === "api") {
+  const isPatch = args[1] === "-X" && args[2] === "PATCH";
+  const path = isPatch ? args[3] : args[1];
+  if (isPatch) {
+    process.exit(0);
+  }
+  if (Object.prototype.hasOwnProperty.call(responses, path)) {
+    process.stdout.write(JSON.stringify(responses[path]));
+    process.exit(0);
+  }
+  process.stderr.write("no stub for " + path + "\\n");
+  process.exit(1);
+}
+process.exit(1);
+`;
+  const ghPath = join(fakeGhDir, "gh");
+  writeFileSync(ghPath, script, { mode: 0o755 });
+}
+
+function runSettings(extraArgs) {
+  return execFileSync("node", [CLI, ...extraArgs], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${fakeGhDir}:${process.env.PATH}` },
+  });
+}
+
+const BASELINE_SETTINGS = {
+  allowSquashMerge: true,
+  allowMergeCommit: false,
+  allowRebaseMerge: false,
+  squashMergeCommitTitle: "PR_TITLE",
+  squashMergeCommitMessage: "PR_BODY",
+  deleteBranchOnMerge: true,
+  allowAutoMerge: true,
+  actionsDefaultWorkflowPermissions: "read",
+  actionsCanApprovePullRequestReviews: false,
+};
+
+beforeEach(() => {
+  settingsDir = mkdtempSync(join(tmpdir(), "platform-sync-settings-test-"));
+  fakeGhDir = mkdtempSync(join(tmpdir(), "platform-sync-fakegh-"));
+  fakeGhLogPath = join(settingsDir, "gh-calls.log");
+  writeFileSync(fakeGhLogPath, "");
+  writeFileSync(join(settingsDir, "baseline.json"), JSON.stringify(BASELINE_SETTINGS));
+});
+
+afterEach(() => {
+  rmSync(settingsDir, { recursive: true, force: true });
+  rmSync(fakeGhDir, { recursive: true, force: true });
+});
+
+test("--check-settings reports no drift when live settings match the baseline", () => {
+  writeFakeGh({
+    "repos/dsj1984/swarm-os": {
+      allow_squash_merge: true,
+      allow_merge_commit: false,
+      allow_rebase_merge: false,
+      squash_merge_commit_title: "PR_TITLE",
+      squash_merge_commit_message: "PR_BODY",
+      delete_branch_on_merge: true,
+      allow_auto_merge: true,
+    },
+    "repos/dsj1984/swarm-os/actions/permissions/workflow": {
+      default_workflow_permissions: "read",
+      can_approve_pull_request_reviews: false,
+    },
+  });
+  const out = JSON.parse(
+    runSettings([
+      "--check-settings",
+      "--consumer-repo",
+      "dsj1984/swarm-os",
+      "--baseline",
+      join(settingsDir, "baseline.json"),
+      "--json",
+    ])
+  );
+  assert.equal(out.mode, "check-settings");
+  assert.equal(out.drift, false);
+  assert.deepEqual(out.mismatches, []);
+});
+
+test("--check-settings reports drift (domio-shaped: write token perms) without mutating anything", () => {
+  writeFakeGh({
+    "repos/dsj1984/domio": {
+      allow_squash_merge: true,
+      allow_merge_commit: false,
+      allow_rebase_merge: false,
+      squash_merge_commit_title: "PR_TITLE",
+      squash_merge_commit_message: "PR_BODY",
+      delete_branch_on_merge: true,
+      allow_auto_merge: true,
+    },
+    "repos/dsj1984/domio/actions/permissions/workflow": {
+      default_workflow_permissions: "write",
+      can_approve_pull_request_reviews: false,
+    },
+  });
+  const out = JSON.parse(
+    runSettings([
+      "--check-settings",
+      "--consumer-repo",
+      "dsj1984/domio",
+      "--baseline",
+      join(settingsDir, "baseline.json"),
+      "--json",
+    ])
+  );
+  assert.equal(out.drift, true);
+  assert.deepEqual(out.mismatches, [
+    { field: "actionsDefaultWorkflowPermissions", expected: "read", actual: "write" },
+  ]);
+  assert.equal(out.applied, false, "--check-settings never applies");
+  const calls = readFileSync(fakeGhLogPath, "utf8").trim().split("\n").filter(Boolean);
+  assert.ok(
+    calls.every((line) => !JSON.parse(line).includes("PATCH")),
+    "no PATCH call issued by --check-settings"
+  );
+});
+
+test("--check-settings never fails the exit code on drift (non-blocking, standing decision #10)", () => {
+  writeFakeGh({
+    "repos/dsj1984/athportal": {
+      allow_squash_merge: true,
+      allow_merge_commit: true,
+      allow_rebase_merge: true,
+      squash_merge_commit_title: "PR_TITLE",
+      squash_merge_commit_message: "COMMIT_MESSAGES",
+      delete_branch_on_merge: true,
+      allow_auto_merge: true,
+    },
+    "repos/dsj1984/athportal/actions/permissions/workflow": {
+      default_workflow_permissions: "read",
+      can_approve_pull_request_reviews: true,
+    },
+  });
+  // execFileSync throws on non-zero exit; a clean return proves exit 0.
+  assert.doesNotThrow(() => {
+    runSettings([
+      "--check-settings",
+      "--consumer-repo",
+      "dsj1984/athportal",
+      "--baseline",
+      join(settingsDir, "baseline.json"),
+      "--json",
+    ]);
+  });
+});
+
+test("--apply-settings PATCHes only the drifted fields, across both endpoints", () => {
+  writeFakeGh({
+    "repos/dsj1984/athportal": {
+      allow_squash_merge: true,
+      allow_merge_commit: true, // drift
+      allow_rebase_merge: true, // drift
+      squash_merge_commit_title: "PR_TITLE",
+      squash_merge_commit_message: "PR_BODY",
+      delete_branch_on_merge: true,
+      allow_auto_merge: true,
+    },
+    "repos/dsj1984/athportal/actions/permissions/workflow": {
+      default_workflow_permissions: "read",
+      can_approve_pull_request_reviews: true, // drift
+    },
+  });
+  const out = JSON.parse(
+    runSettings([
+      "--apply-settings",
+      "--consumer-repo",
+      "dsj1984/athportal",
+      "--baseline",
+      join(settingsDir, "baseline.json"),
+      "--json",
+    ])
+  );
+  assert.equal(out.applied, true);
+  assert.equal(out.mismatches.length, 3);
+
+  const calls = readFileSync(fakeGhLogPath, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const patchCalls = calls.filter((c) => c[1] === "-X" && c[2] === "PATCH");
+  assert.equal(patchCalls.length, 2, "one PATCH for the repo endpoint, one for the Actions endpoint");
+  const repoPatch = patchCalls.find((c) => c[3] === "repos/dsj1984/athportal");
+  const actionsPatch = patchCalls.find((c) => c[3] === "repos/dsj1984/athportal/actions/permissions/workflow");
+  assert.ok(repoPatch, "repo-settings PATCH issued");
+  assert.ok(actionsPatch, "Actions-permissions PATCH issued");
+});
+
+test("--apply-settings --dry-run reports the plan without issuing any PATCH", () => {
+  writeFakeGh({
+    "repos/dsj1984/domio": {
+      allow_squash_merge: true,
+      allow_merge_commit: false,
+      allow_rebase_merge: false,
+      squash_merge_commit_title: "PR_TITLE",
+      squash_merge_commit_message: "PR_BODY",
+      delete_branch_on_merge: true,
+      allow_auto_merge: true,
+    },
+    "repos/dsj1984/domio/actions/permissions/workflow": {
+      default_workflow_permissions: "write", // drift
+      can_approve_pull_request_reviews: false,
+    },
+  });
+  const out = JSON.parse(
+    runSettings([
+      "--apply-settings",
+      "--dry-run",
+      "--consumer-repo",
+      "dsj1984/domio",
+      "--baseline",
+      join(settingsDir, "baseline.json"),
+      "--json",
+    ])
+  );
+  assert.equal(out.dryRun, true);
+  assert.equal(out.applied, false, "dry-run never applies");
+  const calls = readFileSync(fakeGhLogPath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  assert.ok(
+    calls.every((c) => !(c[1] === "-X" && c[2] === "PATCH")),
+    "no PATCH issued under --dry-run"
+  );
+});
+
+test("--check-settings requires --consumer-repo", () => {
+  assert.throws(() => {
+    execFileSync("node", [CLI, "--check-settings"], { encoding: "utf8" });
+  }, /consumer-repo/);
+});
