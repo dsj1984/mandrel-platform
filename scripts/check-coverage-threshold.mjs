@@ -127,10 +127,19 @@ export function meetsThreshold(pct, threshold) {
 }
 
 /**
- * Recursively find every `coverage-summary.json` under `coverage/` directories
- * below `root`. `node_modules` and dotted dirs (e.g. `.git`, `.agents`) are
- * pruned so the scan stays fast and never reads a vendored framework tree.
- * `roots` (from `--coverage-dir`) overrides the auto-scan when provided.
+ * Recursively find every `coverage-summary.json` under `root`, regardless of
+ * the name of the directory that directly contains it. `node_modules` and
+ * dotted dirs (e.g. `.git`, `.agents`) are pruned so the scan stays fast and
+ * never reads a vendored framework tree. `roots` (from `--coverage-dir`)
+ * overrides the auto-scan when provided.
+ *
+ * A directory literally named `coverage` (the common single-workspace shape)
+ * is still discovered, but so is a per-workspace fan-out layout where the
+ * top-level `coverage/` dir nests differently-named subdirectories per
+ * package (e.g. `coverage/web/coverage-summary.json`,
+ * `coverage/shared/coverage-summary.json`) — the match condition is "this
+ * directory contains a coverage-summary.json file", not "this directory is
+ * named coverage".
  */
 export function findCoverageSummaries(root, roots = []) {
   if (roots.length > 0) {
@@ -151,17 +160,13 @@ export function findCoverageSummaries(root, roots = []) {
     } catch {
       return;
     }
+    const file = join(dir, "coverage-summary.json");
+    if (existsSync(file)) found.push(file);
     for (const entry of entries) {
       const name = entry.name;
       if (!entry.isDirectory()) continue;
       if (name === "node_modules" || name.startsWith(".")) continue;
-      const full = join(dir, name);
-      if (name === "coverage") {
-        const file = join(full, "coverage-summary.json");
-        if (existsSync(file)) found.push(file);
-        // A coverage dir may still nest sub-package coverage; keep walking.
-      }
-      walk(full);
+      walk(join(dir, name));
     }
   };
   walk(resolve(root));
