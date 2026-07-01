@@ -80,7 +80,14 @@ already makes, and a second `PIN_REPAIR_TOKEN`-shaped write credential
 question for any future auto-repair-PR wiring of `--apply-settings` (deferred;
 today it's an operator-invoked command, not a scheduled workflow). The
 repo-ops consumers matrix §3a Platform column flip (○ → ●) is tracked in the
-sibling `repo-ops` planning repo, not in this repo.
+sibling `repo-ops` planning repo (`mandrel-platform-consumers.md`), not in
+this repo — that repo is a separate git remote (`dsj1984/repo-ops`) outside
+this Story's PR boundary, and it independently carries unrelated in-flight
+edits to the same file as of this writing. The flip should be applied there
+once this Story (mandrel-platform#171) merges, citing this decision entry and
+the shipped `config/repo-settings.schema.json` / `check-repo-settings.mjs` /
+`platform-sync.mjs --check-settings`/`--apply-settings` as the now-existing
+contract the five §3a merge/Actions-permission rows can point to.
 
 ## 2026-06-30 — Edge-security middleware ships via the npm package-export channel (two CORS variants)
 
