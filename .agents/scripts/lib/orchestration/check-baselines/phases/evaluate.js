@@ -7,10 +7,10 @@
  * @module lib/orchestration/check-baselines/phases/evaluate
  */
 
-import { Logger } from '../../../Logger.js';
 import { resolveBundleSizeEnvOverrides } from '../../../baselines/env-overrides.js';
 import { checkKernelVersion } from '../../../baselines/kernel.js';
 import * as reader from '../../../baselines/reader.js';
+import { Logger } from '../../../Logger.js';
 import { applyTolerance, evaluateCompare, runCompareStage } from './compare.js';
 import { applyFloors, flattenBreaches } from './floors.js';
 
