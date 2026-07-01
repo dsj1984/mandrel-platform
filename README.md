@@ -413,7 +413,7 @@ into a repo's own `scripts/`.
 | `check-destructive-migration.mjs` | Blocks `DROP` / `TRUNCATE` / `ALTER … DROP` (and Drizzle `.dropTable()`) in migration files unless a reviewer applies the override label. | `pr-quality.yml` (migration-guard tier, opt-in) |
 | `check-workflow-portability.mjs` | Catches cross-repo footguns in reusable workflows / composite actions: relative `uses:` paths, `${{ }}` in `workflow_call` input metadata, and lagging first-party pins. | `pr-quality.yml` + `ci.yml` |
 | `check-action-pins.mjs` | Ratchet requiring every third-party Action to be pinned to a full 40-char commit SHA (tag-swap defence); local and first-party refs are exempt. | `ci.yml` |
-| `check-required-contexts.mjs` | Validates that every branch-protection required check in `main-protection.json` maps to a real CI job — no phantom required checks. | `ci.yml` |
+| `check-required-contexts.mjs` | Validates that every branch-protection required check in `main-protection.json` maps to a real CI job — no phantom required checks. Also **warns** (never blocks) when the caller file / display `name:` / caller job id diverge from the canonical `ci.yml` / `CI` / `ci` triplet ([details](docs/reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)). | `ci.yml` |
 | `check-docs-staleness.mjs` | Lints markdown/JSON docs for known staleness patterns (stale URLs, expired dates, dead runbook paths); suppressible per-rule. | standalone |
 
 > **`config/main-protection.schema.json`** is the JSON Schema for the

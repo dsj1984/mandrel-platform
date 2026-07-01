@@ -56,9 +56,25 @@ consumer inherits a network-egress baseline for free.
 
 ### Minimal caller
 
+> **File and job naming.** Name the caller workflow file `ci.yml`, its display
+> `name:` `CI`, and the job that wraps this call `ci` — the canonical triplet
+> (see [Canonical caller naming](#canonical-caller-naming-the-ciyml--ci--ci-triplet)
+> below) that keeps the required-context string `ci / ci-required` stable and
+> onboarding-friendly across the fleet. New consumers should start from this
+> shape rather than an ad hoc file/job name.
+
 ```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
 jobs:
-  pr-quality:
+  ci:
     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
     secrets: inherit
 ```
@@ -783,6 +799,53 @@ Branch protection → required status checks → add: ci-required
 Do **not** register the individual tier jobs (`Lint & format`, `Typecheck`,
 `Unit (1/3)`, …) as required — their names change with shard count and toggle
 state, which is exactly the drift `ci-required` exists to absorb.
+
+### Canonical caller naming (the `ci.yml` / `CI` / `ci` triplet)
+
+`ci-required` fixes the required-**check** name, but it does not fix the
+**caller** naming three layers up the stack: the consumer workflow *file* that
+calls `pr-quality.yml`, that workflow's display `name:`, and the caller
+*job id* that wraps the `pr-quality` call. Three fleet consumers converged on
+three different spellings for the same shared workflow (validated 2026-07-01):
+
+| Consumer   | Caller file    | Display `name:` | Caller job id | Required context      |
+| ---------- | -------------- | ---------------- | ------------- | ---------------------- |
+| domio      | `ci-pr.yml`    | `CI (PR)`         | —             | `ci-required`           |
+| athportal  | `quality.yml`  | `quality`         | —             | `pr-quality / ci-required` |
+| swarm-os   | `ci.yml`       | `CI`              | —             | `quality / ci-required` |
+
+Same shared `pr-quality.yml`, three spellings — a papercut for onboarding, for
+org-level rulesets that name a required context by string, and for every doc
+that has to describe "the CI workflow" generically across the fleet.
+
+**Operator decision (2026-07-01, D2 — canonical triplet):**
+
+| Layer                 | Canonical value      |
+| ---------------------- | -------------------- |
+| Caller file             | `ci.yml`              |
+| Display `name:`         | `CI`                  |
+| Caller job id           | `ci`                  |
+| Required context (full) | `ci / ci-required`    |
+
+See the [Minimal caller](#minimal-caller) snippet above for the canonical
+`ci.yml` shape. With that shape, the branch-protection required context reads
+**`ci / ci-required`** (`<caller job id> / <aggregator job id>`) — the same
+`<job id> / <job id>` composition GitHub always uses for a `workflow_call`
+target's status context, just anchored on the canonical `ci` job id instead of
+each consumer's own ad hoc name.
+
+> **Renaming an existing caller is a per-consumer story, not this one.** This
+> section documents the target shape; it does **not** rename `domio`'s
+> `ci-pr.yml`, `athportal`'s `quality.yml`, or `swarm-os`'s `ci.yml`/`quality`
+> job id. Each consumer rename lands atomically with its own branch-protection
+> ruleset context update (old context removed, `ci / ci-required` added) in a
+> dedicated Story — renaming the file/job id without also flipping the
+> ruleset's registered context reintroduces the exact "phantom required
+> check" failure mode [`check-required-contexts.mjs`](#the-ci-required-aggregator)
+> guards against on the platform's own CI, this time on the consumer side.
+> mandrel-platform's own `ci.yml` (file) / `CI` (display name) / `ci-required`
+> aggregator already matches this canonical shape — see
+> [the action-pin ratchet](#the-action-pin-ratchet).
 
 ---
 
