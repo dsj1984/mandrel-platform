@@ -527,12 +527,20 @@ reports `already in sync`):
    actions (`actions/checkout`, …) are left untouched. The trailing
    `# <ref>` comment is refreshed so the pin stays human-auditable and the
    Renovate auto-bump rule above can track it.
-2. **Materializes runbook reference stubs** (§2.2 *link, don't copy*). Copies
+2. **Checks CI-caller naming** (advisory only, Story #173). Reports whether
+   `.github/workflows/ci.yml` matches the canonical caller triplet — file
+   `ci.yml`, display name `CI`, caller job id `ci` (required context
+   `ci / ci-required`; see
+   [reusable-workflows.md § "Canonical caller naming"](docs/reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)).
+   Never renames or rewrites anything — a caller rename must land atomically
+   with its own branch-protection ruleset context update, which is a
+   deliberate per-consumer Story, not an automatic sync side-effect.
+3. **Materializes runbook reference stubs** (§2.2 *link, don't copy*). Copies
    the thin stubs from `templates/runbooks/` into the consumer's
    `docs/runbooks/` **only when absent** — an already-adopted stub is skipped,
    and a full local copy (no stub marker) is surfaced as a warning to
    reconcile by hand, never silently overwritten.
-3. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
+4. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
    consumer's Renovate `extends` and `mandrel-platform/tsconfig.base.json` to
    its `tsconfig.json` `extends`. The SSOT goes first so the consumer's own
    later entries continue to override it.

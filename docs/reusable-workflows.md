@@ -843,9 +843,16 @@ each consumer's own ad hoc name.
 > ruleset's registered context reintroduces the exact "phantom required
 > check" failure mode [`check-required-contexts.mjs`](#the-ci-required-aggregator)
 > guards against on the platform's own CI, this time on the consumer side.
-> mandrel-platform's own `ci.yml` (file) / `CI` (display name) / `ci-required`
-> aggregator already matches this canonical shape — see
-> [the action-pin ratchet](#the-action-pin-ratchet).
+> **Note on mandrel-platform's own CI:** this repo's `ci.yml` (file) / `CI`
+> (display name) already matches the canonical file and display-name layers,
+> but mandrel-platform is not itself a `pr-quality.yml` **consumer** — its
+> `ci.yml` self-tests the platform's own scripts/workflows (`check-required-
+> contexts`, `check-workflow-portability`, `check-action-pins`, `actionlint`)
+> and has no `ci` caller job wrapping a `pr-quality.yml` call, so the `ci /
+> ci-required` required-context shape does not apply to it. The canonical
+> triplet targets **consumer** repos that call `pr-quality.yml` — see
+> [the action-pin ratchet](#the-action-pin-ratchet) for mandrel-platform's own,
+> unrelated `ci-required` aggregator.
 
 ---
 

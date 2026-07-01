@@ -87,6 +87,38 @@ test("apply pins first-party SHAs, leaves external actions untouched", () => {
   assert.ok(ci.includes(`actions/checkout@${"2".repeat(40)} # external`), "external action untouched");
 });
 
+test("ciNaming: flags a non-canonical job id (seeded fixture uses job id 'q', not 'ci')", () => {
+  const out = JSON.parse(run([]));
+  assert.equal(out.ciNaming.status, "non-canonical");
+  assert.match(out.ciNaming.message, /no "ci" job id/);
+});
+
+test("ciNaming: reports 'no-canonical-file' when no ci.yml exists", () => {
+  rmSync(join(consumer, ".github", "workflows", "ci.yml"));
+  const out = JSON.parse(run([]));
+  assert.equal(out.ciNaming.status, "no-canonical-file");
+});
+
+test("ciNaming: reports 'canonical' when ci.yml matches the triplet (display name CI + job id ci)", () => {
+  writeFileSync(
+    join(consumer, ".github", "workflows", "ci.yml"),
+    ["name: CI", "jobs:", "  ci:", "    steps:", "      - run: echo hi", ""].join("\n")
+  );
+  const out = JSON.parse(run([]));
+  assert.equal(out.ciNaming.status, "canonical");
+  assert.equal(out.ciNaming.message, null);
+});
+
+test("ciNaming never mutates ci.yml — it is advisory only", () => {
+  const before = readFileSync(join(consumer, ".github", "workflows", "ci.yml"), "utf8");
+  run([]);
+  const after = readFileSync(join(consumer, ".github", "workflows", "ci.yml"), "utf8");
+  // Only the pin rewrite (already covered above) may change bytes; re-read the
+  // *naming* fields specifically — name:/job id text must be byte-identical.
+  assert.equal(before.match(/^name:.*$/m)?.[0], after.match(/^name:.*$/m)?.[0]);
+  assert.equal(before.includes("  q:"), after.includes("  q:"));
+});
+
 test("apply materializes runbook reference stubs (link, don't copy)", () => {
   run([]);
   const stub = join(consumer, "docs", "runbooks", "deploy-promotion.md");
