@@ -87,6 +87,13 @@ every consumer.
 A Biome base config with the recommended linter rule set, import organizer,
 and standard formatter defaults (2-space indent, 100-char line width).
 
+**Minimum Biome version: 2.0.** The base targets the **Biome v2 schema**
+(`$schema: https://biomejs.dev/schemas/2.5.0/schema.json`, `assist.actions.
+source.organizeImports`, `linter.rules.preset`). Biome v1 consumers cannot
+`extends` this base — the v2 config shape is a hard configuration error on
+Biome 1.x. There is no dual v1/v2 export; consumers on Biome 1.x must
+upgrade to 2.x before adopting this base (refs #153).
+
 **Consumer usage (`biome.json`):**
 
 ```jsonc
