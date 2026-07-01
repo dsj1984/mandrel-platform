@@ -296,6 +296,20 @@ Consumer adoption itself is out of scope for this runbook change — see
 [Out of Scope](#out-of-scope) — but each consumer can flip the flag
 immediately once its own branch policies are in place.
 
+### Consumers-matrix follow-up (action required, tracked outside this repo)
+
+This platform repo has no in-repo "consumers matrix" file — cross-consumer
+rollout tracking for shared units lives in each consumer's own repo-ops
+tracking doc (`mandrel-platform-consumers.md`, where present), the same
+convention documented for the pnpm supply-chain block rollout (see
+[pin-drift-dashboard.md](pin-drift-dashboard.md#pnpm-native-supply-chain-rollout-tracking-story-133)).
+**Action required:** whichever repo/document hosts the "repo-ops consumers
+matrix" referenced in Story #172 (§3/§3a Environments rows) needs its ◐ → ●
+cells flipped for the Environments isolation-audit now that the shared unit
+has shipped here — that edit is out of this repo's reach (the file is not
+present in mandrel-platform) and must be applied directly in the
+matrix's home document/repo once this Story merges.
+
 ### Out of Scope
 
 - **Required reviewers on environments.** 0 reviewers is the deliberate,
