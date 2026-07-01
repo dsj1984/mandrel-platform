@@ -264,6 +264,29 @@ on:
         type: string
         default: ''
 
+      # Transitional lockfile-policy exception (Story #149). Passed through to
+      # every setup-toolchain invocation's `trust-lockfile` input, appending
+      # --trust-lockfile to the install step's `pnpm install --frozen-lockfile`
+      # when 'true'. Exists so a consumer whose lockfile trips the pnpm
+      # supply-chain policy check (TRUST_DOWNGRADE / MINIMUM_RELEASE_AGE_VIOLATION
+      # findings introduced by #133's canonical config) has a documented,
+      # consumer-controlled remediation path instead of hard-failing every tier
+      # that delegates to setup-toolchain for its install. Default 'false'
+      # preserves today's behavior on every job — no --trust-lockfile appended.
+      # See docs/reusable-workflows.md for the documented-exception framing:
+      # this is a transitional flag, not a permanent bypass — drop it once the
+      # flagged lockfile entries clear the policy naturally.
+      trust-lockfile:
+        description: >
+          Passed through to setup-toolchain's `trust-lockfile` input on every
+          call site. Appends --trust-lockfile to the install step when 'true'.
+          Default 'false' preserves current behavior (no --trust-lockfile) on
+          every job. Intended as a transitional/documented-exception flag —
+          see docs/reusable-workflows.md.
+        required: false
+        type: string
+        default: 'false'
+
       # Egress audit (Story #112). Adds step-security/harden-runner in
       # `egress-policy: audit` mode as the FIRST step of every tier job, so each
       # consumer inherits a zero-risk network-egress baseline on every PR run.
@@ -408,6 +431,7 @@ jobs:
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
+          trust-lockfile: ${{ inputs.trust-lockfile }}
 
       - name: Lint
         run: pnpm run lint
@@ -442,6 +466,7 @@ jobs:
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
+          trust-lockfile: ${{ inputs.trust-lockfile }}
 
       - name: Typecheck
         run: pnpm run typecheck
@@ -474,6 +499,7 @@ jobs:
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
+          trust-lockfile: ${{ inputs.trust-lockfile }}
 
       - name: Unit tests (shard ${{ matrix.shard }}/${{ inputs.shards }})
         run: pnpm run test:unit --shard=${{ matrix.shard }}/${{ inputs.shards }}
@@ -608,6 +634,7 @@ jobs:
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
+          trust-lockfile: ${{ inputs.trust-lockfile }}
 
       - name: Contract tests (shard ${{ matrix.shard }}/${{ inputs.shards }})
         run: pnpm run test:contract --shard=${{ matrix.shard }}/${{ inputs.shards }}
@@ -648,6 +675,7 @@ jobs:
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
+          trust-lockfile: ${{ inputs.trust-lockfile }}
 
       - name: Resolve Playwright version
         id: pw-version

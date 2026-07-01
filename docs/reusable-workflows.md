@@ -89,6 +89,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `gitleaks-version` | string  | `'8.30.1'`       | Pinned gitleaks release version (no leading `v`) for the secret scan. Bump deliberately; the per-platform asset checksum is pinned to match.    |
 | `toolchain-cache`  | string  | `'true'`         | Passed through to `setup-toolchain`'s `cache` input. Set `'false'` on self-hosted runners with a warm pnpm store.                              |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
+| `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
 | `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest`; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
 | `enable-osv-scan`  | boolean | `true`           | Enable the OSV-scanner advisory tier (scans the lockfile/manifest tree for known dependency advisories via a pinned, checksum-verified binary; no SARIF/GHAS). Set `false` to skip. See [OSV advisory tier](#osv-advisory-tier-enable-osv-scan).                                  |
 | `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
@@ -298,6 +299,63 @@ to one number, that is a Renovate preset cadence change tracked separately
 ruleset consumed by the SAST sub-step above — see the SAST ruleset
 pinning/vendoring work tracked in Story #132, which keeps these rules
 enforced deliberately rather than relying on registry drift.
+
+### `trust-lockfile` — transitional lockfile-policy exception
+
+`setup-toolchain` (the composite action every `pr-quality.yml` tier delegates
+its install step to) runs `pnpm install --frozen-lockfile` with no way for a
+consumer to pass additional install flags. That collided with the [pnpm
+supply-chain config](#pnpm-supply-chain-config-vs-renovate-minimumreleaseage)
+above (Story #133): a consumer lockfile carrying a `TRUST_DOWNGRADE` or
+`MINIMUM_RELEASE_AGE_VIOLATION` finding hard-fails
+`ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION` on **every** tier that delegates
+to `setup-toolchain` for its install, with no remediation available from the
+consumer side — `TRUST_DOWNGRADE` findings in particular are not age-based and
+never clear on their own by waiting out `minimumReleaseAge`.
+
+**What it does.** `trust-lockfile` (string, default `'false'`) is threaded
+through `pr-quality.yml`'s `workflow_call` inputs and passed to **all five**
+`setup-toolchain` invocations (`Lint & format`, `Typecheck`, `Unit`,
+`Contract`, `E2E / Smoke`). When `'true'`, `setup-toolchain`'s install step
+appends `--trust-lockfile` to the `pnpm install --frozen-lockfile` command it
+already runs.
+
+**Backwards compatible by default.** A consumer that does not set the input
+sees **byte-for-byte identical** behaviour to today on every one of the five
+jobs: the default `'false'` means the install step remains plain
+`pnpm install --frozen-lockfile`, with no `--trust-lockfile` appended anywhere.
+
+> **Minimal opt-in caller.**
+>
+> ```yaml
+> jobs:
+>   pr-quality:
+>     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+>     with:
+>       trust-lockfile: 'true'
+>     secrets: inherit
+> ```
+
+**Transitional, not a permanent bypass.** `trust-lockfile: 'true'` is a
+**documented exception**, not a standing configuration. It exists to unblock a
+consumer whose lockfile carries findings it has consciously accepted — the
+same review-and-document posture `security-baseline.md` requires of any
+deferred security finding — while the underlying entries either get bumped
+past the pnpm supply-chain policy's checks or a maintainer risk-accepts them
+permanently through some other mechanism. Consumers should treat it as
+temporary: drop `trust-lockfile` (or revert to the default `'false'`) once the
+flagged lockfile entries clear the policy naturally (age out past
+`minimumReleaseAge`, or the flagged package is bumped past the
+`trustPolicy: no-downgrade` trigger). Leaving it permanently `'true'` defeats
+the purpose of the pnpm supply-chain gate it is working around — it should be
+reviewed the same way any other standing security exception is, not treated as
+a one-time toggle-and-forget.
+
+**Scope.** This is a targeted `--trust-lockfile` passthrough, not a general
+arbitrary pnpm-install-flags mechanism, and it does not change the canonical
+pnpm supply-chain config values from #133 — it only lets a consumer opt a
+specific install invocation out of the lockfile-resolution verification those
+values enforce.
 
 ### Egress audit (`enable-harden-runner`)
 
