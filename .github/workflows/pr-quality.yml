@@ -388,6 +388,59 @@ on:
         type: string
         default: '.osv-allowlist.json'
 
+      # Wrangler-baseline tier (Story #177, roadmap §2a.3). Four wrangler
+      # invariants — env.* named-Environment split, logpush: true, an
+      # Analytics Engine binding, and a compatibility_date staleness policy —
+      # were "kept by convention" with no automated check (repo-ops consumers
+      # matrix §2/§7). scripts/check-wrangler-baseline.mjs enforces all four
+      # against the consumer's own wrangler.toml / wrangler.jsonc; a consumer
+      # with no wrangler config at all (not every consumer is a Cloudflare
+      # Worker) is a no-op pass. Runs as a step inside the `lint` tier rather
+      # than a standalone job — it needs no toolchain beyond Node, matching
+      # the check-docs-staleness.mjs precedent of a dependency-free inline
+      # script. Default ON, but see `wrangler-baseline-fail-on-violation`
+      # below for the advisory rollout posture.
+      enable-wrangler-baseline-check:
+        description: >
+          Enable the wrangler.toml/wrangler.jsonc baseline check (env.* split,
+          logpush, Analytics Engine binding, compatibility_date staleness
+          window) as a step in the lint tier. A consumer with no wrangler
+          config is a no-op pass. Default true.
+        required: false
+        type: boolean
+        default: true
+
+      # Advisory-first rollout (acceptance criteria): the gate ships
+      # non-blocking by default so the fleet can be swept clean via the
+      # dashboard output before any consumer's `ci-required` starts failing on
+      # it. Flip the caller's default to `true` once every consumer is green,
+      # mirroring the repo-settings dashboard's non-blocking-by-design posture
+      # until a per-consumer decision promotes it.
+      wrangler-baseline-fail-on-violation:
+        description: >
+          When true, an un-excepted wrangler-baseline violation fails the
+          lint tier (and therefore ci-required). When false (default),
+          violations are reported in the run log but never block — the
+          advisory rollout posture until the fleet is clean. A consumer
+          declares a legitimate per-rule opt-out via
+          "mandrel.wranglerBaselineExceptions" in its own wrangler config
+          regardless of this setting (see docs/reusable-workflows.md).
+        required: false
+        type: boolean
+        default: false
+
+      # Staleness window (days) for the compatibility_date rule. Renovate's
+      # shared preset bumps compatibility_date whenever wrangler itself is
+      # bumped, but a Worker that goes untouched by that bump for a long
+      # stretch can still drift; this is the independent staleness backstop.
+      wrangler-baseline-max-age-days:
+        description: >
+          Maximum age (in days) of compatibility_date before the
+          wrangler-baseline check flags it as stale. Default 90.
+        required: false
+        type: number
+        default: 90
+
     secrets:
       # Turbo remote cache credentials (athportal pattern).
       TURBO_TOKEN:
@@ -448,6 +501,37 @@ jobs:
         env:
           TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
           TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      # Wrangler-baseline check (Story #177, roadmap §2a.3). Dependency-free
+      # Node script — no toolchain beyond what setup-toolchain already
+      # installed above. Runs against the consumer's own wrangler.toml /
+      # wrangler.jsonc at the repo root; a consumer with none is a no-op pass.
+      # Resolves the script from the installed npm config package first (the
+      # `mandrel-platform` `exports["./scripts/*"]` surface every consumer
+      # already gets via its devDependency), falling back to this repo's own
+      # checkout path when running inside mandrel-platform itself (there is no
+      # installed copy of the package to depend on here).
+      - name: Wrangler baseline check
+        if: ${{ inputs.enable-wrangler-baseline-check }}
+        shell: bash
+        env:
+          MAX_AGE_DAYS: ${{ inputs.wrangler-baseline-max-age-days }}
+          FAIL_ON_VIOLATION: ${{ inputs.wrangler-baseline-fail-on-violation }}
+        run: |
+          set -euo pipefail
+          if [ -f "node_modules/mandrel-platform/scripts/check-wrangler-baseline.mjs" ]; then
+            script="node_modules/mandrel-platform/scripts/check-wrangler-baseline.mjs"
+          elif [ -f "scripts/check-wrangler-baseline.mjs" ]; then
+            script="scripts/check-wrangler-baseline.mjs"
+          else
+            echo "::warning::check-wrangler-baseline.mjs not found in node_modules/mandrel-platform/scripts or ./scripts — skipping (add mandrel-platform as a devDependency to enable this check)."
+            exit 0
+          fi
+          args=(--max-age-days "${MAX_AGE_DAYS}")
+          if [ "${FAIL_ON_VIOLATION}" != "true" ]; then
+            args+=(--warn-only)
+          fi
+          node "${script}" "${args[@]}"
 
   # ── Tier 2: Typecheck ─────────────────────────────────────────────────────
   typecheck:
