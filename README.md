@@ -413,7 +413,7 @@ into a repo's own `scripts/`.
 | `check-destructive-migration.mjs` | Blocks `DROP` / `TRUNCATE` / `ALTER … DROP` (and Drizzle `.dropTable()`) in migration files unless a reviewer applies the override label. | `pr-quality.yml` (migration-guard tier, opt-in) |
 | `check-workflow-portability.mjs` | Catches cross-repo footguns in reusable workflows / composite actions: relative `uses:` paths, `${{ }}` in `workflow_call` input metadata, and lagging first-party pins. | `pr-quality.yml` + `ci.yml` |
 | `check-action-pins.mjs` | Ratchet requiring every third-party Action to be pinned to a full 40-char commit SHA (tag-swap defence); local and first-party refs are exempt. | `ci.yml` |
-| `check-required-contexts.mjs` | Validates that every branch-protection required check in `main-protection.json` maps to a real CI job — no phantom required checks. | `ci.yml` |
+| `check-required-contexts.mjs` | Validates that every branch-protection required check in `main-protection.json` maps to a real CI job — no phantom required checks. Also **warns** (never blocks) when the caller file / display `name:` / caller job id diverge from the canonical `ci.yml` / `CI` / `ci` triplet ([details](docs/reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)). | `ci.yml` |
 | `check-docs-staleness.mjs` | Lints markdown/JSON docs for known staleness patterns (stale URLs, expired dates, dead runbook paths); suppressible per-rule. | standalone |
 | `check-repo-settings.mjs` | Cross-consumer dashboard for the GitHub-side repo-settings baseline (merge methods, squash source, auto-merge, Actions default token permissions, PR-approval-by-Actions) — see below. | standalone / `platform-sync --check-settings` |
 
@@ -572,19 +572,27 @@ reports `already in sync`):
    actions (`actions/checkout`, …) are left untouched. The trailing
    `# <ref>` comment is refreshed so the pin stays human-auditable and the
    Renovate auto-bump rule above can track it.
-2. **Materializes runbook reference stubs** (§2.2 *link, don't copy*). Copies
+2. **Checks CI-caller naming** (advisory only, Story #173). Reports whether
+   `.github/workflows/ci.yml` matches the canonical caller triplet — file
+   `ci.yml`, display name `CI`, caller job id `ci` (required context
+   `ci / ci-required`; see
+   [reusable-workflows.md § "Canonical caller naming"](docs/reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)).
+   Never renames or rewrites anything — a caller rename must land atomically
+   with its own branch-protection ruleset context update, which is a
+   deliberate per-consumer Story, not an automatic sync side-effect.
+3. **Materializes runbook reference stubs** (§2.2 *link, don't copy*). Copies
    the thin stubs from `templates/runbooks/` into the consumer's
    `docs/runbooks/` **only when absent** — an already-adopted stub is skipped,
    and a full local copy (no stub marker) is surfaced as a warning to
    reconcile by hand, never silently overwritten.
-3. **Materializes workflow caller templates.** Copies canonical callers from
+4. **Materializes workflow caller templates.** Copies canonical callers from
    `templates/workflows/` (e.g. `deploy-staging.yml`, the one-paved-road
    `workflow_run` caller for `deploy-cloudflare.yml`'s CI-green guard — see
    [`docs/reusable-workflows.md`](docs/reusable-workflows.md#deploy-cloudflareyml))
    into the consumer's `.github/workflows/` — same link-don't-copy semantics:
    only when absent, and a hand-authored file without the template marker is
    surfaced as a warning rather than overwritten.
-4. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
+5. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
    consumer's Renovate `extends` and `mandrel-platform/tsconfig.base.json` to
    its `tsconfig.json` `extends`. The SSOT goes first so the consumer's own
    later entries continue to override it.

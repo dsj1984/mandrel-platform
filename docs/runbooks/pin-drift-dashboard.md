@@ -226,6 +226,35 @@ per-consumer adoption is tracked in each consumer's own
 pin-drift check. This repo has no equivalent file today since pin-drift
 tracking lives in `scripts/pin-drift-consumers.json` above instead.
 
+### CI-naming convergence tracking (Story #173)
+
+The [canonical CI caller naming triplet](../reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)
+(`ci.yml` file / `CI` display name / `ci` job id → required context
+`ci / ci-required`, operator decision 2026-07-01, D2) has the same
+non-pin-shaped rollout profile as the pnpm-native, Biome-v2, and Lighthouse
+tracking above: a consumer's caller-file/job-id rename is not a `uses:` or
+npm-version drift, so this dashboard's pin-drift checker does not — and will
+not — track it. Renaming an existing caller and flipping its branch-protection ruleset
+context is each consumer's own atomic Story — see the "renaming an existing
+caller" note on the
+[canonical caller naming](../reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)
+section of the platform doc; this dashboard stays scoped to `uses:`/npm pin
+drift.
+
+Each consumer's own repo-ops tracking doc (`mandrel-platform-consumers.md`,
+where present) should gain a **CI-naming** row recording that consumer's
+current triplet against the canonical one, e.g.:
+
+| Item | Current | Canonical | Status |
+| ---- | ------- | --------- | ------ |
+| CI caller naming | `<file>` / `<display name>` / `<job id>` | `ci.yml` / `CI` / `ci` | ☐ not yet renamed |
+
+`scripts/check-required-contexts.mjs` (non-blocking) surfaces the same
+divergence automatically for any consumer that has adopted it — see
+[README — Guardrail & policy-check scripts](../../README.md#guardrail--policy-check-scripts).
+This repo has no equivalent file today since pin-drift tracking lives in
+`scripts/pin-drift-consumers.json` above instead.
+
 ## Running it locally
 
 ```bash
