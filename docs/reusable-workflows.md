@@ -111,6 +111,9 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
 | `osv-scanner-version` | string | `'2.4.0'`     | Pinned OSV-scanner release version (no leading `v`) for the advisory tier. Bump deliberately; the per-platform asset checksum is pinned to match.                                                                                                                              |
 | `osv-allowlist-path` | string | `'.osv-allowlist.json'` | Path (relative to the consumer repo root) to an optional OSV per-finding suppression/allow-list file. A missing file is a no-op — identical gating behaviour to having no allow-list at all. See [Per-finding suppression / allow-list](#per-finding-suppression--allow-list-osv-allowlist-path). |
+| `enable-wrangler-baseline-check` | boolean | `true` | Enable the wrangler.toml/wrangler.jsonc baseline check (env.\* split, logpush, Analytics Engine binding, compatibility_date staleness) as a step in the `lint` tier. A consumer with no wrangler config is a no-op pass. See [Wrangler-baseline check](#wrangler-baseline-check-enable-wrangler-baseline-check). |
+| `wrangler-baseline-fail-on-violation` | boolean | `false` | When `true`, an un-excepted violation fails the `lint` tier (and therefore `ci-required`). Default `false` is the **advisory rollout** posture — violations are reported but never block until the fleet is clean. |
+| `wrangler-baseline-max-age-days` | number | `90` | Maximum age (days) of `compatibility_date` before the check flags it stale. |
 
 > **Sharding contract.** `shards` and `shard-matrix` must agree. `shards` sets
 > the denominator passed to the test runner (`--shard=<n>/<shards>`);
@@ -628,6 +631,112 @@ warning, and blocking findings apart at a glance:
 > unchanged. It also does not change the default `osv-fail-on-severity` or
 > `enable-osv-scan` values; suppression narrows what blocks within whatever
 > band a consumer has already configured.
+
+### Wrangler-baseline check (`enable-wrangler-baseline-check`)
+
+A **lint-tier step** that enforces four wrangler configuration invariants the
+fleet had previously kept only "by convention" with no automated check
+(repo-ops consumers matrix §2/§7, roadmap §2a.3):
+
+1. **`env.*` named-Environment split** — at least one named `[env.<name>]`
+   (TOML) / `"env": { "<name>": {...} }` (JSON) block exists.
+2. **`logpush: true`** — set at the top level, or on every named environment
+   the config declares.
+3. **Analytics Engine binding** — at least one
+   `[[analytics_engine_datasets]]` / `"analytics_engine_datasets"` entry, at
+   the top level or on any named environment.
+4. **`compatibility_date` staleness policy** — the date is present, valid,
+   and within `wrangler-baseline-max-age-days` (default **90 days**) of the
+   run date. Renovate's shared preset bumps `compatibility_date` whenever
+   `wrangler` itself is bumped, but a Worker that goes untouched by that bump
+   for a long stretch can still drift past the policy window — this rule is
+   the independent backstop.
+
+**Implementation.** `scripts/check-wrangler-baseline.mjs` — a dependency-free
+Node script (no TOML/JSONC library; both formats are parsed with small,
+purpose-built parsers scoped to wrangler's actual shape) — runs as a step in
+the `lint` job, after `setup-toolchain` but requiring nothing from it beyond
+Node itself. It auto-detects `wrangler.jsonc` (preferred), `wrangler.json`,
+then `wrangler.toml` at the consumer's repo root. **A consumer with no
+wrangler config at all is a no-op pass** — not every mandrel-platform
+consumer is a Cloudflare Worker.
+
+The step resolves the script from the installed `mandrel-platform` npm
+package first (`node_modules/mandrel-platform/scripts/check-wrangler-baseline.mjs`,
+via the existing `exports["./scripts/*"]` surface every consumer already gets
+through its `mandrel-platform` devDependency), falling back to this repo's
+own `scripts/` checkout path when the caller is mandrel-platform itself.
+
+#### Advisory-first rollout (`wrangler-baseline-fail-on-violation`)
+
+Ships **non-blocking by default** (`wrangler-baseline-fail-on-violation:
+false`) so the fleet can be swept clean via the run-log/job-summary report
+before any consumer's `ci-required` starts failing on it — the same posture
+[`check-repo-settings.mjs`](#the-ci-required-aggregator) and the pin-drift
+dashboard use for a new cross-fleet contract. Flip the caller's default to
+`true` (or set it explicitly) once a consumer's wrangler config is clean.
+
+```yaml
+jobs:
+  pr-quality:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      wrangler-baseline-fail-on-violation: true # promote once clean (default: false)
+      # wrangler-baseline-max-age-days: 60      # tighten the compatibility_date window
+      # enable-wrangler-baseline-check: false   # opt out entirely (not recommended)
+    secrets: inherit
+```
+
+#### Per-consumer exceptions (declared, not silent)
+
+A Worker that legitimately opts out of one rule declares it explicitly in its
+own wrangler config under a top-level `mandrel.wranglerBaselineExceptions`
+block, rather than silently failing to match. A declared exception suppresses
+*only that rule's* finding — it is still echoed back in the report (with its
+reason) so the opt-out stays visible to reviewers, never silent.
+
+`wrangler.jsonc`:
+
+```jsonc
+{
+  // ...
+  "mandrel": {
+    "wranglerBaselineExceptions": {
+      "analytics-engine": "no telemetry sink for this static-asset Worker",
+    },
+  },
+}
+```
+
+`wrangler.toml`:
+
+```toml
+[mandrel.wranglerBaselineExceptions]
+analytics-engine = "no telemetry sink for this static-asset Worker"
+```
+
+Valid exception keys match the rule ids: `env-split`, `logpush`,
+`analytics-engine`, `compat-date-stale`.
+
+#### Standalone / dashboard usage
+
+The script also runs standalone, outside the `pr-quality` wiring — useful for
+a local pre-push check or a cross-fleet dashboard run:
+
+```bash
+node scripts/check-wrangler-baseline.mjs                       # auto-detect, exit 1 on violation
+node scripts/check-wrangler-baseline.mjs --warn-only            # report only, always exit 0
+node scripts/check-wrangler-baseline.mjs --file path/to/wrangler.jsonc
+node scripts/check-wrangler-baseline.mjs --max-age-days 60
+node scripts/check-wrangler-baseline.mjs --json                 # machine-readable envelope
+```
+
+> **Consumers-matrix follow-up (action required, tracked outside this
+> repo).** This platform repo has no in-repo "consumers matrix" file — the
+> same standing note as the [repo-settings baseline](decisions.md). Once
+> domio/athportal/swarm-os adopt `wrangler-baseline-fail-on-violation: true`
+> with a clean config, flip the repo-ops consumers matrix §2/§7 rows (◐/○ →
+> ●) in that document's home repo.
 
 ### Destructive-migration guard (`enable-migration-guard`)
 

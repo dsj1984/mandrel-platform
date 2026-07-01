@@ -33,6 +33,46 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-01 — Wrangler baseline gate (env split, logpush, Analytics Engine, compatibility_date), advisory-first
+
+**Context.** Four wrangler invariants were "kept by convention" across the
+fleet with no automated enforcement (repo-ops consumers matrix §2/§7,
+roadmap §2a.3): the `env.*` named-Environment split (○), `logpush: true` per
+Worker (◐), an Analytics Engine binding (◐), and the `compatibility_date`
+policy (◐ — Renovate's shared preset bumps the date whenever `wrangler`
+itself is bumped, but nothing flags a `compatibility_date` that goes stale on
+its own between bumps).
+
+**Decision.** Ship `scripts/check-wrangler-baseline.mjs`: a dependency-free
+Node script (hand-rolled TOML/JSONC parsers scoped to wrangler's actual
+shape — no new package dependency) that asserts all four invariants against
+a consumer's own `wrangler.toml` / `wrangler.jsonc`. A consumer with no
+wrangler config at all is a no-op pass (not every consumer is a Cloudflare
+Worker). Wired into the `pr-quality.yml` reusable workflow's `lint` tier as
+an opt-toggled step (`enable-wrangler-baseline-check`, default `true`).
+**Advisory-first by design**: `wrangler-baseline-fail-on-violation` defaults
+`false` — violations are reported in the run log but never block — until the
+fleet is swept clean, then callers flip it to `true` per consumer. A
+`compatibility_date` staleness window defaults to 90 days
+(`wrangler-baseline-max-age-days`). Per-consumer exceptions are declared, not
+silent: a Worker legitimately opting out of one rule sets a
+`mandrel.wranglerBaselineExceptions.<rule-id>` string in its own wrangler
+config; the exception suppresses only that rule's finding and is echoed back
+in the report. Documented in full in
+[`docs/reusable-workflows.md`](reusable-workflows.md#wrangler-baseline-check-enable-wrangler-baseline-check).
+
+**Consequences.** The four previously-manual invariants are now check-able
+in CI with a single opt-in step, at zero new npm dependencies. Cost: a
+second wrangler-config-shape assumption to maintain alongside
+`deploy-cloudflare.yml`'s existing wrangler-adjacent logic (D1 export via
+`--env`), and a compatibility_date policy number (90 days) invented for this
+Story with no prior documented precedent to anchor it — revisit if a
+consumer's legitimate release cadence exceeds the window. As with the
+repo-settings baseline (previous entry), the repo-ops consumers matrix §2/§7
+Platform-column flip (◐/○ → ●) lives in the sibling `dsj1984/repo-ops`
+planning repo, outside this Story's PR boundary — apply it there once this
+Story merges and each consumer's config is verified clean.
+
 ## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
 
 **Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix
