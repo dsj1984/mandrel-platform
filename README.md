@@ -13,7 +13,7 @@ hand-maintaining its own copies and drifting apart over time.
 | ------ | ---------------- |
 | **Reusable workflows** | `workflow_call` CI, deploy, secret-scan, release, and CodeQL pipelines, consumed by tag/SHA pin. |
 | **Composite action** | `setup-toolchain` — pnpm + Node + frozen install in one step. |
-| **Config bases (npm)** | `extends`-able baselines: TypeScript, Biome, Knip, Stryker, dependency-cruiser, size-limit, Lighthouse. |
+| **Config bases (npm)** | `extends`-able baselines: TypeScript, Biome, Knip, Stryker, commitlint, dependency-cruiser, size-limit, Lighthouse. |
 | **Edge-security middleware (npm)** | Per-env closed-allowlist CORS, security headers, and app-layer rate limiting for Astro + Hono. |
 | **Guardrail scripts (npm)** | Dependency-free policy checks: CVE gate, action-pin ratchet, coverage floor, destructive-migration guard, workflow-portability, required-contexts, docs-staleness. |
 | **Renovate preset** | Shared dependency-update policy, including auto-bumping this repo's own `uses:` pins. |
@@ -182,6 +182,30 @@ mutate set (`stryker.config.json`):
   "mutate": ["src/**/*.ts", "!src/**/*.test.ts"]
 }
 ```
+
+#### `commitlint.base.mjs`
+
+Single-sources the conventional-commit **type-enum** — the eleven types
+(`feat`, `fix`, `perf`, `refactor`, `revert`, `docs`, `style`, `chore`,
+`test`, `build`, `ci`) documented in
+[`.agents/rules/git-conventions.md`](.agents/rules/git-conventions.md) — so
+consumers stop hand-copying the list into their own
+`commitlint.config.js`. Extends `@commitlint/config-conventional` for
+everything else (header casing/length, body/footer blank-line rules) and
+narrows `type-enum` to the fleet list. commitlint supports a native
+`extends`, so a consumer's local config reduces to the extend plus any
+repo-specific scope enforcement (`commitlint.config.js`):
+
+```js
+export default {
+  extends: ["mandrel-platform/commitlint.base.mjs"],
+  // repo-specific scope-enum, etc. — optional
+};
+```
+
+Keep this base's `type-enum`, the git-conventions.md prose list, and
+`release-please-config.json`'s `changelog-sections` in sync when adding a
+type — all three must agree.
 
 #### `dependency-cruiser.base.json`
 
@@ -682,6 +706,7 @@ repo is developed with — dev-time only, and not shipped in the npm package.
 | `mandrel-platform/biome.base.json`              | `config/biome.base.json`              |
 | `mandrel-platform/knip.base.json`               | `config/knip.base.json`               |
 | `mandrel-platform/stryker.base.json`            | `config/stryker.base.json`            |
+| `mandrel-platform/commitlint.base.mjs`          | `config/commitlint.base.mjs`          |
 | `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
 | `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
 | `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
