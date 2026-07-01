@@ -93,6 +93,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-osv-scan`  | boolean | `true`           | Enable the OSV-scanner advisory tier (scans the lockfile/manifest tree for known dependency advisories via a pinned, checksum-verified binary; no SARIF/GHAS). Set `false` to skip. See [OSV advisory tier](#osv-advisory-tier-enable-osv-scan).                                  |
 | `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
 | `osv-scanner-version` | string | `'2.4.0'`     | Pinned OSV-scanner release version (no leading `v`) for the advisory tier. Bump deliberately; the per-platform asset checksum is pinned to match.                                                                                                                              |
+| `osv-allowlist-path` | string | `'.osv-allowlist.json'` | Path (relative to the consumer repo root) to an optional OSV per-finding suppression/allow-list file. A missing file is a no-op — identical gating behaviour to having no allow-list at all. See [Per-finding suppression / allow-list](#per-finding-suppression--allow-list-osv-allowlist-path). |
 
 > **Sharding contract.** `shards` and `shard-matrix` must agree. `shards` sets
 > the denominator passed to the test runner (`--shard=<n>/<shards>`);
@@ -467,8 +468,92 @@ are visible with no GHAS dependency.
 >     with:
 >       # osv-fail-on-severity: critical   # gate on criticals only (default: high)
 >       # enable-osv-scan: false           # opt out of the advisory tier entirely
+>       # osv-allowlist-path: '.osv-allowlist.json'  # per-finding suppression file
 >     secrets: inherit
 > ```
+
+#### Per-finding suppression / allow-list (`osv-allowlist-path`)
+
+The OSV tier is otherwise a **blunt CVSS-band gate**: every finding at or
+above `osv-fail-on-severity` blocks `ci-required`, with no way to honor a
+finding a consumer has already triaged and risk-accepted (e.g. a transitive
+dependency reachable only through build tooling, never shipped in the
+deployed artifact). `osv-allowlist-path` (default `.osv-allowlist.json`, the
+consumer repo root) closes that gap with a checked-in JSON suppression file —
+mirroring the PR-diff baseline scoping the gitleaks/Semgrep tiers already use
+to narrow what blocks a given PR, but keyed by advisory id instead of diff
+scope.
+
+**Backwards compatible by default.** A consumer with **no file** at
+`osv-allowlist-path` sees **byte-for-byte identical** gating behaviour to the
+tier with no suppression mechanism at all — the allow-list load is a no-op
+when the file is absent. Adopting the mechanism is opt-in: a consumer only
+sees a behaviour change once it checks in a file at that path.
+
+**File shape.** Either a bare JSON array of entries, or an object with a
+`suppressions` array (both are accepted so the file can carry top-level
+comments-as-keys if a consumer wants metadata alongside the array):
+
+```json
+[
+  {
+    "id": "GHSA-xxxx-yyyy-zzzz",
+    "reason": "Transitive via @astrojs/cloudflare's bundled wrangler/miniflare build tooling; never shipped in the deployed Worker bundle.",
+    "revisitBy": "2026-09-30",
+    "package": "undici",
+    "ecosystem": "npm"
+  }
+]
+```
+
+| Field       | Required | Meaning                                                                                          |
+| ----------- | -------- | -------------------------------------------------------------------------------------------------- |
+| `id`        | yes      | The OSV/GHSA id as it appears in OSV-scanner's report (matches against the finding's aliased ids). |
+| `reason`    | yes      | Free-text risk-acceptance rationale. Mirrors the `security-baseline.md` requirement that deferred findings be documented with a review date. |
+| `revisitBy` | yes      | `YYYY-MM-DD`. Once today is past this date, the suppression **re-gates** the finding as if unsuppressed (see below) — a suppression cannot silently shield a finding forever. |
+| `package`   | no       | Scopes the match to a specific package name in addition to the id.                                 |
+| `ecosystem` | no       | Scopes the match to a specific ecosystem (e.g. `npm`) in addition to the id.                        |
+
+**Validation is strict, not best-effort.** An entry missing `id`, `reason`,
+or a valid `revisitBy` date fails the job with a clear `::error::` pointing at
+the offending entry's index — it never silently falls through to "matches
+everything" or "matches nothing." A present-but-unparsable allow-list file
+(invalid JSON, wrong top-level shape) fails the same way.
+
+**Matching.** A finding is suppressed when its OSV/GHSA id (or one of its
+aliased ids in the OSV-scanner group) matches an entry's `id`, and — when the
+entry specifies `package` and/or `ecosystem` — those also match the finding's
+package/ecosystem. Findings with **no** corresponding allow-list entry
+continue to gate exactly as before; the allow-list only ever narrows what
+blocks, never widens it.
+
+**Expiry re-gating.** A finding matched by an entry whose `revisitBy` is in
+the past is treated as **unsuppressed** for the pass/fail decision (it moves
+back into the blocking bucket) and is additionally called out in its own
+"past `revisitBy`" section of the job summary, so a stale suppression turns
+back into a hard failure rather than aging into permanent silence.
+
+**Job summary sections.** The `$GITHUB_STEP_SUMMARY` table is split into
+clearly labeled, independent sections so a reviewer can tell suppressed,
+warning, and blocking findings apart at a glance:
+
+- An optional **"past `revisitBy`"** callout (only present when at least one
+  suppression has expired), naming the finding, its original `revisitBy`,
+  and the original `reason`.
+- **Blocking** — findings at or above `osv-fail-on-severity` with no
+  suppression (or an expired one). Fails the job.
+- **Warning — below gate** — findings under `osv-fail-on-severity`, exactly
+  as in the un-suppressed tier. Never blocks.
+- **Suppressed via allow-list** — findings that matched a live (non-expired)
+  allow-list entry, along with the entry's `revisitBy` and `reason` for
+  traceability. Reported, never blocking.
+
+> **Out of scope.** This mechanism is the platform tier's own suppression
+> surface; it does not reconcile with consumer-local CVE gates (e.g. a
+> hand-rolled `scripts/audit-check.mjs`) — those keep their own allow-lists
+> unchanged. It also does not change the default `osv-fail-on-severity` or
+> `enable-osv-scan` values; suppression narrows what blocks within whatever
+> band a consumer has already configured.
 
 ### Destructive-migration guard (`enable-migration-guard`)
 
