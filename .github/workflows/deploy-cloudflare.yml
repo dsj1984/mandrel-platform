@@ -12,6 +12,10 @@
 #       secrets: inherit
 #
 # Defence-in-depth layers (in execution order):
+#   0. environments-isolation-audit — opt-in (enable-environments-isolation-audit),
+#                              audits GitHub Environments' deployment branch
+#                              policies against the canonical posture (custom
+#                              policy, single allowed branch, no wildcard).
 #   1. secret-isolation-audit — scans for plaintext secrets before any code runs.
 #   2. check-env             — validates required env/secrets exist for the target
 #                              environment; blocks deploy if any are absent.
@@ -32,7 +36,11 @@
 #                              workers.dev host is derived from the account
 #                              subdomain slug (never the account ID) and can be
 #                              overridden with smoke_base_url / smoke_paths, or
-#                              disabled entirely with smoke:false.
+#                              disabled entirely with smoke:false. Opt-in
+#                              verify-commit-sha (Story #176) additionally
+#                              asserts the health response's "version" field
+#                              matches github.sha, failing smoke (and
+#                              triggering rollback) on a mismatch.
 #
 # Command seams (Story #41): the D1 export/apply, build, and workers.dev smoke
 # defaults are all overridable so non-D1 / build-step / custom-host consumers can
@@ -238,6 +246,58 @@ on:
         required: false
         type: string
         default: ''
+      verify-commit-sha:
+        description: >
+          Opt-in (Story #176). When true, the built-in boot-smoke probe
+          additionally asserts that each deployed worker's health endpoint
+          reports the SHA this run is deploying (github.sha), turning the
+          release-tagging convention into a deploy-time invariant. Requires
+          the worker's health endpoint to return a JSON body with a
+          "version" field set to the deployed commit SHA (see
+          docs/runbooks/post-deploy-smoke.md#3-health-endpoint-contract), e.g.
+          `app.get('/health', (c) => c.json({ status: 'ok', version:
+          c.env.GIT_COMMIT_SHA }))`. A mismatch (or a missing/unparsable
+          "version" field) fails the smoke check for that worker and
+          triggers the same auto-rollback as an HTTP-status failure.
+          Ignored when smoke-command is set (the consumer-supplied probe
+          owns its own verification). Defaults to false so existing
+          consumers are unaffected until they opt in.
+        required: false
+        type: boolean
+        default: false
+      enable-environments-isolation-audit:
+        description: >
+          Run the shared Environments isolation-audit job (Story #172)
+          BEFORE secret-isolation-audit. Verifies that gh-environment (when
+          set) and any additional environments-to-audit both restrict
+          deploys via a custom deployment branch policy naming ONLY
+          isolation-audit-branch (default "main") — never a wildcard,
+          never "protected branches only", never zero policies. Defaults to
+          false (opt-in) so existing consumers without branch policies
+          configured yet (see docs/runbooks/environments-provisioning.md#6-deployment-branch-policy)
+          are not broken by adopting a workflow update. Set true once your
+          consumer has applied the canonical posture.
+        required: false
+        type: boolean
+        default: false
+      environments-to-audit:
+        description: >
+          Comma-separated GitHub Environment names to audit when
+          enable-environments-isolation-audit is true, IN ADDITION to
+          gh-environment (deduplicated automatically). Leave empty to audit
+          only gh-environment. Ignored when
+          enable-environments-isolation-audit is false.
+        required: false
+        type: string
+        default: ''
+      isolation-audit-branch:
+        description: >
+          The single branch name the isolation audit requires each audited
+          environment to restrict deploys to. Defaults to "main" (the
+          platform's canonical deployable branch).
+        required: false
+        type: string
+        default: 'main'
     secrets:
       CLOUDFLARE_API_TOKEN:
         description: 'Cloudflare API token with Worker and D1 write permissions'
@@ -288,6 +348,97 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 0a. Environments isolation audit (opt-in, Story #172)
+  #    Verifies that this repo's GitHub Environments restrict deploys to the
+  #    canonical branch (default "main") via a custom deployment branch
+  #    policy — never a wildcard, never "protected branches only", never zero
+  #    policies. Runs BEFORE the secret scan so a mis-scoped environment is
+  #    caught even faster than a leaked secret. Opt-in via
+  #    enable-environments-isolation-audit (default false) so existing
+  #    consumers without branch policies configured yet are not broken by
+  #    adopting a workflow bump.
+  # ---------------------------------------------------------------------------
+  environments-isolation-audit:
+    name: Environments isolation audit
+    runs-on: ubuntu-latest
+    if: ${{ inputs.enable-environments-isolation-audit == true }}
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve audited environment list
+        id: resolve-envs
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -A seen=()
+          envs=()
+          IFS=',' read -ra extra <<< "$ENVIRONMENTS_TO_AUDIT"
+          for e in "$GH_ENVIRONMENT" "${extra[@]}"; do
+            e="$(echo "$e" | xargs)"
+            [ -z "$e" ] && continue
+            if [ -z "${seen[$e]:-}" ]; then
+              seen[$e]=1
+              envs+=("$e")
+            fi
+          done
+          if [ "${#envs[@]}" -eq 0 ]; then
+            echo "::error::enable-environments-isolation-audit is true but no environment resolved (set gh-environment and/or environments-to-audit)."
+            exit 1
+          fi
+          printf -v joined '%s,' "${envs[@]}"
+          echo "environments=${joined%,}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_ENVIRONMENT: ${{ inputs.gh-environment }}
+          ENVIRONMENTS_TO_AUDIT: ${{ inputs.environments-to-audit }}
+
+      - name: Audit deployment branch policies
+        uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@17868b84fa1491e506172bac8426737b0cf99092
+        with:
+          environments: ${{ steps.resolve-envs.outputs.environments }}
+          allowed-branch: ${{ inputs.isolation-audit-branch }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ---------------------------------------------------------------------------
+  # 0b. CI-green guard (Story #175)
+  #    `github.event` inside a reusable workflow is the CALLER's event, so this
+  #    workflow can own the CI-green guard even though it cannot own the
+  #    caller's `on:` block. Consumers gating staging on CI (`workflow_run`)
+  #    previously hand-copied this exact guard as a caller-side `preflight`
+  #    job (athportal, swarm-os) — `workflow_run` fires on BOTH success and
+  #    failure, so without the guard a red upstream run would still deploy.
+  #    Centralizing it here means a `workflow_run`-triggered caller needs no
+  #    caller-side preflight guard at all; see the canonical
+  #    `templates/workflows/deploy-staging.yml` caller template.
+  #
+  #    - `workflow_run` events: skip-with-notice unless the upstream run's
+  #      conclusion was `success`.
+  #    - Every other event (`workflow_dispatch`, `push`, `pull_request`, …):
+  #      pass through unconditionally — those triggers are operator- or
+  #      branch-protection-intentional and carry no upstream conclusion to
+  #      gate on.
+  # ---------------------------------------------------------------------------
+  require-ci-green:
+    name: Require CI-green (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate CI-green gate
+        shell: bash
+        run: |
+          if [ "$EVENT_NAME" = "workflow_run" ] && [ "$CONCLUSION" != "success" ]; then
+            echo "::notice::Skipping deploy — upstream workflow_run concluded '${CONCLUSION}' (not 'success')."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+    outputs:
+      skip: ${{ steps.gate.outputs.skip }}
+
+  # ---------------------------------------------------------------------------
   # 1. Secret isolation audit
   #    Scans the checkout for hardcoded secrets BEFORE any deploy step runs.
   #    Fails fast so a secret-in-source-tree never reaches Cloudflare.
@@ -295,6 +446,11 @@ jobs:
   secret-isolation-audit:
     name: Secret isolation audit
     runs-on: ubuntu-latest
+    needs: [environments-isolation-audit, require-ci-green]
+    if: >-
+      ${{ always() &&
+          (needs.environments-isolation-audit.result == 'success' || needs.environments-isolation-audit.result == 'skipped') &&
+          needs.require-ci-green.outputs.skip != 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -779,7 +935,8 @@ jobs:
               WORKER_URL="${base}${p}"
 
               echo "::group::Smoke-testing $worker → $WORKER_URL"
-              HTTP_STATUS=$(curl --silent --output /dev/null \
+              RESPONSE_BODY_FILE="$(mktemp)"
+              HTTP_STATUS=$(curl --silent --output "$RESPONSE_BODY_FILE" \
                 --write-out "%{http_code}" \
                 --max-time 15 \
                 --retry 3 \
@@ -790,9 +947,38 @@ jobs:
               if [ "$HTTP_STATUS" != "200" ]; then
                 echo "::error::Smoke check FAILED for $worker at $WORKER_URL (HTTP $HTTP_STATUS). Triggering rollback."
                 failed+=("$worker")
-              else
-                echo "✅ $worker smoke check passed at $WORKER_URL (HTTP 200)"
+                rm -f "$RESPONSE_BODY_FILE"
+                echo "::endgroup::"
+                continue
               fi
+
+              echo "✅ $worker smoke check passed at $WORKER_URL (HTTP 200)"
+
+              # ----- verify-commit-sha (Story #176, opt-in) -----
+              # Assert the deployed worker's health response reports the SHA
+              # this run deployed (github.sha). Contract: docs/runbooks/
+              # post-deploy-smoke.md#3-health-endpoint-contract — the health
+              # endpoint returns a JSON body with a "version" field set to
+              # env.GIT_COMMIT_SHA. A mismatch or unparsable field fails the
+              # smoke check and triggers the same auto-rollback as an
+              # HTTP-status failure.
+              if [ "$VERIFY_COMMIT_SHA" = "true" ]; then
+                DEPLOYED_SHA="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$RESPONSE_BODY_FILE" \
+                  | head -n1 \
+                  | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
+
+                if [ -z "$DEPLOYED_SHA" ]; then
+                  echo "::error::verify-commit-sha FAILED for $worker at $WORKER_URL — response has no parsable \"version\" field. Triggering rollback."
+                  failed+=("$worker")
+                elif [ "$DEPLOYED_SHA" != "$EXPECTED_SHA" ]; then
+                  echo "::error::verify-commit-sha FAILED for $worker — deployed SHA '$DEPLOYED_SHA' does not match expected SHA '$EXPECTED_SHA'. Triggering rollback."
+                  failed+=("$worker")
+                else
+                  echo "✅ $worker reports expected commit SHA: $DEPLOYED_SHA"
+                fi
+              fi
+
+              rm -f "$RESPONSE_BODY_FILE"
               echo "::endgroup::"
             done
           done
@@ -810,6 +996,8 @@ jobs:
           SMOKE_BASE_URL: ${{ inputs.smoke_base_url }}
           SMOKE_PATHS: ${{ inputs.smoke_paths }}
           WORKERS_DEV_SUBDOMAIN: ${{ inputs.workers_dev_subdomain }}
+          VERIFY_COMMIT_SHA: ${{ inputs.verify-commit-sha }}
+          EXPECTED_SHA: ${{ github.sha }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 

@@ -13,7 +13,7 @@ hand-maintaining its own copies and drifting apart over time.
 | ------ | ---------------- |
 | **Reusable workflows** | `workflow_call` CI, deploy, secret-scan, release, and CodeQL pipelines, consumed by tag/SHA pin. |
 | **Composite action** | `setup-toolchain` — pnpm + Node + frozen install in one step. |
-| **Config bases (npm)** | `extends`-able baselines: TypeScript, Biome, Knip, Stryker, dependency-cruiser, size-limit, Lighthouse. |
+| **Config bases (npm)** | `extends`-able baselines: TypeScript, Biome, Knip, Stryker, commitlint, dependency-cruiser, size-limit, Lighthouse. |
 | **Edge-security middleware (npm)** | Per-env closed-allowlist CORS, security headers, and app-layer rate limiting for Astro + Hono. |
 | **Guardrail scripts (npm)** | Dependency-free policy checks: CVE gate, action-pin ratchet, coverage floor, destructive-migration guard, workflow-portability, required-contexts, docs-staleness. |
 | **Renovate preset** | Shared dependency-update policy, including auto-bumping this repo's own `uses:` pins. |
@@ -182,6 +182,30 @@ mutate set (`stryker.config.json`):
   "mutate": ["src/**/*.ts", "!src/**/*.test.ts"]
 }
 ```
+
+#### `commitlint.base.mjs`
+
+Single-sources the conventional-commit **type-enum** — the eleven types
+(`feat`, `fix`, `perf`, `refactor`, `revert`, `docs`, `style`, `chore`,
+`test`, `build`, `ci`) documented in
+[`.agents/rules/git-conventions.md`](.agents/rules/git-conventions.md) — so
+consumers stop hand-copying the list into their own
+`commitlint.config.js`. Extends `@commitlint/config-conventional` for
+everything else (header casing/length, body/footer blank-line rules) and
+narrows `type-enum` to the fleet list. commitlint supports a native
+`extends`, so a consumer's local config reduces to the extend plus any
+repo-specific scope enforcement (`commitlint.config.js`):
+
+```js
+export default {
+  extends: ["mandrel-platform/commitlint.base.mjs"],
+  // repo-specific scope-enum, etc. — optional
+};
+```
+
+Keep this base's `type-enum`, the git-conventions.md prose list, and
+`release-please-config.json`'s `changelog-sections` in sync when adding a
+type — all three must agree.
 
 #### `dependency-cruiser.base.json`
 
@@ -413,8 +437,9 @@ into a repo's own `scripts/`.
 | `check-destructive-migration.mjs` | Blocks `DROP` / `TRUNCATE` / `ALTER … DROP` (and Drizzle `.dropTable()`) in migration files unless a reviewer applies the override label. | `pr-quality.yml` (migration-guard tier, opt-in) |
 | `check-workflow-portability.mjs` | Catches cross-repo footguns in reusable workflows / composite actions: relative `uses:` paths, `${{ }}` in `workflow_call` input metadata, and lagging first-party pins. | `pr-quality.yml` + `ci.yml` |
 | `check-action-pins.mjs` | Ratchet requiring every third-party Action to be pinned to a full 40-char commit SHA (tag-swap defence); local and first-party refs are exempt. | `ci.yml` |
-| `check-required-contexts.mjs` | Validates that every branch-protection required check in `main-protection.json` maps to a real CI job — no phantom required checks. | `ci.yml` |
+| `check-required-contexts.mjs` | Validates that every branch-protection required check in `main-protection.json` maps to a real CI job — no phantom required checks. Also **warns** (never blocks) when the caller file / display `name:` / caller job id diverge from the canonical `ci.yml` / `CI` / `ci` triplet ([details](docs/reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)). | `ci.yml` |
 | `check-docs-staleness.mjs` | Lints markdown/JSON docs for known staleness patterns (stale URLs, expired dates, dead runbook paths); suppressible per-rule. | standalone |
+| `check-repo-settings.mjs` | Cross-consumer dashboard for the GitHub-side repo-settings baseline (merge methods, squash source, auto-merge, Actions default token permissions, PR-approval-by-Actions) — see below. | standalone / `platform-sync --check-settings` |
 
 > **`config/main-protection.schema.json`** is the JSON Schema for the
 > branch-protection contract (`docs/runbooks/main-protection.json`) — required
@@ -422,6 +447,50 @@ into a repo's own `scripts/`.
 > `check-required-contexts.mjs` validates the contract against the actual
 > workflow job graph; see the
 > [branch-protection runbook](docs/runbooks/branch-protection-setup.md).
+
+> **`config/repo-settings.schema.json`** is the JSON Schema for the
+> repo-settings baseline contract (`docs/runbooks/repo-settings.json`),
+> sibling to `main-protection.schema.json` — merge methods, squash-commit
+> source, auto-merge/delete-branch-on-merge, Actions default workflow token
+> permissions, and whether Actions can approve pull requests. Fleet baseline
+> decided 2026-07-01 (see `docs/decisions.md`): squash-only merges, squash
+> source `PR_TITLE`/`PR_BODY`, auto-merge + delete-branch-on-merge on, Actions
+> default token permissions `read`, `can_approve_pull_request_reviews` off.
+>
+> **Because `squashMergeCommitMessage` is `PR_BODY`, PR templates must stay
+> commit-body-safe.** The PR description becomes the literal squash-commit
+> body on `main`, which `release-please` and `commitlint` then parse — a
+> template that injects checklist boilerplate, HTML comments, or
+> non-conventional-commit prose into that body will land in commit history and
+> can break changelog generation or commitlint's body rules. Keep PR templates
+> to short, commit-message-safe prose, or put checklists in sections authors
+> delete before merge.
+>
+> **Check + apply.** `scripts/check-repo-settings.mjs` is the GitHub-side
+> drift dashboard (mirrors `check-pin-drift.mjs`'s shape: data-driven consumer
+> registry — reuses `scripts/pin-drift-consumers.json` — injectable `gh`
+> runner, `--json`/`--strict`). `scripts/platform-sync.mjs` gained a
+> settings mode for the per-consumer check/apply flow:
+>
+> ```bash
+> # Report drift for one consumer against the baseline — never mutates, never
+> # fails the exit code unless the read itself errors (standing decision #10).
+> node scripts/platform-sync.mjs --check-settings --consumer-repo dsj1984/domio
+>
+> # Same read, then PATCH the drifted fields to match the baseline.
+> node scripts/platform-sync.mjs --apply-settings --consumer-repo dsj1984/domio
+>
+> # Preview what --apply-settings would PATCH without mutating anything.
+> node scripts/platform-sync.mjs --apply-settings --dry-run --consumer-repo dsj1984/domio
+> ```
+>
+> Both commands accept `--baseline <path>` (default:
+> `docs/runbooks/repo-settings.json`) and `--json` for a machine-readable
+> envelope. **Non-blocking by design** (standing decision #10, same posture as
+> the pin-drift dashboard and `check-ruleset.mjs`): drift is reported, not a
+> hard gate — it never fails CI on a consumer's `main`. Branch-protection
+> ruleset drift is out of scope here (see the companion `check-ruleset.mjs`
+> story); this contract covers repo-settings only.
 
 ---
 
@@ -527,12 +596,27 @@ reports `already in sync`):
    actions (`actions/checkout`, …) are left untouched. The trailing
    `# <ref>` comment is refreshed so the pin stays human-auditable and the
    Renovate auto-bump rule above can track it.
-2. **Materializes runbook reference stubs** (§2.2 *link, don't copy*). Copies
+2. **Checks CI-caller naming** (advisory only, Story #173). Reports whether
+   `.github/workflows/ci.yml` matches the canonical caller triplet — file
+   `ci.yml`, display name `CI`, caller job id `ci` (required context
+   `ci / ci-required`; see
+   [reusable-workflows.md § "Canonical caller naming"](docs/reusable-workflows.md#canonical-caller-naming-the-ciyml--ci--ci-triplet)).
+   Never renames or rewrites anything — a caller rename must land atomically
+   with its own branch-protection ruleset context update, which is a
+   deliberate per-consumer Story, not an automatic sync side-effect.
+3. **Materializes runbook reference stubs** (§2.2 *link, don't copy*). Copies
    the thin stubs from `templates/runbooks/` into the consumer's
    `docs/runbooks/` **only when absent** — an already-adopted stub is skipped,
    and a full local copy (no stub marker) is surfaced as a warning to
    reconcile by hand, never silently overwritten.
-3. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
+4. **Materializes workflow caller templates.** Copies canonical callers from
+   `templates/workflows/` (e.g. `deploy-staging.yml`, the one-paved-road
+   `workflow_run` caller for `deploy-cloudflare.yml`'s CI-green guard — see
+   [`docs/reusable-workflows.md`](docs/reusable-workflows.md#deploy-cloudflareyml))
+   into the consumer's `.github/workflows/` — same link-don't-copy semantics:
+   only when absent, and a hand-authored file without the template marker is
+   surfaced as a warning rather than overwritten.
+5. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
    consumer's Renovate `extends` and `mandrel-platform/tsconfig.base.json` to
    its `tsconfig.json` `extends`. The SSOT goes first so the consumer's own
    later entries continue to override it.
@@ -622,6 +706,7 @@ repo is developed with — dev-time only, and not shipped in the npm package.
 | `mandrel-platform/biome.base.json`              | `config/biome.base.json`              |
 | `mandrel-platform/knip.base.json`               | `config/knip.base.json`               |
 | `mandrel-platform/stryker.base.json`            | `config/stryker.base.json`            |
+| `mandrel-platform/commitlint.base.mjs`          | `config/commitlint.base.mjs`          |
 | `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
 | `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
 | `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |

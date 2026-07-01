@@ -1,0 +1,155 @@
+# Shared Environments isolation-audit composite action (Story #172).
+#
+# Audits this repo's GitHub Environments against the platform's canonical
+# deployment branch-policy posture (see
+# docs/runbooks/environments-provisioning.md#6-deployment-branch-policy):
+# every environment must restrict deploys to `custom_branch_policies` with
+# ONLY the configured deployable branch (default: "main") permitted — never
+# "*", never protected-branches-only (which would silently admit any branch
+# with a protection rule), and never zero policies (an unrestricted
+# environment any branch can deploy to).
+#
+# Seeded from athportal's implementation (best-of-breed — the gold-standard
+# exemplar referenced in Story #172) and generalized into a reusable unit so
+# `deploy-cloudflare.yml` and any other consumer workflow can opt in with one
+# step instead of re-deriving the `gh api` calls per repo.
+#
+# Usage:
+#   - name: Environments isolation audit
+#     uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@<sha>
+#     with:
+#       environments: 'staging,production'
+#       allowed-branch: 'main'
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#
+# Requires a token with at least read access to the repo (contents: read is
+# NOT sufficient by itself for the environments API — this needs the default
+# GITHUB_TOKEN, which has read access to environments in the same repo, or a
+# PAT with `repo` scope for cross-repo use).
+name: Environments isolation audit
+description: >
+  Audits GitHub Environments' deployment branch policies against the
+  platform's canonical posture (custom policy, single allowed branch, no
+  wildcard). Fails the run when any audited environment is missing, has no
+  branch policy configured, allows a wildcard/protected-branches policy, or
+  permits a branch other than the allowed one.
+
+inputs:
+  environments:
+    description: >
+      Comma-separated list of GitHub Environment names to audit (e.g.
+      "staging,production"). Required — the action does not enumerate all
+      environments on the repo so a typo'd or newly-added environment can't
+      silently widen the audited set without a workflow change.
+    required: true
+  allowed-branch:
+    description: >
+      The single branch name permitted to deploy to each audited
+      environment under the canonical posture. Defaults to "main" (the
+      platform's canonical deployable branch — see
+      docs/runbooks/environments-provisioning.md).
+    required: false
+    default: 'main'
+  repo:
+    description: >
+      "owner/repo" slug to audit. Defaults to the current repository
+      (github.repository) — override only for cross-repo audits.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Audit deployment branch policies
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        REPO="${AUDIT_REPO:-$GITHUB_REPOSITORY}"
+        ALLOWED_BRANCH="${ALLOWED_BRANCH:-main}"
+
+        IFS=',' read -ra ENVS <<< "$ENVIRONMENTS_CSV"
+        if [ "${#ENVS[@]}" -eq 0 ]; then
+          echo "::error::environments-isolation-audit: no environments provided (inputs.environments is empty)."
+          exit 1
+        fi
+
+        errors=0
+
+        for raw_env in "${ENVS[@]}"; do
+          env_name="$(echo "$raw_env" | xargs)"
+          [ -z "$env_name" ] && continue
+
+          echo "::group::Auditing environment '${env_name}'"
+
+          env_json="$(gh api "repos/${REPO}/environments/${env_name}" 2>/dev/null || true)"
+          if [ -z "$env_json" ]; then
+            echo "::error::Environment '${env_name}' does not exist on ${REPO} (or the token lacks access)."
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          custom_policies="$(echo "$env_json" | jq -r '.deployment_branch_policy.custom_branch_policies // false')"
+          protected_only="$(echo "$env_json" | jq -r '.deployment_branch_policy.protected_branches // false')"
+
+          if [ "$custom_policies" != "true" ]; then
+            if [ "$protected_only" = "true" ]; then
+              echo "::error::Environment '${env_name}' uses 'protected branches only' — this silently admits ANY branch with a protection rule, not just '${ALLOWED_BRANCH}'. Switch to a custom branch policy naming only '${ALLOWED_BRANCH}'."
+            else
+              echo "::error::Environment '${env_name}' has NO deployment branch policy — any branch can deploy. Configure a custom policy restricted to '${ALLOWED_BRANCH}'."
+            fi
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          policies_json="$(gh api "repos/${REPO}/environments/${env_name}/deployment-branch-policies" 2>/dev/null || echo '{"total_count":0,"branch_policies":[]}')"
+          policy_count="$(echo "$policies_json" | jq -r '.total_count // 0')"
+          policy_names="$(echo "$policies_json" | jq -r '[.branch_policies[]?.name] | join(",")')"
+
+          if [ "$policy_count" -eq 0 ]; then
+            echo "::error::Environment '${env_name}' has custom_branch_policies enabled but ZERO named policies — this is equivalent to allowing no branch, which likely means deploys are silently broken or the policy was misconfigured."
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          # Wildcard patterns effectively open the environment to any matching
+          # ref; the canonical posture is a single, exact branch name.
+          if echo "$policies_json" | jq -e '[.branch_policies[]?.name] | any(contains("*"))' >/dev/null; then
+            echo "::error::Environment '${env_name}' has a wildcard branch policy (${policy_names}) — wildcards defeat the single-allowed-branch posture. Use an exact branch name ('${ALLOWED_BRANCH}')."
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          if [ "$policy_count" -ne 1 ]; then
+            echo "::error::Environment '${env_name}' has ${policy_count} branch policies (${policy_names}) — the canonical posture is exactly one policy naming only '${ALLOWED_BRANCH}'."
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          if [ "$policy_names" != "$ALLOWED_BRANCH" ]; then
+            echo "::error::Environment '${env_name}' allows branch '${policy_names}', not '${ALLOWED_BRANCH}'."
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          echo "✅ Environment '${env_name}' restricts deploys to '${ALLOWED_BRANCH}' only."
+          echo "::endgroup::"
+        done
+
+        if [ "$errors" -gt 0 ]; then
+          echo "::error::environments-isolation-audit: ${errors} environment(s) failed the deployment branch-policy audit. See docs/runbooks/environments-provisioning.md#6-deployment-branch-policy for the canonical posture and remediation."
+          exit 1
+        fi
+
+        echo "environments-isolation-audit: all audited environments restrict deploys to '${ALLOWED_BRANCH}'."
+      env:
+        ENVIRONMENTS_CSV: ${{ inputs.environments }}
+        ALLOWED_BRANCH: ${{ inputs.allowed-branch }}
+        AUDIT_REPO: ${{ inputs.repo }}

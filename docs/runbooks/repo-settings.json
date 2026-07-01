@@ -1,0 +1,13 @@
+{
+  "$schema": "../../config/repo-settings.schema.json",
+  "allowSquashMerge": true,
+  "allowMergeCommit": false,
+  "allowRebaseMerge": false,
+  "squashMergeCommitTitle": "PR_TITLE",
+  "squashMergeCommitMessage": "PR_BODY",
+  "deleteBranchOnMerge": true,
+  "allowAutoMerge": true,
+  "actionsDefaultWorkflowPermissions": "read",
+  "actionsCanApprovePullRequestReviews": false,
+  "_note": "Fleet baseline decided 2026-07-01 (repo-ops consumers matrix §3a / roadmap §2.1): squash-only merges, squash source PR_TITLE/PR_BODY, auto-merge + delete-branch-on-merge on, Actions default token permissions read, can_approve_pull_request_reviews off. Consumer projects copy this file to their own docs/runbooks/ and use it as the --settings input to `check-repo-settings.mjs` / `platform-sync.mjs --check-settings`. Do not hand-edit the values without updating the operator decision record in docs/decisions.md."
+}

@@ -58,6 +58,23 @@ A minimal health handler:
 app.get('/health', (c) => c.json({ status: 'ok', version: c.env.GIT_COMMIT_SHA ?? 'unknown' }));
 ```
 
+### Commit-SHA verification (opt-in, Story #176)
+
+The `version` field above is not just informational — `deploy-cloudflare.yml`
+can verify it. Passing `verify-commit-sha: true` to the reusable workflow
+makes the built-in boot-smoke probe additionally assert that the deployed
+worker's `version` matches the commit SHA (`github.sha`) this run is
+deploying. A mismatch, or a missing/unparsable `version` field, fails the
+smoke check and triggers the same auto-rollback as an HTTP-status failure.
+
+This requires `GIT_COMMIT_SHA` to actually be injected as a build-time /
+runtime binding pointing at the deployed commit — each consumer owns that
+injection in its own build step (the build-split model). `verify-commit-sha`
+is opt-in and defaults to `false` so consumers that have not yet wired
+`GIT_COMMIT_SHA` through are unaffected. See
+[`reusable-workflows.md` — Commit-SHA verification](../reusable-workflows.md#commit-sha-verification-opt-in)
+for the full input contract.
+
 ---
 
 ## 4. Running the Smoke Manually

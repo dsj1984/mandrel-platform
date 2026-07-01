@@ -56,9 +56,25 @@ consumer inherits a network-egress baseline for free.
 
 ### Minimal caller
 
+> **File and job naming.** Name the caller workflow file `ci.yml`, its display
+> `name:` `CI`, and the job that wraps this call `ci` — the canonical triplet
+> (see [Canonical caller naming](#canonical-caller-naming-the-ciyml--ci--ci-triplet)
+> below) that keeps the required-context string `ci / ci-required` stable and
+> onboarding-friendly across the fleet. New consumers should start from this
+> shape rather than an ad hoc file/job name.
+
 ```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
 jobs:
-  pr-quality:
+  ci:
     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
     secrets: inherit
 ```
@@ -95,6 +111,9 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
 | `osv-scanner-version` | string | `'2.4.0'`     | Pinned OSV-scanner release version (no leading `v`) for the advisory tier. Bump deliberately; the per-platform asset checksum is pinned to match.                                                                                                                              |
 | `osv-allowlist-path` | string | `'.osv-allowlist.json'` | Path (relative to the consumer repo root) to an optional OSV per-finding suppression/allow-list file. A missing file is a no-op — identical gating behaviour to having no allow-list at all. See [Per-finding suppression / allow-list](#per-finding-suppression--allow-list-osv-allowlist-path). |
+| `enable-wrangler-baseline-check` | boolean | `true` | Enable the wrangler.toml/wrangler.jsonc baseline check (env.\* split, logpush, Analytics Engine binding, compatibility_date staleness) as a step in the `lint` tier. A consumer with no wrangler config is a no-op pass. See [Wrangler-baseline check](#wrangler-baseline-check-enable-wrangler-baseline-check). |
+| `wrangler-baseline-fail-on-violation` | boolean | `false` | When `true`, an un-excepted violation fails the `lint` tier (and therefore `ci-required`). Default `false` is the **advisory rollout** posture — violations are reported but never block until the fleet is clean. |
+| `wrangler-baseline-max-age-days` | number | `90` | Maximum age (days) of `compatibility_date` before the check flags it stale. |
 
 > **Sharding contract.** `shards` and `shard-matrix` must agree. `shards` sets
 > the denominator passed to the test runner (`--shard=<n>/<shards>`);
@@ -613,6 +632,128 @@ warning, and blocking findings apart at a glance:
 > `enable-osv-scan` values; suppression narrows what blocks within whatever
 > band a consumer has already configured.
 
+### Wrangler-baseline check (`enable-wrangler-baseline-check`)
+
+A **lint-tier step** that enforces four wrangler configuration invariants the
+fleet had previously kept only "by convention" with no automated check
+(repo-ops consumers matrix §2/§7, roadmap §2a.3):
+
+1. **`env.*` named-Environment split** — at least one named `[env.<name>]`
+   (TOML) / `"env": { "<name>": {...} }` (JSON) block exists.
+2. **`logpush: true`** — set at the top level, or on every named environment
+   the config declares.
+3. **Analytics Engine binding** — at least one
+   `[[analytics_engine_datasets]]` / `"analytics_engine_datasets"` entry, at
+   the top level or on any named environment.
+4. **`compatibility_date` staleness policy** — the date is present, valid,
+   and within `wrangler-baseline-max-age-days` (default **90 days**) of the
+   run date. Renovate's shared preset bumps `compatibility_date` whenever
+   `wrangler` itself is bumped, but a Worker that goes untouched by that bump
+   for a long stretch can still drift past the policy window — this rule is
+   the independent backstop.
+
+**Implementation.** `scripts/check-wrangler-baseline.mjs` — a dependency-free
+Node script (no TOML/JSONC library; both formats are parsed with small,
+purpose-built parsers scoped to wrangler's actual shape) — runs as a step in
+the `lint` job, after `setup-toolchain` but requiring nothing from it beyond
+Node itself. It auto-detects `wrangler.jsonc` (preferred), `wrangler.json`,
+then `wrangler.toml` at the consumer's repo root. **A consumer with no
+wrangler config at all is a no-op pass** — not every mandrel-platform
+consumer is a Cloudflare Worker.
+
+The step resolves the script from the installed `mandrel-platform` npm
+package first (`node_modules/mandrel-platform/scripts/check-wrangler-baseline.mjs`,
+via the existing `exports["./scripts/*"]` surface every consumer already gets
+through its `mandrel-platform` devDependency), falling back to this repo's
+own `scripts/` checkout path when the caller is mandrel-platform itself.
+
+#### Advisory-first rollout (`wrangler-baseline-fail-on-violation`)
+
+Ships **non-blocking by default** (`wrangler-baseline-fail-on-violation:
+false`) so the fleet can be swept clean via the run-log/job-summary report
+before any consumer's `ci-required` starts failing on it — the same posture
+[`check-repo-settings.mjs`](#the-ci-required-aggregator) and the pin-drift
+dashboard use for a new cross-fleet contract. Flip the caller's default to
+`true` (or set it explicitly) once a consumer's wrangler config is clean.
+
+```yaml
+jobs:
+  pr-quality:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      wrangler-baseline-fail-on-violation: true # promote once clean (default: false)
+      # wrangler-baseline-max-age-days: 60      # tighten the compatibility_date window
+      # enable-wrangler-baseline-check: false   # opt out entirely (not recommended)
+    secrets: inherit
+```
+
+#### Per-consumer exceptions (declared, not silent)
+
+A Worker that legitimately opts out of one rule declares it explicitly in its
+own wrangler config under a top-level `mandrel.wranglerBaselineExceptions`
+block, rather than silently failing to match. A declared exception suppresses
+*only that rule's* finding — it is still echoed back in the report (with its
+reason) so the opt-out stays visible to reviewers, never silent.
+
+`wrangler.jsonc`:
+
+```jsonc
+{
+  // ...
+  "mandrel": {
+    "wranglerBaselineExceptions": {
+      "analytics-engine": "no telemetry sink for this static-asset Worker",
+    },
+  },
+}
+```
+
+`wrangler.toml`:
+
+```toml
+[mandrel.wranglerBaselineExceptions]
+analytics-engine = "no telemetry sink for this static-asset Worker"
+```
+
+Valid exception keys match the rule ids: `env-split`, `logpush`,
+`analytics-engine`, `compat-date-stale`.
+
+#### Standalone / dashboard usage
+
+The script also runs standalone, outside the `pr-quality` wiring — useful for
+a local pre-push check or a cross-fleet dashboard run:
+
+```bash
+node scripts/check-wrangler-baseline.mjs                       # auto-detect, exit 1 on violation
+node scripts/check-wrangler-baseline.mjs --warn-only            # report only, always exit 0
+node scripts/check-wrangler-baseline.mjs --file path/to/wrangler.jsonc
+node scripts/check-wrangler-baseline.mjs --max-age-days 60
+node scripts/check-wrangler-baseline.mjs --json                 # machine-readable envelope
+```
+
+> **Consumers-matrix follow-up (action required, tracked outside this
+> repo).** This platform repo has no in-repo "consumers matrix" file — the
+> same standing note as the [repo-settings baseline](decisions.md). This
+> Story does **not** flip the ◐/○ → ● cells itself (there is nothing to
+> edit in this checkout); it ships the mechanism the flip depends on. The
+> flip is a **required follow-up action**, not a someday-maybe:
+>
+> 1. On release of this Story's tag, open (or reuse) a tracking Story in
+>    whichever repo hosts `mandrel-platform-consumers.md` (the sibling
+>    `dsj1984/repo-ops` planning repo per the Story #171 precedent) to flip
+>    the §2/§7 rows for `env.*` split, `logpush`, Analytics Engine, and
+>    `compatibility_date` to ◐ (mechanism shipped, advisory) immediately —
+>    this does not wait on a clean fleet.
+> 2. Per consumer (domio, athportal, swarm-os), once its own wrangler config
+>    is verified clean under this check and
+>    `wrangler-baseline-fail-on-violation: true` is set, flip that
+>    consumer's row to ● in the same tracking document.
+> 3. Cite this Story (mandrel-platform#177) and the shipped
+>    `scripts/check-wrangler-baseline.mjs` contract in the tracking Story so
+>    the row-flip has a concrete artifact to point at, mirroring how the
+>    repo-settings baseline entry in `docs/decisions.md` cites
+>    `config/repo-settings.schema.json`.
+
 ### Destructive-migration guard (`enable-migration-guard`)
 
 A **PR-time label guard** that blocks a pull request introducing a
@@ -784,6 +925,60 @@ Do **not** register the individual tier jobs (`Lint & format`, `Typecheck`,
 `Unit (1/3)`, …) as required — their names change with shard count and toggle
 state, which is exactly the drift `ci-required` exists to absorb.
 
+### Canonical caller naming (the `ci.yml` / `CI` / `ci` triplet)
+
+`ci-required` fixes the required-**check** name, but it does not fix the
+**caller** naming three layers up the stack: the consumer workflow *file* that
+calls `pr-quality.yml`, that workflow's display `name:`, and the caller
+*job id* that wraps the `pr-quality` call. Three fleet consumers converged on
+three different spellings for the same shared workflow (validated 2026-07-01):
+
+| Consumer   | Caller file    | Display `name:` | Caller job id | Required context      |
+| ---------- | -------------- | ---------------- | ------------- | ---------------------- |
+| domio      | `ci-pr.yml`    | `CI (PR)`         | —             | `ci-required`           |
+| athportal  | `quality.yml`  | `quality`         | —             | `pr-quality / ci-required` |
+| swarm-os   | `ci.yml`       | `CI`              | —             | `quality / ci-required` |
+
+Same shared `pr-quality.yml`, three spellings — a papercut for onboarding, for
+org-level rulesets that name a required context by string, and for every doc
+that has to describe "the CI workflow" generically across the fleet.
+
+**Operator decision (2026-07-01, D2 — canonical triplet):**
+
+| Layer                 | Canonical value      |
+| ---------------------- | -------------------- |
+| Caller file             | `ci.yml`              |
+| Display `name:`         | `CI`                  |
+| Caller job id           | `ci`                  |
+| Required context (full) | `ci / ci-required`    |
+
+See the [Minimal caller](#minimal-caller) snippet above for the canonical
+`ci.yml` shape. With that shape, the branch-protection required context reads
+**`ci / ci-required`** (`<caller job id> / <aggregator job id>`) — the same
+`<job id> / <job id>` composition GitHub always uses for a `workflow_call`
+target's status context, just anchored on the canonical `ci` job id instead of
+each consumer's own ad hoc name.
+
+> **Renaming an existing caller is a per-consumer story, not this one.** This
+> section documents the target shape; it does **not** rename `domio`'s
+> `ci-pr.yml`, `athportal`'s `quality.yml`, or `swarm-os`'s `ci.yml`/`quality`
+> job id. Each consumer rename lands atomically with its own branch-protection
+> ruleset context update (old context removed, `ci / ci-required` added) in a
+> dedicated Story — renaming the file/job id without also flipping the
+> ruleset's registered context reintroduces the exact "phantom required
+> check" failure mode [`check-required-contexts.mjs`](#the-ci-required-aggregator)
+> guards against on the platform's own CI, this time on the consumer side.
+> **Note on mandrel-platform's own CI:** this repo's `ci.yml` (file) / `CI`
+> (display name) already matches the canonical file and display-name layers,
+> but mandrel-platform is not itself a `pr-quality.yml` **consumer** — its
+> `ci.yml` self-tests the platform's own scripts/workflows (`check-required-
+> contexts`, `check-workflow-portability`, `check-action-pins`, `actionlint`)
+> and has no `ci` caller job wrapping a `pr-quality.yml` call, so the `ci /
+> ci-required` required-context shape does not apply to it. The canonical
+> triplet targets **consumer** repos that call `pr-quality.yml` — see
+> [the action-pin ratchet](#the-action-pin-ratchet) for mandrel-platform's own,
+> unrelated `ci-required` aggregator.
+
 ---
 
 ## `deploy-cloudflare.yml`
@@ -792,11 +987,99 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `workflow_call` target. The jobs run in this order:
 
 ```text
-secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
+(environments-isolation-audit, require-ci-green) → secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
 ```
 
+`environments-isolation-audit` only runs when
+`enable-environments-isolation-audit: true` (default `false` — opt-in, see
+[Environments isolation audit](#environments-isolation-audit) below).
 `pre-migration-snapshot` and `migrate` only run when `migrate: true`;
 `boot-smoke` only runs when `smoke: true` (the default).
+
+### Environments isolation audit
+
+> Story #172. An **opt-in** job (`enable-environments-isolation-audit`,
+> default `false`) that runs the shared
+> `.github/actions/environments-isolation-audit` composite action against
+> `gh-environment` (when set) plus any names in `environments-to-audit`,
+> BEFORE `secret-isolation-audit`. It fails the run when an audited
+> environment lacks a custom deployment branch policy, uses "protected
+> branches only", allows a wildcard, or permits any branch other than
+> `isolation-audit-branch` (default `main`) — the canonical posture
+> documented in
+> [`environments-provisioning.md` §6](runbooks/environments-provisioning.md#6-deployment-branch-policy).
+>
+> Defaults to `false` so existing consumers without branch policies
+> configured yet are not broken by adopting a `deploy-cloudflare.yml`
+> version bump. See the runbook's
+> [Adopting the isolation audit](runbooks/environments-provisioning.md#adopting-the-isolation-audit)
+> section for the exact caller wiring.
+
+| Input                                  | Type    | Default | When to override |
+| --------------------------------------- | ------- | ------- | ----------------- |
+| `enable-environments-isolation-audit`   | boolean | `false` | Set `true` once every environment you list has the canonical branch policy applied. |
+| `environments-to-audit`                 | string  | `''`    | Additional environment names to audit beyond `gh-environment` (comma-separated, deduplicated). Set this when `gh-environment` is empty or you want to audit an environment the deploy itself doesn't attach to. |
+| `isolation-audit-branch`                | string  | `'main'`| The single branch each audited environment must restrict deploys to. |
+
+### CI-green guard (`require-ci-green`)
+
+> Story #175 (operator decision 2026-07-01, D4: one paved road — every
+> consumer converges on `workflow_run` for staging).
+
+`github.event` inside a reusable workflow is the **caller's** event, so this
+workflow can own the CI-green guard even though it cannot own the caller's
+`on:` block. The first job, `require-ci-green`, evaluates that event:
+
+- **`workflow_run` events** — skip-with-notice (every downstream job reports
+  `skipped`) unless `github.event.workflow_run.conclusion == 'success'`.
+  `workflow_run` fires on **both** a successful and a failed upstream run, so
+  this guard is load-bearing: without it, a red CI run on `main` would still
+  trigger a deploy.
+- **Every other event** (`workflow_dispatch`, `push`, `pull_request`, …) —
+  passes through unconditionally. These triggers are operator- or
+  branch-protection-intentional and carry no upstream conclusion to gate on.
+
+Before this guard existed, every consumer gating staging on CI hand-copied the
+same caller-side `preflight` job to re-implement this exact check (see
+athportal's / swarm-os's `deploy-staging.yml` history). A `workflow_run`
+caller now needs **no caller-side preflight guard at all** — see the
+canonical [`templates/workflows/deploy-staging.yml`](https://github.com/dsj1984/mandrel-platform/blob/main/templates/workflows/deploy-staging.yml)
+caller template, which `platform-sync` materializes into a consumer's
+`.github/workflows/` (link-don't-copy, same semantics as the runbook stubs —
+see [`scripts/platform-sync.mjs`](../README.md#adoption-cli-platform-sync)).
+
+`environments-isolation-audit` and `require-ci-green` run as independent
+sibling jobs — one gates on GitHub Environments branch-policy hygiene, the
+other on the caller's upstream CI conclusion — and `secret-isolation-audit`
+only proceeds once both have cleared (`needs: [environments-isolation-audit,
+require-ci-green]`).
+
+### Commit-SHA verification (opt-in)
+
+> Story #176. `GIT_COMMIT_SHA` injection at deploy is per-consumer
+> (build-split model: each consumer injects the SHA in its own build step),
+> and nothing previously verified it survived to the running Worker. When
+> `verify-commit-sha: true`, the built-in boot-smoke probe additionally
+> asserts that each deployed worker's health response reports the SHA this
+> run is deploying (`github.sha`), turning the release-tagging convention
+> into a deploy-time invariant.
+
+The probe reuses the existing [health endpoint
+contract](runbooks/post-deploy-smoke.md#3-health-endpoint-contract): the
+worker's health handler must return a JSON body with a `version` field set
+to the deployed commit SHA, e.g.:
+
+```typescript
+app.get('/health', (c) => c.json({ status: 'ok', version: c.env.GIT_COMMIT_SHA ?? 'unknown' }));
+```
+
+- A missing or unparsable `version` field, or a `version` that does not
+  match `github.sha`, fails the smoke check for that worker and takes the
+  **same auto-rollback path** as an HTTP-status failure.
+- Ignored when `smoke-command` is set — a consumer-supplied probe owns its
+  own verification.
+- Defaults to `false` (opt-in) so existing consumers are unaffected until
+  they wire `GIT_COMMIT_SHA` through to their health endpoint and opt in.
 
 ### Resolved-ref deploy summary (single source of truth)
 
@@ -851,6 +1134,7 @@ jobs:
 | `smoke_base_url`             | string  | `''`        | Base URL for the built-in probe (e.g. `https://godomio.com`). Each smoke path is appended to this base instead of the derived workers.dev host. No trailing slash. |
 | `smoke_paths`                | string  | `'/health'` | Comma-separated paths the built-in probe requests against each target (e.g. `"/,/portal,/api/health"`). Each must start with a leading slash.                |
 | `workers_dev_subdomain`      | string  | `''`        | workers.dev account **subdomain slug** (e.g. `"dsj1984"`) used to build the probe URL. Empty derives it from `wrangler whoami`. **Never** pass the account ID. |
+| `verify-commit-sha`          | boolean | `false`     | Opt-in (Story #176). When `true`, the built-in probe additionally asserts the health response's `version` field equals `github.sha`. A mismatch fails smoke and triggers rollback. Ignored when `smoke-command` is set. See [Commit-SHA verification](#commit-sha-verification-opt-in) below. |
 
 > **Command seams.** `snapshot-command`, `migrate-command`, `build-command`,
 > `deploy-command`, and `smoke-command` are override seams: with **none** set,
