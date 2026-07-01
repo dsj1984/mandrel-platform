@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.15.1...mandrel-platform-v0.16.0) (2026-07-01)
+
+
+### Added
+
+* **ci:** trust-lockfile passthrough for setup-toolchain / pr-quality.yml ([#150](https://github.com/dsj1984/mandrel-platform/issues/150)) ([d50afe9](https://github.com/dsj1984/mandrel-platform/commit/d50afe9147eb60c16cc32c5524b0d63ed6b3d3d4))
+* **security:** per-finding suppression/allow-list for osv-scan (refs [#145](https://github.com/dsj1984/mandrel-platform/issues/145)) ([#147](https://github.com/dsj1984/mandrel-platform/issues/147)) ([787d610](https://github.com/dsj1984/mandrel-platform/commit/787d610acf4584a83bf95d9c9a6cd59ad81d912d))
+
 ## [0.15.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.15.0...mandrel-platform-v0.15.1) (2026-06-30)
 
 
