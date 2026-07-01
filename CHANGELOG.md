@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.17.1...mandrel-platform-v0.17.2) (2026-07-01)
+
+
+### Fixed
+
+* **deploy:** scan secrets via event-agnostic gitleaks CLI so workflow_run callers work ([#167](https://github.com/dsj1984/mandrel-platform/issues/167)) ([ff175a2](https://github.com/dsj1984/mandrel-platform/commit/ff175a231d6962de3b2e44d2f9b348a2d78ee448))
+
 ## [0.17.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.17.0...mandrel-platform-v0.17.1) (2026-07-01)
 
 
