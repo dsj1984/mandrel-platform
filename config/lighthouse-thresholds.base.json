@@ -1,0 +1,9 @@
+{
+  "_comment": "Mechanism-neutral Lighthouse score-floor thresholds for mandrel-platform consumers (refs #157). Runner-agnostic: both an LHCI `lighthouserc` (via lighthouse.base.json, which spreads this file's `categories` into its `ci.assert.assertions`) and a bespoke puppeteer + baseline-drift script (reading `categories` directly against each category's `lighthouse-result.categories.<key>.score`) can consume the same floors. Consumer-tunable: override any entry locally in either mechanism.",
+  "categories": {
+    "performance": 0.9,
+    "accessibility": 0.9,
+    "best-practices": 0.9,
+    "seo": 0.9
+  }
+}

@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared Lighthouse CI base for mandrel-platform consumers. Lighthouse's `lighthouserc.json` has no whole-file `extends`, so this ships the shared `ci` block (collect settings + category assertions on the recommended preset). Consumers deep-merge it and add repo-specific `ci.collect.url` / `ci.collect.staticDistDir` and any per-repo assertion overrides (see README). Category score floors stay consumer-tunable.",
+  "_comment": "Shared Lighthouse CI base for mandrel-platform LHCI (@lhci/cli) consumers. Lighthouse's `lighthouserc.json` has no whole-file `extends`, so this ships the shared `ci` block (collect settings + category assertions on the recommended preset). Consumers deep-merge it and add repo-specific `ci.collect.url` / `ci.collect.staticDistDir` and any per-repo assertion overrides (see README). The `categories:*` minScore floors below are sourced from the mechanism-neutral `mandrel-platform/lighthouse-thresholds.base.json` (refs #157) — keep the two files' scores in sync when a floor changes. Consumers who run Lighthouse via a bespoke puppeteer + baseline-drift script instead of @lhci/cli should extend `lighthouse-thresholds.base.json` directly rather than this file (see README). Category score floors stay consumer-tunable.",
   "ci": {
     "collect": {
       "numberOfRuns": 3,

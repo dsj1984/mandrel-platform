@@ -182,13 +182,28 @@ export default [
 ];
 ```
 
-#### `lighthouse.base.json`
+#### `lighthouse.base.json` / `lighthouse-thresholds.base.json`
 
-Lighthouse's `lighthouserc.json` has no whole-file `extends`, so the
-base ships the shared `ci` block — collect settings plus the four
-category assertions on the `lighthouse:recommended` preset. Deep-merge
-it and add your repo-specific `ci.collect.url` /
-`ci.collect.staticDistDir`:
+Lighthouse has **two runner mechanisms** in the fleet — `@lhci/cli`
+(`lighthouserc`) and a bespoke puppeteer + baseline-drift script (collect a
+Lighthouse result programmatically, diff category scores against a checked-in
+baseline JSON). Neither can consume the other's config shape natively, so the
+package ships **two bases**:
+
+- **`lighthouse-thresholds.base.json`** — the **mechanism-neutral** score
+  floors (`categories.performance` / `.accessibility` / `.best-practices` /
+  `.seo`, each a bare `0.0`–`1.0` number). This is the shared source of
+  truth both mechanisms read. Runner-agnostic on purpose: it has no LHCI
+  `ci.assert` wrapper and no puppeteer-script wiring, just the floors.
+- **`lighthouse.base.json`** — the **LHCI wrapper**. Ships the shared `ci`
+  block (collect settings + the four category assertions on the
+  `lighthouse:recommended` preset) for `@lhci/cli` consumers. Its
+  `categories:*` `minScore` values are sourced from
+  `lighthouse-thresholds.base.json` — keep the two in sync when a floor
+  changes.
+
+**LHCI consumers** (`@lhci/cli`) deep-merge `lighthouse.base.json` and add
+repo-specific `ci.collect.url` / `ci.collect.staticDistDir`:
 
 ```jsonc
 // lighthouserc.js — deep-merge the base, add repo-specific collect targets
@@ -203,6 +218,23 @@ export default {
     }
   }
 };
+```
+
+**Puppeteer / baseline-drift consumers** (no `@lhci/cli`, no `lighthouserc`)
+extend `lighthouse-thresholds.base.json` directly — read the bare category
+floors and gate the collected result against them, independent of any LHCI
+config shape:
+
+```jsonc
+// scripts/lighthouse-baseline.mjs — read the shared floors, gate the collected result
+import thresholds from "mandrel-platform/lighthouse-thresholds.base.json" with { type: "json" };
+
+for (const [category, minScore] of Object.entries(thresholds.categories)) {
+  const score = lighthouseResult.categories[category].score;
+  if (score < minScore) {
+    throw new Error(`${category} score ${score} below floor ${minScore}`);
+  }
+}
 ```
 
 > **Budgets stay consumer-tunable.** These bases standardize *which*
@@ -472,6 +504,7 @@ pnpm run bootstrap
 | `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
 | `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
 | `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
+| `mandrel-platform/lighthouse-thresholds.base.json` | `config/lighthouse-thresholds.base.json` |
 | `mandrel-platform/pnpm-workspace.supply-chain.yaml` | `config/pnpm-workspace.supply-chain.yaml` |
 | `mandrel-platform/edge-security`                | `config/edge-security/index.mjs`      |
 | `mandrel-platform/edge-security/*`              | `config/edge-security/*`              |
