@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.17.0...mandrel-platform-v0.17.1) (2026-07-01)
+
+
+### Fixed
+
+* **ci:** bump pr-quality.yml internal setup-toolchain pin to v0.17.0 so trust-lockfile takes effect ([#164](https://github.com/dsj1984/mandrel-platform/issues/164)) ([e642540](https://github.com/dsj1984/mandrel-platform/commit/e64254050f38a2bf8f3e4a8e853f67468ff81c49))
+* **ci:** pr-quality.yml coverage gate discovers coverage-summary.json at any depth (refs [#163](https://github.com/dsj1984/mandrel-platform/issues/163)) ([#166](https://github.com/dsj1984/mandrel-platform/issues/166)) ([3633c18](https://github.com/dsj1984/mandrel-platform/commit/3633c180808328ba61a9e631564e7e4ca83eb5c1))
+
 ## [0.17.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.16.0...mandrel-platform-v0.17.0) (2026-07-01)
 
 
