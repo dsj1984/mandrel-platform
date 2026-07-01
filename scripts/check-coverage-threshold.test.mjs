@@ -243,6 +243,42 @@ test("findCoverageSummaries auto-scans **/coverage/, pruning node_modules + dott
   }
 });
 
+test("findCoverageSummaries discovers a per-workspace fan-out layout (coverage/<workspace>/coverage-summary.json)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cov-gate-"));
+  try {
+    // domio's shape: top-level coverage/ dir nests per-workspace subdirs that
+    // are NOT themselves named "coverage".
+    mkdirSync(join(root, "coverage", "web"), { recursive: true });
+    writeFileSync(
+      join(root, "coverage", "web", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 77 }))
+    );
+    mkdirSync(join(root, "coverage", "shared"), { recursive: true });
+    writeFileSync(
+      join(root, "coverage", "shared", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 93 }))
+    );
+    // Decoys that must still be pruned.
+    mkdirSync(join(root, "node_modules", "dep", "coverage"), { recursive: true });
+    writeFileSync(
+      join(root, "node_modules", "dep", "coverage", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 1 }))
+    );
+    mkdirSync(join(root, ".agents", "coverage"), { recursive: true });
+    writeFileSync(
+      join(root, ".agents", "coverage", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 2 }))
+    );
+
+    const files = findCoverageSummaries(root).sort();
+    assert.equal(files.length, 2);
+    assert.ok(files.some((f) => /coverage[/\\]shared[/\\]coverage-summary\.json$/.test(f)));
+    assert.ok(files.some((f) => /coverage[/\\]web[/\\]coverage-summary\.json$/.test(f)));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("findCoverageSummaries honours explicit --coverage-dir roots", () => {
   const root = mkdtempSync(join(tmpdir(), "cov-gate-"));
   try {
