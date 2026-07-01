@@ -159,6 +159,150 @@ turso db destroy <DB_NAME>-staging --yes
 - [ ] Staging deploy successful and smoke passing.
 - [ ] Project's `docs/environments.md` updated with the new environment details.
 - [ ] Branch protection applied (see [Branch Protection Setup](branch-protection-setup.md)).
+- [ ] Deployment branch policy applied to every environment (see [§6](#6-deployment-branch-policy) below).
+
+---
+
+## 6. Deployment Branch Policy
+
+GitHub Environments and **deployment branch policies** are two separate
+controls that are easy to conflate:
+
+- **GitHub Environments** (`staging` / `production`) gate *which secrets* a
+  job can read and *whether reviewers must approve* before a deployment job
+  runs. Every mandrel-platform consumer provisions the same two environments
+  uniformly (0 required reviewers is the deliberate, solo-maintained default
+  — see [Out of Scope](#out-of-scope) below).
+- **Deployment branch policies** gate *which git ref* is allowed to trigger a
+  deployment to that environment at all, independent of secrets or
+  reviewers. This is the control this section covers, and it is where
+  consumers have historically diverged: some projects configure it on every
+  environment, some on only one, some not at all.
+
+### Canonical posture
+
+**Only `main` may deploy, on both `staging` and `production`.** Concretely,
+each environment must have:
+
+- `deployment_branch_policy.custom_branch_policies: true` (NOT
+  `protected_branches: true` — "protected branches only" silently admits
+  *any* branch that later gains a protection rule, which is a wider surface
+  than intended and drifts without a workflow change).
+- Exactly **one** named branch policy, and that policy's `name` is the
+  literal branch name `main` — never a wildcard (`*`, `release/*`, etc.) and
+  never a second policy for a hotfix/staging branch. A single exact name is
+  the whole point: it is the one lever that can't silently widen.
+
+This mirrors the platform's `baseBranch` convention (`.agentrc.json` →
+`project.baseBranch`, default `main`) — the same branch every Story/Epic PR
+merges into is the only branch permitted to deploy.
+
+### Why this matters
+
+A deploy job authorized by a compromised feature branch, an accidentally
+un-deleted long-lived branch, or a fork PR is a direct production-secrets
+exposure path — the deployment branch policy is the last gate between "code
+on a branch" and "code with `CLOUDFLARE_API_TOKEN` in scope." Without a
+custom policy, GitHub's default is **no restriction**: any branch can
+trigger a deployment to the environment as long as it can reach the
+`workflow_call` in the first place.
+
+### Applying the policy
+
+```bash
+# Enable custom branch policies on the environment (idempotent).
+gh api repos/<OWNER>/<REPO>/environments/staging --method PUT \
+  --field "deployment_branch_policy[protected_branches]=false" \
+  --field "deployment_branch_policy[custom_branch_policies]=true"
+
+# Add the single allowed branch policy.
+gh api repos/<OWNER>/<REPO>/environments/staging/deployment-branch-policies \
+  --method POST \
+  --field name=main
+
+# Repeat for production.
+gh api repos/<OWNER>/<REPO>/environments/production --method PUT \
+  --field "deployment_branch_policy[protected_branches]=false" \
+  --field "deployment_branch_policy[custom_branch_policies]=true"
+gh api repos/<OWNER>/<REPO>/environments/production/deployment-branch-policies \
+  --method POST \
+  --field name=main
+```
+
+If a stale policy already exists (e.g. a wildcard or a second branch from an
+earlier experiment), list and delete it first:
+
+```bash
+gh api repos/<OWNER>/<REPO>/environments/staging/deployment-branch-policies
+gh api repos/<OWNER>/<REPO>/environments/staging/deployment-branch-policies/<policy-id> --method DELETE
+```
+
+### Verifying with the shared isolation-audit unit
+
+Rather than eyeballing `gh api` output, adopt the shared **Environments
+isolation-audit** composite action
+(`.github/actions/environments-isolation-audit`), which encodes exactly the
+posture above and fails loudly on any drift (missing policy, wildcard,
+protected-branches-only, wrong branch, or a mismatched count). It ships as
+an opt-in job in [`deploy-cloudflare.yml`](../reusable-workflows.md#environments-isolation-audit) —
+see [Adopting the isolation audit](#adopting-the-isolation-audit) below for
+the wiring, or invoke the composite action directly from any other
+workflow:
+
+```yaml
+- name: Environments isolation audit
+  uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@<sha>
+  with:
+    environments: 'staging,production'
+    allowed-branch: 'main'
+  env:
+    GH_TOKEN: ${{ github.token }}
+```
+
+### Adopting the isolation audit
+
+`deploy-cloudflare.yml` ships the audit as an **opt-in** job
+(`enable-environments-isolation-audit`, default `false`) so existing
+consumers that have not yet applied the canonical posture above are not
+broken by picking up a workflow update. Adoption is two steps:
+
+1. Apply the canonical posture (previous section) to every environment you
+   intend to audit.
+2. Flip the flag on in your `deploy-cloudflare.yml` caller:
+
+   ```yaml
+   jobs:
+     deploy:
+       uses: dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml@<sha>
+       with:
+         environment: production
+         gh-environment: production
+         workers: "api,worker-cron"
+         enable-environments-isolation-audit: true
+         # Optional: audit additional environments beyond gh-environment.
+         environments-to-audit: 'staging'
+       secrets: inherit
+   ```
+
+   When `gh-environment` is empty (repo-scoped / D1 consumers with no
+   GitHub Environment attached to the deploy), set `environments-to-audit`
+   explicitly to the environment name(s) you want audited — the job has
+   nothing to resolve from `gh-environment` alone in that case.
+
+Existing per-consumer adoption status (validated 2026-07-01): swarm-os has
+the canonical policy on both environments already; athportal has it on
+`staging` only (needs `production`); domio has neither (needs both).
+Consumer adoption itself is out of scope for this runbook change — see
+[Out of Scope](#out-of-scope) — but each consumer can flip the flag
+immediately once its own branch policies are in place.
+
+### Out of Scope
+
+- **Required reviewers on environments.** 0 reviewers is the deliberate,
+  solo-maintained default across all consumers — this section governs
+  *branch* policy only, not the *reviewer* protection rule.
+- **Per-consumer rollout.** Applying the policy and flipping the flag in
+  domio/athportal/swarm-os is tracked as separate, per-consumer work.
 
 ---
 

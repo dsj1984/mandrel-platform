@@ -12,6 +12,10 @@
 #       secrets: inherit
 #
 # Defence-in-depth layers (in execution order):
+#   0. environments-isolation-audit — opt-in (enable-environments-isolation-audit),
+#                              audits GitHub Environments' deployment branch
+#                              policies against the canonical posture (custom
+#                              policy, single allowed branch, no wildcard).
 #   1. secret-isolation-audit — scans for plaintext secrets before any code runs.
 #   2. check-env             — validates required env/secrets exist for the target
 #                              environment; blocks deploy if any are absent.
@@ -238,6 +242,39 @@ on:
         required: false
         type: string
         default: ''
+      enable-environments-isolation-audit:
+        description: >
+          Run the shared Environments isolation-audit job (Story #172)
+          BEFORE secret-isolation-audit. Verifies that gh-environment (when
+          set) and any additional environments-to-audit both restrict
+          deploys via a custom deployment branch policy naming ONLY
+          isolation-audit-branch (default "main") — never a wildcard,
+          never "protected branches only", never zero policies. Defaults to
+          false (opt-in) so existing consumers without branch policies
+          configured yet (see docs/runbooks/environments-provisioning.md#6-deployment-branch-policy)
+          are not broken by adopting a workflow update. Set true once your
+          consumer has applied the canonical posture.
+        required: false
+        type: boolean
+        default: false
+      environments-to-audit:
+        description: >
+          Comma-separated GitHub Environment names to audit when
+          enable-environments-isolation-audit is true, IN ADDITION to
+          gh-environment (deduplicated automatically). Leave empty to audit
+          only gh-environment. Ignored when
+          enable-environments-isolation-audit is false.
+        required: false
+        type: string
+        default: ''
+      isolation-audit-branch:
+        description: >
+          The single branch name the isolation audit requires each audited
+          environment to restrict deploys to. Defaults to "main" (the
+          platform's canonical deployable branch).
+        required: false
+        type: string
+        default: 'main'
     secrets:
       CLOUDFLARE_API_TOKEN:
         description: 'Cloudflare API token with Worker and D1 write permissions'
@@ -288,6 +325,58 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 0. Environments isolation audit (opt-in, Story #172)
+  #    Verifies that this repo's GitHub Environments restrict deploys to the
+  #    canonical branch (default "main") via a custom deployment branch
+  #    policy — never a wildcard, never "protected branches only", never zero
+  #    policies. Runs BEFORE the secret scan so a mis-scoped environment is
+  #    caught even faster than a leaked secret. Opt-in via
+  #    enable-environments-isolation-audit (default false) so existing
+  #    consumers without branch policies configured yet are not broken by
+  #    adopting a workflow bump.
+  # ---------------------------------------------------------------------------
+  environments-isolation-audit:
+    name: Environments isolation audit
+    runs-on: ubuntu-latest
+    if: ${{ inputs.enable-environments-isolation-audit == true }}
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve audited environment list
+        id: resolve-envs
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -A seen=()
+          envs=()
+          IFS=',' read -ra extra <<< "$ENVIRONMENTS_TO_AUDIT"
+          for e in "$GH_ENVIRONMENT" "${extra[@]}"; do
+            e="$(echo "$e" | xargs)"
+            [ -z "$e" ] && continue
+            if [ -z "${seen[$e]:-}" ]; then
+              seen[$e]=1
+              envs+=("$e")
+            fi
+          done
+          if [ "${#envs[@]}" -eq 0 ]; then
+            echo "::error::enable-environments-isolation-audit is true but no environment resolved (set gh-environment and/or environments-to-audit)."
+            exit 1
+          fi
+          printf -v joined '%s,' "${envs[@]}"
+          echo "environments=${joined%,}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_ENVIRONMENT: ${{ inputs.gh-environment }}
+          ENVIRONMENTS_TO_AUDIT: ${{ inputs.environments-to-audit }}
+
+      - name: Audit deployment branch policies
+        uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@17868b84fa1491e506172bac8426737b0cf99092
+        with:
+          environments: ${{ steps.resolve-envs.outputs.environments }}
+          allowed-branch: ${{ inputs.isolation-audit-branch }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ---------------------------------------------------------------------------
   # 1. Secret isolation audit
   #    Scans the checkout for hardcoded secrets BEFORE any deploy step runs.
   #    Fails fast so a secret-in-source-tree never reaches Cloudflare.
@@ -295,6 +384,8 @@ jobs:
   secret-isolation-audit:
     name: Secret isolation audit
     runs-on: ubuntu-latest
+    needs: environments-isolation-audit
+    if: ${{ always() && (needs.environments-isolation-audit.result == 'success' || needs.environments-isolation-audit.result == 'skipped') }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

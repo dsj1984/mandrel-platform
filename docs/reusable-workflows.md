@@ -792,11 +792,39 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `workflow_call` target. The jobs run in this order:
 
 ```text
-secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
+environments-isolation-audit → secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
 ```
 
+`environments-isolation-audit` only runs when
+`enable-environments-isolation-audit: true` (default `false` — opt-in, see
+[Environments isolation audit](#environments-isolation-audit) below).
 `pre-migration-snapshot` and `migrate` only run when `migrate: true`;
 `boot-smoke` only runs when `smoke: true` (the default).
+
+### Environments isolation audit
+
+> Story #172. An **opt-in** job (`enable-environments-isolation-audit`,
+> default `false`) that runs the shared
+> `.github/actions/environments-isolation-audit` composite action against
+> `gh-environment` (when set) plus any names in `environments-to-audit`,
+> BEFORE `secret-isolation-audit`. It fails the run when an audited
+> environment lacks a custom deployment branch policy, uses "protected
+> branches only", allows a wildcard, or permits any branch other than
+> `isolation-audit-branch` (default `main`) — the canonical posture
+> documented in
+> [`environments-provisioning.md` §6](runbooks/environments-provisioning.md#6-deployment-branch-policy).
+>
+> Defaults to `false` so existing consumers without branch policies
+> configured yet are not broken by adopting a `deploy-cloudflare.yml`
+> version bump. See the runbook's
+> [Adopting the isolation audit](runbooks/environments-provisioning.md#adopting-the-isolation-audit)
+> section for the exact caller wiring.
+
+| Input                                  | Type    | Default | When to override |
+| --------------------------------------- | ------- | ------- | ----------------- |
+| `enable-environments-isolation-audit`   | boolean | `false` | Set `true` once every environment you list has the canonical branch policy applied. |
+| `environments-to-audit`                 | string  | `''`    | Additional environment names to audit beyond `gh-environment` (comma-separated, deduplicated). Set this when `gh-environment` is empty or you want to audit an environment the deploy itself doesn't attach to. |
+| `isolation-audit-branch`                | string  | `'main'`| The single branch each audited environment must restrict deploys to. |
 
 ### Resolved-ref deploy summary (single source of truth)
 
