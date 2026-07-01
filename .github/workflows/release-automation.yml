@@ -135,14 +135,17 @@ jobs:
       # consumer that manually merges release PRs. See docs/reusable-workflows.md
       # § release-automation.yml → Secrets for the wiring fix.
       - name: Warn when release-token is unset
-        if: ${{ secrets.release-token == '' }}
         shell: bash
+        env:
+          RELEASE_TOKEN: ${{ secrets.release-token }}
         run: |
-          echo "::warning::release-automation.yml: 'release-token' secret is unset — falling back to the default GITHUB_TOKEN. \
-          GitHub's anti-recursion safeguard means PRs opened with GITHUB_TOKEN do NOT trigger downstream workflows, so the \
-          release PR release-please just opened will never run your required CI and can never auto-merge. Wire a PAT or \
-          GitHub App installation token (scopes: contents:write, pull-requests:write) as this caller's 'release-token' \
-          secret. See docs/reusable-workflows.md § release-automation.yml → Secrets."
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::warning::release-automation.yml: 'release-token' secret is unset — falling back to the default GITHUB_TOKEN. \
+            GitHub's anti-recursion safeguard means PRs opened with GITHUB_TOKEN do NOT trigger downstream workflows, so the \
+            release PR release-please just opened will never run your required CI and can never auto-merge. Wire a PAT or \
+            GitHub App installation token (scopes: contents:write, pull-requests:write) as this caller's 'release-token' \
+            secret. See docs/reusable-workflows.md § release-automation.yml → Secrets."
+          fi
 
       - name: Run release-please
         id: release
