@@ -1,7 +1,34 @@
 # mandrel-platform
 
-Shared CI/deploy workflows, composite toolchain action, npm config package,
-Renovate preset, and operator runbook templates for the Mandrel platform.
+The **single source of truth (SSOT)** for CI/CD, security, and configuration
+across the Mandrel fleet. A consumer repo adopts this platform once and inherits
+a converged, hardened baseline — reusable GitHub Actions workflows, a composite
+toolchain action, importable config bases, guardrail scripts, edge-security
+middleware, a Renovate preset, and operator runbook templates — instead of
+hand-maintaining its own copies and drifting apart over time.
+
+## What's in scope
+
+| Pillar | What it provides |
+| ------ | ---------------- |
+| **Reusable workflows** | `workflow_call` CI, deploy, secret-scan, release, and CodeQL pipelines, consumed by tag/SHA pin. |
+| **Composite action** | `setup-toolchain` — pnpm + Node + frozen install in one step. |
+| **Config bases (npm)** | `extends`-able baselines: TypeScript, Biome, Knip, Stryker, dependency-cruiser, size-limit, Lighthouse. |
+| **Edge-security middleware (npm)** | Per-env closed-allowlist CORS, security headers, and app-layer rate limiting for Astro + Hono. |
+| **Guardrail scripts (npm)** | Dependency-free policy checks: CVE gate, action-pin ratchet, coverage floor, destructive-migration guard, workflow-portability, required-contexts, docs-staleness. |
+| **Renovate preset** | Shared dependency-update policy, including auto-bumping this repo's own `uses:` pins. |
+| **Supply-chain config** | pnpm-native hardening fragment (`blockExoticSubdeps`, `trustPolicy`, 7-day `minimumReleaseAge`). |
+| **Adoption & drift control** | `platform-sync` (adopt/repair) plus a scheduled cross-consumer pin-drift dashboard and auto-repair-PR loop. |
+| **Runbook templates** | Copyable thin-stub operator runbooks that link back to the canonical process docs. |
+
+**Out of scope.** mandrel-platform is not an application and ships no runtime
+service — it deploys nothing of its own beyond its release train. Consumers keep
+every project-specific knob (entrypoints, budgets, score floors, deploy targets)
+local: the platform sets the floor, the consumer sets the ceiling. The `.agents/`
+tree in this repo is the Mandrel agent framework used to *develop* the platform
+(sourced from the separate `mandrel` CLI) — it is dev-time only and is **not**
+part of the published npm package, whose `files` allowlist ships only `config/`,
+`default.json`, `scripts/`, and `templates/`.
 
 **Docs:** [reusable-workflows.md](docs/reusable-workflows.md) (the `workflow_call`
 contract) · [decisions.md](docs/decisions.md) (decision log). Status, the
@@ -11,15 +38,24 @@ consumer convergence matrix, and the forward roadmap are tracked privately.
 
 ## Reusable workflows
 
-The shared `workflow_call` workflows — `pr-quality.yml` and
-`deploy-cloudflare.yml` (plus `secret-scan-push.yml`, `release-automation.yml`,
-`codeql.yml`, and `smoke-dispatch.yml`) — and their public input/secret
-contract are documented in
-**[docs/reusable-workflows.md](docs/reusable-workflows.md)**. Consumers should
-configure their callers from that reference (input types, defaults,
-when-to-override, the frozen `{CLOUDFLARE_*, TURSO_*}` deploy secret allowlist,
-the single `ci-required` aggregator context, and the pin-by-tag/SHA versioning
-model).
+Five workflows expose a stable `workflow_call` contract and are consumed by
+tag/SHA pin. Configure your callers from
+**[docs/reusable-workflows.md](docs/reusable-workflows.md)** — the authoritative
+reference for input types, defaults, when-to-override, the frozen
+`{CLOUDFLARE_*, TURSO_*}` deploy-secret allowlist, the single `ci-required`
+aggregator context, and the pin-by-tag/SHA versioning model.
+
+| Workflow | Purpose |
+| -------- | ------- |
+| [`pr-quality.yml`](docs/reusable-workflows.md#pr-qualityyml) | Tiered PR gate — lint/format → typecheck → unit → contract → e2e/smoke → migration-guard → security → osv-scan, each tier independently toggled, behind one `ci-required` aggregator. |
+| [`deploy-cloudflare.yml`](docs/reusable-workflows.md#deploy-cloudflareyml) | Defence-in-depth Cloudflare deploy with a frozen deploy-secret allowlist. |
+| [`secret-scan-push.yml`](docs/reusable-workflows.md#secret-scan-pushyml) | Full-history gitleaks secret scan on push to the default branch. |
+| [`release-automation.yml`](docs/reusable-workflows.md#release-automationyml) | Conventional-commit release lifecycle (version bump + `CHANGELOG.md` + tag) via release-please. |
+| [`codeql.yml`](docs/reusable-workflows.md#codeqlyml) | CodeQL SAST analysis — dual-mode: runs on this repo's push/PR/schedule **and** is `workflow_call`-consumable. |
+
+> `smoke-dispatch.yml` is a **platform-internal** cross-repo smoke trigger
+> (`push` / `workflow_dispatch`, not `workflow_call`). It appears in the
+> reference for completeness but is not part of the consumer caller surface.
 
 `release-automation.yml` extends the platform from CI/deploy into the **full
 release lifecycle**: a thin caller gets conventional-commit-driven version
@@ -362,6 +398,33 @@ is detected by Renovate).
 
 ---
 
+### Guardrail & policy-check scripts
+
+Beyond the CVE gate, the package ships a set of **dependency-free guardrail
+lints** (`node`-only, nothing to install) that enforce cross-repo CI and
+security invariants. Several are already wired into the reusable workflows, so a
+consumer that adopts those inherits the check for free; each is also runnable
+standalone (`node node_modules/mandrel-platform/scripts/<name>.mjs`) or copyable
+into a repo's own `scripts/`.
+
+| Script | Enforces | Wired into |
+| ------ | -------- | ---------- |
+| `check-coverage-threshold.mjs` | Coverage floor (lines/statements/functions/branches) read from `coverage-summary.json`; threshold `0` disables the gate. | `pr-quality.yml` (unit tier) |
+| `check-destructive-migration.mjs` | Blocks `DROP` / `TRUNCATE` / `ALTER … DROP` (and Drizzle `.dropTable()`) in migration files unless a reviewer applies the override label. | `pr-quality.yml` (migration-guard tier, opt-in) |
+| `check-workflow-portability.mjs` | Catches cross-repo footguns in reusable workflows / composite actions: relative `uses:` paths, `${{ }}` in `workflow_call` input metadata, and lagging first-party pins. | `pr-quality.yml` + `ci.yml` |
+| `check-action-pins.mjs` | Ratchet requiring every third-party Action to be pinned to a full 40-char commit SHA (tag-swap defence); local and first-party refs are exempt. | `ci.yml` |
+| `check-required-contexts.mjs` | Validates that every branch-protection required check in `main-protection.json` maps to a real CI job — no phantom required checks. | `ci.yml` |
+| `check-docs-staleness.mjs` | Lints markdown/JSON docs for known staleness patterns (stale URLs, expired dates, dead runbook paths); suppressible per-rule. | standalone |
+
+> **`config/main-protection.schema.json`** is the JSON Schema for the
+> branch-protection contract (`docs/runbooks/main-protection.json`) — required
+> status checks, the aggregator job, upstream jobs, and enforcement flags.
+> `check-required-contexts.mjs` validates the contract against the actual
+> workflow job graph; see the
+> [branch-protection runbook](docs/runbooks/branch-protection-setup.md).
+
+---
+
 ## Renovate preset
 
 The shared Renovate preset (`default.json`, also exposed at
@@ -481,15 +544,73 @@ result envelope on stdout).
 
 ---
 
+## Drift control & auto-repair
+
+The platform actively keeps consumers converged rather than trusting them to
+stay in sync by hand. Two scheduled workflows run this loop against the consumer
+registry in
+[`scripts/pin-drift-consumers.json`](scripts/pin-drift-consumers.json):
+
+- **Detect** — [`pin-drift.yml`](.github/workflows/pin-drift.yml) (weekly +
+  `workflow_dispatch`) runs `check-pin-drift.mjs`, a cross-consumer dashboard
+  that flags split pins (multiple mandrel-platform SHAs in one repo), release
+  lag, npm lag, and npm-vs-workflow surface skew. Advisory by default; `--strict`
+  turns drift into a failure. See the
+  [pin-drift dashboard runbook](docs/runbooks/pin-drift-dashboard.md).
+- **Repair** — [`platform-sync-repair.yml`](.github/workflows/platform-sync-repair.yml)
+  runs `platform-repair.mjs`, which clones each drifting consumer, runs
+  `platform-sync`, and opens (or updates) an **idempotent** repair PR on a stable
+  head branch. Requires a fine-grained `PIN_REPAIR_TOKEN` scoped to the consumer
+  repos' contents + pull-requests.
+
+`update-semgrep-rules.mjs` is a related maintenance script that vendors Semgrep's
+`p/default` ruleset — filtered to the languages actually in-repo — into
+`.semgrep/rules.json` against a pinned Semgrep version, so the SAST step in
+`pr-quality.yml` scans deterministically. Run it deliberately when bumping the
+ruleset, not on every CI run.
+
+---
+
+## Runbook templates
+
+`templates/runbooks/` ships **copyable thin-stub** operator runbooks — one per
+canonical runbook in [`docs/runbooks/`](docs/runbooks). The adoption model is
+*link, don't copy*: each stub links to the canonical process doc (the source of
+truth) and carries only `<PLACEHOLDER>` slots for project-specific values, so an
+upstream process change is picked up by re-reading the link rather than
+re-authoring the stub. `platform-sync` materializes them for you — link-only, and
+never clobbering a stub you have already filled in.
+
+| Stub | Canonical runbook |
+| ---- | ----------------- |
+| `deploy-promotion.md` | staging → production promotion |
+| `incident-response.md` | severity, escalation, postmortem |
+| `database-backup-restore.md` | backup, PITR, restore/rollback |
+| `observability.md` | logs, Sentry, uptime, metrics |
+| `post-deploy-smoke.md` | boot-smoke gate + diagnosis |
+| `environments-provisioning.md` | env model + provisioning steps |
+| `dependency-update.md` | Renovate, CVE gate, catalog |
+| `branch-protection-setup.md` | aggregator required-check model |
+
+---
+
 ## Development
 
 ```bash
-# Install dependencies
+# Install dependencies (packageManager: pnpm@11.5.2)
 pnpm install
 
 # Bootstrap agent scaffolding
 pnpm run bootstrap
+
+# Run the guardrail-script test suite (node:test)
+pnpm test
 ```
+
+Every script under `scripts/` (the guardrail lints, `platform-sync`,
+`platform-repair`, `update-semgrep-rules`) carries a colocated `*.test.mjs`
+suite run by `pnpm test`. The `.agents/` tree is the Mandrel agent framework this
+repo is developed with — dev-time only, and not shipped in the npm package.
 
 ---
 
