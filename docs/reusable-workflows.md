@@ -792,11 +792,38 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `workflow_call` target. The jobs run in this order:
 
 ```text
-secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
+require-ci-green → secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
 ```
 
 `pre-migration-snapshot` and `migrate` only run when `migrate: true`;
 `boot-smoke` only runs when `smoke: true` (the default).
+
+### CI-green guard (`require-ci-green`)
+
+> Story #175 (operator decision 2026-07-01, D4: one paved road — every
+> consumer converges on `workflow_run` for staging).
+
+`github.event` inside a reusable workflow is the **caller's** event, so this
+workflow can own the CI-green guard even though it cannot own the caller's
+`on:` block. The first job, `require-ci-green`, evaluates that event:
+
+- **`workflow_run` events** — skip-with-notice (every downstream job reports
+  `skipped`) unless `github.event.workflow_run.conclusion == 'success'`.
+  `workflow_run` fires on **both** a successful and a failed upstream run, so
+  this guard is load-bearing: without it, a red CI run on `main` would still
+  trigger a deploy.
+- **Every other event** (`workflow_dispatch`, `push`, `pull_request`, …) —
+  passes through unconditionally. These triggers are operator- or
+  branch-protection-intentional and carry no upstream conclusion to gate on.
+
+Before this guard existed, every consumer gating staging on CI hand-copied the
+same caller-side `preflight` job to re-implement this exact check (see
+athportal's / swarm-os's `deploy-staging.yml` history). A `workflow_run`
+caller now needs **no caller-side preflight guard at all** — see the
+canonical [`templates/workflows/deploy-staging.yml`](https://github.com/dsj1984/mandrel-platform/blob/main/templates/workflows/deploy-staging.yml)
+caller template, which `platform-sync` materializes into a consumer's
+`.github/workflows/` (link-don't-copy, same semantics as the runbook stubs —
+see [`scripts/platform-sync.mjs`](../README.md#adoption-cli-platform-sync)).
 
 ### Resolved-ref deploy summary (single source of truth)
 

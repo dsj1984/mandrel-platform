@@ -76,6 +76,7 @@ test("--dry-run does not mutate any file", () => {
   const after = readFileSync(join(consumer, ".github", "workflows", "ci.yml"), "utf8");
   assert.equal(after, before, "ci.yml must be untouched in dry-run");
   assert.ok(!existsSync(join(consumer, "docs", "runbooks", "observability.md")));
+  assert.ok(!existsSync(join(consumer, ".github", "workflows", "deploy-staging.yml")));
 });
 
 test("apply pins first-party SHAs, leaves external actions untouched", () => {
@@ -399,4 +400,50 @@ test("--check-settings requires --consumer-repo", () => {
   assert.throws(() => {
     execFileSync("node", [CLI, "--check-settings"], { encoding: "utf8" });
   }, /consumer-repo/);
+});
+
+test("apply materializes the canonical deploy-staging.yml workflow caller template", () => {
+  const out = JSON.parse(run([]));
+  const stub = join(consumer, ".github", "workflows", "deploy-staging.yml");
+  assert.ok(existsSync(stub));
+  assert.ok(
+    out.workflowStubs.created.some((f) => f.endsWith("deploy-staging.yml")),
+    "deploy-staging.yml reported as created"
+  );
+  const body = readFileSync(stub, "utf8");
+  assert.ok(
+    body.includes("Canonical staging-deploy caller template"),
+    "materialized workflow carries the template marker"
+  );
+  assert.ok(
+    body.includes("dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml"),
+    "template calls the shared deploy-cloudflare.yml reusable workflow"
+  );
+});
+
+test("workflow caller template materialization is idempotent", () => {
+  run([]); // materialize
+  const out = JSON.parse(run([])); // second pass
+  assert.ok(
+    out.workflowStubs.skipped.some((f) => f.endsWith("deploy-staging.yml")),
+    "already-materialized template is skipped, not re-created"
+  );
+  assert.equal(out.workflowStubs.created.length, 0);
+});
+
+test("a hand-authored deploy-staging.yml is flagged, not overwritten", () => {
+  const destDir = join(consumer, ".github", "workflows");
+  mkdirSync(destDir, { recursive: true });
+  const handAuthored = "name: deploy-staging\n# fully custom, no template marker\njobs: {}\n";
+  writeFileSync(join(destDir, "deploy-staging.yml"), handAuthored);
+  const out = JSON.parse(run([]));
+  assert.ok(
+    out.workflowStubs.localCopies.some((f) => f.endsWith("deploy-staging.yml")),
+    "hand-authored caller surfaced as a warning"
+  );
+  assert.equal(
+    readFileSync(join(destDir, "deploy-staging.yml"), "utf8"),
+    handAuthored,
+    "operator's hand-authored caller is never clobbered"
+  );
 });
