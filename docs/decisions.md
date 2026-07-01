@@ -61,12 +61,28 @@ Story — three per-consumer adoption Stories are blocked on this one.
 instead of four (git-conventions.md prose + three hand-copied consumer
 configs); adding a type is a one-file change here plus the
 `release-please-config.json` mirror, propagated to consumers on their next
-`mandrel-platform` bump. The repo-ops consumers matrix §5 commitlint row
-flip (◐ → ●) is tracked in the sibling `repo-ops` planning repo
-(`mandrel-platform-consumers.md`), not in this repo, consistent with the
-2026-07-01 repo-settings decision above — the flip lands once the three
-adoption Stories merge and each consumer's local config is confirmed to
-extend this base.
+`mandrel-platform` bump.
+
+This Story's complete deliverable, from this repo's side, is: the
+published `commitlint.base.mjs` export plus the documented `extends`
+pattern above — the artifact and contract the row-flip depends on. The
+row-flip action itself is **out of this repo's write boundary by
+construction**: the repo-ops consumers matrix §5 lives in the sibling
+`repo-ops` planning repo (`mandrel-platform-consumers.md`), a separate git
+remote (`dsj1984/repo-ops`) this Story's PR cannot touch, exactly the same
+structural boundary the 2026-07-01 repo-settings decision (Story #171,
+entry above) already crossed for its own §3a Platform-column flip. Per
+that precedent, the row-flip is **not silently dropped** — it is a named
+follow-up, tracked the same way: once this Story ships in a
+`mandrel-platform` release, flip repo-ops §5's commitlint row ◐ → ● there,
+citing this decision entry and the shipped
+`config/commitlint.base.mjs` / `mandrel-platform/commitlint.base.mjs`
+export as the now-existing contract. That flip additionally depends on
+the three per-consumer adoption Stories (out of scope here, blocked on
+this one) actually landing and each consumer's local
+`commitlint.config.js` being confirmed to extend this base — the row
+means "all three consumers extend the base," not merely "the base
+exists."
 
 ## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
 
