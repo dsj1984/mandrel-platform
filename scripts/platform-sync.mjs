@@ -28,7 +28,16 @@
  *      the SSOT (`github>dsj1984/mandrel-platform` for Renovate,
  *      `mandrel-platform/tsconfig.base.json` for TypeScript).
  *
- * Also materializes canonical workflow **caller templates** from
+ * It also runs a fourth, **advisory-only** check (Story #173): whether the
+ * consumer's `.github/workflows/ci.yml` matches the canonical CI-caller
+ * naming triplet (file `ci.yml`, display name `CI`, caller job id `ci` →
+ * required context `ci / ci-required`; see
+ * `docs/reusable-workflows.md` § "Canonical caller naming"). This never
+ * renames or rewrites anything — renaming an existing caller must land
+ * atomically with its own branch-protection ruleset context update, which is
+ * a deliberate per-consumer Story, not an automatic sync side-effect.
+ *
+ * It also materializes canonical workflow **caller templates** from
  * `templates/workflows/` into the consumer's `.github/workflows/` (Story
  * #175) — e.g. `deploy-staging.yml`, the one-paved-road `workflow_run` caller
  * for the shared `deploy-cloudflare.yml`'s CI-green guard. Same link-don't-
@@ -262,6 +271,53 @@ function pinWorkflows(targetSha) {
 }
 
 // ---------------------------------------------------------------------------
+// 2a. Canonical CI-caller-naming advisory (Story #173)
+// ---------------------------------------------------------------------------
+
+/**
+ * Non-blocking advisory: does the consumer's `.github/workflows/` carry the
+ * canonical `ci.yml` / `CI` / `ci` caller triplet documented in
+ * docs/reusable-workflows.md § "Canonical caller naming"? This never mutates
+ * anything — renaming an existing caller file/job id is a deliberate,
+ * atomic per-consumer migration (rename + branch-protection ruleset context
+ * update together), never an automatic sync side-effect. Mirrors the
+ * warn-only posture of `check-required-contexts.mjs`'s naming lint.
+ */
+function checkCiCallerNaming() {
+  const workflowsDir = join(opts.consumer, ".github", "workflows");
+  const files = collectYaml(workflowsDir).map((f) => rel(f));
+  const canonicalPath = files.find((f) => f === ".github/workflows/ci.yml");
+
+  if (!canonicalPath) {
+    return {
+      status: "no-canonical-file",
+      message:
+        `no ".github/workflows/ci.yml" found — the canonical CI caller naming is ` +
+        `file "ci.yml", display name "CI", caller job id "ci" (required context ` +
+        `"ci / ci-required"). See docs/reusable-workflows.md § "Canonical caller naming".`,
+    };
+  }
+
+  const content = readFileSync(join(opts.consumer, canonicalPath), "utf8");
+  const nameMatch = content.match(/^name:\s*(.+?)\s*$/m);
+  const displayName = nameMatch ? nameMatch[1].replace(/^["']|["']$/g, "") : null;
+  const hasCiJob = /^\s{2}ci:\s*$/m.test(content);
+
+  if (displayName === "CI" && hasCiJob) {
+    return { status: "canonical", message: null };
+  }
+
+  const gaps = [];
+  if (displayName !== "CI") gaps.push(`display name is "${displayName ?? "(none)"}" (canonical: "CI")`);
+  if (!hasCiJob) gaps.push(`no "ci" job id found (canonical required context: "ci / ci-required")`);
+
+  return {
+    status: "non-canonical",
+    message: `ci.yml found, but ${gaps.join(" and ")}. See docs/reusable-workflows.md § "Canonical caller naming".`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 3. Materialize runbook reference stubs (link, don't copy)
 // ---------------------------------------------------------------------------
 
@@ -447,6 +503,7 @@ function main() {
   if (opts.dryRun) log("  (dry-run: no files will be written)");
 
   const pins = pinWorkflows(targetSha);
+  const ciNaming = checkCiCallerNaming();
   const runbooks = materializeRunbooks();
   const workflowStubs = materializeWorkflowStubs();
   const renovate = reconcileRenovate();
@@ -463,6 +520,9 @@ function main() {
   log("");
   log(`  pins:      ${pins.length} workflow pin(s) ${opts.dryRun ? "would be " : ""}updated`);
   for (const c of pins) log(`             - ${c.file}: ${c.from} → ${c.to}`);
+  if (ciNaming.status !== "canonical") {
+    log(`             ⚠ CI caller naming: ${ciNaming.message}`);
+  }
   log(
     `  runbooks:  ${runbooks.created.length} stub(s) ${
       opts.dryRun ? "would be " : ""
@@ -503,6 +563,7 @@ function main() {
           dryRun: opts.dryRun,
           changed,
           pins,
+          ciNaming,
           runbooks,
           workflowStubs,
           renovate,
