@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.17.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.16.0...mandrel-platform-v0.17.0) (2026-07-01)
+
+
+### Added
+
+* **baselines:** one-shot BUNDLE_SIZE_REFRESH acknowledge for bundle-size ratchet ([#156](https://github.com/dsj1984/mandrel-platform/issues/156)) ([a67dfe7](https://github.com/dsj1984/mandrel-platform/commit/a67dfe7dd5160de02604c155c308c765329cec1f)), closes [#151](https://github.com/dsj1984/mandrel-platform/issues/151)
+* **config:** ship mechanism-neutral lighthouse-thresholds.base.json for puppeteer baseline-drift consumers (refs [#157](https://github.com/dsj1984/mandrel-platform/issues/157)) ([#159](https://github.com/dsj1984/mandrel-platform/issues/159)) ([4832cae](https://github.com/dsj1984/mandrel-platform/commit/4832cae6769bd11bed2a4dfac52cfab5d726a42d))
+
+
+### Fixed
+
+* **ci:** findCoverageSummaries discovers per-workspace coverage dirs (refs [#158](https://github.com/dsj1984/mandrel-platform/issues/158)) ([#160](https://github.com/dsj1984/mandrel-platform/issues/160)) ([da31772](https://github.com/dsj1984/mandrel-platform/commit/da31772b796f66b4d325fbcbb94b1c86a1484ad3))
+* **config:** reauthor biome.base.json to the Biome v2 schema (refs [#153](https://github.com/dsj1984/mandrel-platform/issues/153)) ([#154](https://github.com/dsj1984/mandrel-platform/issues/154)) ([c983449](https://github.com/dsj1984/mandrel-platform/commit/c9834492b5d168e2f040bc300e41a7de78859b49))
+
 ## [0.16.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.15.1...mandrel-platform-v0.16.0) (2026-07-01)
 
 
