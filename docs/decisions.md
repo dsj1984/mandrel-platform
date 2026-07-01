@@ -33,6 +33,41 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-01 — `commitlint.base.mjs` single-sources the conventional-commit type-enum
+
+**Context.** Commitlint enforcement was ◐: the type-enum is "pinned to
+`git-conventions.md`" by convention only, but all three consumers
+(domio, athportal, swarm-os) carry their own root `commitlint.config.js`
+with the eleven types hand-copied in — the exact copy-drift shape the
+config package exists to kill, and the same shape `tsconfig.base.json` /
+`biome.base.json` / `knip.base.json` / `stryker.base.json` already solved
+for their respective tools.
+
+**Decision.** Ship `config/commitlint.base.mjs`, exported as
+`mandrel-platform/commitlint.base.mjs` (same npm package-export channel as
+the other `*.base.*` files). It extends
+`@commitlint/config-conventional` and narrows `type-enum` to the eleven
+types documented in
+[`.agents/rules/git-conventions.md`](../.agents/rules/git-conventions.md)
+(`feat`, `fix`, `perf`, `refactor`, `revert`, `docs`, `style`, `chore`,
+`test`, `build`, `ci`) — the same list `release-please-config.json`'s
+`changelog-sections` already encodes. commitlint supports a native
+`extends`, so a consumer's local `commitlint.config.js` reduces to
+`{ extends: ["mandrel-platform/commitlint.base.mjs"] }` plus any
+repo-specific scope-enum. Consumer adoption is out of scope for this
+Story — three per-consumer adoption Stories are blocked on this one.
+
+**Consequences.** The type-enum now has exactly one source of truth
+instead of four (git-conventions.md prose + three hand-copied consumer
+configs); adding a type is a one-file change here plus the
+`release-please-config.json` mirror, propagated to consumers on their next
+`mandrel-platform` bump. The repo-ops consumers matrix §5 commitlint row
+flip (◐ → ●) is tracked in the sibling `repo-ops` planning repo
+(`mandrel-platform-consumers.md`), not in this repo, consistent with the
+2026-07-01 repo-settings decision above — the flip lands once the three
+adoption Stories merge and each consumer's local config is confirmed to
+extend this base.
+
 ## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
 
 **Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix
