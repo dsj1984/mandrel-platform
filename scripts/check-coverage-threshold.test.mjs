@@ -14,10 +14,20 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 import {
   VALID_METRICS,
@@ -33,11 +43,21 @@ import {
 } from "./check-coverage-threshold.mjs";
 
 // Build a minimal Istanbul/c8/vitest-shaped coverage-summary object.
-function summary({ lines = 0, statements = 0, functions = 0, branches = 0 } = {}) {
+function summary({
+  lines = 0,
+  statements = 0,
+  functions = 0,
+  branches = 0,
+} = {}) {
   return {
     total: {
       lines: { total: 100, covered: lines, skipped: 0, pct: lines },
-      statements: { total: 100, covered: statements, skipped: 0, pct: statements },
+      statements: {
+        total: 100,
+        covered: statements,
+        skipped: 0,
+        pct: statements,
+      },
       functions: { total: 100, covered: functions, skipped: 0, pct: functions },
       branches: { total: 100, covered: branches, skipped: 0, pct: branches },
     },
@@ -80,10 +100,14 @@ test("parseArgs defaults: threshold 0, metric lines", () => {
 
 test("parseArgs reads --threshold/--metric/--coverage-dir", () => {
   const opts = parseArgs([
-    "--threshold", "85",
-    "--metric", "Statements",
-    "--coverage-dir", "packages/api/coverage",
-    "--coverage-dir", "packages/web/coverage",
+    "--threshold",
+    "85",
+    "--metric",
+    "Statements",
+    "--coverage-dir",
+    "packages/api/coverage",
+    "--coverage-dir",
+    "packages/web/coverage",
   ]);
   assert.equal(opts.threshold, 85);
   assert.equal(opts.metric, "statements"); // normalized lowercase
@@ -98,7 +122,12 @@ test("parseArgs rejects an unknown --metric", () => {
 });
 
 test("VALID_METRICS covers the four Istanbul totals", () => {
-  assert.deepEqual(VALID_METRICS, ["lines", "statements", "functions", "branches"]);
+  assert.deepEqual(VALID_METRICS, [
+    "lines",
+    "statements",
+    "functions",
+    "branches",
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -141,7 +170,7 @@ test("evaluateGate: threshold 0 is a no-op pass (skipped)", () => {
       read: () => {
         throw new Error("read should not run when gate is disabled");
       },
-    }
+    },
   );
   assert.equal(verdict.ok, true);
   assert.equal(verdict.skipped, true);
@@ -158,7 +187,7 @@ test("evaluateGate: SET + measured above floor → pass", () => {
     {
       findSummaries: () => ["/x/coverage/coverage-summary.json"],
       read: () => summary({ lines: 91 }),
-    }
+    },
   );
   assert.equal(verdict.ok, true);
   assert.equal(verdict.skipped, false);
@@ -172,7 +201,7 @@ test("evaluateGate: SET + measured below floor → fail", () => {
     {
       findSummaries: () => ["/x/coverage/coverage-summary.json"],
       read: () => summary({ lines: 73 }),
-    }
+    },
   );
   assert.equal(verdict.ok, false);
   assert.equal(verdict.results[0].pct, 73);
@@ -185,7 +214,7 @@ test("evaluateGate: SET but no coverage summary found → fail (never silent-pas
     {
       findSummaries: () => [],
       read: () => null,
-    }
+    },
   );
   assert.equal(verdict.ok, false);
   assert.equal(verdict.skipped, false);
@@ -196,9 +225,15 @@ test("evaluateGate: SET, one of many packages below floor → fail", () => {
   const verdict = evaluateGate(
     { threshold: 80, metric: "statements", cwd: ".", coverageDirs: [] },
     {
-      findSummaries: () => ["a/coverage/coverage-summary.json", "b/coverage/coverage-summary.json"],
-      read: (f) => (f.startsWith("a") ? summary({ statements: 95 }) : summary({ statements: 40 })),
-    }
+      findSummaries: () => [
+        "a/coverage/coverage-summary.json",
+        "b/coverage/coverage-summary.json",
+      ],
+      read: (f) =>
+        f.startsWith("a")
+          ? summary({ statements: 95 })
+          : summary({ statements: 40 }),
+    },
   );
   assert.equal(verdict.ok, false);
   assert.equal(verdict.results.length, 2);
@@ -217,24 +252,29 @@ test("findCoverageSummaries auto-scans **/coverage/, pruning node_modules + dott
     mkdirSync(join(root, "packages", "api", "coverage"), { recursive: true });
     writeFileSync(
       join(root, "packages", "api", "coverage", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 88 }))
+      JSON.stringify(summary({ lines: 88 })),
     );
     // A decoy under node_modules that MUST be pruned.
-    mkdirSync(join(root, "node_modules", "dep", "coverage"), { recursive: true });
+    mkdirSync(join(root, "node_modules", "dep", "coverage"), {
+      recursive: true,
+    });
     writeFileSync(
       join(root, "node_modules", "dep", "coverage", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 1 }))
+      JSON.stringify(summary({ lines: 1 })),
     );
     // A decoy under a dotted dir that MUST be pruned.
     mkdirSync(join(root, ".agents", "coverage"), { recursive: true });
     writeFileSync(
       join(root, ".agents", "coverage", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 2 }))
+      JSON.stringify(summary({ lines: 2 })),
     );
 
     const files = findCoverageSummaries(root);
     assert.equal(files.length, 1);
-    assert.match(files[0], /packages[/\\]api[/\\]coverage[/\\]coverage-summary\.json$/);
+    assert.match(
+      files[0],
+      /packages[/\\]api[/\\]coverage[/\\]coverage-summary\.json$/,
+    );
 
     const parsed = readSummary(files[0]);
     assert.equal(extractPct(parsed, "lines"), 88);
@@ -251,29 +291,37 @@ test("findCoverageSummaries discovers a per-workspace fan-out layout (coverage/<
     mkdirSync(join(root, "coverage", "web"), { recursive: true });
     writeFileSync(
       join(root, "coverage", "web", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 77 }))
+      JSON.stringify(summary({ lines: 77 })),
     );
     mkdirSync(join(root, "coverage", "shared"), { recursive: true });
     writeFileSync(
       join(root, "coverage", "shared", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 93 }))
+      JSON.stringify(summary({ lines: 93 })),
     );
     // Decoys that must still be pruned.
-    mkdirSync(join(root, "node_modules", "dep", "coverage"), { recursive: true });
+    mkdirSync(join(root, "node_modules", "dep", "coverage"), {
+      recursive: true,
+    });
     writeFileSync(
       join(root, "node_modules", "dep", "coverage", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 1 }))
+      JSON.stringify(summary({ lines: 1 })),
     );
     mkdirSync(join(root, ".agents", "coverage"), { recursive: true });
     writeFileSync(
       join(root, ".agents", "coverage", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 2 }))
+      JSON.stringify(summary({ lines: 2 })),
     );
 
     const files = findCoverageSummaries(root).sort();
     assert.equal(files.length, 2);
-    assert.ok(files.some((f) => /coverage[/\\]shared[/\\]coverage-summary\.json$/.test(f)));
-    assert.ok(files.some((f) => /coverage[/\\]web[/\\]coverage-summary\.json$/.test(f)));
+    assert.ok(
+      files.some((f) =>
+        /coverage[/\\]shared[/\\]coverage-summary\.json$/.test(f),
+      ),
+    );
+    assert.ok(
+      files.some((f) => /coverage[/\\]web[/\\]coverage-summary\.json$/.test(f)),
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -285,7 +333,7 @@ test("findCoverageSummaries honours explicit --coverage-dir roots", () => {
     mkdirSync(join(root, "custom", "cov"), { recursive: true });
     writeFileSync(
       join(root, "custom", "cov", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 90 }))
+      JSON.stringify(summary({ lines: 90 })),
     );
     const files = findCoverageSummaries(root, ["custom/cov"]);
     assert.equal(files.length, 1);
@@ -327,7 +375,7 @@ test("runCli: threshold set, real passing coverage tree → exit 0", () => {
     mkdirSync(join(root, "coverage"), { recursive: true });
     writeFileSync(
       join(root, "coverage", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 95 }))
+      JSON.stringify(summary({ lines: 95 })),
     );
     const out = [];
     const code = runCli(["--threshold", "80", "--cwd", root], {
@@ -347,7 +395,7 @@ test("runCli: threshold set, real failing coverage tree → exit 1", () => {
     mkdirSync(join(root, "coverage"), { recursive: true });
     writeFileSync(
       join(root, "coverage", "coverage-summary.json"),
-      JSON.stringify(summary({ lines: 50 }))
+      JSON.stringify(summary({ lines: 50 })),
     );
     const out = [];
     const code = runCli(["--threshold", "80", "--cwd", root], {
@@ -378,9 +426,179 @@ test("runCli: threshold set but no coverage data → exit 1", () => {
 
 test("formatVerdict renders a skip line for the disabled gate", () => {
   const lines = formatVerdict({
-    ok: true, skipped: true, reason: "threshold 0 — coverage gate disabled (no-op)",
-    threshold: 0, metric: "lines", results: [],
+    ok: true,
+    skipped: true,
+    reason: "threshold 0 — coverage gate disabled (no-op)",
+    threshold: 0,
+    metric: "lines",
+    results: [],
   });
   assert.equal(lines.length, 1);
   assert.match(lines[0], /⏭️/);
+});
+
+// ---------------------------------------------------------------------------
+// pr-quality.yml Coverage threshold gate — inline step regression (#163)
+//
+// The workflow step embeds its OWN copy of the discovery logic (it must stay
+// dependency-free for consumer checkouts that have not adopted
+// check-coverage-threshold.mjs). #158 fixed only the standalone script; this
+// suite's `findCoverageSummaries` tests above cannot catch a regression in the
+// workflow file's embedded JS. These tests extract that embedded node script
+// straight out of pr-quality.yml and run it against real fixture trees, so the
+// exact #163 bug (matching a directory literally named `coverage`, missing
+// `coverage/<workspace>/coverage-summary.json`) cannot survive a refactor.
+// ---------------------------------------------------------------------------
+
+// Pull the embedded `node --input-type=module - <<'NODE' … NODE` script body
+// out of the "Coverage threshold gate" step, de-indenting the YAML block
+// scalar so it runs as a standalone ES module.
+function extractGateScript() {
+  const yaml = readFileSync(
+    join(__dirname, "..", ".github", "workflows", "pr-quality.yml"),
+    "utf8",
+  );
+  const lines = yaml.split(/\r?\n/);
+  const startIdx = lines.findIndex((l) =>
+    /node --input-type=module - <<'NODE'\s*$/.test(l),
+  );
+  assert.ok(
+    startIdx !== -1,
+    "expected an embedded `<<'NODE'` heredoc in pr-quality.yml",
+  );
+  // The heredoc opener carries the block-scalar indent; every body line shares
+  // at least that indent, and the closing `NODE` sentinel sits at the same
+  // indent. Strip it uniformly.
+  const indent = lines[startIdx].match(/^(\s*)/)[1];
+  const body = [];
+  for (let i = startIdx + 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === "NODE") return body.join("\n");
+    body.push(
+      lines[i].startsWith(indent) ? lines[i].slice(indent.length) : lines[i],
+    );
+  }
+  throw new Error("unterminated `NODE` heredoc in pr-quality.yml gate step");
+}
+
+// Run the extracted gate script with COVERAGE_THRESHOLD / COVERAGE_METRIC set
+// and cwd pointed at `treeRoot`. Returns { status, stdout, stderr }.
+function runGateStep(treeRoot, { threshold = "0", metric = "lines" } = {}) {
+  const scriptPath = join(treeRoot, "__gate-step.mjs");
+  writeFileSync(scriptPath, extractGateScript());
+  try {
+    const stdout = execFileSync("node", [scriptPath], {
+      cwd: treeRoot,
+      env: {
+        ...process.env,
+        COVERAGE_THRESHOLD: threshold,
+        COVERAGE_METRIC: metric,
+      },
+      encoding: "utf8",
+    });
+    return { status: 0, stdout, stderr: "" };
+  } catch (err) {
+    return {
+      status: err.status ?? 1,
+      stdout: err.stdout?.toString() ?? "",
+      stderr: err.stderr?.toString() ?? "",
+    };
+  }
+}
+
+test("pr-quality gate step discovers a per-workspace coverage/<ws>/ layout (#163 regression)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gate-step-fanout-"));
+  try {
+    // Per-workspace fan-out: NO top-level coverage/coverage-summary.json,
+    // only coverage/web/ and coverage/shared/ — the exact shape that the
+    // pre-#158 literal-`coverage`-name match missed.
+    mkdirSync(join(dir, "coverage", "web"), { recursive: true });
+    mkdirSync(join(dir, "coverage", "shared"), { recursive: true });
+    writeFileSync(
+      join(dir, "coverage", "web", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 95 })),
+    );
+    writeFileSync(
+      join(dir, "coverage", "shared", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 90 })),
+    );
+
+    const res = runGateStep(dir, { threshold: "80", metric: "lines" });
+    assert.equal(
+      res.status,
+      0,
+      `gate step should PASS on the fan-out layout, got exit ${res.status}\n${res.stderr}`,
+    );
+    // Both per-workspace summaries were discovered and gated — not the
+    // "no coverage-summary.json was found" false failure.
+    assert.doesNotMatch(res.stderr, /no coverage-summary\.json/);
+    assert.match(res.stdout, /coverage[/\\]web[/\\]coverage-summary\.json/);
+    assert.match(res.stdout, /coverage[/\\]shared[/\\]coverage-summary\.json/);
+    assert.match(res.stdout, /coverage meets the 80% floor/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pr-quality gate step: per-workspace summary below floor fails (#163 regression)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gate-step-fanout-fail-"));
+  try {
+    mkdirSync(join(dir, "coverage", "web"), { recursive: true });
+    writeFileSync(
+      join(dir, "coverage", "web", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 40 })),
+    );
+    const res = runGateStep(dir, { threshold: "80", metric: "lines" });
+    assert.equal(
+      res.status,
+      1,
+      "below-floor per-workspace coverage must fail the gate",
+    );
+    assert.match(res.stderr, /coverage[/\\]web[/\\]coverage-summary\.json/);
+    assert.match(res.stderr, /below the 80% floor/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pr-quality gate step stays byte-for-byte compatible with the single coverage/ dir shape (#163)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gate-step-single-"));
+  try {
+    // Legacy single-workspace shape: coverage/coverage-summary.json directly.
+    mkdirSync(join(dir, "coverage"), { recursive: true });
+    writeFileSync(
+      join(dir, "coverage", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 88 })),
+    );
+    // node_modules + dotted dirs must still be pruned (never read a vendored
+    // coverage tree).
+    mkdirSync(join(dir, "node_modules", "pkg", "coverage"), {
+      recursive: true,
+    });
+    writeFileSync(
+      join(dir, "node_modules", "pkg", "coverage", "coverage-summary.json"),
+      JSON.stringify(summary({ lines: 1 })),
+    );
+    const res = runGateStep(dir, { threshold: "80", metric: "lines" });
+    assert.equal(
+      res.status,
+      0,
+      `single-dir shape should PASS, got exit ${res.status}\n${res.stderr}`,
+    );
+    assert.match(res.stdout, /coverage[/\\]coverage-summary\.json/);
+    assert.doesNotMatch(res.stdout, /node_modules/);
+    assert.doesNotMatch(res.stderr, /node_modules/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pr-quality gate step still hard-fails when threshold set but no summary exists (#163)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gate-step-empty-"));
+  try {
+    const res = runGateStep(dir, { threshold: "80", metric: "lines" });
+    assert.equal(res.status, 1, "a set floor must not pass on missing data");
+    assert.match(res.stderr, /no coverage-summary\.json/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

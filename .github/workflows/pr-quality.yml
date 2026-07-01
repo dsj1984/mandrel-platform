@@ -546,22 +546,31 @@ jobs:
             process.exit(1);
           }
 
-          // Auto-scan for **/coverage/coverage-summary.json, pruning
-          // node_modules + dotted dirs (.git, .agents, …).
+          // Discover every coverage-summary.json regardless of its parent
+          // directory's name — matching a directory literally named
+          // `coverage/` (the single-workspace shape) AND per-workspace
+          // fan-out layouts like `coverage/web/coverage-summary.json`. The
+          // match condition is "this directory contains a coverage-summary.json
+          // file", not "this directory is named coverage". node_modules +
+          // dotted dirs (.git, .agents, …) are pruned.
+          //
+          // SSOT: this is an inlined port of findCoverageSummaries() in
+          // scripts/check-coverage-threshold.mjs (fixed in #158). It is
+          // intentionally duplicated so this reusable workflow stays
+          // dependency-free for consumer checkouts that have not adopted that
+          // script. Keep the two in sync — see #163 for the drift that a
+          // literal-`coverage`-name match caused here.
           function find(root) {
             const out = [];
             const walk = (dir) => {
               let entries;
               try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+              const f = join(dir, "coverage-summary.json");
+              if (existsSync(f)) out.push(f);
               for (const e of entries) {
                 if (!e.isDirectory()) continue;
                 if (e.name === "node_modules" || e.name.startsWith(".")) continue;
-                const full = join(dir, e.name);
-                if (e.name === "coverage") {
-                  const f = join(full, "coverage-summary.json");
-                  if (existsSync(f)) out.push(f);
-                }
-                walk(full);
+                walk(join(dir, e.name));
               }
             };
             walk(resolve(root));
@@ -572,8 +581,8 @@ jobs:
           if (files.length === 0) {
             console.error(
               "[coverage-threshold] ❌ threshold is set but no coverage-summary.json " +
-              "was found under any **/coverage/ — ensure the test step emits a " +
-              "json-summary reporter (a set floor must not pass on missing data)."
+              "was found — ensure the test step emits a json-summary reporter " +
+              "(a set floor must not pass on missing data)."
             );
             process.exit(1);
           }
