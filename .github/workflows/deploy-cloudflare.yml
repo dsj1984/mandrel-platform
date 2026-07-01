@@ -36,7 +36,11 @@
 #                              workers.dev host is derived from the account
 #                              subdomain slug (never the account ID) and can be
 #                              overridden with smoke_base_url / smoke_paths, or
-#                              disabled entirely with smoke:false.
+#                              disabled entirely with smoke:false. Opt-in
+#                              verify-commit-sha (Story #176) additionally
+#                              asserts the health response's "version" field
+#                              matches github.sha, failing smoke (and
+#                              triggering rollback) on a mismatch.
 #
 # Command seams (Story #41): the D1 export/apply, build, and workers.dev smoke
 # defaults are all overridable so non-D1 / build-step / custom-host consumers can
@@ -242,6 +246,25 @@ on:
         required: false
         type: string
         default: ''
+      verify-commit-sha:
+        description: >
+          Opt-in (Story #176). When true, the built-in boot-smoke probe
+          additionally asserts that each deployed worker's health endpoint
+          reports the SHA this run is deploying (github.sha), turning the
+          release-tagging convention into a deploy-time invariant. Requires
+          the worker's health endpoint to return a JSON body with a
+          "version" field set to the deployed commit SHA (see
+          docs/runbooks/post-deploy-smoke.md#3-health-endpoint-contract), e.g.
+          `app.get('/health', (c) => c.json({ status: 'ok', version:
+          c.env.GIT_COMMIT_SHA }))`. A mismatch (or a missing/unparsable
+          "version" field) fails the smoke check for that worker and
+          triggers the same auto-rollback as an HTTP-status failure.
+          Ignored when smoke-command is set (the consumer-supplied probe
+          owns its own verification). Defaults to false so existing
+          consumers are unaffected until they opt in.
+        required: false
+        type: boolean
+        default: false
       enable-environments-isolation-audit:
         description: >
           Run the shared Environments isolation-audit job (Story #172)
@@ -912,7 +935,8 @@ jobs:
               WORKER_URL="${base}${p}"
 
               echo "::group::Smoke-testing $worker → $WORKER_URL"
-              HTTP_STATUS=$(curl --silent --output /dev/null \
+              RESPONSE_BODY_FILE="$(mktemp)"
+              HTTP_STATUS=$(curl --silent --output "$RESPONSE_BODY_FILE" \
                 --write-out "%{http_code}" \
                 --max-time 15 \
                 --retry 3 \
@@ -923,9 +947,38 @@ jobs:
               if [ "$HTTP_STATUS" != "200" ]; then
                 echo "::error::Smoke check FAILED for $worker at $WORKER_URL (HTTP $HTTP_STATUS). Triggering rollback."
                 failed+=("$worker")
-              else
-                echo "✅ $worker smoke check passed at $WORKER_URL (HTTP 200)"
+                rm -f "$RESPONSE_BODY_FILE"
+                echo "::endgroup::"
+                continue
               fi
+
+              echo "✅ $worker smoke check passed at $WORKER_URL (HTTP 200)"
+
+              # ----- verify-commit-sha (Story #176, opt-in) -----
+              # Assert the deployed worker's health response reports the SHA
+              # this run deployed (github.sha). Contract: docs/runbooks/
+              # post-deploy-smoke.md#3-health-endpoint-contract — the health
+              # endpoint returns a JSON body with a "version" field set to
+              # env.GIT_COMMIT_SHA. A mismatch or unparsable field fails the
+              # smoke check and triggers the same auto-rollback as an
+              # HTTP-status failure.
+              if [ "$VERIFY_COMMIT_SHA" = "true" ]; then
+                DEPLOYED_SHA="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$RESPONSE_BODY_FILE" \
+                  | head -n1 \
+                  | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
+
+                if [ -z "$DEPLOYED_SHA" ]; then
+                  echo "::error::verify-commit-sha FAILED for $worker at $WORKER_URL — response has no parsable \"version\" field. Triggering rollback."
+                  failed+=("$worker")
+                elif [ "$DEPLOYED_SHA" != "$EXPECTED_SHA" ]; then
+                  echo "::error::verify-commit-sha FAILED for $worker — deployed SHA '$DEPLOYED_SHA' does not match expected SHA '$EXPECTED_SHA'. Triggering rollback."
+                  failed+=("$worker")
+                else
+                  echo "✅ $worker reports expected commit SHA: $DEPLOYED_SHA"
+                fi
+              fi
+
+              rm -f "$RESPONSE_BODY_FILE"
               echo "::endgroup::"
             done
           done
@@ -943,6 +996,8 @@ jobs:
           SMOKE_BASE_URL: ${{ inputs.smoke_base_url }}
           SMOKE_PATHS: ${{ inputs.smoke_paths }}
           WORKERS_DEV_SUBDOMAIN: ${{ inputs.workers_dev_subdomain }}
+          VERIFY_COMMIT_SHA: ${{ inputs.verify-commit-sha }}
+          EXPECTED_SHA: ${{ github.sha }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 

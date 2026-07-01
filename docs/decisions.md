@@ -80,6 +80,93 @@ immediately, citing `scripts/check-wrangler-baseline.mjs`
 consumer's own wrangler config verifies clean under
 `wrangler-baseline-fail-on-violation: true`.
 
+## 2026-07-01 — Opt-in verify-commit-sha: boot-smoke asserts the deployed SHA
+
+**Context.** `GIT_COMMIT_SHA` injection at deploy is `◐` (roadmap §2a.2):
+each consumer injects the SHA in its own build step (the build-split model),
+but nothing verified it survived to the running Worker. The shared
+`deploy-cloudflare.yml` workflow already knows the expected SHA
+(`github.sha`) and already runs a boot-smoke probe against a `version`-
+reporting health endpoint (`docs/runbooks/post-deploy-smoke.md` §3); the gap
+was that the probe checked HTTP status only, never the reported version.
+
+**Decision.** Add an opt-in `verify-commit-sha` boolean input (default
+`false`) to `deploy-cloudflare.yml`. When `true`, the built-in boot-smoke
+probe parses the health response's `version` field and asserts it equals
+`github.sha`; a missing/unparsable field or a mismatch fails smoke and takes
+the **same auto-rollback path** as an HTTP-status failure. The check is
+ignored when `smoke-command` is set (a consumer-supplied probe owns its own
+verification) and defaults to `false` so existing consumers are unaffected
+until they wire `GIT_COMMIT_SHA` through to their health endpoint and opt
+in (Story #176; consumer opt-in itself rides with the per-consumer
+deploy-guard adoption stories, out of scope here). Contract docs
+(`docs/reusable-workflows.md`, `docs/runbooks/post-deploy-smoke.md`) were
+updated with the endpoint expectation and the new input.
+
+**Consequences.** A consumer that wires `GIT_COMMIT_SHA` into its health
+endpoint and sets `verify-commit-sha: true` gets an exact, deploy-time
+rollback-verification invariant instead of an HTTP-200-only smoke check —
+"the Worker is up" now also means "the Worker is running the commit we just
+deployed". The repo-ops consumers matrix §2 "GIT_COMMIT_SHA injected at
+deploy" row flip (`◐` → `●`) is tracked in the sibling `repo-ops` planning
+repo (`mandrel-platform-consumers.md`), not in this repo — same pattern as
+the 2026-07-01 repo-settings decision above: that repo is a separate git
+remote (`dsj1984/repo-ops`) outside this Story's PR boundary. The flip
+should be applied there once this Story (mandrel-platform#176) merges,
+citing this decision entry and the shipped `verify-commit-sha` input as the
+now-existing contract the row can point to.
+
+## 2026-07-01 — `commitlint.base.mjs` single-sources the conventional-commit type-enum
+
+**Context.** Commitlint enforcement was ◐: the type-enum is "pinned to
+`git-conventions.md`" by convention only, but all three consumers
+(domio, athportal, swarm-os) carry their own root `commitlint.config.js`
+with the eleven types hand-copied in — the exact copy-drift shape the
+config package exists to kill, and the same shape `tsconfig.base.json` /
+`biome.base.json` / `knip.base.json` / `stryker.base.json` already solved
+for their respective tools.
+
+**Decision.** Ship `config/commitlint.base.mjs`, exported as
+`mandrel-platform/commitlint.base.mjs` (same npm package-export channel as
+the other `*.base.*` files). It extends
+`@commitlint/config-conventional` and narrows `type-enum` to the eleven
+types documented in
+[`.agents/rules/git-conventions.md`](../.agents/rules/git-conventions.md)
+(`feat`, `fix`, `perf`, `refactor`, `revert`, `docs`, `style`, `chore`,
+`test`, `build`, `ci`) — the same list `release-please-config.json`'s
+`changelog-sections` already encodes. commitlint supports a native
+`extends`, so a consumer's local `commitlint.config.js` reduces to
+`{ extends: ["mandrel-platform/commitlint.base.mjs"] }` plus any
+repo-specific scope-enum. Consumer adoption is out of scope for this
+Story — three per-consumer adoption Stories are blocked on this one.
+
+**Consequences.** The type-enum now has exactly one source of truth
+instead of four (git-conventions.md prose + three hand-copied consumer
+configs); adding a type is a one-file change here plus the
+`release-please-config.json` mirror, propagated to consumers on their next
+`mandrel-platform` bump.
+
+This Story's complete deliverable, from this repo's side, is: the
+published `commitlint.base.mjs` export plus the documented `extends`
+pattern above — the artifact and contract the row-flip depends on. The
+row-flip action itself is **out of this repo's write boundary by
+construction**: the repo-ops consumers matrix §5 lives in the sibling
+`repo-ops` planning repo (`mandrel-platform-consumers.md`), a separate git
+remote (`dsj1984/repo-ops`) this Story's PR cannot touch, exactly the same
+structural boundary the 2026-07-01 repo-settings decision (Story #171,
+entry above) already crossed for its own §3a Platform-column flip. Per
+that precedent, the row-flip is **not silently dropped** — it is a named
+follow-up, tracked the same way: once this Story ships in a
+`mandrel-platform` release, flip repo-ops §5's commitlint row ◐ → ● there,
+citing this decision entry and the shipped
+`config/commitlint.base.mjs` / `mandrel-platform/commitlint.base.mjs`
+export as the now-existing contract. That flip additionally depends on
+the three per-consumer adoption Stories (out of scope here, blocked on
+this one) actually landing and each consumer's local
+`commitlint.config.js` being confirmed to extend this base — the row
+means "all three consumers extend the base," not merely "the base
+exists."
+
 ## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
 
 **Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix
@@ -135,6 +222,60 @@ once this Story (mandrel-platform#171) merges, citing this decision entry and
 the shipped `config/repo-settings.schema.json` / `check-repo-settings.mjs` /
 `platform-sync.mjs --check-settings`/`--apply-settings` as the now-existing
 contract the five §3a merge/Actions-permission rows can point to.
+
+## 2026-07-01 — Branch-ruleset drift dashboard (check-ruleset.mjs), report-only by design
+
+**Context.** The platform ships `config/main-protection.schema.json` +
+`docs/runbooks/main-protection.json` (the decided main-branch protection
+contract) and a setup runbook, but nothing detected a **live** ruleset
+drifting from that contract after initial setup — a bypass actor silently
+added to the ruleset, `strict` status checks turned off, or force-pushes
+re-enabled would go unnoticed indefinitely. The 2026-07-01 audit found
+exactly this risk class at the repo-settings layer (Story #171,
+`check-repo-settings.mjs`); the companion `check-ruleset.mjs` story
+(referenced directly in that decision entry, above) closes the same gap for
+branch rulesets.
+
+**Decision.** `scripts/check-ruleset.mjs` reads each consumer's live
+branch ruleset over the GitHub Rulesets API (`gh api
+repos/{owner}/{repo}/rulesets`, then the per-ruleset detail endpoint — the
+list response omits `rules`/`bypass_actors`) and diffs the ruleset targeting
+`refs/heads/<branch>` against `docs/runbooks/main-protection.json`: PR
+required to merge, `bypass_actors` empty, required status-check contexts
+match with `strict_required_status_checks_policy` on (branch must be
+up to date), linear history iff `requireLinearHistory`, and force-push/
+deletion blocked iff `!allowForcePushes`/`!allowDeletions`. Same shape as
+`check-repo-settings.mjs` / `check-pin-drift.mjs`: data-driven consumer
+registry (reuses `scripts/pin-drift-consumers.json`, no second registry),
+injectable `gh` runner, pure exported classifiers, `--json`/`--strict`.
+Wired into the weekly `pin-drift.yml` dashboard as a third "GitHub-side
+drift" step alongside `check-pin-drift.mjs` and `check-repo-settings.mjs`,
+and composed into `platform-sync.mjs` as a `--check-ruleset` mode (mirroring
+`--check-settings`). **Non-blocking by design** (the same standing posture
+as the pin-drift and repo-settings dashboards): drift is reported, never a
+hard gate.
+
+Unlike `--apply-settings`, there is **deliberately no `--apply-ruleset`**. A
+branch ruleset gates merge eligibility for every in-flight PR on that
+branch; an automated PATCH here could strand a PR mid-review in a way none
+of the `--apply-settings`-patchable same-repo toggles can. Auto-fixing
+rulesets is explicitly out of scope for this Story — report plus a runbook
+pointer only.
+
+**Consequences.** A consumer's live branch-ruleset state is now check-able
+in one command (`check-ruleset.mjs` directly, the scheduled dashboard, or
+`platform-sync.mjs --check-ruleset`) instead of a manual GitHub UI audit.
+Cost: a third GitHub-API surface (`repos/{owner}/{repo}/rulesets` +
+per-ruleset detail) alongside the workflow-contents/package.json reads
+`check-pin-drift.mjs` and the repo-settings reads `check-repo-settings.mjs`
+already make — same `PIN_DRIFT_TOKEN` credential, no new secret. The
+repo-ops consumers matrix §3/§5 branch-protection rows (◐ → ●) live in the
+sibling `repo-ops` planning repo (`dsj1984/repo-ops`), a separate git remote
+outside this Story's PR boundary — same handoff as the repo-settings
+decision above: the flip should be applied there once this Story
+(mandrel-platform#178) merges, citing this decision entry and the shipped
+`check-ruleset.mjs` / `platform-sync.mjs --check-ruleset` as the now-existing
+contract those rows can point to.
 
 ## 2026-06-30 — Edge-security middleware ships via the npm package-export channel (two CORS variants)
 
