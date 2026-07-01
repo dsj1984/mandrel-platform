@@ -28,6 +28,12 @@
  *      the SSOT (`github>dsj1984/mandrel-platform` for Renovate,
  *      `mandrel-platform/tsconfig.base.json` for TypeScript).
  *
+ * Also materializes canonical workflow **caller templates** from
+ * `templates/workflows/` into the consumer's `.github/workflows/` (Story
+ * #175) — e.g. `deploy-staging.yml`, the one-paved-road `workflow_run` caller
+ * for the shared `deploy-cloudflare.yml`'s CI-green guard. Same link-don't-
+ * copy semantics as the runbook stubs: never overwrites an existing file.
+ *
  * Idempotent: re-running on an already-synced consumer makes no changes and
  * reports `unchanged`. `--dry-run` prints the planned diff without touching
  * disk or the network mutation.
@@ -152,6 +158,7 @@ if (!opts.templates) {
   opts.templates = resolve(__dirname, "..", "templates");
 }
 const runbookTemplatesDir = join(opts.templates, "runbooks");
+const workflowTemplatesDir = join(opts.templates, "workflows");
 
 // ---------------------------------------------------------------------------
 // 1. Resolve the chosen ref → commit SHA
@@ -301,6 +308,55 @@ function materializeRunbooks() {
 }
 
 // ---------------------------------------------------------------------------
+// 3a. Materialize workflow caller templates (link, don't copy) — Story #175
+// ---------------------------------------------------------------------------
+
+// Every materialized workflow template names itself as a "canonical staging-
+// deploy caller template" in its header comment — used the same way
+// STUB_MARKER is used for runbooks: detect an already-materialized (or
+// operator-filled-in) file so re-runs are idempotent and an operator's own
+// customized caller is never clobbered.
+const WORKFLOW_TEMPLATE_MARKER = "Canonical staging-deploy caller template";
+
+/**
+ * Copy each `templates/workflows/*.yml` into the consumer's
+ * `.github/workflows/`, but only when the destination is ABSENT — mirrors
+ * `materializeRunbooks`'s link-don't-copy / never-clobber semantics. An
+ * existing destination is left untouched; if it doesn't carry the template
+ * marker, it's surfaced as a `localCopy` warning so the operator can
+ * reconcile a hand-authored caller against the canonical template by hand.
+ */
+function materializeWorkflowStubs() {
+  const created = [];
+  const skipped = [];
+  const localCopies = [];
+  if (!existsSync(workflowTemplatesDir)) {
+    return { created, skipped, localCopies };
+  }
+  const destDir = join(opts.consumer, ".github", "workflows");
+  for (const entry of readdirSync(workflowTemplatesDir)) {
+    if (!/\.ya?ml$/.test(entry)) continue;
+    const src = join(workflowTemplatesDir, entry);
+    const dest = join(destDir, entry);
+    if (existsSync(dest)) {
+      const body = readFileSync(dest, "utf8");
+      if (body.includes(WORKFLOW_TEMPLATE_MARKER)) {
+        skipped.push(rel(dest)); // already materialized — idempotent no-op
+      } else {
+        localCopies.push(rel(dest)); // hand-authored caller — operator must reconcile
+      }
+      continue;
+    }
+    if (!opts.dryRun) {
+      mkdirSync(destDir, { recursive: true });
+      writeFileSync(dest, readFileSync(src, "utf8"));
+    }
+    created.push(rel(dest));
+  }
+  return { created, skipped, localCopies };
+}
+
+// ---------------------------------------------------------------------------
 // 4. Reconcile renovate / tsconfig `extends`
 // ---------------------------------------------------------------------------
 
@@ -392,12 +448,14 @@ function main() {
 
   const pins = pinWorkflows(targetSha);
   const runbooks = materializeRunbooks();
+  const workflowStubs = materializeWorkflowStubs();
   const renovate = reconcileRenovate();
   const tsconfig = reconcileTsconfig();
 
   const changed =
     pins.length > 0 ||
     runbooks.created.length > 0 ||
+    workflowStubs.created.length > 0 ||
     renovate.action === "reconciled" ||
     tsconfig.action === "reconciled";
 
@@ -413,6 +471,15 @@ function main() {
   for (const f of runbooks.created) log(`             + ${f}`);
   for (const f of runbooks.localCopies) {
     log(`             ⚠ ${f}: full local copy detected — reconcile to a reference stub by hand (§2.2)`);
+  }
+  log(
+    `  workflows: ${workflowStubs.created.length} caller template(s) ${
+      opts.dryRun ? "would be " : ""
+    }materialized, ${workflowStubs.skipped.length} already present`
+  );
+  for (const f of workflowStubs.created) log(`             + ${f}`);
+  for (const f of workflowStubs.localCopies) {
+    log(`             ⚠ ${f}: hand-authored caller detected — reconcile against the canonical template by hand`);
   }
   log(`  renovate:  ${renovate.action}${renovate.file ? ` (${renovate.file})` : ""}`);
   log(`  tsconfig:  ${tsconfig.action}${tsconfig.file ? ` (${tsconfig.file})` : ""}`);
@@ -437,6 +504,7 @@ function main() {
           changed,
           pins,
           runbooks,
+          workflowStubs,
           renovate,
           tsconfig,
         },

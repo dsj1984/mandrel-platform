@@ -532,7 +532,14 @@ reports `already in sync`):
    `docs/runbooks/` **only when absent** — an already-adopted stub is skipped,
    and a full local copy (no stub marker) is surfaced as a warning to
    reconcile by hand, never silently overwritten.
-3. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
+3. **Materializes workflow caller templates.** Copies canonical callers from
+   `templates/workflows/` (e.g. `deploy-staging.yml`, the one-paved-road
+   `workflow_run` caller for `deploy-cloudflare.yml`'s CI-green guard — see
+   [`docs/reusable-workflows.md`](docs/reusable-workflows.md#deploy-cloudflareyml))
+   into the consumer's `.github/workflows/` — same link-don't-copy semantics:
+   only when absent, and a hand-authored file without the template marker is
+   surfaced as a warning rather than overwritten.
+4. **Reconciles `extends`.** Prepends `github>dsj1984/mandrel-platform` to the
    consumer's Renovate `extends` and `mandrel-platform/tsconfig.base.json` to
    its `tsconfig.json` `extends`. The SSOT goes first so the consumer's own
    later entries continue to override it.
