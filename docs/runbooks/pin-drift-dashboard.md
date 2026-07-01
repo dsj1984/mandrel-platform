@@ -209,6 +209,23 @@ pin-drift check only understands `uses:`/npm-version pin shapes, and a
 Biome-major bump has neither. This repo has no equivalent file today since
 pin-drift tracking lives in `scripts/pin-drift-consumers.json` above instead.
 
+### `lighthouse-thresholds.base.json` runner-split rollout tracking (Story #157)
+
+Story #157 splits the shared Lighthouse base in two (see
+[README — `lighthouse.base.json` / `lighthouse-thresholds.base.json`](../../README.md#lighthousebasejson--lighthouse-thresholdsbasejson))
+because the fleet runs Lighthouse through **two different mechanisms**:
+`@lhci/cli` (`lighthouserc`) consumers extend `lighthouse.base.json` as
+before, while bespoke puppeteer + baseline-drift consumers (no `@lhci/cli`,
+no `lighthouserc` — e.g. `apps/web/scripts/lighthouse-baseline.mjs` +
+`baselines/lighthouse.json` style harnesses) now have a **mechanism-neutral**
+base, `lighthouse-thresholds.base.json`, to extend instead. Neither the LHCI
+migration nor the puppeteer-harness adoption has a `uses:`/npm-version pin
+shape, so — same as the pnpm-native and Biome-v2 rollouts above —
+per-consumer adoption is tracked in each consumer's own
+`mandrel-platform-consumers.md` (where present), not by this dashboard's
+pin-drift check. This repo has no equivalent file today since pin-drift
+tracking lives in `scripts/pin-drift-consumers.json` above instead.
+
 ## Running it locally
 
 ```bash
