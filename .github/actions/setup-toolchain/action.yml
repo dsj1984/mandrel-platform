@@ -22,6 +22,12 @@
 # to runner.temp keeps the shim job-scoped, not under $HOME, and unaffected by
 # `git clean -ffdx` on the next run.
 #
+# Usage (transitional lockfile-policy exception — see docs/reusable-workflows.md):
+#   - name: Setup toolchain
+#     uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
+#     with:
+#       trust-lockfile: 'true'
+#
 # SHA-pinned third-party actions.
 name: Setup Toolchain
 description: >
@@ -29,6 +35,8 @@ description: >
   project dependencies. Pass cache: 'false' on self-hosted runners that
   maintain their own warm pnpm store. Pass pnpm-dest to override the pnpm
   shim install location (defaults to runner.temp/pnpm for concurrency safety).
+  Pass trust-lockfile: 'true' to append --trust-lockfile to the install step
+  (default 'false' — unchanged behavior).
 
 inputs:
   cache:
@@ -46,6 +54,16 @@ inputs:
       explicitly to the runner.temp/pnpm expression.
     required: false
     default: ''
+  trust-lockfile:
+    description: >
+      Append --trust-lockfile to the install step when 'true'. Intended as a
+      transitional/documented-exception flag for a consumer whose lockfile
+      carries pnpm supply-chain policy findings (TRUST_DOWNGRADE /
+      MINIMUM_RELEASE_AGE_VIOLATION) it has consciously accepted — not a
+      permanent bypass. Default 'false' preserves today's behavior
+      (plain `pnpm install --frozen-lockfile`, no trust override).
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -64,4 +82,11 @@ runs:
 
     - name: Install dependencies
       shell: bash
-      run: pnpm install --frozen-lockfile
+      env:
+        TRUST_LOCKFILE: ${{ inputs.trust-lockfile }}
+      run: |
+        if [ "${TRUST_LOCKFILE}" = "true" ]; then
+          pnpm install --frozen-lockfile --trust-lockfile
+        else
+          pnpm install --frozen-lockfile
+        fi
