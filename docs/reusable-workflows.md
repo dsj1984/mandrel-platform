@@ -733,10 +733,26 @@ node scripts/check-wrangler-baseline.mjs --json                 # machine-readab
 
 > **Consumers-matrix follow-up (action required, tracked outside this
 > repo).** This platform repo has no in-repo "consumers matrix" file — the
-> same standing note as the [repo-settings baseline](decisions.md). Once
-> domio/athportal/swarm-os adopt `wrangler-baseline-fail-on-violation: true`
-> with a clean config, flip the repo-ops consumers matrix §2/§7 rows (◐/○ →
-> ●) in that document's home repo.
+> same standing note as the [repo-settings baseline](decisions.md). This
+> Story does **not** flip the ◐/○ → ● cells itself (there is nothing to
+> edit in this checkout); it ships the mechanism the flip depends on. The
+> flip is a **required follow-up action**, not a someday-maybe:
+>
+> 1. On release of this Story's tag, open (or reuse) a tracking Story in
+>    whichever repo hosts `mandrel-platform-consumers.md` (the sibling
+>    `dsj1984/repo-ops` planning repo per the Story #171 precedent) to flip
+>    the §2/§7 rows for `env.*` split, `logpush`, Analytics Engine, and
+>    `compatibility_date` to ◐ (mechanism shipped, advisory) immediately —
+>    this does not wait on a clean fleet.
+> 2. Per consumer (domio, athportal, swarm-os), once its own wrangler config
+>    is verified clean under this check and
+>    `wrangler-baseline-fail-on-violation: true` is set, flip that
+>    consumer's row to ● in the same tracking document.
+> 3. Cite this Story (mandrel-platform#177) and the shipped
+>    `scripts/check-wrangler-baseline.mjs` contract in the tracking Story so
+>    the row-flip has a concrete artifact to point at, mirroring how the
+>    repo-settings baseline entry in `docs/decisions.md` cites
+>    `config/repo-settings.schema.json`.
 
 ### Destructive-migration guard (`enable-migration-guard`)
 

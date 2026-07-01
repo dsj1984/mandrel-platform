@@ -70,8 +70,15 @@ Story with no prior documented precedent to anchor it — revisit if a
 consumer's legitimate release cadence exceeds the window. As with the
 repo-settings baseline (previous entry), the repo-ops consumers matrix §2/§7
 Platform-column flip (◐/○ → ●) lives in the sibling `dsj1984/repo-ops`
-planning repo, outside this Story's PR boundary — apply it there once this
-Story merges and each consumer's config is verified clean.
+planning repo, outside this Story's PR boundary. **Required follow-up
+action** (see [`docs/reusable-workflows.md`'s consumers-matrix
+follow-up](reusable-workflows.md#wrangler-baseline-check-enable-wrangler-baseline-check)
+for the full three-step sequence): on release of this Story's tag, open or
+reuse a tracking Story in that repo to flip §2/§7 to ◐ (mechanism shipped)
+immediately, citing `scripts/check-wrangler-baseline.mjs`
+(mandrel-platform#177); flip each consumer's row to ● only once that
+consumer's own wrangler config verifies clean under
+`wrangler-baseline-fail-on-violation: true`.
 
 ## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
 
