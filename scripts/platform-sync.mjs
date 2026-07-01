@@ -43,6 +43,14 @@
  * for the shared `deploy-cloudflare.yml`'s CI-green guard. Same link-don't-
  * copy semantics as the runbook stubs: never overwrites an existing file.
  *
+ * A fifth, **report-only** GitHub-side mode (Story #178, `--check-ruleset`)
+ * reads a consumer's LIVE branch ruleset over the GitHub Rulesets API and
+ * reports drift against `docs/runbooks/main-protection.json` — the same
+ * non-blocking posture as `--check-settings`, but deliberately with no
+ * `--apply-ruleset` counterpart: a ruleset gates merge eligibility for every
+ * in-flight PR, so an automated PATCH here has a materially different blast
+ * radius than the same-repo settings toggles `--apply-settings` patches.
+ *
  * Idempotent: re-running on an already-synced consumer makes no changes and
  * reports `unchanged`. `--dry-run` prints the planned diff without touching
  * disk or the network mutation.
@@ -106,6 +114,11 @@ const opts = {
   applySettings: false,
   consumerRepo: null,
   baseline: null,
+  // GitHub-side branch-ruleset drift check (Story #178). Report-only by
+  // design — see the SETTINGS_PATCHABLE_FIELDS comment below for why
+  // rulesets deliberately have no --apply-ruleset counterpart.
+  checkRuleset: false,
+  contract: null,
 };
 
 for (let i = 0; i < args.length; i++) {
@@ -121,6 +134,8 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--apply-settings") opts.applySettings = true;
   else if (a === "--consumer-repo" && args[i + 1]) opts.consumerRepo = args[++i];
   else if (a === "--baseline" && args[i + 1]) opts.baseline = resolve(args[++i]);
+  else if (a === "--check-ruleset") opts.checkRuleset = true;
+  else if (a === "--contract" && args[i + 1]) opts.contract = resolve(args[++i]);
   else if (a === "--help" || a === "-h") {
     printHelp();
     process.exit(0);
@@ -158,6 +173,13 @@ function printHelp() {
       "  --baseline <path>         path to the repo-settings baseline JSON",
       "                            (default: docs/runbooks/repo-settings.json next to this script's package).",
       "",
+      "GitHub-side branch-ruleset drift check (Story #178, report-only — no --apply-ruleset):",
+      "  --check-ruleset           read a consumer's LIVE branch ruleset via `gh api` and report",
+      "                            drift against the main-protection contract (never blocks; never mutates).",
+      "  --consumer-repo <owner/repo>  (required with --check-ruleset) the consumer repo to read.",
+      "  --contract <path>         path to the main-protection contract JSON",
+      "                            (default: docs/runbooks/main-protection.json next to this script's package).",
+      "",
     ].join("\n")
   );
 }
@@ -180,6 +202,7 @@ function log(msg) {
 // ---------------------------------------------------------------------------
 
 const settingsMode = opts.checkSettings || opts.applySettings;
+const rulesetMode = opts.checkRuleset;
 
 if (settingsMode) {
   if (!opts.consumerRepo) {
@@ -187,6 +210,13 @@ if (settingsMode) {
   }
   if (!opts.baseline) {
     opts.baseline = resolve(__dirname, "..", "docs", "runbooks", "repo-settings.json");
+  }
+} else if (rulesetMode) {
+  if (!opts.consumerRepo) {
+    fail("--consumer-repo <owner/repo> is required with --check-ruleset.");
+  }
+  if (!opts.contract) {
+    opts.contract = resolve(__dirname, "..", "docs", "runbooks", "main-protection.json");
   }
 } else {
   if (!opts.ref) fail("--ref <release-tag|branch|floating-tag> is required.");
@@ -688,6 +718,160 @@ function runSettingsMode() {
 }
 
 // ---------------------------------------------------------------------------
+// 6. GitHub-side branch-ruleset drift check (Story #178)
+// ---------------------------------------------------------------------------
+//
+// Report-only — deliberately no --apply-ruleset. Unlike the repo-settings
+// toggles above (same-repo settings PATCHes with no destructive blast
+// radius), a branch ruleset governs merge eligibility for every in-flight
+// PR; an automated PATCH here could strand a PR mid-review. This mode only
+// reads and reports (see the companion scripts/check-ruleset.mjs, which
+// this composes with — same contract, same consumer-registry shape, same
+// non-blocking posture).
+
+/** Find the ruleset (from a full per-ruleset detail fetch) targeting refs/heads/<branch>. */
+function findRuleset(rulesets, branch) {
+  const targetRef = `refs/heads/${branch}`;
+  return (
+    rulesets.find((rs) => {
+      if (rs.enforcement !== "active") return false;
+      const include = rs.conditions?.ref_name?.include ?? [];
+      return include.includes(targetRef) || include.includes("~DEFAULT_BRANCH");
+    }) ?? null
+  );
+}
+
+/** Map a full ruleset object's rules[] into the main-protection contract's field shape. */
+function mapRuleset(ruleset) {
+  const rules = Array.isArray(ruleset.rules) ? ruleset.rules : [];
+  const byType = Object.fromEntries(rules.map((r) => [r.type, r]));
+  const statusCheckRule = byType.required_status_checks;
+  const statusChecks = (statusCheckRule?.parameters?.required_status_checks ?? []).map((c) => c.context);
+  const bypassActors = Array.isArray(ruleset.bypass_actors) ? ruleset.bypass_actors : [];
+  return {
+    pullRequestRequired: Boolean(byType.pull_request),
+    bypassActorsEmpty: bypassActors.length === 0,
+    requiredStatusChecks: statusChecks,
+    strictRequiredStatusChecksPolicy: Boolean(statusCheckRule?.parameters?.strict_required_status_checks_policy),
+    allowForcePushes: !byType.non_fast_forward,
+    allowDeletions: !byType.deletion,
+    requireLinearHistory: Boolean(byType.required_linear_history),
+  };
+}
+
+/** Diff a mapped live ruleset against the main-protection contract. */
+function diffRuleset(live, contract) {
+  const mismatches = [];
+  if (contract.requiredStatusChecks !== undefined) {
+    const expected = [...contract.requiredStatusChecks].sort();
+    const actual = [...(live.requiredStatusChecks ?? [])].sort();
+    if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+      mismatches.push({
+        field: "requiredStatusChecks",
+        expected: contract.requiredStatusChecks,
+        actual: live.requiredStatusChecks,
+      });
+    }
+  }
+  if (live.pullRequestRequired !== true) {
+    mismatches.push({ field: "pullRequestRequired", expected: true, actual: live.pullRequestRequired });
+  }
+  if (live.bypassActorsEmpty !== true) {
+    mismatches.push({ field: "bypassActorsEmpty", expected: true, actual: live.bypassActorsEmpty });
+  }
+  if (live.strictRequiredStatusChecksPolicy !== true) {
+    mismatches.push({
+      field: "strictRequiredStatusChecksPolicy",
+      expected: true,
+      actual: live.strictRequiredStatusChecksPolicy,
+    });
+  }
+  for (const [field, expected] of [
+    ["requireLinearHistory", contract.requireLinearHistory],
+    ["allowForcePushes", contract.allowForcePushes],
+    ["allowDeletions", contract.allowDeletions],
+  ]) {
+    if (expected === undefined) continue;
+    if (live[field] !== expected) mismatches.push({ field, expected, actual: live[field] });
+  }
+  return mismatches;
+}
+
+function runRulesetMode() {
+  let contract;
+  try {
+    contract = JSON.parse(readFileSync(opts.contract, "utf8"));
+  } catch (err) {
+    fail(`could not read contract at ${opts.contract}: ${err.message}`);
+  }
+
+  log(`▶ platform-sync — branch-ruleset check for ${opts.consumerRepo}`);
+  log("  (non-blocking: drift is reported, never a hard gate — standing decision #10)");
+  log("  (report-only: this mode never mutates a live ruleset)");
+
+  const branch = contract.branch ?? "main";
+  let live = null;
+  let mismatches = [];
+  let error = null;
+  let status = "current";
+  try {
+    const list = ghApiJson(`repos/${opts.consumerRepo}/rulesets`);
+    const detailed = (Array.isArray(list) ? list : []).map((rs) =>
+      ghApiJson(`repos/${opts.consumerRepo}/rulesets/${rs.id}`)
+    );
+    const ruleset = findRuleset(detailed, branch);
+    if (!ruleset) {
+      status = "missing";
+      error = `no active ruleset targets refs/heads/${branch}`;
+    } else {
+      live = mapRuleset(ruleset);
+      mismatches = diffRuleset(live, contract);
+      status = mismatches.length > 0 ? "drift" : "current";
+    }
+  } catch (err) {
+    error = err.message;
+    status = "error";
+  }
+
+  log("");
+  if (status === "error") {
+    log(`  ⚠️ error reading ${opts.consumerRepo}: ${error}`);
+  } else if (status === "missing") {
+    log(`  ⚠️ ${opts.consumerRepo}: ${error}`);
+  } else if (status === "current") {
+    log(`  ✅ ${opts.consumerRepo} matches the main-protection contract — no drift.`);
+  } else {
+    log(`  ❌ drift on ${opts.consumerRepo}:`);
+    for (const m of mismatches) {
+      log(`     - ${m.field}: expected ${JSON.stringify(m.expected)}, got ${JSON.stringify(m.actual)}`);
+    }
+  }
+
+  if (opts.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          mode: "check-ruleset",
+          consumerRepo: opts.consumerRepo,
+          contract,
+          live,
+          drift: status === "drift" || status === "missing",
+          mismatches,
+          status,
+          error,
+        },
+        null,
+        2
+      )}\n`
+    );
+  }
+
+  // Report-only by design (standing decision #10): drift never fails this
+  // command's exit code. A hard error reading the consumer IS fatal.
+  if (status === "error") process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -702,6 +886,10 @@ function rel(p) {
 function main() {
   if (settingsMode) {
     runSettingsMode();
+    return;
+  }
+  if (rulesetMode) {
+    runRulesetMode();
     return;
   }
 

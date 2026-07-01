@@ -140,6 +140,60 @@ the shipped `config/repo-settings.schema.json` / `check-repo-settings.mjs` /
 `platform-sync.mjs --check-settings`/`--apply-settings` as the now-existing
 contract the five §3a merge/Actions-permission rows can point to.
 
+## 2026-07-01 — Branch-ruleset drift dashboard (check-ruleset.mjs), report-only by design
+
+**Context.** The platform ships `config/main-protection.schema.json` +
+`docs/runbooks/main-protection.json` (the decided main-branch protection
+contract) and a setup runbook, but nothing detected a **live** ruleset
+drifting from that contract after initial setup — a bypass actor silently
+added to the ruleset, `strict` status checks turned off, or force-pushes
+re-enabled would go unnoticed indefinitely. The 2026-07-01 audit found
+exactly this risk class at the repo-settings layer (Story #171,
+`check-repo-settings.mjs`); the companion `check-ruleset.mjs` story
+(referenced directly in that decision entry, above) closes the same gap for
+branch rulesets.
+
+**Decision.** `scripts/check-ruleset.mjs` reads each consumer's live
+branch ruleset over the GitHub Rulesets API (`gh api
+repos/{owner}/{repo}/rulesets`, then the per-ruleset detail endpoint — the
+list response omits `rules`/`bypass_actors`) and diffs the ruleset targeting
+`refs/heads/<branch>` against `docs/runbooks/main-protection.json`: PR
+required to merge, `bypass_actors` empty, required status-check contexts
+match with `strict_required_status_checks_policy` on (branch must be
+up to date), linear history iff `requireLinearHistory`, and force-push/
+deletion blocked iff `!allowForcePushes`/`!allowDeletions`. Same shape as
+`check-repo-settings.mjs` / `check-pin-drift.mjs`: data-driven consumer
+registry (reuses `scripts/pin-drift-consumers.json`, no second registry),
+injectable `gh` runner, pure exported classifiers, `--json`/`--strict`.
+Wired into the weekly `pin-drift.yml` dashboard as a third "GitHub-side
+drift" step alongside `check-pin-drift.mjs` and `check-repo-settings.mjs`,
+and composed into `platform-sync.mjs` as a `--check-ruleset` mode (mirroring
+`--check-settings`). **Non-blocking by design** (the same standing posture
+as the pin-drift and repo-settings dashboards): drift is reported, never a
+hard gate.
+
+Unlike `--apply-settings`, there is **deliberately no `--apply-ruleset`**. A
+branch ruleset gates merge eligibility for every in-flight PR on that
+branch; an automated PATCH here could strand a PR mid-review in a way none
+of the `--apply-settings`-patchable same-repo toggles can. Auto-fixing
+rulesets is explicitly out of scope for this Story — report plus a runbook
+pointer only.
+
+**Consequences.** A consumer's live branch-ruleset state is now check-able
+in one command (`check-ruleset.mjs` directly, the scheduled dashboard, or
+`platform-sync.mjs --check-ruleset`) instead of a manual GitHub UI audit.
+Cost: a third GitHub-API surface (`repos/{owner}/{repo}/rulesets` +
+per-ruleset detail) alongside the workflow-contents/package.json reads
+`check-pin-drift.mjs` and the repo-settings reads `check-repo-settings.mjs`
+already make — same `PIN_DRIFT_TOKEN` credential, no new secret. The
+repo-ops consumers matrix §3/§5 branch-protection rows (◐ → ●) live in the
+sibling `repo-ops` planning repo (`dsj1984/repo-ops`), a separate git remote
+outside this Story's PR boundary — same handoff as the repo-settings
+decision above: the flip should be applied there once this Story
+(mandrel-platform#178) merges, citing this decision entry and the shipped
+`check-ruleset.mjs` / `platform-sync.mjs --check-ruleset` as the now-existing
+contract those rows can point to.
+
 ## 2026-06-30 — Edge-security middleware ships via the npm package-export channel (two CORS variants)
 
 **Context.** Each consumer hand-rolled the per-env edge-security invariants —
