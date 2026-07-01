@@ -44,7 +44,7 @@
     },
     "squashMergeCommitMessage": {
       "type": "string",
-      "description": "Source of the squash-commit message body. The fleet baseline requires PR_BODY — commits landing on main feed release-please + commitlint, so the PR body becomes the literal commit body and must stay commit-body-safe (see the _note below and docs/runbooks/repo-settings.md).",
+      "description": "Source of the squash-commit message body. The fleet baseline requires PR_BODY — commits landing on main feed release-please + commitlint, so the PR body becomes the literal commit body and must stay commit-body-safe (see the _note below).",
       "enum": ["PR_BODY", "COMMIT_MESSAGES", "BLANK"],
       "default": "PR_BODY"
     },
