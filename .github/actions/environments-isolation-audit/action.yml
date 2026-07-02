@@ -23,10 +23,14 @@
 #     env:
 #       GH_TOKEN: ${{ github.token }}
 #
-# Requires a token with at least read access to the repo (contents: read is
-# NOT sufficient by itself for the environments API — this needs the default
-# GITHUB_TOKEN, which has read access to environments in the same repo, or a
-# PAT with `repo` scope for cross-repo use).
+# Token requirement: reading an environment's `deployment_branch_policy`
+# (and its deployment-branch-policies) requires repo **Administration: read**.
+# The default GITHUB_TOKEN CANNOT satisfy this — `administration` is not a
+# grantable GITHUB_TOKEN workflow permission, so `contents: read` (or any
+# grantable combination) leaves `deployment_branch_policy` absent from the API
+# response and the audit false-fails "NO deployment branch policy" even when a
+# policy is set. Supply a classic PAT with `repo` scope, or a fine-grained PAT
+# with Administration: read (same-repo or cross-repo), via GH_TOKEN.
 name: Environments isolation audit
 description: >
   Audits GitHub Environments' deployment branch policies against the

@@ -400,6 +400,19 @@ on:
       GITLEAKS_LICENSE:
         description: 'Deprecated/unused: retained for back-compat with callers that still pass it.'
         required: false
+      audit-token:
+        description: >
+          Optional PAT used ONLY by the environments-isolation-audit job to
+          read each environment's deployment_branch_policy. That field requires
+          repo Administration:read, which is NOT a grantable GITHUB_TOKEN
+          workflow permission — so with the default token the audit false-fails
+          "NO deployment branch policy" even when a policy IS set. Provide a
+          classic PAT with `repo` scope (or a fine-grained PAT with
+          Administration: read) when enable-environments-isolation-audit is
+          true. Falls back to github.token when unset (behaviour byte-identical
+          to before this secret existed — the audit only reads what the default
+          token can see).
+        required: false
       # ----- worker-secrets passthrough (opt-in, Story #170) -----
       # The in-pipeline worker-secrets step (see the `worker-secrets` input and
       # the "Provision worker secrets in-pipeline" step in the deploy job) does
@@ -478,7 +491,11 @@ jobs:
           environments: ${{ steps.resolve-envs.outputs.environments }}
           allowed-branch: ${{ inputs.isolation-audit-branch }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Prefer the caller-supplied PAT (audit-token) — reading an
+          # environment's deployment_branch_policy needs repo Administration:read,
+          # which the default GITHUB_TOKEN cannot be granted. Fall back to
+          # github.token when no PAT is provided.
+          GH_TOKEN: ${{ secrets.audit-token || github.token }}
 
   # ---------------------------------------------------------------------------
   # 0b. CI-green guard (Story #175)
