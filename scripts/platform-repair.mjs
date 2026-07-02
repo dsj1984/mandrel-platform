@@ -68,7 +68,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildReport, defaultGhRunner, isFullSha } from "./check-pin-drift.mjs";
+import { buildReport, isFullSha } from "./check-pin-drift.mjs";
+import { defaultGhRunner } from "./lib/gh-json.mjs";
+import { parseSemver } from "./lib/semver-duration.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -188,12 +190,16 @@ export function describeDrift(result) {
     const short = v.pinnedSha ? v.pinnedSha.slice(0, 7) : "?";
     out.push(`**Release lag** — workflow \`uses:\` pins \`${short}\`, behind the latest release.`);
   }
+  // Normalize the npm version through the shared parser (Story #198): the
+  // detector already emits a dotted triple, but re-parsing keeps the repair
+  // PR body robust to a raw spec ever reaching here (`^0.11.7` → `0.11.7`).
+  const npmVersion = parseSemver(result.npm?.version ?? null) ?? result.npm?.version ?? "?";
   if (result.surfaceSkew === true) {
     out.push(
-      `**Surface skew** — the npm \`mandrel-platform\` dependency (\`${result.npm?.version ?? "?"}\`) and the workflow \`uses:\` pins are on different releases.`,
+      `**Surface skew** — the npm \`mandrel-platform\` dependency (\`${npmVersion}\`) and the workflow \`uses:\` pins are on different releases.`,
     );
   } else if (result.npm?.npmState === "lagging") {
-    out.push(`**npm lag** — \`mandrel-platform@${result.npm.version}\` is behind the latest release.`);
+    out.push(`**npm lag** — \`mandrel-platform@${npmVersion}\` is behind the latest release.`);
   }
   return out;
 }
