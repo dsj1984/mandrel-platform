@@ -996,7 +996,10 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `enable-environments-isolation-audit: true` (default `false` — opt-in, see
 [Environments isolation audit](#environments-isolation-audit) below).
 `pre-migration-snapshot` and `migrate` only run when `migrate: true`;
-`boot-smoke` only runs when `smoke: true` (the default).
+`boot-smoke` only runs when `smoke: true` (the default). When `worker-secrets`
+is set (opt-in), the `deploy` job additionally provisions those named runtime
+secrets in-pipeline — after the deploy step, before `boot-smoke` — via the
+versions secret API; see [In-pipeline worker secrets](#in-pipeline-worker-secrets-opt-in).
 
 > **Migrate-path deploy safety.** On the built-in D1 path the
 > `pre-migration-snapshot` export is **blocking**: it runs under
@@ -1131,6 +1134,96 @@ app.get('/health', (c) => c.json({ status: 'ok', version: c.env.GIT_COMMIT_SHA ?
 - Defaults to `false` (opt-in) so existing consumers are unaffected until
   they wire `GIT_COMMIT_SHA` through to their health endpoint and opt in.
 
+### In-pipeline worker secrets (opt-in)
+
+> Story #170. Breaks a self-sustaining **rollback ↔ secret-sync deadlock** in
+> the `deploy → boot-smoke → auto-rollback` tail. When a Worker runtime secret
+> the health check depends on (e.g. `TURSO_AUTH_TOKEN`) drifts from its SSOT,
+> boot-smoke fails and the tail runs `wrangler rollback` — which leaves the
+> Worker at `active ≠ latest-uploaded`. Cloudflare then refuses the **standard**
+> secrets API (`wrangler secret put`, the path an out-of-band
+> Infisical→Cloudflare sync writes through) with
+> [error 10215](https://developers.cloudflare.com/workers/observability/errors/#secret-modification-with-worker-versions-10215),
+> so the sync that would *fix* the stale token is blocked by the very rollback
+> the stale token caused. The Worker never heals, the next deploy re-fails
+> smoke, and the deadlock re-arms itself.
+
+`worker-secrets` (string, newline-separated NAMES) has the deploy job
+provision the deploy-critical secrets **itself**, from the values the caller
+already forwards via `secrets: inherit`, in a step that runs **after deploy
+and before boot-smoke**. For each named secret on each deployed worker it:
+
+1. writes the value via the **versions secret API**
+   (`wrangler versions secret put <NAME>`) — which, unlike the standard
+   `wrangler secret put`, is **immune to error 10215** even when a prior
+   rollback left the Worker at `active ≠ latest-uploaded`; then
+2. promotes the resulting version to 100% traffic
+   (`wrangler versions deploy … -y`).
+
+So boot-smoke probes a version carrying **current** secret values (no
+stale-secret smoke failure → no spurious rollback), and any `active ≠ latest`
+split a prior rollback introduced is realigned — the deploy **self-heals** a
+previously-stranded Worker.
+
+**Default-off.** With `worker-secrets` empty (the default) the step is skipped
+entirely and behaviour is **byte-identical** to today. Existing consumers are
+unaffected until they opt in.
+
+**Value resolution — no new declared secret surface.** The provisioned values
+come from the **inherited** secrets context (`secrets: inherit`), the same way
+seam-command secrets already cross the boundary — the step resolves each name
+the consumer lists from `toJSON(secrets)` at runtime. The frozen
+[`{CLOUDFLARE_*, TURSO_*}` deploy surface](#the-frozen-secret-allowlist) is
+**unchanged**: those two remain the only secrets mapped into the deploy/seam
+`env:` blocks, and the opt-in step reads only the names a consumer explicitly
+enumerates. A listed name that is absent (or empty) in the inherited secrets
+is a **hard error** — a deploy-critical secret you named must exist.
+
+> **Minimal opt-in caller.**
+>
+> ```yaml
+> jobs:
+>   deploy:
+>     uses: dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml@<sha> # <tag>
+>     with:
+>       environment: staging
+>       workers: "api"
+>       smoke_paths: "/api/health"
+>       # Provision only the deploy-critical secret(s) the health check needs:
+>       worker-secrets: |
+>         TURSO_AUTH_TOKEN
+>         TURSO_DATABASE_URL
+>     secrets: inherit
+> ```
+
+#### Which secrets belong in-pipeline vs. Infisical-synced
+
+`worker-secrets` is **not** a wholesale replacement for the out-of-band
+Infisical→Cloudflare Workers sync — it is a **targeted** mechanism for the
+narrow set of secrets the deploy's own health gate depends on. Choose per
+secret:
+
+| Provision in-pipeline (`worker-secrets`) | Leave to the Infisical→Cloudflare sync |
+| ---------------------------------------- | -------------------------------------- |
+| **Deploy-critical**: boot-smoke / `/health` fails without a current value (DB auth token, an upstream API key the health handler calls). | Everything else: secrets no health check reads, secrets rotated on their own cadence, secrets not forwarded to this workflow. |
+| Already forwarded to the deploy via `secrets: inherit` (so the value is present at deploy time). | Secrets you deliberately keep out of the CI secret scope. |
+| Where a stale value would trigger the rollback ↔ 10215 deadlock this input exists to break. | Non-deploy-critical config the async sync can settle after the deploy with no ordering risk. |
+
+Keep the list **minimal** — every name you add is a secret the CI job reads
+and writes on every deploy. The goal is to remove the deploy's *ordering
+dependency* on the async sync for the handful of secrets that gate the deploy,
+not to move the entire secret inventory into the pipeline. The broader
+sync-layer follow-up (repointing Infisical's Cloudflare integration at the
+versions secret API so the out-of-band sync self-heals too) is complementary
+and tracked separately; it does not remove this ordering dependency, which is
+why the in-pipeline provisioning is the durable fix here.
+
+> **Ignored inputs / interactions.** `worker-secrets` runs regardless of the
+> `smoke` / `smoke-command` / `deploy-command` settings — it targets the same
+> `deployed_workers` set the smoke and rollback steps use, so it works for the
+> built-in deploy loop and the `deploy-command` monorepo seam alike. It is a
+> no-op when its list is empty.
+
 ### Resolved-ref deploy summary (single source of truth)
 
 > Story #110. The final `deploy-summary` job (`if: always()`) emits the
@@ -1186,6 +1279,7 @@ jobs:
 | `smoke_paths`                | string  | `'/health'` | Comma-separated paths the built-in probe requests against each target (e.g. `"/,/portal,/api/health"`). Each must start with a leading slash.                |
 | `workers_dev_subdomain`      | string  | `''`        | workers.dev account **subdomain slug** (e.g. `"dsj1984"`) used to build the probe URL. Empty derives it from `wrangler whoami`. **Never** pass the account ID. |
 | `verify-commit-sha`          | boolean | `false`     | Opt-in (Story #176). When `true`, the built-in probe additionally asserts the health response's `version` field equals `github.sha`. A mismatch fails smoke and triggers rollback. Ignored when `smoke-command` is set. See [Commit-SHA verification](#commit-sha-verification-opt-in) below. |
+| `worker-secrets`             | string  | `''`        | Opt-in (Story #170). Newline-separated list of Worker runtime secret **names** to provision in-pipeline (via the versions secret API) after deploy and **before** boot-smoke, from values forwarded through `secrets: inherit`. Empty (the default) is a no-op — byte-identical to today. See [In-pipeline worker secrets](#in-pipeline-worker-secrets-opt-in) below. |
 
 > **Command seams.** `snapshot-command`, `migrate-command`, `build-command`,
 > `deploy-command`, and `smoke-command` are override seams: with **none** set,
