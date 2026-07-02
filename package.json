@@ -23,6 +23,7 @@
     "./stryker.base.json": "./config/stryker.base.json",
     "./commitlint.base.mjs": "./config/commitlint.base.mjs",
     "./dependency-cruiser.base.json": "./config/dependency-cruiser.base.json",
+    "./secretlint.base.json": "./config/secretlint.base.json",
     "./size-limit.base.json": "./config/size-limit.base.json",
     "./lighthouse.base.json": "./config/lighthouse.base.json",
     "./lighthouse-thresholds.base.json": "./config/lighthouse-thresholds.base.json",
