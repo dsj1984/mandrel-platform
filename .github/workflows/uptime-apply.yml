@@ -91,7 +91,11 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          ref: ${{ github.job_workflow_sha }}
+          # `job_workflow_sha` is a valid runtime github-context field but is
+          # absent from actionlint's pinned context type model, so read it
+          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`) to
+          # keep the workflow lint-clean — same pattern as pr-quality.yml SAST.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
           sparse-checkout: |
             scripts/apply-uptime-monitors.mjs
           sparse-checkout-cone-mode: false

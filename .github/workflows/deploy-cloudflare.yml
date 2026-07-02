@@ -692,7 +692,7 @@ jobs:
                 "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
               exit 1
             fi
-            pnpm exec wrangler d1 export $D1_DATABASE \
+            pnpm exec wrangler d1 export ${D1_DATABASE:+"$D1_DATABASE"} \
               --env "$DEPLOY_ENV" \
               --remote \
               --output "temp/${SNAPSHOT_KEY}.sql"
@@ -780,7 +780,7 @@ jobs:
                 "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
               exit 1
             fi
-            pnpm exec wrangler d1 migrations apply $D1_DATABASE \
+            pnpm exec wrangler d1 migrations apply ${D1_DATABASE:+"$D1_DATABASE"} \
               --env "$DEPLOY_ENV" \
               --remote \
               --skip-confirmation
