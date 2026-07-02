@@ -1636,6 +1636,44 @@ jobs:
       - run: echo "Cut ${{ needs.release.outputs.tag_name }} — run deploy/publish here."
 ```
 
+### markdownlint: canonical runner + shared base
+
+The fleet standardizes on **`markdownlint-cli2`** as the canonical markdown
+linter — it is the maintained, recommended runner, and the config package
+ships a shared **content** rule base at
+`mandrel-platform/markdownlint.base.jsonc` (documented in the
+[config-package README](../README.md#code-quality-tooling-base-configs)).
+Consumers reference it via `extends` in their own `.markdownlint.jsonc` and
+keep only repo-local **ignore globs** in `.markdownlint-cli2.jsonc`:
+
+```jsonc
+// .markdownlint.jsonc — extend the shared content base
+{
+  "extends": "mandrel-platform/markdownlint.base.jsonc"
+}
+```
+
+```jsonc
+// .markdownlint-cli2.jsonc — repo-local ignores (see next subsection)
+{
+  "ignores": ["CHANGELOG.md"]
+}
+```
+
+**Adoption pattern:** point `extends` at the base for content rules; keep
+`ignores` local. markdownlint (content rules) is complementary to Prettier
+(formatting), not a substitute — run both.
+
+**Wire-or-retire (domio):** a consumer that carries a classic `markdownlint`
+config which is **unwired** — no `markdownlint`/`markdownlint-cli2` dependency,
+no lint script, not invoked by husky/CI, with markdown effectively linted only
+by Prettier and the `.markdownlint.json` serving as editor-only hints — has a
+per-consumer decision to make: either **wire it** (adopt `markdownlint-cli2`,
+`extends` the shared base, add it to the CI/husky lint step) or **retire it**
+(delete the dead editor-only config so it stops implying a gate that never
+runs). That wire-or-retire call is tracked in the domio consumer story; do not
+leave an unwired config in place as ambiguous dead configuration.
+
 ### Excluding the generated `CHANGELOG.md` from markdownlint
 
 Every consumer that runs a markdown linter (e.g. `markdownlint-cli2`) in its

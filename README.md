@@ -143,10 +143,11 @@ upgrade to 2.x before adopting this base (refs #153).
 
 ### Code-quality tooling base configs
 
-The package also ships shared base configs for the five code-quality /
+The package also ships shared base configs for the code-quality /
 hygiene tools every consumer runs — **Knip**, **Stryker**,
-**dependency-cruiser**, **size-limit**, and **Lighthouse**. Each is the
-best-of-breed union of the consumers' previously hand-maintained configs.
+**dependency-cruiser**, **markdownlint**, **size-limit**, and
+**Lighthouse**. Each is the best-of-breed union of the consumers'
+previously hand-maintained configs.
 Adoption is opt-in via `extends` (or a spread / deep-merge where the tool
 has no native `extends`), and every project-specific knob — entrypoints,
 mutate globs, bundle paths, score floors, and budgets — stays
@@ -237,6 +238,46 @@ resolve the package export and add repo-specific rules
   ]
 }
 ```
+
+#### `markdownlint.base.jsonc`
+
+Shared markdownlint **content** rule base — the union of the fleet's three
+previously per-repo configs, which had diverged only by accretion (~90%
+identical). Ships the common core (`default: true`) narrowed by `MD013: false`
+(line-length — Prettier owns wrap), `MD024: { siblings_only: true }`
+(duplicate headings allowed under different parents), `MD033: false` (inline
+HTML), `MD041: false` (first-line-heading), and `MD060: false` (GFM table
+style — Prettier owns table reflow).
+
+**Canonical runner: `markdownlint-cli2`.** It is the maintained, recommended
+runner and two of the three consumers already run it; new adopters standardize
+on it (classic `markdownlint` consumes the same `MDxxx` rule IDs, so the base
+is compatible either way). markdownlint-cli2 resolves `extends` to a package
+path, so a consumer's local config reduces to the extend plus repo-specific
+**ignore globs** — which stay local, since generated/vendored trees differ per
+repo (`.markdownlint.jsonc`):
+
+```jsonc
+// .markdownlint.jsonc — extend the shared content base
+{
+  "extends": "mandrel-platform/markdownlint.base.jsonc"
+  // ...repo-specific rule overrides (rare)
+}
+```
+
+```jsonc
+// .markdownlint-cli2.jsonc — ignore globs stay consumer-local
+{
+  "ignores": ["CHANGELOG.md"]
+}
+```
+
+The base carries **content rules only, never `ignores`**. Excluding the
+release-please-generated `CHANGELOG.md` is a mandatory per-consumer ignore
+documented in
+[`docs/reusable-workflows.md`](docs/reusable-workflows.md). markdownlint gates
+content rules Prettier does not — the two are **complementary**, not
+substitutes: keep both.
 
 #### `size-limit.base.json`
 
@@ -722,6 +763,7 @@ repo is developed with — dev-time only, and not shipped in the npm package.
 | `mandrel-platform/stryker.base.json`            | `config/stryker.base.json`            |
 | `mandrel-platform/commitlint.base.mjs`          | `config/commitlint.base.mjs`          |
 | `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
+| `mandrel-platform/markdownlint.base.jsonc`      | `config/markdownlint.base.jsonc`      |
 | `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
 | `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
 | `mandrel-platform/lighthouse-thresholds.base.json` | `config/lighthouse-thresholds.base.json` |
