@@ -30,6 +30,16 @@
 #                              runs a consumer-supplied deploy-command (for
 #                              pnpm-workspace monorepos with no root wrangler
 #                              config) that replaces the built-in deploy loop.
+#   5b. worker-secrets       — opt-in (worker-secrets input). After deploy and
+#                              BEFORE boot-smoke, writes each named runtime
+#                              secret onto every deployed worker via the
+#                              VERSIONS secret API (wrangler versions secret
+#                              put — immune to Cloudflare error 10215) and
+#                              promotes the resulting version to 100%, so
+#                              boot-smoke probes a worker carrying current
+#                              secret values and any active≠latest split from a
+#                              prior rollback self-heals (Story #170). Default
+#                              off → skipped, byte-identical to today.
 #   6. boot-smoke            — HTTP health-check against each deployed worker, or
 #                              a consumer-supplied smoke-command. Non-200 fails
 #                              the run AND triggers wrangler rollback. The
@@ -265,6 +275,30 @@ on:
         required: false
         type: boolean
         default: false
+      worker-secrets:
+        description: >
+          Opt-in (Story #170). Newline-separated list of Worker runtime
+          secret NAMES to provision IN-PIPELINE, from the values the deploy
+          job already receives via `secrets: inherit`, immediately after the
+          deploy step and BEFORE boot-smoke. Each name is written onto every
+          deployed worker via the VERSIONS secret API
+          (`wrangler versions secret put <NAME>`), which — unlike the standard
+          `wrangler secret put` — is IMMUNE to Cloudflare error 10215
+          ("secret modification with Worker versions") even when a prior
+          rollback left the Worker at active ≠ latest-uploaded. The workflow
+          then promotes the resulting version to 100% traffic
+          (`wrangler versions deploy`), so the just-uploaded secrets are the
+          ACTIVE version boot-smoke probes AND the active/latest split any
+          prior rollback introduced is realigned (self-heal). Use this ONLY
+          for deploy-critical secrets a health check depends on (e.g.
+          TURSO_AUTH_TOKEN); leave everything else to the out-of-band
+          Infisical→Cloudflare sync. Empty (the default) is a no-op — the step
+          is skipped entirely and behaviour is byte-identical to today. See
+          docs/reusable-workflows.md#in-pipeline-worker-secrets-opt-in for the
+          in-pipeline-vs-Infisical guidance.
+        required: false
+        type: string
+        default: ''
       enable-environments-isolation-audit:
         description: >
           Run the shared Environments isolation-audit job (Story #172)
@@ -335,6 +369,22 @@ on:
       GITLEAKS_LICENSE:
         description: 'Deprecated/unused: retained for back-compat with callers that still pass it.'
         required: false
+      # ----- worker-secrets passthrough (opt-in, Story #170) -----
+      # The in-pipeline worker-secrets step (see the `worker-secrets` input and
+      # the "Provision worker secrets in-pipeline" step in the deploy job) does
+      # NOT declare each provisioned secret as its own named `secrets:` entry —
+      # a reusable workflow cannot map a runtime-variable set of secret NAMES
+      # into typed `secrets:` slots, and freezing a per-name allowlist here would
+      # defeat the opt-in "consumer enumerates the names" model. Instead, the
+      # step resolves each name the consumer lists in `worker-secrets` from the
+      # INHERITED secrets context (`${{ toJSON(secrets) }}`), which a caller
+      # forwards with `secrets: inherit` exactly as it already does for the seam
+      # commands. This keeps the frozen {CLOUDFLARE_*, TURSO_*} DEPLOY surface
+      # unchanged (those two remain the only secrets mapped into deploy/seam
+      # `env:` blocks) while letting the opt-in step provision any consumer-named
+      # runtime secret that is already inherited. When `worker-secrets` is empty
+      # (the default) the step is skipped and no secret beyond the frozen set is
+      # ever read.
 
 # Least-privilege: content-read only. Each job that needs more escalates
 # individually (wrangler deploy needs no additional GH permissions).
@@ -830,6 +880,103 @@ jobs:
           # Frozen allowlist: TURSO_* (CLOUDFLARE_* above). No build secrets.
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+
+      # ----- In-pipeline worker-secrets provisioning (opt-in, Story #170) -----
+      # Runs AFTER the deploy step and BEFORE boot-smoke (boot-smoke is a
+      # separate downstream job). For each secret NAME the consumer enumerates
+      # in `worker-secrets`, write the value (resolved from the INHERITED
+      # secrets context) onto every deployed worker via the VERSIONS secret API
+      # — `wrangler versions secret put`, which is immune to Cloudflare error
+      # 10215 even when a prior rollback left the Worker at
+      # active ≠ latest-uploaded — then promote the resulting version to 100%
+      # with `wrangler versions deploy`. This makes the just-written secrets the
+      # ACTIVE version that boot-smoke probes AND realigns any active/latest
+      # split a prior rollback introduced (self-heal), breaking the
+      # rollback ↔ secret-sync deadlock. When `worker-secrets` is empty (the
+      # default) the whole step is skipped and behaviour is byte-identical to
+      # today.
+      - name: Provision worker secrets in-pipeline (versions secret API)
+        if: ${{ inputs.worker-secrets != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Worker list: the deploy step's resolved output (built-in loop OR
+          # deploy-command both set deployed_workers), same targeting the
+          # downstream smoke / rollback uses.
+          IFS=',' read -ra WORKER_LIST <<< "$DEPLOYED_WORKERS"
+
+          # Secret NAMES to provision, one per line. Blank lines and leading '#'
+          # comment lines are ignored so a consumer can annotate the list.
+          mapfile -t RAW_NAMES <<< "$WORKER_SECRETS"
+          names=()
+          for n in "${RAW_NAMES[@]}"; do
+            n="$(echo "$n" | xargs)"  # trim whitespace
+            [ -z "$n" ] && continue
+            case "$n" in \#*) continue ;; esac
+            names+=("$n")
+          done
+
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "::notice::worker-secrets was set but resolved to zero names — nothing to provision."
+            exit 0
+          fi
+
+          # The inherited secrets context, as JSON, so each enumerated name can
+          # be looked up at runtime. GitHub redacts every secret VALUE in the
+          # logs; only names are ever echoed below.
+          SECRETS_JSON="$SECRETS_CONTEXT"
+
+          for worker in "${WORKER_LIST[@]}"; do
+            worker="$(echo "$worker" | xargs)"
+            [ -z "$worker" ] && continue
+
+            for name in "${names[@]}"; do
+              # Resolve the value for this name from the inherited secrets JSON.
+              # A missing / empty inherited secret is a hard error — a
+              # deploy-critical secret the consumer explicitly listed must exist.
+              value="$(printf '%s' "$SECRETS_JSON" \
+                | jq -er --arg k "$name" '.[$k] // empty')" || value=""
+              if [ -z "$value" ]; then
+                echo "::error::worker-secrets: '$name' is not present (or empty) in the inherited secrets — forward it via 'secrets: inherit' before listing it in worker-secrets."
+                exit 1
+              fi
+
+              echo "::group::Provisioning $name onto $worker (versions secret API)"
+              # `wrangler versions secret put` reads the value from stdin (same
+              # non-interactive path as `wrangler secret put`) and creates a NEW
+              # version WITHOUT deploying it. This write is immune to error 10215
+              # even when active ≠ latest-uploaded.
+              printf '%s' "$value" | pnpx wrangler versions secret put "$name" \
+                --name "$worker" \
+                --env "$DEPLOY_ENV"
+              echo "::endgroup::"
+            done
+
+            echo "::group::Promoting latest version of $worker to 100% (self-heal active=latest)"
+            # Deploy the latest-uploaded version (the one carrying the secrets
+            # just written) at 100% traffic, non-interactively. This both makes
+            # the current secret values the ACTIVE version boot-smoke probes and
+            # realigns active = latest so no residual 10215-inducing split
+            # remains. `-y` selects the non-interactive default (latest @ 100%).
+            pnpx wrangler versions deploy \
+              --name "$worker" \
+              --env "$DEPLOY_ENV" \
+              --message "In-pipeline worker-secrets provisioning (Story #170)" \
+              -y
+            echo "::endgroup::"
+          done
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          DEPLOYED_WORKERS: ${{ steps.deploy-step.outputs.deployed_workers }}
+          WORKER_SECRETS: ${{ inputs.worker-secrets }}
+          # Whole inherited secrets context as JSON so the step can resolve each
+          # consumer-enumerated name at runtime (values redacted in logs). This
+          # does NOT widen the frozen DEPLOY surface — only names the consumer
+          # explicitly lists in worker-secrets are read, and only when opted in.
+          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
   # 6. Boot-smoke + auto-rollback
