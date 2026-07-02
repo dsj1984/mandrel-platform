@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.18.0...mandrel-platform-v0.19.0) (2026-07-02)
+
+
+### Added
+
+* **deploy:** provision worker secrets in-pipeline via versions secret API (refs [#170](https://github.com/dsj1984/mandrel-platform/issues/170)) ([#208](https://github.com/dsj1984/mandrel-platform/issues/208)) ([3039227](https://github.com/dsj1984/mandrel-platform/commit/30392277f1623acc9bd32aa71d80496385a1e0db))
+* Epic [#189](https://github.com/dsj1984/mandrel-platform/issues/189) ([#210](https://github.com/dsj1984/mandrel-platform/issues/210)) ([f832141](https://github.com/dsj1984/mandrel-platform/commit/f83214145e7092d671b37e1267db9a02ada5fd1e))
+
 ## [0.18.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.17.2...mandrel-platform-v0.18.0) (2026-07-02)
 
 
