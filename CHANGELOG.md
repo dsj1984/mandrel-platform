@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.18.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.17.2...mandrel-platform-v0.18.0) (2026-07-02)
+
+
+### Added
+
+* **config:** check-ruleset.mjs — live branch-ruleset drift detection against the main-protection contract (refs [#178](https://github.com/dsj1984/mandrel-platform/issues/178)) ([#187](https://github.com/dsj1984/mandrel-platform/issues/187)) ([a11938d](https://github.com/dsj1984/mandrel-platform/commit/a11938d47c465f969bb1e9a599bda99e627a2a88))
+* **config:** check-wrangler-baseline.mjs — enforce env split, logpush, Analytics Engine, compatibility_date policy ([#177](https://github.com/dsj1984/mandrel-platform/issues/177)) ([#204](https://github.com/dsj1984/mandrel-platform/issues/204)) ([c1d0ca7](https://github.com/dsj1984/mandrel-platform/commit/c1d0ca75b26075614d31648a6f1740d700cfde26))
+* **config:** repo-settings baseline contract + GitHub-side check/apply in platform-sync ([#171](https://github.com/dsj1984/mandrel-platform/issues/171)) ([#184](https://github.com/dsj1984/mandrel-platform/issues/184)) ([511d154](https://github.com/dsj1984/mandrel-platform/commit/511d154d7c7309dd81e3b5a6879a9c8729587cd0))
+* **config:** ship commitlint.base.mjs — single-source the conventional-commit type-enum ([#179](https://github.com/dsj1984/mandrel-platform/issues/179)) ([#186](https://github.com/dsj1984/mandrel-platform/issues/186)) ([587fc13](https://github.com/dsj1984/mandrel-platform/commit/587fc133715fd05274b315ed668009f4d0679bb0))
+* **deploy:** opt-in verify-commit-sha — boot-smoke asserts the deployed SHA (refs [#176](https://github.com/dsj1984/mandrel-platform/issues/176)) ([#188](https://github.com/dsj1984/mandrel-platform/issues/188)) ([6de1311](https://github.com/dsj1984/mandrel-platform/commit/6de131181099144c7dbbd6a49224b15c5a01b87f))
+* **deploy:** own the CI-green gate in deploy-cloudflare.yml (refs [#175](https://github.com/dsj1984/mandrel-platform/issues/175)) ([#181](https://github.com/dsj1984/mandrel-platform/issues/181)) ([ba82e8f](https://github.com/dsj1984/mandrel-platform/commit/ba82e8f1d0e49858a8fd88a7e00dca75289a504c))
+* **environments:** deployment branch-policy guidance + shared Environments isolation-audit unit ([#172](https://github.com/dsj1984/mandrel-platform/issues/172)) ([#185](https://github.com/dsj1984/mandrel-platform/issues/185)) ([57ae0b2](https://github.com/dsj1984/mandrel-platform/commit/57ae0b24c3d5ffd59bf93d11e52d6bb595d75450))
+* **release:** harden release-automation contract docs and token preflight ([#205](https://github.com/dsj1984/mandrel-platform/issues/205)) ([c3bcf94](https://github.com/dsj1984/mandrel-platform/commit/c3bcf9487a1c1ef85e06dcc469fd6d7e2e26fb62))
+* **uptime:** reusable uptime-apply.yml + shared Better Stack monitor schema/apply unit ([#180](https://github.com/dsj1984/mandrel-platform/issues/180)) ([#207](https://github.com/dsj1984/mandrel-platform/issues/207)) ([ce814a2](https://github.com/dsj1984/mandrel-platform/commit/ce814a2049ca227502443dc9c2c2326ed56f83fb))
+
+
+### Fixed
+
+* **ci:** move release-token preflight check out of step-level if ([#206](https://github.com/dsj1984/mandrel-platform/issues/206)) ([a810ef8](https://github.com/dsj1984/mandrel-platform/commit/a810ef877bf512af0880277b5e86c4b62f261505))
+
 ## [0.17.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.17.1...mandrel-platform-v0.17.2) (2026-07-01)
 
 
