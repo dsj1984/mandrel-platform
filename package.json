@@ -24,6 +24,7 @@
     "./commitlint.base.mjs": "./config/commitlint.base.mjs",
     "./dependency-cruiser.base.json": "./config/dependency-cruiser.base.json",
     "./markdownlint.base.jsonc": "./config/markdownlint.base.jsonc",
+    "./secretlint.base.json": "./config/secretlint.base.json",
     "./size-limit.base.json": "./config/size-limit.base.json",
     "./lighthouse.base.json": "./config/lighthouse.base.json",
     "./lighthouse-thresholds.base.json": "./config/lighthouse-thresholds.base.json",

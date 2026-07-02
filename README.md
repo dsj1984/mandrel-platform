@@ -13,7 +13,7 @@ hand-maintaining its own copies and drifting apart over time.
 | ------ | ---------------- |
 | **Reusable workflows** | `workflow_call` CI, deploy, secret-scan, release, and CodeQL pipelines, consumed by tag/SHA pin. |
 | **Composite action** | `setup-toolchain` — pnpm + Node + frozen install in one step. |
-| **Config bases (npm)** | `extends`-able baselines: TypeScript, Biome, Knip, Stryker, commitlint, dependency-cruiser, size-limit, Lighthouse. |
+| **Config bases (npm)** | `extends`-able baselines: TypeScript, Biome, Knip, Stryker, commitlint, dependency-cruiser, secretlint, size-limit, Lighthouse. |
 | **Edge-security middleware (npm)** | Per-env closed-allowlist CORS, security headers, and app-layer rate limiting for Astro + Hono. |
 | **Guardrail scripts (npm)** | Dependency-free policy checks: CVE gate, action-pin ratchet, coverage floor, destructive-migration guard, workflow-portability, required-contexts, docs-staleness. |
 | **Renovate preset** | Shared dependency-update policy, including auto-bumping this repo's own `uses:` pins. |
@@ -145,8 +145,8 @@ upgrade to 2.x before adopting this base (refs #153).
 
 The package also ships shared base configs for the code-quality /
 hygiene tools every consumer runs — **Knip**, **Stryker**,
-**dependency-cruiser**, **markdownlint**, **size-limit**, and
-**Lighthouse**. Each is the best-of-breed union of the consumers'
+**dependency-cruiser**, **markdownlint**, **secretlint**, **size-limit**,
+and **Lighthouse**. Each is the best-of-breed union of the consumers'
 previously hand-maintained configs.
 Adoption is opt-in via `extends` (or a spread / deep-merge where the tool
 has no native `extends`), and every project-specific knob — entrypoints,
@@ -278,6 +278,52 @@ documented in
 [`docs/reusable-workflows.md`](docs/reusable-workflows.md). markdownlint gates
 content rules Prettier does not — the two are **complementary**, not
 substitutes: keep both.
+
+#### `secretlint.base.json`
+
+The single source of truth for the **local pre-commit secret-scan mirror**
+of the CI gitleaks tiers — the shift-left dev-experience twin that catches
+a secret at `git commit` time before it ever reaches the CI gitleaks gate.
+The ruleset ships the recommended preset
+(`@secretlint/secretlint-rule-preset-recommend`); single-sourcing it here
+means a rule change lands fleet-wide in one place instead of drifting across
+each consumer's hand-copied `.secretlintrc.json`.
+
+secretlint's `.secretlintrc` has **no native file-level `extends`**, so
+consumers adopt this base one of two ways. The **husky hook _wiring_ stays
+consumer-local** either way — only the _ruleset_ is single-sourced.
+
+**Reference the base directly from the husky hook (simplest — no local
+config file).** Point the pre-commit hook's `--secretlintrc` at the package
+export; there is no `.secretlintrc.json` to maintain:
+
+```sh
+# .husky/pre-commit — scan staged files against the shared ruleset
+npx secretlint --secretlintrc node_modules/mandrel-platform/config/secretlint.base.json --maskSecrets "$(git diff --cached --name-only)"
+```
+
+**Or import + spread into a JS-module `.secretlintrc.mjs`** when the repo has
+genuine, explicitly-listed local overrides (an extra rule, an
+`allowMessageIds` suppression). Keep the local file to the base plus **only**
+the deltas:
+
+```js
+// .secretlintrc.mjs — spread the shared ruleset, layer repo-specific deltas only
+import base from "mandrel-platform/secretlint.base.json" with { type: "json" };
+
+export default {
+  ...base,
+  // repo-specific overrides ONLY — e.g. an additional rule, or an
+  // allowMessageIds suppression for a known-safe fixture. Leave empty
+  // to inherit the shared ruleset verbatim.
+};
+```
+
+> **Local mirror, not a CI replacement.** This base is the *local* shift-left
+> scanner; the blocking secret-scan gate remains the shared CI gitleaks
+> tiers (see [reusable-workflows.md](docs/reusable-workflows.md)). Swapping
+> the local tool for a local↔CI gitleaks-parity scan is a deliberate separate
+> question, out of scope for this base.
 
 #### `size-limit.base.json`
 
@@ -764,6 +810,7 @@ repo is developed with — dev-time only, and not shipped in the npm package.
 | `mandrel-platform/commitlint.base.mjs`          | `config/commitlint.base.mjs`          |
 | `mandrel-platform/dependency-cruiser.base.json` | `config/dependency-cruiser.base.json` |
 | `mandrel-platform/markdownlint.base.jsonc`      | `config/markdownlint.base.jsonc`      |
+| `mandrel-platform/secretlint.base.json`         | `config/secretlint.base.json`         |
 | `mandrel-platform/size-limit.base.json`         | `config/size-limit.base.json`         |
 | `mandrel-platform/lighthouse.base.json`         | `config/lighthouse.base.json`         |
 | `mandrel-platform/lighthouse-thresholds.base.json` | `config/lighthouse-thresholds.base.json` |
