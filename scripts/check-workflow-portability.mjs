@@ -76,33 +76,38 @@ import { resolve, join, relative, basename } from "node:path";
 // Arg parsing
 // ---------------------------------------------------------------------------
 
-const args = process.argv.slice(2);
-let workflowsDir = null;
-let actionsDir = null;
-let pinCheck = true;
-
-for (let i = 0; i < args.length; i++) {
-  if ((args[i] === "--workflows-dir" || args[i] === "-w") && args[i + 1]) {
-    workflowsDir = args[++i];
-  } else if ((args[i] === "--actions-dir" || args[i] === "-a") && args[i + 1]) {
-    actionsDir = args[++i];
-  } else if (args[i] === "--no-pin-check") {
-    pinCheck = false;
-  } else if (args[i] === "--help" || args[i] === "-h") {
-    process.stdout.write(
-      "Usage: node scripts/check-workflow-portability.mjs [--workflows-dir <dir>] [--actions-dir <dir>] [--no-pin-check]\n"
-    );
-    process.exit(0);
+/**
+ * Parse the CLI argv slice into an options object. Pure — no I/O, no exit — so
+ * the sibling node:test suite can exercise it. `--help` is surfaced as a flag
+ * for the CLI wrapper to act on rather than exiting here.
+ */
+export function parseArgs(argv) {
+  let workflowsDir = null;
+  let actionsDir = null;
+  let pinCheck = true;
+  let help = false;
+  for (let i = 0; i < argv.length; i++) {
+    if ((argv[i] === "--workflows-dir" || argv[i] === "-w") && argv[i + 1]) {
+      workflowsDir = argv[++i];
+    } else if ((argv[i] === "--actions-dir" || argv[i] === "-a") && argv[i + 1]) {
+      actionsDir = argv[++i];
+    } else if (argv[i] === "--no-pin-check") {
+      pinCheck = false;
+    } else if (argv[i] === "--help" || argv[i] === "-h") {
+      help = true;
+    }
   }
+  return { workflowsDir, actionsDir, pinCheck, help };
 }
 
+// Runtime bindings shared by the discovery/lint helpers below. Initialized at
+// module load with safe defaults (cwd-relative dirs, pin-check on) and
+// re-derived per invocation inside runCli() so importing this module never
+// triggers a scan.
 const repoRoot = process.cwd();
-const resolvedWorkflowsDir = workflowsDir
-  ? resolve(workflowsDir)
-  : resolve(repoRoot, ".github/workflows");
-const resolvedActionsDir = actionsDir
-  ? resolve(actionsDir)
-  : resolve(repoRoot, ".github/actions");
+let resolvedWorkflowsDir = resolve(repoRoot, ".github/workflows");
+let resolvedActionsDir = resolve(repoRoot, ".github/actions");
+let pinCheck = true;
 
 // ---------------------------------------------------------------------------
 // Minimal indentation-aware YAML walk (dependency-free)
@@ -117,7 +122,7 @@ const resolvedActionsDir = actionsDir
 // for a parent mapping. Quotes are stripped from keys so `"on":` === `on`.
 // ---------------------------------------------------------------------------
 
-function walkYaml(content) {
+export function walkYaml(content) {
   const lines = content.split("\n");
   const stack = []; // [{ indent, key }]
   const records = [];
@@ -193,19 +198,42 @@ const EXPR = /\$\{\{/;
 // Content checks (reused for both working-tree files and pinned blobs)
 // ---------------------------------------------------------------------------
 
+/**
+ * Detect whether a workflow declares `workflow_call` — i.e. is reusable and
+ * therefore subject to Rules 1 & 2. Two shapes count:
+ *
+ *   1. Mapping form — `on:` is a mapping with a `workflow_call:` child, so the
+ *      walk yields a record whose path is `on.workflow_call` (or a descendant).
+ *   2. Inline form — `workflow_call` sits directly on the `on:` value, as a
+ *      bare scalar (`on: workflow_call`) or inside a flow sequence
+ *      (`on: [workflow_call]`, `on: [push, workflow_call]`). The walk yields a
+ *      single record with path `on` whose value carries the trigger token(s).
+ *
+ * The former mapping-only check silently skipped inline-declared reusable
+ * workflows, so Rules 1 & 2 never ran on them.
+ */
+export function isReusableWorkflow(records) {
+  return records.some((r) => {
+    const p = r.path.join(".");
+    if (p === "on.workflow_call" || p.startsWith("on.workflow_call.")) return true;
+    // Inline scalar / flow-sequence on the top-level `on:` key.
+    if (p === "on" && /\bworkflow_call\b/.test(r.value)) return true;
+    return false;
+  });
+}
+
 /** Reusable-workflow checks (Rules 1 & 2). Returns [{line, message}]. */
-function checkWorkflowContent(content) {
+export function checkWorkflowContent(content) {
   const violations = [];
   const records = walkYaml(content);
 
-  const isReusable = records.some(
-    (r) => r.path.join(".") === "on.workflow_call" || r.path.join(".").startsWith("on.workflow_call.")
-  );
-  if (!isReusable) return violations;
+  if (!isReusableWorkflow(records)) return violations;
 
-  // Rule 1: no relative `uses:` anywhere in a reusable workflow.
+  // Rule 1: no relative `uses:` anywhere in a reusable workflow. Allow an
+  // optional leading `- ` so the sequence/list form (`- uses: ./…`) is caught
+  // as well as the mapping form — mirrors check-action-pins.mjs's `usesRe`.
   content.split("\n").forEach((raw, idx) => {
-    if (/^\s*uses:\s*['"]?\.\//.test(raw)) {
+    if (/^\s*(?:-\s+)?uses:\s*['"]?\.\//.test(raw)) {
       violations.push({
         line: idx + 1,
         message:
@@ -239,7 +267,7 @@ function checkWorkflowContent(content) {
 }
 
 /** Composite-action checks (Rules 3/4 of the original; manifest cleanliness). */
-function checkActionContent(content) {
+export function checkActionContent(content) {
   const violations = [];
   const records = walkYaml(content);
 
@@ -442,52 +470,94 @@ function lintFile(filePath) {
 // Run
 // ---------------------------------------------------------------------------
 
-const workflowFiles = listWorkflowFiles(resolvedWorkflowsDir);
-const actionFiles = listActionFiles(resolvedActionsDir);
-const allFiles = [...workflowFiles, ...actionFiles];
-
-process.stdout.write(
-  `[check-workflow-portability] Workflows: ${relative(repoRoot, resolvedWorkflowsDir)}/ (${workflowFiles.length})\n` +
-  `[check-workflow-portability] Actions  : ${relative(repoRoot, resolvedActionsDir)}/ (${actionFiles.length})\n` +
-  `[check-workflow-portability] Pin check: ${pinCheck ? (isGitRepo() ? "on" : "on (git unavailable — skipped)") : "off"}\n`
-);
-
-if (allFiles.length === 0) {
-  process.stdout.write(
-    `[check-workflow-portability] No workflow or action files found — nothing to lint.\n`
-  );
-  process.exit(0);
-}
-
-let total = 0;
-for (const file of allFiles) {
-  const violations = lintFile(file);
-  if (violations.length === 0) continue;
-  total += violations.length;
-  const rel = relative(repoRoot, file);
-  process.stderr.write(`\n[check-workflow-portability] ❌ ${rel}\n`);
-  for (const v of violations) {
-    process.stderr.write(`     ${rel}:${v.line} — ${v.message}\n`);
+/**
+ * Run the full lint end-to-end and return a POSIX exit code (0 = clean,
+ * 1 = violations). Applies the parsed options to the shared runtime bindings,
+ * discovers the workflow/action files, lints each, and reports. `log` / `err`
+ * are injectable so the sibling node:test suite can capture output without
+ * touching the real streams; the direct-invocation guard below wires them to
+ * process.stdout / process.stderr.
+ */
+export function runCli(argv, { log = writeStdout, err = writeStderr } = {}) {
+  const opts = parseArgs(argv);
+  if (opts.help) {
+    log(
+      "Usage: node scripts/check-workflow-portability.mjs [--workflows-dir <dir>] [--actions-dir <dir>] [--no-pin-check]\n"
+    );
+    return 0;
   }
-}
 
-if (pinSkips.length > 0) {
-  process.stdout.write(
-    `\n[check-workflow-portability] ⚠️  ${pinSkips.length} internal pin(s) could not be verified (Rule 3 skipped):\n`
+  resolvedWorkflowsDir = opts.workflowsDir
+    ? resolve(opts.workflowsDir)
+    : resolve(repoRoot, ".github/workflows");
+  resolvedActionsDir = opts.actionsDir
+    ? resolve(opts.actionsDir)
+    : resolve(repoRoot, ".github/actions");
+  pinCheck = opts.pinCheck;
+  pinSkips.length = 0; // idempotent across repeated runCli() calls
+
+  const workflowFiles = listWorkflowFiles(resolvedWorkflowsDir);
+  const actionFiles = listActionFiles(resolvedActionsDir);
+  const allFiles = [...workflowFiles, ...actionFiles];
+
+  log(
+    `[check-workflow-portability] Workflows: ${relative(repoRoot, resolvedWorkflowsDir)}/ (${workflowFiles.length})\n` +
+    `[check-workflow-portability] Actions  : ${relative(repoRoot, resolvedActionsDir)}/ (${actionFiles.length})\n` +
+    `[check-workflow-portability] Pin check: ${pinCheck ? (isGitRepo() ? "on" : "on (git unavailable — skipped)") : "off"}\n`
   );
-  for (const s of pinSkips) process.stdout.write(`     ${s}\n`);
-}
 
-if (total > 0) {
-  process.stderr.write(
-    `\n[check-workflow-portability] ${total} portability violation${total === 1 ? "" : "s"} detected.\n` +
-    `   These fail only when a CONSUMER repo calls the workflow/action, which is\n` +
-    `   exactly why in-repo CI never caught them before. Fix each above.\n\n`
+  if (allFiles.length === 0) {
+    log(
+      `[check-workflow-portability] No workflow or action files found — nothing to lint.\n`
+    );
+    return 0;
+  }
+
+  let total = 0;
+  for (const file of allFiles) {
+    const violations = lintFile(file);
+    if (violations.length === 0) continue;
+    total += violations.length;
+    const rel = relative(repoRoot, file);
+    err(`\n[check-workflow-portability] ❌ ${rel}\n`);
+    for (const v of violations) {
+      err(`     ${rel}:${v.line} — ${v.message}\n`);
+    }
+  }
+
+  if (pinSkips.length > 0) {
+    log(
+      `\n[check-workflow-portability] ⚠️  ${pinSkips.length} internal pin(s) could not be verified (Rule 3 skipped):\n`
+    );
+    for (const s of pinSkips) log(`     ${s}\n`);
+  }
+
+  if (total > 0) {
+    err(
+      `\n[check-workflow-portability] ${total} portability violation${total === 1 ? "" : "s"} detected.\n` +
+      `   These fail only when a CONSUMER repo calls the workflow/action, which is\n` +
+      `   exactly why in-repo CI never caught them before. Fix each above.\n\n`
+    );
+    return 1;
+  }
+
+  log(
+    `[check-workflow-portability] ✅ All reusable workflows and composite actions are cross-repo portable.\n`
   );
-  process.exit(1);
+  return 0;
 }
 
-process.stdout.write(
-  `[check-workflow-portability] ✅ All reusable workflows and composite actions are cross-repo portable.\n`
-);
-process.exit(0);
+function writeStdout(s) {
+  process.stdout.write(s);
+}
+function writeStderr(s) {
+  process.stderr.write(s);
+}
+
+// Only run when executed directly, not when imported by the test suite.
+const invokedDirectly =
+  process.argv[1] &&
+  resolve(process.argv[1]).endsWith("check-workflow-portability.mjs");
+if (invokedDirectly) {
+  process.exit(runCli(process.argv.slice(2)));
+}
