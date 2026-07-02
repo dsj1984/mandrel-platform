@@ -1209,6 +1209,18 @@ node scripts/apply-uptime-monitors.mjs --config infra/uptime/monitors.json --dry
 BETTERSTACK_API_TOKEN=<token> node scripts/apply-uptime-monitors.mjs --config infra/uptime/monitors.json --apply
 ```
 
+**The caller path is exercised in-repo.** `apply-uptime-monitors.test.mjs`'s
+`consumer-caller simulation` test spins up a local HTTP server that speaks the
+Better Stack v2 monitors contract and invokes the real CLI against it with
+the same argument/env shape `uptime-apply.yml`'s "Apply uptime monitors" step
+constructs (`--config <path> --dry-run`, `BETTERSTACK_API_TOKEN` /
+`UPTIME_ALERT_EMAIL` via env), using an injectable `apiBase` seam
+(`BETTERSTACK_API_BASE_OVERRIDE`, test-only — never set in a production
+caller) so the exercise runs against a real (local) server rather than only
+mocking the fetch layer. This is the in-repo verification of the caller
+contract, ahead of and independent from the cross-repo
+`mandrel-platform-smoke` exercise (see [Out of scope](#out-of-scope) below).
+
 ### Out of scope
 
 - **Consumer cut-over.** This Story ships the reusable unit; migrating

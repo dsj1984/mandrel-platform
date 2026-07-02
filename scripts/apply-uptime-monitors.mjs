@@ -175,20 +175,25 @@ function monitorNeedsUpdate(live, desired) {
  * @param {object} opts
  * @param {string} opts.token
  * @param {typeof fetch} [opts.fetchImpl]
+ * @param {string} [opts.apiBase]  Override the Better Stack API base URL.
+ *   Defaults to BETTERSTACK_API_BASE. Exists so a local/offline consumer-
+ *   caller simulation (see apply-uptime-monitors.test.mjs) can point the
+ *   real CLI at an in-process HTTP server instead of the live API — never
+ *   set this in a production caller.
  * @returns {{
  *   listMonitors: () => Promise<Array<{id:string,url:string,name?:string,checkFrequency?:number,alertEmail?:string}>>,
  *   createMonitor: (entry: object) => Promise<{id:string}>,
  *   updateMonitor: (id:string, entry: object) => Promise<{id:string}>
  * }}
  */
-export function createBetterStackClient({ token, fetchImpl = fetch }) {
+export function createBetterStackClient({ token, fetchImpl = fetch, apiBase = BETTERSTACK_API_BASE }) {
   const headers = {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
   };
 
   async function request(path, init) {
-    const res = await fetchImpl(`${BETTERSTACK_API_BASE}${path}`, { ...init, headers: { ...headers, ...(init?.headers ?? {}) } });
+    const res = await fetchImpl(`${apiBase}${path}`, { ...init, headers: { ...headers, ...(init?.headers ?? {}) } });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       throw new Error(`Better Stack API ${init?.method ?? "GET"} ${path} failed: ${res.status} ${res.statusText} ${body}`);
@@ -336,7 +341,14 @@ async function main() {
     process.exit(1);
   }
 
-  const client = createBetterStackClient({ token: opts.token });
+  // Test-only escape hatch: point the CLI at a local/offline server instead
+  // of the live Better Stack API. Never set in a production caller — see
+  // createBetterStackClient's apiBase docblock.
+  const apiBaseOverride = process.env.BETTERSTACK_API_BASE_OVERRIDE || undefined;
+  const client = createBetterStackClient({
+    token: opts.token,
+    ...(apiBaseOverride ? { apiBase: apiBaseOverride } : {}),
+  });
 
   try {
     const result = await applyMonitorConfig({

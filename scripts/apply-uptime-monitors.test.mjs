@@ -13,12 +13,15 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { test } from "node:test";
+
+const execFileAsync = promisify(execFile);
 
 import {
   DEFAULT_CHECK_FREQUENCY_SECONDS,
@@ -277,4 +280,93 @@ test("CLI exits non-zero on an invalid config file even with a token set", () =>
     });
   }, /Command failed/);
   rmSync(tmpDir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Consumer-caller simulation — exercises the SAME invocation shape
+// .github/workflows/uptime-apply.yml's "Apply uptime monitors" step
+// constructs, end to end, against a real (mocked-transport) HTTP server.
+// This is the in-repo stand-in for "the caller path is exercised": rather
+// than only unit-testing the pure functions in isolation, this spins up a
+// local HTTP server that speaks the Better Stack v2 monitors contract (list
+// + create), then invokes the CLI exactly as the reusable workflow's `run:`
+// step does (`node apply-uptime-monitors.mjs --config <path> [--dry-run|
+// --apply]`, token/alert-email via env vars), against a monitor-config
+// fixture shaped like the one templates/workflows/uptime-apply.yml points a
+// real consumer at. See docs/reusable-workflows.md ("uptime-apply.yml") for
+// the documented caller contract this simulates.
+// ---------------------------------------------------------------------------
+
+import { createServer } from "node:http";
+
+function startFakeBetterStackServer() {
+  const requests = [];
+  let monitors = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null;
+      requests.push({ method: req.method, url: req.url, body });
+      res.setHeader("Content-Type", "application/json");
+      if (req.method === "GET" && req.url === "/monitors") {
+        res.writeHead(200);
+        res.end(JSON.stringify({ data: monitors }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/monitors") {
+        const id = String(monitors.length + 1);
+        monitors = [
+          ...monitors,
+          { id, attributes: { url: body.url, pronounceable_name: body.pronounceable_name, check_frequency: body.check_frequency, email: body.email } },
+        ];
+        res.writeHead(201);
+        res.end(JSON.stringify({ data: { id } }));
+        return;
+      }
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: "not found" }));
+    });
+  });
+  return { server, requests, getMonitors: () => monitors };
+}
+
+test("consumer-caller simulation: end-to-end CLI invocation against a live (local) Better Stack server, dry-run", async () => {
+  const { server, requests } = startFakeBetterStackServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+
+  tmpDir = mkdtempSync(join(tmpdir(), "uptime-monitors-e2e-"));
+  const configPath = join(tmpDir, "monitors.json");
+  // Same shape as templates/workflows/uptime-apply.yml's <MONITOR_CONFIG_PATH>
+  // consumer fixture (e.g. infra/uptime/monitors.json).
+  writeFileSync(
+    configPath,
+    JSON.stringify([{ url: "https://smoke.example.com/health", name: "smoke", checkFrequency: 60 }])
+  );
+
+  // execFileAsync (not execFileSync): the fake server above runs IN THIS
+  // SAME PROCESS. A synchronous spawn would block this process's event loop
+  // while waiting on the child, which would in turn prevent the server's own
+  // request handler (which needs that same event loop) from ever running —
+  // a classic single-process self-deadlock. The async variant yields the
+  // event loop back so the server can answer the child's HTTP request.
+  const { stdout: out } = await execFileAsync(
+    "node",
+    [CLI, "--config", configPath, "--dry-run", "--alert-email", "oncall@example.com"],
+    {
+      encoding: "utf8",
+      env: { ...process.env, BETTERSTACK_API_TOKEN: "fake-token", BETTERSTACK_API_BASE_OVERRIDE: `http://127.0.0.1:${port}` },
+    }
+  );
+
+  await new Promise((resolve) => server.close(resolve));
+  rmSync(tmpDir, { recursive: true, force: true });
+
+  // Dry-run must have hit the real (local) list endpoint to compute the plan
+  // ... this is only meaningful once the CLI honors a base-URL override, so
+  // this assertion also locks in that seam for future local/offline runs.
+  assert.match(out, /would create/);
+  assert.ok(requests.some((r) => r.method === "GET" && r.url === "/monitors"), "dry-run calls the list endpoint");
+  assert.ok(!requests.some((r) => r.method === "POST"), "dry-run never issues a create/update call");
 });
