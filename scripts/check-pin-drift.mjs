@@ -720,8 +720,15 @@ export function resolveLatestRelease(platformRepo, runGh) {
   let release;
   try {
     release = ghApiJson(`repos/${platformRepo}/releases/latest`, runGh);
-  } catch {
-    return { tag: null, sha: null, publishedAt: null };
+  } catch (err) {
+    // A genuine 404 means the platform repo has no published release yet — a
+    // legitimate "no lag baseline" state, so return nulls. Every other error
+    // (5xx / 403 rate-limit / transport) must propagate so the strict gate
+    // fails CLOSED rather than silently classifying the whole fleet as
+    // lagState "unknown" (drift=false). Mirrors the per-consumer fetchers'
+    // fail-closed contract in scripts/lib/gh-json.mjs.
+    if (isNotFound(err)) return { tag: null, sha: null, publishedAt: null };
+    throw err;
   }
   const tag = release && typeof release.tag_name === "string" ? release.tag_name : null;
   const publishedAt =
@@ -742,8 +749,12 @@ export function resolveLatestRelease(platformRepo, runGh) {
       sha = tagObj?.object?.sha ?? sha;
     }
     return { tag, sha: sha ? sha.toLowerCase() : null, publishedAt };
-  } catch {
-    return { tag, sha: null, publishedAt };
+  } catch (err) {
+    // Same fail-closed contract as the release fetch above: a 404 (tag
+    // vanished) degrades to sha:null, but a transient/auth error propagates
+    // so the strict gate fails closed instead of suppressing lag detection.
+    if (isNotFound(err)) return { tag, sha: null, publishedAt };
+    throw err;
   }
 }
 

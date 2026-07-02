@@ -35,6 +35,7 @@ import {
   parseDurationMs,
   parseSemver,
   renderReport,
+  resolveLatestRelease,
   runCli,
 } from "./check-pin-drift.mjs";
 import { httpStatusOf, isNotFound } from "./lib/gh-json.mjs";
@@ -703,6 +704,46 @@ test("buildReport: a 404-shaped gh error is classified no-pins, drift false", ()
   assert.equal(r.verdict.lagState, "no-pins");
   assert.equal(r.drift, false);
   assert.equal(hasDrift(report), false);
+});
+
+test("resolveLatestRelease rethrows a non-404 error on releases/latest (fail closed)", () => {
+  // A transient 5xx/403 on the platform's own release resolution must NOT be
+  // swallowed into sha:null — that would classify the whole fleet as lagState
+  // "unknown" (drift=false) and silently pass the strict gate.
+  const runGh = (args) => {
+    if (args[1] === `repos/${PLATFORM}/releases/latest`) {
+      throw ghHttpError(500, "Server Error");
+    }
+    throw new Error(`unexpected gh api path: ${args[1]}`);
+  };
+  assert.throws(() => resolveLatestRelease(PLATFORM, runGh), /HTTP 500/);
+});
+
+test("resolveLatestRelease returns nulls on a 404 (repo has no release yet)", () => {
+  const runGh = (args) => {
+    if (args[1] === `repos/${PLATFORM}/releases/latest`) {
+      throw ghHttpError(404, "Not Found");
+    }
+    throw new Error(`unexpected gh api path: ${args[1]}`);
+  };
+  assert.deepEqual(resolveLatestRelease(PLATFORM, runGh), {
+    tag: null,
+    sha: null,
+    publishedAt: null,
+  });
+});
+
+test("resolveLatestRelease rethrows a non-404 error on the tag→sha deref (fail closed)", () => {
+  const runGh = (args) => {
+    if (args[1] === `repos/${PLATFORM}/releases/latest`) {
+      return JSON.stringify({ tag_name: TAG });
+    }
+    if (args[1] === `repos/${PLATFORM}/git/ref/tags/${TAG}`) {
+      throw ghHttpError(503, "Service Unavailable");
+    }
+    throw new Error(`unexpected gh api path: ${args[1]}`);
+  };
+  assert.throws(() => resolveLatestRelease(PLATFORM, runGh), /HTTP 503/);
 });
 
 test("runCli --strict exits non-zero on a non-404 gh error (fail closed)", () => {
