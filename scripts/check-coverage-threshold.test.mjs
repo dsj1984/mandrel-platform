@@ -121,6 +121,49 @@ test("parseArgs rejects an unknown --metric", () => {
   assert.throws(() => parseArgs(["--metric", "nonsense"]), /unknown --metric/);
 });
 
+test("parseArgs rejects a valueless --threshold (must not silently disable the gate)", () => {
+  // A bare trailing `--threshold` previously fell through and left the
+  // threshold at its 0 default — silently turning the gate OFF. It MUST now
+  // throw instead.
+  assert.throws(() => parseArgs(["--threshold"]), /requires a value/);
+  assert.throws(() => parseArgs(["-t"]), /requires a value/);
+  // Same for the other value-taking flags.
+  assert.throws(() => parseArgs(["--metric"]), /requires a value/);
+  assert.throws(() => parseArgs(["--coverage-dir"]), /requires a value/);
+  assert.throws(() => parseArgs(["--cwd"]), /requires a value/);
+});
+
+test("parseArgs rejects a mistyped/unknown flag rather than ignoring it", () => {
+  // A typo like `--threshhold 80` used to be silently dropped, disabling the
+  // gate. It MUST now fail loudly.
+  assert.throws(() => parseArgs(["--threshhold", "80"]), /unknown flag/);
+  assert.throws(() => parseArgs(["--nope"]), /unknown flag/);
+});
+
+test("parseArgs rejects unexpected positional arguments", () => {
+  assert.throws(() => parseArgs(["80"]), /unexpected positional argument/);
+});
+
+test("runCli: a mistyped threshold flag exits non-zero instead of passing silently", () => {
+  const out = [];
+  const code = runCli(["--threshhold", "80"], {
+    log: (m) => out.push(m),
+    err: (m) => out.push(m),
+  });
+  assert.equal(code, 1);
+  assert.ok(out.some((l) => /unknown flag/.test(l)));
+});
+
+test("runCli: a valueless threshold flag exits non-zero instead of passing silently", () => {
+  const out = [];
+  const code = runCli(["--threshold"], {
+    log: (m) => out.push(m),
+    err: (m) => out.push(m),
+  });
+  assert.equal(code, 1);
+  assert.ok(out.some((l) => /requires a value/.test(l)));
+});
+
 test("VALID_METRICS covers the four Istanbul totals", () => {
   assert.deepEqual(VALID_METRICS, [
     "lines",

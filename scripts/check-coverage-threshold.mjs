@@ -55,9 +55,22 @@ import { join, resolve } from "node:path";
 export const VALID_METRICS = ["lines", "statements", "functions", "branches"];
 
 /**
+ * Assert that a value-taking flag at index `i` is actually followed by a
+ * value token. Throws otherwise so a trailing/valueless flag fails loudly
+ * instead of falling through to a silent default (e.g. a bare `--threshold`
+ * must not leave the gate disabled at threshold 0).
+ */
+export function requireValue(flag, argv, i) {
+  if (argv[i + 1] === undefined) {
+    throw new Error(`flag "${flag}" requires a value`);
+  }
+}
+
+/**
  * Parse the CLI argv (array AFTER `node script.mjs`) into an options object.
- * Throws on a malformed numeric threshold or an unknown metric so the gate
- * fails loudly rather than silently mis-reading its own configuration.
+ * Throws on a malformed numeric threshold, an unknown metric, an unknown
+ * flag, or a valueless value-taking flag so the gate fails loudly rather
+ * than silently mis-reading its own configuration.
  */
 export function parseArgs(argv) {
   const opts = {
@@ -66,11 +79,25 @@ export function parseArgs(argv) {
     coverageDirs: [],
     cwd: process.cwd(),
   };
+  // Value-taking flags. Each MUST be followed by a value token; a trailing
+  // (valueless) occurrence is a hard error rather than a silent skip — a
+  // valueless `--threshold` must never leave the gate at its disabled default.
+  const VALUE_FLAGS = new Set([
+    "--threshold",
+    "-t",
+    "--metric",
+    "-m",
+    "--coverage-dir",
+    "--cwd",
+  ]);
+
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if ((arg === "--threshold" || arg === "-t") && argv[i + 1] !== undefined) {
+    if (arg === "--threshold" || arg === "-t") {
+      requireValue(arg, argv, i);
       opts.threshold = parseThreshold(argv[++i]);
-    } else if ((arg === "--metric" || arg === "-m") && argv[i + 1] !== undefined) {
+    } else if (arg === "--metric" || arg === "-m") {
+      requireValue(arg, argv, i);
       const metric = String(argv[++i]).trim().toLowerCase();
       if (!VALID_METRICS.includes(metric)) {
         throw new Error(
@@ -78,10 +105,21 @@ export function parseArgs(argv) {
         );
       }
       opts.metric = metric;
-    } else if (arg === "--coverage-dir" && argv[i + 1] !== undefined) {
+    } else if (arg === "--coverage-dir") {
+      requireValue(arg, argv, i);
       opts.coverageDirs.push(String(argv[++i]));
-    } else if (arg === "--cwd" && argv[i + 1] !== undefined) {
+    } else if (arg === "--cwd") {
+      requireValue(arg, argv, i);
       opts.cwd = String(argv[++i]);
+    } else if (arg.startsWith("-")) {
+      // An unknown flag (e.g. a typo'd `--threshhold`) MUST fail loudly. Left
+      // unhandled it would be silently ignored, leaving `--threshold` at its
+      // 0 default and disabling the gate — the exact fail-open we forbid.
+      throw new Error(
+        `unknown flag "${arg}" (expected one of: ${[...VALUE_FLAGS].join(", ")})`
+      );
+    } else {
+      throw new Error(`unexpected positional argument "${arg}"`);
     }
   }
   return opts;
