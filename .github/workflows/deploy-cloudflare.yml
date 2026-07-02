@@ -22,6 +22,12 @@
 #   3. pre-migration-snapshot — when migrate:true, snapshots the database before
 #                              any forward-only migration runs (D1 by default;
 #                              overridable via snapshot-command for non-D1 engines).
+#                              The built-in D1 export is BLOCKING: a failed export
+#                              (or an empty snapshot artifact) fails the run so no
+#                              migrate:true pipeline proceeds without a recovery
+#                              point. The D1 database name is passed positionally
+#                              via the optional d1-database input (falls back to
+#                              wrangler config resolution when empty).
 #   4. migrate               — applies migrations after the snapshot (D1 by
 #                              default; overridable via migrate-command, gated by
 #                              an optional pre-migrate-assert-command host guard).
@@ -45,9 +51,10 @@
 # Command seams (Story #41): the D1 export/apply, build, and workers.dev smoke
 # defaults are all overridable so non-D1 / build-step / custom-host consumers can
 # adopt the workflow without losing snapshot, migrate, build-env, or smoke safety
-# nets. With NONE of the seam inputs set, behaviour is identical to the legacy D1
-# path (export/apply + workers.dev smoke) — except the smoke host is now the
-# corrected account subdomain rather than the account ID.
+# nets. With NONE of the seam inputs set, behaviour is the built-in D1
+# path (export/apply against the remote DB + workers.dev smoke) — the smoke host
+# is the corrected account subdomain rather than the account ID, and the D1
+# snapshot is blocking (a failed export fails the run).
 #
 # Secret surface (FROZEN — Story #61, build-split capstone): only the stable
 # {CLOUDFLARE_*, TURSO_*} set crosses this reusable-workflow boundary. CF creds
@@ -108,6 +115,18 @@ on:
         required: false
         type: string
         default: 'd1'
+      d1-database:
+        description: >
+          Optional D1 database name passed as the positional argument to the
+          built-in "wrangler d1 export" / "wrangler d1 migrations apply"
+          commands (both target --remote). Only consulted on the built-in D1
+          path (db-engine d1, no snapshot-command / migrate-command). Leave
+          empty (the default) to let wrangler resolve the database from the
+          consumer's wrangler config for the target --env; set it when the
+          config does not make the database unambiguous for the environment.
+        required: false
+        type: string
+        default: ''
       snapshot-command:
         description: >
           Consumer-supplied pre-migration snapshot command. When set, it
@@ -570,6 +589,7 @@ jobs:
       - name: Pre-migration snapshot (backup before migration)
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p temp
           SNAPSHOT_KEY="pre-migration-${DEPLOY_ENV}-$(date -u +%Y%m%dT%H%M%SZ)"
           echo "SNAPSHOT_KEY=$SNAPSHOT_KEY" >> "$GITHUB_ENV"
@@ -583,26 +603,27 @@ jobs:
             bash -c "$SNAPSHOT_COMMAND"
             echo "::endgroup::"
           else
-            # Default D1 export.
+            # Built-in D1 export — BLOCKING.
             #
-            # Export each database defined for this environment.
-            # Consumers define their D1 binding names in wrangler.toml;
-            # wrangler reads the config and routes to the correct DB UUID.
+            # Exports the remote D1 database for this environment to a local SQL
+            # dump. The database name is passed positionally (d1-database input);
+            # when empty, wrangler resolves it from the consumer's wrangler
+            # config for the target --env. This is the recovery point for the
+            # forward-only migration that follows, so a failed export MUST fail
+            # the job (set -euo pipefail above; no warning fallback) rather than
+            # letting the pipeline migrate without a snapshot. The empty-artifact
+            # case is caught by if-no-files-found: error on the upload step.
             #
-            # Export creates a local SQL dump. In production workflows,
-            # callers should forward the dump to durable storage (R2, GCS, S3)
-            # via an additional step using `secrets: inherit`.
-            pnpx wrangler d1 export --env "$DEPLOY_ENV" \
-              --output "temp/${SNAPSHOT_KEY}.sql" \
-              --yes \
-              || {
-                echo "::warning::D1 export step failed or no D1 binding found." \
-                  "Ensure wrangler.toml declares [[d1_databases]] for this environment." \
-                  "Continuing with migration — check your wrangler config."
-              }
+            # In production workflows, callers should forward the dump to durable
+            # storage (R2, GCS, S3) via an additional step using `secrets: inherit`.
+            pnpx wrangler d1 export $D1_DATABASE \
+              --env "$DEPLOY_ENV" \
+              --remote \
+              --output "temp/${SNAPSHOT_KEY}.sql"
           fi
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
+          D1_DATABASE: ${{ inputs.d1-database }}
           SNAPSHOT_COMMAND: ${{ inputs.snapshot-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -616,7 +637,10 @@ jobs:
           name: db-snapshot-${{ inputs.environment }}-${{ github.run_id }}
           path: temp/*.sql
           retention-days: 7
-          if-no-files-found: warn
+          # Blocking: an empty snapshot artifact means the D1 export produced no
+          # dump — fail the run so a migrate:true pipeline never proceeds without
+          # a recovery point.
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   # 4. Migrate
@@ -666,12 +690,19 @@ jobs:
             bash -c "$MIGRATE_COMMAND"
             echo "::endgroup::"
           else
-            pnpx wrangler d1 migrations apply \
+            # Built-in D1 migrations apply against the remote database. The
+            # database name is passed positionally (d1-database input); when
+            # empty, wrangler resolves it from the consumer's wrangler config
+            # for the target --env. --skip-confirmation is the documented
+            # non-interactive flag (the previous --yes was not a valid flag).
+            pnpx wrangler d1 migrations apply $D1_DATABASE \
               --env "$DEPLOY_ENV" \
-              --yes
+              --remote \
+              --skip-confirmation
           fi
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
+          D1_DATABASE: ${{ inputs.d1-database }}
           MIGRATE_COMMAND: ${{ inputs.migrate-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -695,12 +726,20 @@ jobs:
       - check-env
       - migrate
     # Run when check-env passes AND either:
-    #   - migrate was skipped (inputs.migrate == false) → needs.migrate is skipped → always()
-    #   - migrate succeeded
+    #   - migrate succeeded, OR
+    #   - migrate was legitimately skipped BECAUSE this is a no-migrate run
+    #     (inputs.migrate == false → needs.migrate is 'skipped').
+    # A 'skipped' migrate result is ONLY safe to deploy on when migrate is off.
+    # When migrate:true, a failing pre-migration-snapshot (or migrate) reports
+    # the migrate job as 'skipped' too — accepting that 'skipped' unconditionally
+    # would deploy a pipeline whose snapshot/migration never ran, defeating the
+    # recovery-point guarantee. Gating the 'skipped' branch on
+    # inputs.migrate == false closes that hole.
     if: >-
       always() &&
       needs.check-env.result == 'success' &&
-      (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
+      (needs.migrate.result == 'success' ||
+       (inputs.migrate == false && needs.migrate.result == 'skipped'))
     outputs:
       deployed_workers: ${{ steps.deploy-step.outputs.deployed_workers }}
     steps:
@@ -800,10 +839,14 @@ jobs:
           for worker in "${WORKERS[@]}"; do
             worker="$(echo "$worker" | xargs)"  # trim whitespace
             echo "::group::Deploying $worker to ${DEPLOY_ENV}"
+            # No --compatibility-date override: the consumer's wrangler config
+            # owns compatibility_date. Injecting today's date here would silently
+            # override the pinned value on every deploy, defeating the
+            # wrangler-baseline compatibility_date staleness policy and risking
+            # untested runtime-behaviour changes at deploy time.
             if pnpx wrangler deploy \
               --name "$worker" \
-              --env "$DEPLOY_ENV" \
-              --compatibility-date "$(date -u +%Y-%m-%d)"; then
+              --env "$DEPLOY_ENV"; then
               echo "✅ $worker deployed"
               deployed+=("$worker")
             else
