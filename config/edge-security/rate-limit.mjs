@@ -7,10 +7,21 @@
  * decision function — `createRateLimiter` — parameterized by limit, window, a
  * key extractor, and a pluggable store, so a consumer swaps the in-memory store
  * for a Cloudflare KV / Durable Object store without re-deriving the limiter
- * logic. The default store is a self-pruning in-memory `Map` suitable for a
+ * logic. The default store is a bounded in-memory `Map` suitable for a
  * single-isolate dev / small deployment; production multi-isolate consumers
  * pass a shared store.
  */
+
+/**
+ * Max number of live buckets the default in-memory store retains before it
+ * evicts. A stream of distinct keys (e.g. a rotating-IP flood, or a spoofed
+ * forwarded header — see `defaultKeyExtractor`) would otherwise grow the
+ * backing `Map` without bound. Once the store holds this many buckets, the
+ * least-recently-touched entry is evicted (LRU) on the next `set`. The value
+ * is large enough to be a non-event for legitimate single-isolate traffic
+ * while capping worst-case memory.
+ */
+const DEFAULT_MAX_BUCKETS = 10_000;
 
 /**
  * @typedef {Object} RateLimitStore
@@ -19,14 +30,45 @@
  */
 
 /**
- * In-memory fixed-window store. Self-prunes expired buckets on access so it
- * does not leak unboundedly. NOT shared across isolates — fine for dev / single
- * instance; pass a KV-backed store in production.
+ * In-memory fixed-window store. Bounded two ways so a stream of distinct keys
+ * cannot grow the backing `Map` without bound:
+ *
+ *  1. **Expired-bucket sweep.** `get` evicts a bucket the moment its window has
+ *     elapsed, and `set` amortizes a full sweep of expired buckets across
+ *     writes. Keys that stop being seen do not linger past their window.
+ *  2. **Max-size LRU cap.** The `Map` retains at most `maxBuckets` live
+ *     entries. When a `set` would exceed the cap after sweeping, the
+ *     least-recently-touched entry is evicted first (a `Map` preserves
+ *     insertion order, and every touch re-inserts, so the first key is the
+ *     LRU one). This caps worst-case memory even under an active flood of
+ *     keys that have not yet expired.
+ *
+ * NOT shared across isolates — fine for dev / single instance; pass a
+ * KV-backed store in production.
+ *
+ * @param {{ maxBuckets?: number }} [options]
+ *   Optional cap override. Defaults to {@link DEFAULT_MAX_BUCKETS}. Callers
+ *   that pass no argument get the default — the zero-arg signature is
+ *   preserved for existing consumers.
  * @returns {RateLimitStore}
  */
-export function createMemoryStore() {
+export function createMemoryStore(options) {
+  const maxBuckets =
+    options && typeof options.maxBuckets === "number" && options.maxBuckets >= 1
+      ? Math.floor(options.maxBuckets)
+      : DEFAULT_MAX_BUCKETS;
   /** @type {Map<string, { count: number, resetAt: number }>} */
   const buckets = new Map();
+
+  /** Evict every bucket whose window has already elapsed. */
+  function sweepExpired(now) {
+    for (const [key, bucket] of buckets) {
+      if (bucket.resetAt <= now) {
+        buckets.delete(key);
+      }
+    }
+  }
+
   return {
     get(key) {
       const bucket = buckets.get(key);
@@ -37,10 +79,31 @@ export function createMemoryStore() {
         buckets.delete(key);
         return null;
       }
+      // Re-insert so the touched key moves to the most-recently-used end,
+      // keeping the LRU eviction order in `set` honest.
+      buckets.delete(key);
+      buckets.set(key, bucket);
       return bucket;
     },
     set(key, value) {
+      const now = Date.now();
+      // A re-`set` of an existing key must not double-count toward the cap;
+      // drop it first so the size check and LRU ordering stay correct.
+      buckets.delete(key);
       buckets.set(key, value);
+      if (buckets.size > maxBuckets) {
+        // Cheap first: reclaim anything already expired.
+        sweepExpired(now);
+      }
+      // Still over cap (an active flood of un-expired keys) — evict LRU
+      // entries (insertion-order-oldest) until we are back within bound.
+      while (buckets.size > maxBuckets) {
+        const oldest = buckets.keys().next().value;
+        if (oldest === undefined) {
+          break;
+        }
+        buckets.delete(oldest);
+      }
     },
   };
 }
@@ -50,10 +113,12 @@ export function createMemoryStore() {
  * @property {number} limit          Max requests allowed per window. Required.
  * @property {number} windowMs       Window length in milliseconds. Required.
  * @property {(request: Request) => string} [keyExtractor]
- *   Derives the rate-limit bucket key from the request. Defaults to the
- *   client IP from `CF-Connecting-IP` / `X-Forwarded-For` (first hop), falling
- *   back to a constant so a missing IP fails *closed* into one shared bucket
- *   rather than bypassing the limit per-request.
+ *   Derives the rate-limit bucket key from the request. Defaults to
+ *   {@link defaultKeyExtractor}, which trusts only `CF-Connecting-IP` and
+ *   falls back to a constant shared bucket — it does NOT read
+ *   `X-Forwarded-For`, which is client-spoofable. See that function's doc for
+ *   the trust boundary and how to opt back into `X-Forwarded-For` when your
+ *   own edge is known to overwrite it.
  * @property {RateLimitStore} [store] Defaults to `createMemoryStore()`.
  */
 
@@ -67,24 +132,42 @@ export function createMemoryStore() {
  */
 
 /**
- * Default key extractor: client IP, failing closed to a shared bucket.
+ * Default key extractor: the Cloudflare-supplied client IP, failing closed to
+ * a shared bucket.
+ *
+ * **Trust boundary.** Identity is derived only from `CF-Connecting-IP`, a
+ * header Cloudflare's edge sets (and overwrites) from the terminating TCP
+ * connection — a client cannot forge it. `X-Forwarded-For` is deliberately
+ * NOT consulted: any client can send an arbitrary `X-Forwarded-For`, so
+ * keying off it lets an attacker mint a fresh bucket per request (defeating
+ * the limit) or impersonate another client's bucket. When no trusted client
+ * IP is present, we fail *closed* into one shared `"anonymous"` bucket rather
+ * than handing every request its own unlimited allowance.
+ *
+ * If your own reverse proxy is known to strip inbound `X-Forwarded-For` and
+ * append the real client, opt back in explicitly with a custom
+ * `keyExtractor`, e.g.:
+ *
+ * ```js
+ * createRateLimiter({
+ *   limit, windowMs,
+ *   keyExtractor: (req) =>
+ *     req.headers.get("CF-Connecting-IP") ??
+ *     req.headers.get("X-Forwarded-For")?.split(",").pop()?.trim() ??
+ *     "anonymous",
+ * });
+ * ```
+ *
  * @param {Request} request
  * @returns {string}
  */
 function defaultKeyExtractor(request) {
   const cf = request.headers.get("CF-Connecting-IP");
   if (cf) {
-    return cf;
+    return cf.trim();
   }
-  const xff = request.headers.get("X-Forwarded-For");
-  if (xff) {
-    const first = xff.split(",")[0];
-    if (first) {
-      return first.trim();
-    }
-  }
-  // No identifiable client — fail closed into one shared bucket rather than
-  // handing every anonymous request its own unlimited allowance.
+  // No trusted client identity. `X-Forwarded-For` is intentionally ignored
+  // here because it is client-spoofable; fail closed into one shared bucket.
   return "anonymous";
 }
 
