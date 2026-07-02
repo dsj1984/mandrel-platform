@@ -1,0 +1,127 @@
+# Reusable Better Stack uptime-monitor apply workflow (Story #180).
+#
+# Post-convergence triplication (2026-07-01 audit): domio, athportal, and
+# swarm-os each carried their own `uptime-apply.yml` + Better Stack IaC
+# (`infra/uptime/`). swarm-os's implementation (Story #163) was the
+# newest/cleanest and is the seed donor here per standing decision #4
+# (best-of-breed seeding) — thinned into a `workflow_call` target on the same
+# thin-caller model as `pr-quality.yml` / `deploy-cloudflare.yml`, so a
+# consumer ships only its own monitor-config file instead of re-deriving the
+# Better Stack monitor-CRUD calls.
+#
+# The shared monitor schema + apply script (`scripts/apply-uptime-monitors.mjs`)
+# is the platform-owned unit this workflow wraps — see its module docblock for
+# the config shape and API contract. This workflow adds no logic of its own
+# beyond checkout + invoking that script, so "the process" (skip-with-notice,
+# diff semantics, additive-only apply) lives in ONE place, versioned with the
+# rest of the platform.
+#
+# Consumed as a workflow_call target. Minimal caller:
+#   jobs:
+#     uptime:
+#       uses: dsj1984/mandrel-platform/.github/workflows/uptime-apply.yml@<sha> # <tag>
+#       with:
+#         monitor-config: infra/uptime/monitors.json
+#       secrets:
+#         BETTERSTACK_API_TOKEN: ${{ secrets.BETTERSTACK_API_TOKEN }}
+#         UPTIME_ALERT_EMAIL: ${{ secrets.UPTIME_ALERT_EMAIL }}
+#
+# Graceful degradation (acceptance criterion): when BETTERSTACK_API_TOKEN is
+# not provisioned on the caller, the job still runs (never `if:`-skipped —
+# GitHub renders an `if:`-skipped job as neither pass nor fail, which is a
+# worse signal than an explicit, visible skip-with-notice in the job log) and
+# the shared script exits 0 with a printed notice. See
+# docs/reusable-workflows.md (`uptime-apply.yml`) for the full contract.
+#
+# SHA-pinned third-party actions.
+name: Uptime apply
+
+on:
+  workflow_call:
+    inputs:
+      monitor-config:
+        description: >
+          Path (relative to the caller repo root) to the JSON monitor-config
+          file. See scripts/apply-uptime-monitors.mjs's docblock for the
+          schema (a bare array of {url, name?, alertEmail?, checkFrequency?}
+          entries, or an object with a `monitors` array).
+        required: true
+        type: string
+      apply:
+        description: >
+          When 'true', apply the computed plan against the Better Stack API
+          (create/update). Default 'false' runs a dry-run: the plan is
+          computed and printed to the job log/summary, but no write is
+          issued. Set 'true' on your production apply trigger (e.g. push to
+          main) and leave 'false' for a PR-time preview.
+        required: false
+        type: string
+        default: 'false'
+      runner:
+        description: 'Runs-on label for the apply job. Default ubuntu-latest.'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+
+    secrets:
+      BETTERSTACK_API_TOKEN:
+        description: >
+          Better Stack API token. When absent, the job skips-with-notice
+          (exit 0, no write) — this is the documented graceful-degradation
+          path for a consumer that has not yet provisioned Better Stack.
+        required: false
+      UPTIME_ALERT_EMAIL:
+        description: >
+          Default alert-contact email applied to any monitor-config entry
+          that does not set its own `alertEmail`. Optional — a monitor entry
+          with no alertEmail and no default simply ships with no alert
+          contact configured.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  uptime-apply:
+    name: uptime-apply
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (shared script)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          ref: ${{ github.job_workflow_sha }}
+          sparse-checkout: |
+            scripts/apply-uptime-monitors.mjs
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-uptime
+          persist-credentials: false
+
+      - name: Checkout (caller — monitor config)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: _caller
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Apply uptime monitors
+        shell: bash
+        env:
+          BETTERSTACK_API_TOKEN: ${{ secrets.BETTERSTACK_API_TOKEN }}
+          UPTIME_ALERT_EMAIL: ${{ secrets.UPTIME_ALERT_EMAIL }}
+          MONITOR_CONFIG: ${{ inputs.monitor-config }}
+          APPLY_FLAG: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          MODE_FLAG="--dry-run"
+          if [ "${APPLY_FLAG}" = "true" ]; then
+            MODE_FLAG="--apply"
+          fi
+          node "${GITHUB_WORKSPACE}/_mandrel-platform-uptime/scripts/apply-uptime-monitors.mjs" \
+            --config "${GITHUB_WORKSPACE}/_caller/${MONITOR_CONFIG}" \
+            "${MODE_FLAG}"
