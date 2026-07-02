@@ -1011,6 +1011,41 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 > `migrate: true` pipeline whose snapshot or migration failed **never**
 > deploys — the recovery point is guaranteed for every migrate run.
 
+### Wrangler version pinning
+
+Every wrangler invocation in this workflow runs the **consumer's own
+lockfile-pinned wrangler** via `pnpm exec wrangler`, installed by the shared
+`setup-toolchain` action (`pnpm install --frozen-lockfile`). This applies at
+**all** call sites uniformly:
+
+| Call site                          | Job                     | Invocation                          |
+| ---------------------------------- | ----------------------- | ----------------------------------- |
+| Built-in D1 export (snapshot)      | `pre-migration-snapshot`| `pnpm exec wrangler d1 export …`     |
+| Built-in D1 migrate                | `migrate`               | `pnpm exec wrangler d1 migrations apply …` |
+| Built-in per-worker deploy loop    | `deploy`                | `pnpm exec wrangler deploy …`        |
+| workers.dev subdomain derivation   | `boot-smoke`            | `pnpm exec wrangler whoami`          |
+| Auto-rollback on smoke failure     | `boot-smoke`            | `pnpm exec wrangler rollback …`      |
+
+The workflow **never** fetches a registry-latest wrangler at runtime (the
+previous `pnpx wrangler` behaviour) while production Cloudflare credentials
+are in scope. Each call site preflights `pnpm exec wrangler --version` and
+**fails loudly** with an actionable message when wrangler is not installed
+from the lockfile, so a consumer that has not pinned it is told to add it
+rather than silently deploying with a floating version:
+
+```console
+pnpm add -D wrangler
+```
+
+Because the pin comes from the consumer's own `pnpm-lock.yaml`, the deployed
+wrangler version is exactly the one the consumer tests against locally and in
+CI — there is no `wrangler-version` input to keep in sync, and no way for a
+mid-incident rollback to run an untested binary. Consumer-supplied seam
+commands (`snapshot-command`, `migrate-command`, `deploy-command`,
+`smoke-command`) own their own wrangler invocation and are unaffected by this
+pinning; a consumer using those seams should pin wrangler the same way in the
+command it supplies.
+
 ### Environments isolation audit
 
 > Story #172. An **opt-in** job (`enable-environments-isolation-audit`,
