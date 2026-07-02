@@ -99,12 +99,18 @@ Log in to the Better Stack dashboard and acknowledge the incident. Leave a note 
 
 ### 4c. Apply the uptime IaC (if monitors are missing)
 
-```bash
-# Dry-run to preview changes
-node scripts/apply-uptime-monitors.mjs --dry-run
+The platform ships `scripts/apply-uptime-monitors.mjs` (an additive Better
+Stack monitor create/update from a JSON monitor-config file). It requires a
+`--config <path>` pointing at the monitor-config, and the Better Stack token
+via `BETTERSTACK_API_TOKEN` (or `--token`); with no token it skips and exits 0.
 
-# Apply
-node scripts/apply-uptime-monitors.mjs --apply
+```bash
+# Dry-run to preview the create/update plan (default when neither flag is set)
+node scripts/apply-uptime-monitors.mjs --config <MONITOR_CONFIG_JSON> --dry-run
+
+# Apply — issues the create/update calls against Better Stack
+BETTERSTACK_API_TOKEN=<token> \
+  node scripts/apply-uptime-monitors.mjs --config <MONITOR_CONFIG_JSON> --apply
 ```
 
 ---

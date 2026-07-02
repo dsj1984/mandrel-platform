@@ -80,34 +80,19 @@
       "groupSlug": "clerk"
     },
     {
-      "description": "Keep .nvmrc and engines.node in lockstep — bump both when Node.js advances",
+      "description": "Keep .nvmrc and engines.node in lockstep — Renovate's nvm manager bumps .nvmrc; group the matching engines.node bump into the same PR. NOTE: automatically rewriting engines.node requires a postUpgradeTasks command, which hosted Mend (the Renovate app) DISABLES for security. Self-hosted Renovate runners must allowlist the command via allowedCommands; on hosted Mend, bump engines.node by hand in the same PR — see docs/runbooks/dependency-update.md.",
       "matchManagers": ["nvm"],
       "matchPackageNames": ["node"],
-      "postUpdateOptions": ["nodeToolchainFile"],
-      "postUpgradeTasks": {
-        "commands": [
-          "node -e \"const fs=require('fs'),path=require('path');const ver=fs.readFileSync('.nvmrc','utf8').trim().replace(/^v/,'');function walk(d){return fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>{const p=path.join(d,e.name);return e.isDirectory()&&e.name!=='node_modules'?walk(p):e.isFile()&&e.name==='package.json'?[p]:[]});}walk('.').forEach(f=>{try{const pkg=JSON.parse(fs.readFileSync(f,'utf8'));if(pkg.engines&&pkg.engines.node){pkg.engines.node=ver;fs.writeFileSync(f,JSON.stringify(pkg,null,2)+'\\n','utf8');console.log('Updated engines.node to '+ver+' in '+f);}}catch(e){}});\""
-        ],
-        "fileFilters": ["**/.nvmrc", "**/package.json"]
-      },
       "automerge": true,
       "automergeType": "pr",
       "platformAutomerge": true
     },
     {
-      "description": "Advance wrangler compatibility_date to today when wrangler is bumped",
+      "description": "Group wrangler bumps so the wrangler compatibility_date can be advanced alongside. NOTE: automatically rewriting compatibility_date requires a postUpgradeTasks command, which hosted Mend (the Renovate app) DISABLES for security. Self-hosted Renovate runners must allowlist the command via allowedCommands; on hosted Mend, advance compatibility_date by hand in the same PR — see docs/runbooks/dependency-update.md.",
       "matchManagers": ["npm"],
       "matchPackageNames": ["wrangler"],
-      "postUpgradeTasks": {
-        "commands": [
-          "node -e \"const fs=require('fs'),path=require('path');function walk(d){return fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>{const p=path.join(d,e.name);return e.isDirectory()&&e.name!=='node_modules'?walk(p):e.isFile()&&/wrangler\\.(json|jsonc|toml)$/.test(e.name)?[p]:[]});}const today=new Date().toISOString().slice(0,10);walk('.').forEach(f=>{let c=fs.readFileSync(f,'utf8');const u=c.replace(/compatibility_date\\s*=\\s*\\\"[0-9-]+\\\"/g,'compatibility_date = \\\"'+today+'\\\"').replace(/\\\"compatibility_date\\\"\\s*:\\s*\\\"[0-9-]+\\\"/g,'\\\"compatibility_date\\\": \\\"'+today+'\\\"');if(u!==c){fs.writeFileSync(f,u,'utf8');console.log('Updated compatibility_date in '+f);}});\""
-        ],
-        "fileFilters": [
-          "**/wrangler.json",
-          "**/wrangler.jsonc",
-          "**/wrangler.toml"
-        ]
-      }
+      "groupName": "wrangler",
+      "groupSlug": "wrangler"
     }
   ]
 }
