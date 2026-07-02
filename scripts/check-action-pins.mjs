@@ -2,7 +2,7 @@
 /**
  * check-action-pins.mjs
  *
- * Action-pin ratchet (Story #112).
+ * Action-pin ratchet (Story #112) + intra-repo single-pin invariant (#203).
  *
  * Third-party GitHub Actions referenced by `uses:` in this repo's workflows
  * and composite actions are SHA-pinned by convention — but until now NOTHING
@@ -32,11 +32,19 @@
  *     composite actions, governed by the cross-repo portability lint's pin-lag
  *     guard (`check-workflow-portability.mjs`, Rule 3), and they carry a
  *     release-tag shape at publish time. The first-party owner is overridable
- *     via `--first-party-owner` for a fork.
+ *     via `--first-party-owner` for a fork. They ARE, however, subject to the
+ *     single-pin invariant below.
  *
  *   • LOCAL `./path` references and `docker://image` references are EXEMPT —
  *     a local path has no upstream tag to move, and a docker ref is pinned by
  *     its own digest convention, out of scope for this action-tag ratchet.
+ *
+ * Single-pin invariant (Story #203): across `.github/workflows/`, two
+ * first-party `uses:` refs to the SAME subpath MUST carry the SAME SHA. Two
+ * workflows pinning `owner/repo/.github/actions/foo` at different commits is a
+ * silent split-brain — one workflow runs the fixed action, the other the
+ * stale one. This lint fails when that drift is present. Disable with
+ * `--no-single-pin` (e.g. mid-migration).
  *
  * The reference is read from the `uses:` value with any trailing `# comment`
  * (the conventional `# v4.2.2` tag annotation) stripped first, so the human
@@ -47,11 +55,13 @@
  *   node scripts/check-action-pins.mjs --workflows-dir .github/workflows
  *   node scripts/check-action-pins.mjs --actions-dir .github/actions
  *   node scripts/check-action-pins.mjs --first-party-owner my-org/my-repo
+ *   node scripts/check-action-pins.mjs --no-single-pin
  *
  * Exit codes:
- *   0 — every third-party `uses:` is pinned to a full 40-char commit SHA.
- *   1 — one or more third-party actions are not SHA-pinned (each named in
- *       stderr with file:line).
+ *   0 — every third-party `uses:` is SHA-pinned and the single-pin invariant holds.
+ *   1 — one or more third-party actions are not SHA-pinned, or a first-party
+ *       subpath is pinned to two different SHAs (each named in stderr with
+ *       file:line).
  *
  * Consumer adoption:
  *   Copy this script into your project's `scripts/` directory and wire it into
@@ -60,20 +70,37 @@
  *     - name: Lint third-party action pins
  *       run: node scripts/check-action-pins.mjs --first-party-owner <owner/repo>
  *
- *   It is dependency-free (no YAML parser) so it copies cleanly into any repo.
+ *   It depends only on the sibling `scripts/lib/` helpers (no YAML parser), so
+ *   copy `scripts/lib/{args,uses-pins,walk}.mjs` alongside it.
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
-import { resolve, join, relative } from "node:path";
+import { readFileSync } from "node:fs";
+import { resolve, relative } from "node:path";
+
+import { parseFlags } from "./lib/args.mjs";
+import {
+  DEFAULT_FIRST_PARTY_OWNER,
+  stripUsesValue,
+  parseUsesLine,
+  classifyUses,
+  isSha40,
+  findSinglePinViolations,
+} from "./lib/uses-pins.mjs";
+import { listWorkflowFiles, listActionFiles } from "./lib/walk.mjs";
+
+// Re-export the shared primitives so the sibling test suite (and any external
+// consumer that imports from this script) keeps its existing import surface.
+export {
+  stripUsesValue,
+  classifyUses,
+  isSha40,
+  listWorkflowFiles,
+  listActionFiles,
+};
 
 // ---------------------------------------------------------------------------
-// Pure helpers (exported for the sibling node:test suite)
+// Arg parsing
 // ---------------------------------------------------------------------------
-
-const DEFAULT_FIRST_PARTY_OWNER = "dsj1984/mandrel-platform";
-
-/** A full git commit SHA is exactly 40 lowercase/uppercase hex characters. */
-const SHA40_RE = /^[0-9a-fA-F]{40}$/;
 
 /**
  * Parse the CLI argv (array AFTER `node script.mjs`) into an options object.
@@ -81,106 +108,21 @@ const SHA40_RE = /^[0-9a-fA-F]{40}$/;
  * loudly rather than silently mis-reading its own configuration.
  */
 export function parseArgs(argv) {
-  const opts = {
-    workflowsDir: ".github/workflows",
-    actionsDir: ".github/actions",
-    firstPartyOwner: DEFAULT_FIRST_PARTY_OWNER,
-    cwd: process.cwd(),
-  };
-  const takeValue = (i, flag) => {
-    const v = argv[i + 1];
-    if (v === undefined || v.startsWith("--")) {
-      throw new Error(`missing value for "${flag}"`);
-    }
-    return v;
-  };
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    switch (arg) {
-      case "--workflows-dir":
-        opts.workflowsDir = takeValue(i, arg);
-        i++;
-        break;
-      case "--actions-dir":
-        opts.actionsDir = takeValue(i, arg);
-        i++;
-        break;
-      case "--first-party-owner":
-        opts.firstPartyOwner = takeValue(i, arg);
-        i++;
-        break;
-      case "--cwd":
-        opts.cwd = takeValue(i, arg);
-        i++;
-        break;
-      default:
-        throw new Error(`unknown argument "${arg}"`);
-    }
-  }
-  return opts;
+  return parseFlags(argv, {
+    flags: {
+      "--workflows-dir": { type: "string", dest: "workflowsDir", default: ".github/workflows" },
+      "--actions-dir": { type: "string", dest: "actionsDir", default: ".github/actions" },
+      "--first-party-owner": { type: "string", dest: "firstPartyOwner", default: DEFAULT_FIRST_PARTY_OWNER },
+      "--cwd": { type: "string", dest: "cwd", default: process.cwd() },
+      "--no-single-pin": { type: "boolean", dest: "singlePin", value: false, default: true },
+    },
+    onUnknown: "throw",
+  });
 }
 
-/**
- * Strip a trailing `# comment` (the conventional `# v4.2.2` tag note) and
- * surrounding whitespace/quotes from a raw `uses:` value, returning the bare
- * action reference. A `#` inside the ref itself is not valid GitHub syntax,
- * so splitting on the first ` #` is safe.
- */
-export function stripUsesValue(raw) {
-  let v = String(raw).trim();
-  // Drop a trailing comment: the first '#' that is preceded by whitespace (or
-  // at the start) begins a comment. GitHub action refs never contain '#'.
-  const hashIdx = v.search(/\s#/);
-  if (hashIdx !== -1) v = v.slice(0, hashIdx);
-  v = v.trim();
-  // Unwrap matched surrounding quotes.
-  if (
-    (v.startsWith('"') && v.endsWith('"')) ||
-    (v.startsWith("'") && v.endsWith("'"))
-  ) {
-    v = v.slice(1, -1).trim();
-  }
-  return v;
-}
-
-/**
- * Classify a bare `uses:` reference. Returns one of:
- *   { kind: 'local' }            — `./path` or `../path` (exempt)
- *   { kind: 'docker' }           — `docker://image` (exempt)
- *   { kind: 'first-party', owner, ref } — the configured first-party owner (exempt)
- *   { kind: 'third-party', owner, ref } — external action (MUST be SHA-pinned)
- *   { kind: 'unparseable' }      — not a recognizable `uses:` reference
- */
-export function classifyUses(bareRef, firstPartyOwner = DEFAULT_FIRST_PARTY_OWNER) {
-  const ref = String(bareRef).trim();
-  if (ref === "") return { kind: "unparseable" };
-  if (ref.startsWith("./") || ref.startsWith("../")) return { kind: "local" };
-  if (ref.startsWith("docker://")) return { kind: "docker" };
-
-  // owner/repo[/subpath]@gitref. The git ref is everything after the LAST '@'
-  // (an action subpath never contains '@'; the ref does not either).
-  const atIdx = ref.lastIndexOf("@");
-  if (atIdx === -1) {
-    // No `@ref` at all — not a pinnable external reference (e.g. a malformed
-    // entry). Treat as unparseable so the caller can flag it explicitly.
-    return { kind: "unparseable", ownerRepoPath: ref };
-  }
-  const ownerRepoPath = ref.slice(0, atIdx);
-  const gitRef = ref.slice(atIdx + 1);
-  const segments = ownerRepoPath.split("/");
-  if (segments.length < 2) return { kind: "unparseable", ownerRepoPath, ref: gitRef };
-
-  const ownerRepo = `${segments[0]}/${segments[1]}`;
-  if (ownerRepo.toLowerCase() === String(firstPartyOwner).toLowerCase()) {
-    return { kind: "first-party", owner: ownerRepo, ref: gitRef };
-  }
-  return { kind: "third-party", owner: ownerRepo, ref: gitRef };
-}
-
-/** True when a git ref is a full 40-character commit SHA. */
-export function isSha40(gitRef) {
-  return SHA40_RE.test(String(gitRef).trim());
-}
+// ---------------------------------------------------------------------------
+// Content scan
+// ---------------------------------------------------------------------------
 
 /**
  * Scan a single file's TEXT for `uses:` step keys and evaluate each third-party
@@ -198,17 +140,9 @@ export function scanContent(content, displayFile, firstPartyOwner = DEFAULT_FIRS
   const violations = [];
   let scanned = 0;
   const lines = String(content).split(/\r?\n/);
-  // Matches a YAML `uses:` mapping key: optional leading whitespace, an
-  // optional leading `- ` (sequence item), then `uses:` and the value.
-  const usesRe = /^\s*(?:-\s+)?uses:\s*(\S.*)$/;
   for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    // Skip whole-line comments outright (defensive; the regex below also
-    // won't match a leading '#').
-    if (/^\s*#/.test(raw)) continue;
-    const m = raw.match(usesRe);
-    if (!m) continue;
-    const bareRef = stripUsesValue(m[1]);
+    const bareRef = parseUsesLine(lines[i]);
+    if (bareRef === null) continue;
     const cls = classifyUses(bareRef, firstPartyOwner);
     if (cls.kind !== "third-party") continue; // local/docker/first-party/unparseable → exempt
     scanned++;
@@ -226,66 +160,28 @@ export function scanContent(content, displayFile, firstPartyOwner = DEFAULT_FIRS
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem walking
-// ---------------------------------------------------------------------------
-
-/** List `*.yml` / `*.yaml` files directly under a workflows dir (non-recursive). */
-export function listWorkflowFiles(dir) {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => /\.ya?ml$/.test(f))
-    .map((f) => join(dir, f))
-    .filter((p) => {
-      try {
-        return statSync(p).isFile();
-      } catch {
-        return false;
-      }
-    })
-    .sort();
-}
-
-/** Recursively list composite `action.yml` / `action.yaml` files under a dir. */
-export function listActionFiles(dir) {
-  const out = [];
-  if (!existsSync(dir)) return out;
-  const walk = (d) => {
-    let entries;
-    try {
-      entries = readdirSync(d, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const full = join(d, e.name);
-      if (e.isDirectory()) {
-        walk(full);
-      } else if (/^action\.ya?ml$/.test(e.name)) {
-        out.push(full);
-      }
-    }
-  };
-  walk(dir);
-  return out.sort();
-}
-
-// ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
 /**
  * Run the full lint against the resolved option set. Returns
- * `{ ok, violations, scanned, files }`. Pure with respect to stdout — the CLI
- * wrapper formats and prints.
+ * `{ ok, violations, scanned, files, singlePinViolations }`. Pure with respect
+ * to stdout — the CLI wrapper formats and prints. `singlePinViolations` is
+ * populated only when `opts.singlePin` is not `false`, and reflects the
+ * intra-repo single-pin invariant across the workflow files only.
  */
 export function runLint(opts) {
   const cwd = opts.cwd || process.cwd();
   const wfDir = resolve(cwd, opts.workflowsDir);
   const acDir = resolve(cwd, opts.actionsDir);
-  const files = [...listWorkflowFiles(wfDir), ...listActionFiles(acDir)];
+  const workflowFiles = listWorkflowFiles(wfDir);
+  const files = [...workflowFiles, ...listActionFiles(acDir)];
 
   const violations = [];
   let scanned = 0;
+  // Keep the raw workflow-file contents for the single-pin pass so we read
+  // each file from disk once.
+  const workflowRecords = [];
   for (const file of files) {
     let content;
     try {
@@ -297,8 +193,23 @@ export function runLint(opts) {
     const res = scanContent(content, display, opts.firstPartyOwner);
     violations.push(...res.violations);
     scanned += res.scanned;
+    if (workflowFiles.includes(file)) {
+      workflowRecords.push({ file: display, content });
+    }
   }
-  return { ok: violations.length === 0, violations, scanned, files };
+
+  const singlePin = opts.singlePin !== false;
+  const singlePinViolations = singlePin
+    ? findSinglePinViolations(workflowRecords, opts.firstPartyOwner)
+    : [];
+
+  return {
+    ok: violations.length === 0 && singlePinViolations.length === 0,
+    violations,
+    scanned,
+    files,
+    singlePinViolations,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +227,10 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
 
   const result = runLint(opts);
 
-  if (!result.ok) {
+  let failed = false;
+
+  if (result.violations.length > 0) {
+    failed = true;
     err(`[action-pins] ❌ ${result.violations.length} unpinned third-party action(s):`);
     for (const v of result.violations) {
       err(`  • ${v.file}:${v.line} — ${v.reason}`);
@@ -326,12 +240,31 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
         "(keep the `# vX.Y.Z` tag note as a comment). A mutable tag can be " +
         "force-moved to a malicious commit after review."
     );
-    return 1;
   }
+
+  if (result.singlePinViolations.length > 0) {
+    failed = true;
+    err(
+      `[action-pins] ❌ ${result.singlePinViolations.length} first-party subpath(s) pinned to different SHAs (single-pin invariant):`
+    );
+    for (const v of result.singlePinViolations) {
+      err(`  • ${v.target} is pinned to ${v.shas.length} distinct refs:`);
+      for (const occ of v.occurrences) {
+        err(`      ${occ.file}:${occ.line} — @${occ.ref}`);
+      }
+    }
+    err(
+      "[action-pins] Every first-party `uses:` to the same subpath across " +
+        ".github/workflows/ must carry the SAME SHA — otherwise one workflow " +
+        "runs the fixed action and another the stale one."
+    );
+  }
+
+  if (failed) return 1;
 
   log(
     `[action-pins] ✅ all ${result.scanned} third-party action reference(s) are SHA-pinned ` +
-      `(${result.files.length} file(s) scanned).`
+      `(${result.files.length} file(s) scanned); first-party single-pin invariant holds.`
   );
   return 0;
 }

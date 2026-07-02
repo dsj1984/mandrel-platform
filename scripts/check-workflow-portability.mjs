@@ -68,9 +68,13 @@
  *   It is dependency-free (no YAML parser) so it copies cleanly into any repo.
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { readFileSync, statSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolve, join, relative, basename } from "node:path";
+
+import { parseFlags } from "./lib/args.mjs";
+import { parseUsesLine, classifyUses, isSha40 } from "./lib/uses-pins.mjs";
+import { listWorkflowFiles, listActionFiles } from "./lib/walk.mjs";
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -79,25 +83,24 @@ import { resolve, join, relative, basename } from "node:path";
 /**
  * Parse the CLI argv slice into an options object. Pure — no I/O, no exit — so
  * the sibling node:test suite can exercise it. `--help` is surfaced as a flag
- * for the CLI wrapper to act on rather than exiting here.
+ * for the CLI wrapper to act on rather than exiting here. Unknown flags are
+ * ignored (lenient CLI), preserving this script's historical behavior.
  */
 export function parseArgs(argv) {
-  let workflowsDir = null;
-  let actionsDir = null;
-  let pinCheck = true;
-  let help = false;
-  for (let i = 0; i < argv.length; i++) {
-    if ((argv[i] === "--workflows-dir" || argv[i] === "-w") && argv[i + 1]) {
-      workflowsDir = argv[++i];
-    } else if ((argv[i] === "--actions-dir" || argv[i] === "-a") && argv[i + 1]) {
-      actionsDir = argv[++i];
-    } else if (argv[i] === "--no-pin-check") {
-      pinCheck = false;
-    } else if (argv[i] === "--help" || argv[i] === "-h") {
-      help = true;
-    }
-  }
-  return { workflowsDir, actionsDir, pinCheck, help };
+  return parseFlags(argv, {
+    flags: {
+      "--workflows-dir": { type: "string", dest: "workflowsDir", default: null },
+      "--actions-dir": { type: "string", dest: "actionsDir", default: null },
+      "--no-pin-check": { type: "boolean", dest: "pinCheck", value: false, default: true },
+      "--help": { type: "boolean", dest: "help", value: true, default: false },
+    },
+    aliases: {
+      "-w": "--workflows-dir",
+      "-a": "--actions-dir",
+      "-h": "--help",
+    },
+    onUnknown: "ignore",
+  });
 }
 
 // Runtime bindings shared by the discovery/lint helpers below. Initialized at
@@ -335,15 +338,23 @@ function gitShow(sha, path) {
 function collectInternalPins(content) {
   const pins = [];
   content.split("\n").forEach((raw, idx) => {
-    const m = raw.match(
-      /uses:\s*['"]?[\w.-]+\/[\w.-]+\/([^@\s'"]+)@([0-9a-fA-F]{40})/
-    );
-    if (!m) return;
-    const subpath = m[1];
-    const sha = m[2];
+    const bareRef = parseUsesLine(raw);
+    if (bareRef === null) return;
+    // `owner/repo/<subpath>@<sha>` — classify against *any* owner (this repo's
+    // own slug or a fork's), then keep only same-repo refs whose subpath
+    // resolves to a real path in the working tree. Passing the parsed owner as
+    // the "first-party" owner makes classifyUses treat every owner/repo the
+    // same; the existsSync gate below is what actually decides "internal".
+    const atIdx = bareRef.lastIndexOf("@");
+    if (atIdx === -1) return;
+    const owner = bareRef.slice(0, atIdx).split("/").slice(0, 2).join("/");
+    const cls = classifyUses(bareRef, owner);
+    if (cls.kind !== "first-party" || !cls.subpath) return;
+    if (!isSha40(cls.ref)) return; // only full-SHA pins are validated by Rule 3
+    const subpath = cls.subpath;
     const local = join(repoRoot, subpath);
     if (!existsSync(local)) return; // external ref → skip
-    pins.push({ subpath, sha, line: idx + 1 });
+    pins.push({ subpath, sha: cls.ref, line: idx + 1 });
   });
   return pins;
 }
@@ -371,45 +382,9 @@ function resolvePinnedManifest(subpath) {
 }
 
 // ---------------------------------------------------------------------------
-// File discovery
+// File discovery — `listWorkflowFiles` / `listActionFiles` are imported from
+// `./lib/walk.mjs` (Story #203).
 // ---------------------------------------------------------------------------
-
-function listWorkflowFiles(dir) {
-  let entries;
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return [];
-  }
-  return entries
-    .filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"))
-    .map((f) => join(dir, f));
-}
-
-function listActionFiles(dir) {
-  const found = [];
-  let entries;
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return found;
-  }
-  for (const entry of entries) {
-    const full = join(dir, entry);
-    let st;
-    try {
-      st = statSync(full);
-    } catch {
-      continue;
-    }
-    if (st.isDirectory()) {
-      found.push(...listActionFiles(full));
-    } else if (entry === "action.yml" || entry === "action.yaml") {
-      found.push(full);
-    }
-  }
-  return found;
-}
 
 // ---------------------------------------------------------------------------
 // Per-file lint
