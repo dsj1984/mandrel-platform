@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.20.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.19.2...mandrel-platform-v0.20.0) (2026-07-02)
+
+
+### Added
+
+* **config:** ship a shared secretlint base (refs [#214](https://github.com/dsj1984/mandrel-platform/issues/214)) ([#217](https://github.com/dsj1984/mandrel-platform/issues/217)) ([aeb2188](https://github.com/dsj1984/mandrel-platform/commit/aeb2188308a5b857c1575c2a95e4830492d568eb))
+* **config:** ship markdownlint.base.jsonc + standardize the fleet on markdownlint-cli2 (refs [#216](https://github.com/dsj1984/mandrel-platform/issues/216)) ([#219](https://github.com/dsj1984/mandrel-platform/issues/219)) ([c823de9](https://github.com/dsj1984/mandrel-platform/commit/c823de98cf5d33c2894ebb4928a5d787faf088f7))
+
 ## [0.19.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.19.1...mandrel-platform-v0.19.2) (2026-07-02)
 
 
