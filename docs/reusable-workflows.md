@@ -1001,6 +1001,54 @@ is set (opt-in), the `deploy` job additionally provisions those named runtime
 secrets in-pipeline — after the deploy step, before `boot-smoke` — via the
 versions secret API; see [In-pipeline worker secrets](#in-pipeline-worker-secrets-opt-in).
 
+> **Migrate-path deploy safety.** On the built-in D1 path the
+> `pre-migration-snapshot` export is **blocking**: it runs under
+> `set -euo pipefail` with no warning fallback, and the snapshot artifact
+> upload uses `if-no-files-found: error`, so a failed or empty export fails
+> the run before any migration. The `deploy` job only proceeds when `migrate`
+> **succeeded**, or when it was legitimately skipped because `migrate: false`
+> (`needs.migrate.result == 'success' || (inputs.migrate == false &&
+> needs.migrate.result == 'skipped')`). This matters because a failed
+> `pre-migration-snapshot` or `migrate` also reports the `migrate` job as
+> `skipped`; gating the `skipped` branch on `migrate: false` ensures a
+> `migrate: true` pipeline whose snapshot or migration failed **never**
+> deploys — the recovery point is guaranteed for every migrate run.
+
+### Wrangler version pinning
+
+Every wrangler invocation in this workflow runs the **consumer's own
+lockfile-pinned wrangler** via `pnpm exec wrangler`, installed by the shared
+`setup-toolchain` action (`pnpm install --frozen-lockfile`). This applies at
+**all** call sites uniformly:
+
+| Call site                          | Job                     | Invocation                          |
+| ---------------------------------- | ----------------------- | ----------------------------------- |
+| Built-in D1 export (snapshot)      | `pre-migration-snapshot`| `pnpm exec wrangler d1 export …`     |
+| Built-in D1 migrate                | `migrate`               | `pnpm exec wrangler d1 migrations apply …` |
+| Built-in per-worker deploy loop    | `deploy`                | `pnpm exec wrangler deploy …`        |
+| workers.dev subdomain derivation   | `boot-smoke`            | `pnpm exec wrangler whoami`          |
+| Auto-rollback on smoke failure     | `boot-smoke`            | `pnpm exec wrangler rollback …`      |
+
+The workflow **never** fetches a registry-latest wrangler at runtime (the
+previous `pnpx wrangler` behaviour) while production Cloudflare credentials
+are in scope. Each call site preflights `pnpm exec wrangler --version` and
+**fails loudly** with an actionable message when wrangler is not installed
+from the lockfile, so a consumer that has not pinned it is told to add it
+rather than silently deploying with a floating version:
+
+```console
+pnpm add -D wrangler
+```
+
+Because the pin comes from the consumer's own `pnpm-lock.yaml`, the deployed
+wrangler version is exactly the one the consumer tests against locally and in
+CI — there is no `wrangler-version` input to keep in sync, and no way for a
+mid-incident rollback to run an untested binary. Consumer-supplied seam
+commands (`snapshot-command`, `migrate-command`, `deploy-command`,
+`smoke-command`) own their own wrangler invocation and are unaffected by this
+pinning; a consumer using those seams should pin wrangler the same way in the
+command it supplies.
+
 ### Environments isolation audit
 
 > Story #172. An **opt-in** job (`enable-environments-isolation-audit`,
@@ -1216,6 +1264,7 @@ jobs:
 | `gh-environment`             | string  | `''`        | GitHub **Deployment Environment** name attached to every secret-touching job, for secret scoping and protection rules. See [gh-environment model](#the-gh-environment-model). |
 | `migrate`                    | boolean | `false`     | Run migrations. When `true`, a pre-migration snapshot runs first. Defaults to D1 tooling; override the command seams for non-D1.                           |
 | `db-engine`                  | string  | `'d1'`      | Engine label for default migrate/snapshot tooling. Any non-`d1` value **requires** `migrate-command` **and** `snapshot-command` (no built-in non-D1 tooling). |
+| `d1-database`                | string  | `''`        | D1 database name passed **positionally** to the built-in `wrangler d1 export` / `wrangler d1 migrations apply` (both target `--remote`). Only consulted on the built-in D1 path. Empty lets wrangler resolve the database from the consumer's config for the target `--env`; set it when the config is ambiguous for the environment. |
 | `snapshot-command`           | string  | `''`        | Consumer pre-migration snapshot command. Replaces the built-in `wrangler d1 export` for non-D1 engines. `*.sql` it writes under `temp/` is uploaded as the snapshot artifact. |
 | `migrate-command`            | string  | `''`        | Consumer migrate command. Replaces `wrangler d1 migrations apply` for non-D1 engines. Runs after the snapshot and after `pre-migrate-assert-command`.       |
 | `pre-migrate-assert-command` | string  | `''`        | Optional host-guard hook run **before** migrate. A non-zero exit aborts the migrate job — use it to refuse migrating unless the resolved DB host matches an expected pattern. |
@@ -1234,10 +1283,13 @@ jobs:
 
 > **Command seams.** `snapshot-command`, `migrate-command`, `build-command`,
 > `deploy-command`, and `smoke-command` are override seams: with **none** set,
-> behaviour is identical to the legacy D1 path (export/apply, root-level
-> deploy loop, workers.dev smoke). Set the relevant seam to adopt the workflow
-> for non-D1 engines, monorepo deploys, or custom smoke targets without losing
-> the snapshot, migrate, build-env, or rollback safety nets.
+> behaviour is the built-in D1 path — `wrangler d1 export` / `wrangler d1
+> migrations apply` (both positional-database, `--remote`), the root-level
+> deploy loop, and the workers.dev smoke. Set the relevant seam to adopt the
+> workflow for non-D1 engines, monorepo deploys, or custom smoke targets
+> without losing the snapshot, migrate, build-env, or rollback safety nets.
+> The built-in deploy loop no longer injects a `--compatibility-date`: the
+> consumer's wrangler config owns `compatibility_date`.
 
 > **`db-engine` guard.** When `migrate: true` and `db-engine` is not `d1`, the
 > `check-env` job fails fast unless both `migrate-command` and

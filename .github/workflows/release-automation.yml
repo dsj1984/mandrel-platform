@@ -153,11 +153,20 @@ jobs:
         with:
           token: ${{ secrets.release-token || github.token }}
           target-branch: ${{ inputs.target-branch }}
-          # release-type / package-name drive single-package mode; they are
-          # ignored by the action when config-file is supplied (the config owns
-          # per-package release-type). config-file / manifest-file are passed
-          # only when non-empty so single-package callers stay config-free.
-          release-type: ${{ inputs.release-type }}
-          package-name: ${{ inputs.package-name }}
+          # release-type / package-name drive single-package mode. When the
+          # caller supplies a config-file (and matched manifest-file), the
+          # config file owns per-package release-type, so release-type MUST NOT
+          # be forced here — passing it would shadow the config. We therefore
+          # send an empty release-type/package-name in config-file mode and the
+          # single-package input otherwise.
+          #
+          # The branch order matters: GitHub Actions `A && B || C` returns
+          # operand *values* with `''` treated as falsy, so `config-file != ''
+          # && '' || release-type` ALWAYS collapses to `release-type` (the `''`
+          # is falsy and falls through). We must instead gate on config-file
+          # being EMPTY so the truthy branch carries the value we want to keep:
+          # single-package → inputs.release-type; config-file mode → ''.
+          release-type: ${{ inputs.config-file == '' && inputs.release-type || '' }}
+          package-name: ${{ inputs.config-file == '' && inputs.package-name || '' }}
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}

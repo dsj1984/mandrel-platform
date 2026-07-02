@@ -35,8 +35,10 @@ import {
   parseDurationMs,
   parseSemver,
   renderReport,
+  resolveLatestRelease,
   runCli,
 } from "./check-pin-drift.mjs";
+import { httpStatusOf, isNotFound } from "./lib/gh-json.mjs";
 
 // ---------------------------------------------------------------------------
 // parseSemver
@@ -385,8 +387,28 @@ function pkgJson(version) {
 }
 
 /**
+ * Build an error shaped like the one `execFileSync('gh', …)` throws when
+ * `gh api` exits non-zero: the HTTP status is carried in the `(HTTP <code>)`
+ * marker `gh` writes to stderr. This is exactly what the fail-closed seam
+ * (`httpStatusOf` / `isNotFound` in scripts/lib/gh-json.mjs) parses.
+ *
+ * @param {number} status  HTTP status code (e.g. 404, 500).
+ * @param {string} [label]  Human label gh prints before the marker.
+ * @returns {Error}
+ */
+function ghHttpError(status, label = "Error") {
+  const err = new Error(`Command failed: gh api …\ngh: ${label} (HTTP ${status})`);
+  // execFileSync surfaces the CLI's stderr on `.stderr`; the status parser
+  // reads it there first.
+  err.stderr = `gh: ${label} (HTTP ${status})\n`;
+  return err;
+}
+
+/**
  * Build an injectable gh runner from a per-repo fixture map:
  *   { "owner/repo": { workflowSha, npm: string | null | "throw" } }
+ * `npm: "throw"` simulates a 404 on the package.json fetch (the legitimate
+ * "consumer has no package.json" case → treated as absent).
  */
 function makeRunGh(fixtures) {
   return (args) => {
@@ -407,7 +429,8 @@ function makeRunGh(fixtures) {
         ]);
       }
       if (path === `repos/${repo}/contents/package.json?ref=main`) {
-        if (cfg.npm === "throw") throw new Error("404 Not Found");
+        // A 404 on package.json is the "no npm config package" case → absent.
+        if (cfg.npm === "throw") throw ghHttpError(404, "Not Found");
         return JSON.stringify({ encoding: "base64", content: b64(pkgJson(cfg.npm)) });
       }
     }
@@ -548,11 +571,18 @@ test("buildReport: a stale pin literal beyond uses: is drift (Story #110)", () =
   assert.match(text, /STALE PIN LITERAL/);
 });
 
-test("fetchConsumerPackageJson returns null when the file is missing", () => {
+test("fetchConsumerPackageJson returns null when the file is missing (404)", () => {
   const runGh = () => {
-    throw new Error("404");
+    throw ghHttpError(404, "Not Found");
   };
   assert.equal(fetchConsumerPackageJson("o/x", "main", runGh), null);
+});
+
+test("fetchConsumerPackageJson rethrows a non-404 error (fail closed)", () => {
+  const runGh = () => {
+    throw ghHttpError(500, "Server Error");
+  };
+  assert.throws(() => fetchConsumerPackageJson("o/x", "main", runGh), /HTTP 500/);
 });
 
 // ---------------------------------------------------------------------------
@@ -605,6 +635,148 @@ test("runCli --strict exits 1 when drift is present", () => {
       summaryPath: undefined,
     });
     assert.equal(code, 1);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed on a non-404 gh error (Story #198) — the fail-open the strict
+// gate must not have. Historically EVERY gh error was swallowed into an
+// "absent" sentinel, so a 500/403/network blip read as "no drift" and
+// `--strict` exited 0. The seam now surfaces the HTTP status: only a 404 is
+// swallowed; every other error propagates to an `error` row.
+// ---------------------------------------------------------------------------
+
+const ERROR_CONFIG = {
+  platformRepo: PLATFORM,
+  consumers: [{ name: "flaky", repo: "o/flaky", branch: "main" }],
+};
+
+/**
+ * A gh runner whose workflow-listing call fails. `status` selects the HTTP
+ * code so a single helper drives both the 404 (swallow → absent) and non-404
+ * (rethrow → error row) cases.
+ */
+function makeFailingRunGh(status) {
+  return (args) => {
+    const path = args[1];
+    if (path === `repos/${PLATFORM}/releases/latest`) {
+      return JSON.stringify({ tag_name: TAG });
+    }
+    if (path === `repos/${PLATFORM}/git/ref/tags/${TAG}`) {
+      return JSON.stringify({ object: { sha: LATEST_SHA, type: "commit" } });
+    }
+    if (path === "repos/o/flaky/contents/.github/workflows?ref=main") {
+      throw ghHttpError(status, status === 404 ? "Not Found" : "Server Error");
+    }
+    if (path === "repos/o/flaky/contents/package.json?ref=main") {
+      return JSON.stringify({ encoding: "base64", content: b64(pkgJson("1.4.0")) });
+    }
+    throw new Error(`unexpected gh api path: ${path}`);
+  };
+}
+
+test("httpStatusOf / isNotFound parse the HTTP status out of a gh error", () => {
+  assert.equal(httpStatusOf(ghHttpError(404)), 404);
+  assert.equal(httpStatusOf(ghHttpError(500)), 500);
+  assert.equal(isNotFound(ghHttpError(404)), true);
+  assert.equal(isNotFound(ghHttpError(500)), false);
+  // A bare error with no parseable status is NOT a 404 → must fail closed.
+  assert.equal(httpStatusOf(new Error("socket hang up")), null);
+  assert.equal(isNotFound(new Error("socket hang up")), false);
+});
+
+test("buildReport: a non-404 gh error yields an `error` row (fail closed)", () => {
+  const report = buildReport(ERROR_CONFIG, makeFailingRunGh(500));
+  const r = byName(report, "flaky");
+  assert.notEqual(r.error, undefined);
+  assert.match(r.error, /HTTP 500/);
+  assert.equal(r.drift, false); // drift itself is false…
+  // …but hasDrift counts the error row, so the report is NOT clean.
+  assert.equal(hasDrift(report), true);
+});
+
+test("buildReport: a 404-shaped gh error is classified no-pins, drift false", () => {
+  const report = buildReport(ERROR_CONFIG, makeFailingRunGh(404));
+  const r = byName(report, "flaky");
+  assert.equal(r.error, undefined);
+  assert.equal(r.verdict.lagState, "no-pins");
+  assert.equal(r.drift, false);
+  assert.equal(hasDrift(report), false);
+});
+
+test("resolveLatestRelease rethrows a non-404 error on releases/latest (fail closed)", () => {
+  // A transient 5xx/403 on the platform's own release resolution must NOT be
+  // swallowed into sha:null — that would classify the whole fleet as lagState
+  // "unknown" (drift=false) and silently pass the strict gate.
+  const runGh = (args) => {
+    if (args[1] === `repos/${PLATFORM}/releases/latest`) {
+      throw ghHttpError(500, "Server Error");
+    }
+    throw new Error(`unexpected gh api path: ${args[1]}`);
+  };
+  assert.throws(() => resolveLatestRelease(PLATFORM, runGh), /HTTP 500/);
+});
+
+test("resolveLatestRelease returns nulls on a 404 (repo has no release yet)", () => {
+  const runGh = (args) => {
+    if (args[1] === `repos/${PLATFORM}/releases/latest`) {
+      throw ghHttpError(404, "Not Found");
+    }
+    throw new Error(`unexpected gh api path: ${args[1]}`);
+  };
+  assert.deepEqual(resolveLatestRelease(PLATFORM, runGh), {
+    tag: null,
+    sha: null,
+    publishedAt: null,
+  });
+});
+
+test("resolveLatestRelease rethrows a non-404 error on the tag→sha deref (fail closed)", () => {
+  const runGh = (args) => {
+    if (args[1] === `repos/${PLATFORM}/releases/latest`) {
+      return JSON.stringify({ tag_name: TAG });
+    }
+    if (args[1] === `repos/${PLATFORM}/git/ref/tags/${TAG}`) {
+      throw ghHttpError(503, "Service Unavailable");
+    }
+    throw new Error(`unexpected gh api path: ${args[1]}`);
+  };
+  assert.throws(() => resolveLatestRelease(PLATFORM, runGh), /HTTP 503/);
+});
+
+test("runCli --strict exits non-zero on a non-404 gh error (fail closed)", () => {
+  cfgDir = mkdtempSync(join(tmpdir(), "pin-drift-failclosed-"));
+  const p = join(cfgDir, "consumers.json");
+  writeFileSync(p, JSON.stringify(ERROR_CONFIG));
+  try {
+    const code = runCli({
+      argv: ["--config", p, "--strict"],
+      runGh: makeFailingRunGh(500),
+      stdout: capture(),
+      stderr: capture(),
+      summaryPath: undefined,
+    });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
+test("runCli --strict exits 0 on a 404-shaped gh error (genuine absence)", () => {
+  cfgDir = mkdtempSync(join(tmpdir(), "pin-drift-404-"));
+  const p = join(cfgDir, "consumers.json");
+  writeFileSync(p, JSON.stringify(ERROR_CONFIG));
+  try {
+    const code = runCli({
+      argv: ["--config", p, "--strict"],
+      runGh: makeFailingRunGh(404),
+      stdout: capture(),
+      stderr: capture(),
+      summaryPath: undefined,
+    });
+    assert.equal(code, 0);
   } finally {
     rmSync(cfgDir, { recursive: true, force: true });
   }

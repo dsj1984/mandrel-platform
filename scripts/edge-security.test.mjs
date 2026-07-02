@@ -252,10 +252,90 @@ test("default key extractor fails closed to a shared bucket when no IP", async (
   assert.equal((await limiter.check(bare())).allowed, false); // same "anonymous" bucket
 });
 
-test("memory store self-prunes expired buckets", async () => {
+test("memory store evicts expired buckets on access", async () => {
   const store = createMemoryStore();
   store.set("k", { count: 5, resetAt: Date.now() - 1 });
   assert.equal(store.get("k"), null);
+});
+
+test("memory store sweeps expired buckets on write so distinct keys do not leak", () => {
+  const store = createMemoryStore({ maxBuckets: 4 });
+  // Seed the store to capacity with already-expired buckets.
+  for (let i = 0; i < 4; i += 1) {
+    store.set(`expired-${i}`, { count: 1, resetAt: Date.now() - 1 });
+  }
+  // One more distinct key triggers the amortized sweep; the expired entries
+  // are reclaimed instead of growing the map past the cap.
+  store.set("live", { count: 1, resetAt: Date.now() + 60_000 });
+  assert.equal(store.get("live") !== null, true);
+  for (let i = 0; i < 4; i += 1) {
+    assert.equal(store.get(`expired-${i}`), null);
+  }
+});
+
+test("memory store caps live-key count via LRU eviction under a distinct-key flood", () => {
+  const maxBuckets = 8;
+  const store = createMemoryStore({ maxBuckets });
+  const resetAt = Date.now() + 60_000; // all un-expired, so only the cap bounds size
+  // A flood of far more distinct, still-live keys than the cap.
+  for (let i = 0; i < maxBuckets * 50; i += 1) {
+    store.set(`ip-${i}`, { count: 1, resetAt });
+  }
+  // Size stays bounded — the map never grew to the flood count.
+  let liveCount = 0;
+  for (let i = 0; i < maxBuckets * 50; i += 1) {
+    if (store.get(`ip-${i}`) !== null) {
+      liveCount += 1;
+    }
+  }
+  assert.equal(liveCount <= maxBuckets, true, `expected <= ${maxBuckets} live buckets, got ${liveCount}`);
+  // The most-recently-inserted key survived; the oldest was evicted (LRU).
+  assert.equal(store.get(`ip-${maxBuckets * 50 - 1}`) !== null, true);
+  assert.equal(store.get("ip-0"), null);
+});
+
+test("a rate limiter over the bounded store stays memory-bounded across a distinct-key flood", async () => {
+  const store = createMemoryStore({ maxBuckets: 16 });
+  const limiter = createRateLimiter({ limit: 1, windowMs: 60_000, store });
+  // Each request presents a distinct client IP; without the cap this would
+  // grow one bucket per request forever.
+  for (let i = 0; i < 5_000; i += 1) {
+    await limiter.check(ipReq(`10.0.${(i >> 8) & 255}.${i & 255}`));
+  }
+  let liveCount = 0;
+  for (let i = 0; i < 5_000; i += 1) {
+    if (store.get(`10.0.${(i >> 8) & 255}.${i & 255}`) !== null) {
+      liveCount += 1;
+    }
+  }
+  assert.equal(liveCount <= 16, true, `expected <= 16 live buckets, got ${liveCount}`);
+});
+
+test("default key extractor ignores spoofable X-Forwarded-For", async () => {
+  const limiter = createRateLimiter({ limit: 1, windowMs: 60_000 });
+  // Two requests with different X-Forwarded-For values but no CF-Connecting-IP
+  // must land in the SAME bucket — a client cannot mint fresh buckets by
+  // rotating a forged X-Forwarded-For.
+  const xffReq = (xff) =>
+    new Request("https://api.example.com/", {
+      headers: { "X-Forwarded-For": xff },
+    });
+  assert.equal((await limiter.check(xffReq("1.2.3.4"))).allowed, true);
+  // Different forged header, same shared "anonymous" bucket → denied.
+  assert.equal((await limiter.check(xffReq("5.6.7.8"))).allowed, false);
+});
+
+test("default key extractor keys off trusted CF-Connecting-IP even when X-Forwarded-For differs", async () => {
+  const limiter = createRateLimiter({ limit: 1, windowMs: 60_000 });
+  const req = (cf, xff) =>
+    new Request("https://api.example.com/", {
+      headers: { "CF-Connecting-IP": cf, "X-Forwarded-For": xff },
+    });
+  // Distinct trusted IPs get distinct buckets regardless of the forged XFF.
+  assert.equal((await limiter.check(req("1.1.1.1", "9.9.9.9"))).allowed, true);
+  assert.equal((await limiter.check(req("2.2.2.2", "9.9.9.9"))).allowed, true);
+  // Same trusted IP, different forged XFF → same bucket → denied.
+  assert.equal((await limiter.check(req("1.1.1.1", "8.8.8.8"))).allowed, false);
 });
 
 test("rateLimitHeaders includes Retry-After only when denied", () => {

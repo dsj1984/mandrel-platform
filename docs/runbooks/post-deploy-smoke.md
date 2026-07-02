@@ -16,29 +16,28 @@ The smoke test is **not** a functional acceptance test — it only proves the Wo
 
 ## 2. What the Smoke Step Does
 
-The shared deploy workflow runs the following sequence after `wrangler deploy`:
+The smoke test is a **built-in job of the shared `deploy-cloudflare.yml`
+workflow** — the `boot-smoke` job that runs after the `deploy` job succeeds.
+There is no `smoke-deploy.sh` script to invoke; the probe is driven by the
+workflow's `smoke*` inputs. The default probe HTTP-GETs each `smoke_paths`
+entry (default `/health`) against each deployed worker's derived
+`workers.dev` host and treats any 2xx as a pass; a non-2xx (or timeout) fails
+the run and triggers `wrangler rollback`.
 
-```bash
-# scripts/smoke-deploy.sh
-HEALTH_URL="${1}"         # e.g. https://<worker>.workers.dev/health
-MAX_ATTEMPTS="${2:-5}"    # retry count (default 5)
-DELAY_SECONDS="${3:-10}"  # delay between retries (default 10s)
+Consumer-facing inputs (see
+[`reusable-workflows.md` — deploy-cloudflare.yml](../reusable-workflows.md#deploy-cloudflareyml)):
 
-for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL")
-  if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-    echo "Smoke passed (attempt $attempt): $HTTP_STATUS"
-    exit 0
-  fi
-  echo "Smoke attempt $attempt failed: $HTTP_STATUS — retrying in ${DELAY_SECONDS}s"
-  sleep "$DELAY_SECONDS"
-done
+| Input | Purpose |
+|-------|---------|
+| `smoke` | Run the built-in boot-smoke + auto-rollback job. Default `true`; set `false` to run your own post-deploy verification instead (auto-rollback is skipped too). |
+| `smoke_paths` | Comma-separated paths probed against each target (e.g. `/,/portal,/api/health`). Default `/health`; each path needs a leading slash. |
+| `smoke_base_url` | Base URL to prepend to each path instead of the derived `workers.dev` host (e.g. `https://godomio.com`). No trailing slash. |
+| `smoke-command` | A consumer-supplied smoke command that **replaces** the built-in probe entirely (multi-route / custom-host consumers). Runs with `WORKERS` and `SMOKE_BASE_URL` exported; a non-zero exit fails the run and triggers the same rollback. |
+| `workers_dev_subdomain` | `workers.dev` account slug used to build the probe URL. Derived from `wrangler whoami` when empty. |
+| `verify-commit-sha` | Opt-in: additionally assert each worker's health `version` field matches `github.sha` (see § 3). |
 
-echo "Smoke FAILED after $MAX_ATTEMPTS attempts — triggering rollback"
-exit 1
-```
-
-On exit code 1, the workflow triggers `wrangler rollback` and fails the run.
+On a smoke failure, the workflow triggers `wrangler rollback` for the
+affected worker(s) and fails the run.
 
 ---
 
@@ -79,15 +78,23 @@ for the full input contract.
 
 ## 4. Running the Smoke Manually
 
+The smoke gate lives in the workflow, not a standalone script, so reproduce it
+manually with `curl` against the same health URL the built-in probe targets:
+
 ```bash
-# From the repo root — pass the health URL and optional retry params
-./scripts/smoke-deploy.sh https://<WORKER_NAME>.<SUBDOMAIN>.workers.dev/health 5 10
+# One-shot check — the same 2xx/non-2xx decision the built-in probe makes
+curl -sf https://<WORKER_NAME>.<SUBDOMAIN>.workers.dev/health && echo "OK" || echo "FAIL"
 ```
 
-Or, using curl directly for a one-shot check:
+To mirror the workflow's retry behaviour (it retries a slow cold-start before
+declaring failure), loop the same check:
 
 ```bash
-curl -sf https://<WORKER_NAME>.<SUBDOMAIN>.workers.dev/health && echo "OK" || echo "FAIL"
+HEALTH_URL="https://<WORKER_NAME>.<SUBDOMAIN>.workers.dev/health"
+for attempt in $(seq 1 5); do
+  if curl -sf -o /dev/null "$HEALTH_URL"; then echo "Smoke passed (attempt $attempt)"; break; fi
+  echo "Smoke attempt $attempt failed — retrying in 10s"; sleep 10
+done
 ```
 
 ---

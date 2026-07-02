@@ -21,9 +21,15 @@
 ## Apply & Verify
 
 ```bash
-# Preview / apply
-node scripts/apply-branch-protection.mjs --dry-run
-node scripts/apply-branch-protection.mjs --apply
+# Apply — PUT the protection with the aggregator as the only required context.
+# (There is no apply-branch-protection script; use gh api directly — see the
+# canonical runbook § 3.)
+gh api repos/<OWNER>/<REPO>/branches/<PROTECTED_BRANCH>/protection \
+  --method PUT \
+  --raw-field required_status_checks='{"strict":false,"contexts":["<AGGREGATOR_CHECK>"]}' \
+  --field enforce_admins=false \
+  --raw-field required_pull_request_reviews=null \
+  --raw-field restrictions=null
 
 # Verify
 gh api repos/<OWNER>/<REPO>/branches/<PROTECTED_BRANCH>/protection \

@@ -23,42 +23,8 @@
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, extname } from 'node:path';
+import { join, relative, extname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-
-// ---------------------------------------------------------------------------
-// CLI argument parsing
-// ---------------------------------------------------------------------------
-
-const { values: argv } = parseArgs({
-  options: {
-    dir: { type: 'string', default: 'docs' },
-    'warn-only': { type: 'boolean', default: false },
-    quiet: { type: 'boolean', default: false },
-    help: { type: 'boolean', default: false },
-  },
-  strict: false,
-});
-
-if (argv.help) {
-  console.log(`
-check-docs-staleness.mjs — docs staleness lint for mandrel-platform consumers
-
-Usage:
-  node scripts/check-docs-staleness.mjs [options]
-
-Options:
-  --dir <path>      Directory to scan (default: docs/)
-  --warn-only       Exit 0 even when issues are found
-  --quiet           Suppress per-file output; only print summary
-  --help            Print this help and exit
-`);
-  process.exit(0);
-}
-
-const SCAN_DIR = argv.dir ?? 'docs';
-const WARN_ONLY = argv['warn-only'] ?? false;
-const QUIET = argv.quiet ?? false;
 
 // ---------------------------------------------------------------------------
 // Staleness patterns
@@ -74,7 +40,7 @@ const QUIET = argv.quiet ?? false;
 // flagged text to suppress a specific rule for that occurrence.
 // ---------------------------------------------------------------------------
 
-const RULES = [
+export const RULES = [
   {
     id: 'pages-deploy-command',
     description: 'References `wrangler pages deploy` — may be stale if the project has migrated web to a Worker',
@@ -130,11 +96,49 @@ const RULES = [
   {
     id: 'expired-placeholder',
     description: 'Placeholder date that has passed (YYYY-MM-DD pattern in an expiry/todo context)',
-    // Matches explicit expiry dates like "expires: 2025-01-01" that are in the past
-    pattern: /expires[:\s]+202[0-4]-\d{2}-\d{2}/gi,
+    // Matches explicit expiry dates like "expires: 2025-01-01" for ANY 20xx
+    // year. The hardcoded 2020–2024 window meant an expiry that lapsed in
+    // 2025/2026 (or any later year) sailed through the gate. We now match any
+    // 4-digit 20xx year and defer the "is it actually in the past?" decision
+    // to `matchFilter`, so the rule stays correct as the calendar advances and
+    // never flags a still-valid FUTURE expiry.
+    pattern: /expires[:\s]+(20\d{2}-\d{2}-\d{2})/gi,
     severity: 'error',
+    // Only flag when the captured date is strictly before today (UTC). Future
+    // expiries are still valid and must not be reported.
+    matchFilter: (match, { now = new Date() } = {}) => isExpiredDate(match, now),
   },
 ];
+
+// ---------------------------------------------------------------------------
+// Date helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Given a full regex match like "expires: 2025-03-01", extract the YYYY-MM-DD
+ * date and return true when it is strictly before `now` (i.e. it has expired).
+ * Malformed / unparseable dates return false (nothing to flag).
+ *
+ * @param {string} matchText  The full matched substring (e.g. "expires: 2025-03-01").
+ * @param {Date}   now        Reference "today" (defaults to the current date).
+ * @returns {boolean}
+ */
+export function isExpiredDate(matchText, now = new Date()) {
+  const m = /(\d{4})-(\d{2})-(\d{2})/.exec(String(matchText));
+  if (!m) return false;
+  const [, y, mo, d] = m;
+  // Parse as a UTC calendar date to avoid local-timezone drift.
+  const dateMs = Date.UTC(Number(y), Number(mo) - 1, Number(d));
+  if (Number.isNaN(dateMs)) return false;
+  // Compare against today's UTC calendar date (midnight), so an expiry dated
+  // strictly earlier than today counts as expired regardless of clock time.
+  const todayMs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+  );
+  return dateMs < todayMs;
+}
 
 // ---------------------------------------------------------------------------
 // File walker
@@ -145,7 +149,7 @@ const RULES = [
  * @param {string} dir
  * @returns {string[]}
  */
-function walkDir(dir) {
+export function walkDir(dir) {
   const results = [];
   let entries;
   try {
@@ -179,7 +183,7 @@ function walkDir(dir) {
  * @param {string} filePath
  * @returns {Finding[]}
  */
-function lintFile(filePath) {
+export function lintFile(filePath) {
   const findings = [];
   let content;
   try {
@@ -205,6 +209,12 @@ function lintFile(filePath) {
       rule.pattern.lastIndex = 0;
       let match;
       while ((match = rule.pattern.exec(line)) !== null) {
+        // A rule may declare a `matchFilter` predicate to decide, per match,
+        // whether the hit is actually a finding (e.g. the expired-placeholder
+        // rule only fires when the captured date is in the past).
+        if (typeof rule.matchFilter === 'function' && !rule.matchFilter(match[0])) {
+          continue;
+        }
         findings.push({
           file: filePath,
           line: i + 1,
@@ -219,59 +229,98 @@ function lintFile(filePath) {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// CLI entrypoint (guarded so `node --test` imports don't run the scan)
 // ---------------------------------------------------------------------------
 
-const files = walkDir(SCAN_DIR);
+function main() {
+  const { values: argv } = parseArgs({
+    options: {
+      dir: { type: 'string', default: 'docs' },
+      'warn-only': { type: 'boolean', default: false },
+      quiet: { type: 'boolean', default: false },
+      help: { type: 'boolean', default: false },
+    },
+    strict: false,
+  });
 
-if (files.length === 0) {
-  console.log(`[docs-staleness] No files found under '${SCAN_DIR}' — nothing to check.`);
-  process.exit(0);
-}
+  if (argv.help) {
+    console.log(`
+check-docs-staleness.mjs — docs staleness lint for mandrel-platform consumers
 
-/** @type {Finding[]} */
-const allFindings = [];
+Usage:
+  node scripts/check-docs-staleness.mjs [options]
 
-for (const file of files) {
-  const findings = lintFile(file);
-  allFindings.push(...findings);
-}
+Options:
+  --dir <path>      Directory to scan (default: docs/)
+  --warn-only       Exit 0 even when issues are found
+  --quiet           Suppress per-file output; only print summary
+  --help            Print this help and exit
+`);
+    return 0;
+  }
 
-// Group findings by file for readable output
-const byFile = new Map();
-for (const finding of allFindings) {
-  const key = finding.file;
-  if (!byFile.has(key)) byFile.set(key, []);
-  byFile.get(key).push(finding);
-}
+  const SCAN_DIR = argv.dir ?? 'docs';
+  const WARN_ONLY = argv['warn-only'] ?? false;
+  const QUIET = argv.quiet ?? false;
 
-const errors = allFindings.filter((f) => f.rule.severity === 'error');
-const warnings = allFindings.filter((f) => f.rule.severity === 'warning');
+  const files = walkDir(SCAN_DIR);
 
-if (!QUIET) {
-  for (const [file, findings] of byFile.entries()) {
-    const relPath = relative(process.cwd(), file);
-    for (const f of findings) {
-      const sev = f.rule.severity === 'error' ? 'ERR ' : 'WARN';
-      console.log(`[${sev}] ${relPath}:${f.line} — ${f.rule.id}: ${f.rule.description}`);
-      console.log(`       matched: ${JSON.stringify(f.match)}`);
+  if (files.length === 0) {
+    console.log(`[docs-staleness] No files found under '${SCAN_DIR}' — nothing to check.`);
+    return 0;
+  }
+
+  /** @type {Finding[]} */
+  const allFindings = [];
+
+  for (const file of files) {
+    const findings = lintFile(file);
+    allFindings.push(...findings);
+  }
+
+  // Group findings by file for readable output
+  const byFile = new Map();
+  for (const finding of allFindings) {
+    const key = finding.file;
+    if (!byFile.has(key)) byFile.set(key, []);
+    byFile.get(key).push(finding);
+  }
+
+  const errors = allFindings.filter((f) => f.rule.severity === 'error');
+  const warnings = allFindings.filter((f) => f.rule.severity === 'warning');
+
+  if (!QUIET) {
+    for (const [file, findings] of byFile.entries()) {
+      const relPath = relative(process.cwd(), file);
+      for (const f of findings) {
+        const sev = f.rule.severity === 'error' ? 'ERR ' : 'WARN';
+        console.log(`[${sev}] ${relPath}:${f.line} — ${f.rule.id}: ${f.rule.description}`);
+        console.log(`       matched: ${JSON.stringify(f.match)}`);
+      }
     }
   }
+
+  console.log(
+    `\n[docs-staleness] Scanned ${files.length} file(s). ` +
+    `Found ${errors.length} error(s), ${warnings.length} warning(s).`,
+  );
+
+  if (allFindings.length > 0) {
+    console.log(`\nTo suppress a specific rule occurrence, add this comment on the line above:`);
+    console.log(`  <!-- staleness-ignore: <rule-id> -->`);
+    console.log(`\nAvailable rule IDs: ${RULES.map((r) => r.id).join(', ')}`);
+  }
+
+  if (errors.length > 0 && !WARN_ONLY) {
+    return 1;
+  }
+
+  return 0;
 }
 
-console.log(
-  `\n[docs-staleness] Scanned ${files.length} file(s). ` +
-  `Found ${errors.length} error(s), ${warnings.length} warning(s).`,
-);
-
-if (allFindings.length > 0) {
-  console.log(`\nTo suppress a specific rule occurrence, add this comment on the line above:`);
-  console.log(`  <!-- staleness-ignore: <rule-id> -->`);
-  console.log(`\nAvailable rule IDs: ${RULES.map((r) => r.id).join(', ')}`);
+// Only run when executed directly, not when imported by the test suite.
+const invokedDirectly =
+  process.argv[1] && resolve(process.argv[1]).endsWith('check-docs-staleness.mjs');
+if (invokedDirectly) {
+  process.exit(main());
 }
-
-if (errors.length > 0 && !WARN_ONLY) {
-  process.exit(1);
-}
-
-process.exit(0);

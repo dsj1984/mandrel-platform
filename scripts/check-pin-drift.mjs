@@ -85,7 +85,23 @@
 
 import { readFileSync, appendFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { execFileSync } from "node:child_process";
+
+import {
+  defaultGhRunner,
+  ghApiJson,
+  isNotFound,
+} from "./lib/gh-json.mjs";
+import {
+  compareSemver,
+  parseDurationMs,
+  parseSemver,
+} from "./lib/semver-duration.mjs";
+
+// Re-export the extracted seams so existing importers (platform-repair.mjs,
+// the test suite) keep their `check-pin-drift.mjs` import paths. The canonical
+// homes are scripts/lib/gh-json.mjs and scripts/lib/semver-duration.mjs
+// (Story #198).
+export { compareSemver, parseDurationMs, parseSemver, defaultGhRunner };
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -316,79 +332,6 @@ export function classifyConsumer(pins, latestReleaseSha) {
     lagState,
     drift,
   };
-}
-
-/**
- * Extract a comparable `x.y.z` semver core from a release tag or version spec.
- * The platform tags releases as `mandrel-platform-v<semver>`; consumer specs
- * may carry a range prefix (`^0.11.3`, `~0.11.3`). Returns the dotted triple
- * or null when no numeric semver core is present (`workspace:*`, `latest`, a
- * git URL).
- *
- * @param {unknown} value
- * @returns {string | null}
- */
-export function parseSemver(value) {
-  if (typeof value !== "string") return null;
-  const m = /(\d+)\.(\d+)\.(\d+)/.exec(value);
-  return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
-}
-
-/**
- * Compare two `x.y.z` semver cores. Returns -1 when a < b, 0 when equal, 1
- * when a > b. Inputs MUST already be normalized dotted triples (see
- * `parseSemver`).
- *
- * @param {string} a
- * @param {string} b
- * @returns {-1 | 0 | 1}
- */
-export function compareSemver(a, b) {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < 3; i += 1) {
-    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
-  }
-  return 0;
-}
-
-/**
- * Parse a Renovate-style `minimumReleaseAge` duration into milliseconds. The
- * preset uses human strings like `"3 days"`, `"36 hours"`, `"1 week"`; this
- * accepts an integer (or float) count followed by a unit (the same units
- * Renovate's `ms`-backed parser accepts). Returns null for an unparseable or
- * non-positive value so the caller can fall back to "no hold window".
- *
- * @param {unknown} value
- * @returns {number | null}  Window length in ms, or null.
- */
-export function parseDurationMs(value) {
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    // Bare number is interpreted as days (the preset's unit of record).
-    return value * 24 * 60 * 60 * 1000;
-  }
-  if (typeof value !== "string") return null;
-  const m = /^\s*(\d+(?:\.\d+)?)\s*([a-z]+)\s*$/i.exec(value.trim());
-  if (!m) return null;
-  const count = Number.parseFloat(m[1]);
-  if (!Number.isFinite(count) || count <= 0) return null;
-  const unit = m[2].toLowerCase();
-  const units = {
-    minute: 60 * 1000,
-    minutes: 60 * 1000,
-    min: 60 * 1000,
-    mins: 60 * 1000,
-    hour: 60 * 60 * 1000,
-    hours: 60 * 60 * 1000,
-    hr: 60 * 60 * 1000,
-    hrs: 60 * 60 * 1000,
-    day: 24 * 60 * 60 * 1000,
-    days: 24 * 60 * 60 * 1000,
-    week: 7 * 24 * 60 * 60 * 1000,
-    weeks: 7 * 24 * 60 * 60 * 1000,
-  };
-  const factor = units[unit];
-  return factor ? count * factor : null;
 }
 
 /**
@@ -756,32 +699,11 @@ export function renderReport(report) {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub access (via gh CLI) — thin, injectable seam for testing
+// GitHub access — the injectable `gh` seam lives in scripts/lib/gh-json.mjs
+// (Story #198). `ghApiJson` surfaces the HTTP status on any error; the
+// per-consumer fetchers below swallow ONLY a 404 into an "absent" sentinel and
+// rethrow every other error so the strict gate fails CLOSED.
 // ---------------------------------------------------------------------------
-
-/**
- * Run `gh api <path>` and parse the JSON response.
- *
- * @param {string} apiPath  e.g. "repos/owner/repo/releases/latest".
- * @param {(args: string[]) => string} runGh  Injectable runner (default execFileSync gh).
- * @returns {unknown}
- */
-function ghApiJson(apiPath, runGh) {
-  const raw = runGh(["api", apiPath, "-H", "Accept: application/vnd.github+json"]);
-  return JSON.parse(raw);
-}
-
-/**
- * Default gh runner — shells out to the `gh` CLI.
- * @param {string[]} args
- * @returns {string}
- */
-export function defaultGhRunner(args) {
-  return execFileSync("gh", args, {
-    encoding: "utf-8",
-    maxBuffer: 32 * 1024 * 1024,
-  });
-}
 
 /**
  * Resolve the latest platform release tag, the commit SHA that tag points at,
@@ -798,8 +720,15 @@ export function resolveLatestRelease(platformRepo, runGh) {
   let release;
   try {
     release = ghApiJson(`repos/${platformRepo}/releases/latest`, runGh);
-  } catch {
-    return { tag: null, sha: null, publishedAt: null };
+  } catch (err) {
+    // A genuine 404 means the platform repo has no published release yet — a
+    // legitimate "no lag baseline" state, so return nulls. Every other error
+    // (5xx / 403 rate-limit / transport) must propagate so the strict gate
+    // fails CLOSED rather than silently classifying the whole fleet as
+    // lagState "unknown" (drift=false). Mirrors the per-consumer fetchers'
+    // fail-closed contract in scripts/lib/gh-json.mjs.
+    if (isNotFound(err)) return { tag: null, sha: null, publishedAt: null };
+    throw err;
   }
   const tag = release && typeof release.tag_name === "string" ? release.tag_name : null;
   const publishedAt =
@@ -820,8 +749,12 @@ export function resolveLatestRelease(platformRepo, runGh) {
       sha = tagObj?.object?.sha ?? sha;
     }
     return { tag, sha: sha ? sha.toLowerCase() : null, publishedAt };
-  } catch {
-    return { tag, sha: null, publishedAt };
+  } catch (err) {
+    // Same fail-closed contract as the release fetch above: a 404 (tag
+    // vanished) degrades to sha:null, but a transient/auth error propagates
+    // so the strict gate fails closed instead of suppressing lag detection.
+    if (isNotFound(err)) return { tag, sha: null, publishedAt };
+    throw err;
   }
 }
 
@@ -842,8 +775,13 @@ export function fetchConsumerWorkflows(repo, branch, runGh) {
       `repos/${repo}/contents/.github/workflows?ref=${encodeURIComponent(branch)}`,
       runGh,
     );
-  } catch {
-    return [];
+  } catch (err) {
+    // A 404 genuinely means the consumer has no `.github/workflows/` dir —
+    // return "no files". Any OTHER error (403 / 429 / 5xx / transport) must
+    // fail CLOSED: rethrow so buildReport records an `error` row for this
+    // consumer instead of silently reading it as "no pins → no drift".
+    if (isNotFound(err)) return [];
+    throw err;
   }
   if (!Array.isArray(listing)) return [];
   const files = [];
@@ -860,7 +798,10 @@ export function fetchConsumerWorkflows(repo, branch, runGh) {
         if (blob?.encoding === "base64" && typeof blob.content === "string") {
           text = Buffer.from(blob.content, "base64").toString("utf-8");
         }
-      } catch {
+      } catch (err) {
+        // Same fail-closed rule for the per-file blob fetch: a missing blob
+        // (404) yields empty text; any other failure propagates.
+        if (!isNotFound(err)) throw err;
         text = "";
       }
     }
@@ -888,8 +829,13 @@ export function fetchConsumerPackageJson(repo, branch, runGh) {
       `repos/${repo}/contents/package.json?ref=${encodeURIComponent(branch)}`,
       runGh,
     );
-  } catch {
-    return null;
+  } catch (err) {
+    // A 404 is the legitimate "no package.json / doesn't adopt the npm config
+    // package" case → treat as absent (null). Any OTHER error must fail
+    // CLOSED: rethrow so buildReport records an `error` row rather than
+    // silently reading the consumer as "npm absent → no drift".
+    if (isNotFound(err)) return null;
+    throw err;
   }
   if (obj && obj.encoding === "base64" && typeof obj.content === "string") {
     return Buffer.from(obj.content, "base64").toString("utf-8");
@@ -910,8 +856,13 @@ export function resolveBranch(consumer, runGh) {
   try {
     const repoMeta = ghApiJson(`repos/${consumer.repo}`, runGh);
     return repoMeta?.default_branch || "main";
-  } catch {
-    return "main";
+  } catch (err) {
+    // A 404 means the repo (or our access to it) is genuinely gone — fall back
+    // to "main" as before. Any OTHER error (403 / 429 / 5xx / transport) must
+    // fail CLOSED: rethrow so buildReport records an `error` row instead of
+    // guessing a branch and silently reporting "no drift".
+    if (isNotFound(err)) return "main";
+    throw err;
   }
 }
 

@@ -1523,9 +1523,32 @@ jobs:
           scan_rc="${scan_rc:-0}"
           echo "OSV-scanner raw exit code: ${scan_rc}"
 
-          # Exit 127/128 (no scannable target) is treated as a clean pass: a
-          # repo with no recognized lockfile/manifest has nothing to advise on.
+          # Documented no-target exit codes: OSV-scanner exits 127/128 when it
+          # finds no recognized lockfile/manifest to scan. Those are the ONLY
+          # non-zero codes we treat as a clean no-op pass. Any other non-zero
+          # code (a scanner crash, a download/parse error, an unexpected
+          # runtime failure) must FAIL the job — otherwise the advisory tier
+          # fails open, silently reporting "no advisories" when the scanner
+          # never actually ran. Findings themselves also surface as a non-zero
+          # code, but those always come with a JSON report, so they fall
+          # through to the severity-band gate below (which owns pass/fail).
+          NO_TARGET_CODES="127 128"
           if [ ! -s "${report}" ]; then
+            is_no_target=0
+            for code in ${NO_TARGET_CODES}; do
+              if [ "${scan_rc}" = "${code}" ]; then is_no_target=1; break; fi
+            done
+            if [ "${scan_rc}" != "0" ] && [ "${is_no_target}" = "0" ]; then
+              echo "::error::OSV-scanner exited ${scan_rc} with no JSON report — this is not a documented no-target code (${NO_TARGET_CODES}). Failing closed: the advisory scan did not complete."
+              {
+                echo "### ❌ OSV advisory scan — scanner error"
+                echo ""
+                echo "OSV-scanner exited with code \`${scan_rc}\` and produced no report."
+                echo "This is not a documented no-target exit code (\`${NO_TARGET_CODES}\`),"
+                echo "so the advisory tier fails closed rather than passing silently."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
             echo "No OSV JSON report produced (no scannable lockfile/manifest) — advisory scan is a no-op pass."
             {
               echo "### OSV advisory scan — no scannable target"
