@@ -1,10 +1,14 @@
 # Runbook Templates (copyable thin stubs)
 
-These are **copyable thin-stub templates** — one per canonical mandrel-platform
-runbook in [`docs/runbooks/`](https://github.com/dsj1984/mandrel-platform/tree/main/docs/runbooks).
-They implement the MP-9 adoption model (§7.7 / F1): *replace each duplicated
-process runbook with a thin local doc that holds project-specific values plus a
-link to the canonical runbook.*
+These are **copyable thin-stub templates** for the eight most commonly-adopted
+canonical mandrel-platform runbooks in
+[`docs/runbooks/`](https://github.com/dsj1984/mandrel-platform/tree/main/docs/runbooks)
+(listed in the table below). It is **not** a stub-per-canonical-runbook set —
+several canonical runbooks (`rollback.md`, `slo.md`, `secret-rotation.md`,
+`pin-drift-dashboard.md`) are platform-process docs a consumer reads directly
+and ships no local stub for. They implement the MP-9 adoption model
+(§7.7 / F1): *replace each duplicated process runbook with a thin local doc
+that holds project-specific values plus a link to the canonical runbook.*
 
 Each stub:
 

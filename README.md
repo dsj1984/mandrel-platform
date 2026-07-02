@@ -155,32 +155,45 @@ mutate globs, bundle paths, score floors, and budgets — stays
 #### `knip.base.json`
 
 Shared Knip defaults (`ignoreExportsUsedInFile`, the `mandrel` binary +
-`mandrel-platform` dependency ignores). Knip supports a native `extends`,
-so consumers point at the base and add their own `entry` / `project`
-globs (`knip.json`):
+`mandrel-platform` dependency ignores). Knip has **no native top-level
+`extends`** to an npm-package config, so consumers import the base JSON in a
+`knip.config.ts` (or `.js`) module and spread it, layering their own `entry`
+/ `project` globs on top:
 
-```jsonc
-{
-  "extends": ["mandrel-platform/knip.base.json"],
-  "entry": ["src/index.ts", "scripts/*.ts"],
-  "project": ["src/**", "scripts/**"]
-}
+```ts
+// knip.config.ts — import the base and spread it
+import type { KnipConfig } from "knip";
+import base from "mandrel-platform/knip.base.json" with { type: "json" };
+
+const config: KnipConfig = {
+  ...base,
+  entry: ["src/index.ts", "scripts/*.ts"],
+  project: ["src/**", "scripts/**"],
+};
+
+export default config;
 ```
 
 #### `stryker.base.json`
 
 Shared Stryker mutation-testing defaults (pnpm package manager,
 `perTest` coverage analysis, HTML + clear-text + progress reporters,
-`ignoreStatic`, a 60 s timeout, and high/low/break thresholds). Stryker
-supports a native `extends`; the consumer pins its test runner and
-mutate set (`stryker.config.json`):
+`ignoreStatic`, a 60 s timeout, and high/low/break thresholds). Stryker's
+`extends` resolves a **local JSON path**, not an npm-package specifier, so
+the working mechanism is a `stryker.config.mjs` (or `.js` when
+`"type": "module"`) module that imports the base JSON and spreads it, then
+pins the test runner and mutate set:
 
-```jsonc
-{
-  "extends": ["mandrel-platform/stryker.base.json"],
-  "testRunner": "vitest",
-  "mutate": ["src/**/*.ts", "!src/**/*.test.ts"]
-}
+```js
+// stryker.config.mjs — import the base and spread it
+import base from "mandrel-platform/stryker.base.json" with { type: "json" };
+
+/** @type {import('@stryker-mutator/api/core').PartialStrykerOptions} */
+export default {
+  ...base,
+  testRunner: "vitest",
+  mutate: ["src/**/*.ts", "!src/**/*.test.ts"],
+};
 ```
 
 #### `commitlint.base.mjs`
@@ -229,8 +242,9 @@ resolve the package export and add repo-specific rules
 
 size-limit's own config is a per-entry **array** whose paths and limits
 are inherently repo-specific, so the base ships the shared *check
-options* (gzip sizing, `running: false`). Spread it into each entry of
-your `.size-limit.json`:
+options* (gzip sizing, `running: false`). A JSON config can't `import` the
+base, so use a JS-module config (`.size-limit.js`) that imports the base
+JSON and spreads it into each entry:
 
 ```jsonc
 // .size-limit.js — spread the base into each entry

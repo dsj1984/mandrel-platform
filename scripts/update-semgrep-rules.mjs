@@ -50,16 +50,18 @@
  *   node scripts/update-semgrep-rules.mjs --semgrep-pin semgrep==1.97.0
  *   node scripts/update-semgrep-rules.mjs --out .semgrep/rules.json --dry-run
  *
- * Requires network egress to PyPI (to install the pinned `semgrep` package)
- * and to the Semgrep registry (to resolve `p/default`) — this script is run
- * by a human/agent deliberately bumping the ruleset, NOT by CI on every PR.
+ * Requires network egress to PyPI (to install the pinned `semgrep` package,
+ * whose artifact is verified against the recorded SHA-256 hashes via pip's
+ * `--require-hashes`) and to the Semgrep registry (to resolve `p/default`) —
+ * this script is run by a human/agent deliberately bumping the ruleset, NOT
+ * by CI on every PR.
  *
  * Exit codes:
  *   0 — rules file written (or, with --dry-run, would-write reported).
  *   1 — semgrep install or rule resolution failed.
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -74,6 +76,26 @@ const REPO_ROOT = resolve(__dirname, "..");
 // so scanning with a different installed version than the one used to
 // generate the file is a (harmless but inconsistent) version skew.
 const DEFAULT_SEMGREP_PIN = "semgrep==1.97.0";
+
+// SHA-256 hashes for every `DEFAULT_SEMGREP_PIN` distribution published on
+// PyPI (the four platform wheels + the sdist). pip's `--require-hashes` mode
+// verifies the downloaded `semgrep` artifact against this set before it is
+// installed, so a compromised or swapped PyPI artifact for this exact version
+// is rejected at install time — the same "pin the supply-chain input" posture
+// the action-pin ratchet (SHA-pinned Actions) and the OSV advisory pin apply
+// to their inputs. When bumping `DEFAULT_SEMGREP_PIN`, refresh this map from
+// `https://pypi.org/pypi/semgrep/<version>/json` (the `urls[].digests.sha256`
+// values) — a version with no hash entry here fails fast rather than
+// installing unverified.
+const SEMGREP_HASHES = {
+  "1.97.0": [
+    "sha256:0ddaa25ee45e669e1fef87e88dcef73b2aee0874b507e09f618862c42452a205",
+    "sha256:9184500bf8c49ad19d0fb2d84923abb4aa53058b0ece7008b57a3b0b5e6ce3ee",
+    "sha256:f7d21d6499d4e6fafb4c0b04b1750e9f4b704a26bd78f0aff19f1c73d44843b4",
+    "sha256:996fe0b2bfac3a4d4511e470fdf5f3bca96b1f794f398e0336c8388802c218de",
+    "sha256:c585164358e03cd7868e1f0d38fbcb422c88dbe08795b83caeb5e36cf18874aa",
+  ],
+};
 
 const DEFAULT_OUT = join(REPO_ROOT, ".semgrep", "rules.json");
 
@@ -143,11 +165,59 @@ function resolveRegistryRules(semgrepPin) {
   const venvDir = join(mkdtempSync(join(tmpdir(), "semgrep-vendor-")), "venv");
   const targetDir = mkdtempSync(join(tmpdir(), "semgrep-vendor-target-"));
   const semgrepHome = mkdtempSync(join(tmpdir(), "semgrep-vendor-home-"));
+  const reqsFile = join(mkdtempSync(join(tmpdir(), "semgrep-vendor-reqs-")), "semgrep.txt");
 
   try {
     spawnSync("python3", ["-m", "venv", venvDir], { stdio: "inherit" });
     const pip = join(venvDir, "bin", "pip");
     const semgrep = join(venvDir, "bin", "semgrep");
+
+    // Resolve the exact version from the pin (`semgrep==<version>`) so we can
+    // look up its published artifact hashes. Only the `==` form is hashable;
+    // an unpinned or range pin cannot be verified.
+    const versionMatch = /^semgrep==(.+)$/.exec(semgrepPin.trim());
+    if (!versionMatch) {
+      throw new Error(
+        `cannot hash-pin ${semgrepPin}: only an exact 'semgrep==<version>' pin is supported`
+      );
+    }
+    const version = versionMatch[1];
+    const hashes = SEMGREP_HASHES[version];
+    if (!hashes || hashes.length === 0) {
+      throw new Error(
+        `no published artifact hashes recorded for ${semgrepPin} in SEMGREP_HASHES — ` +
+          `refresh from https://pypi.org/pypi/semgrep/${version}/json before pinning`
+      );
+    }
+
+    // Hash-pinned install: write a requirements file that pins `semgrep` to
+    // the exact version with every published artifact hash, then install it
+    // with `--require-hashes --no-deps`. pip verifies the downloaded semgrep
+    // artifact against this set before installing — a swapped/compromised
+    // artifact for this version is rejected. Dependencies are resolved in a
+    // separate, non-hashed step (semgrep is already satisfied), keeping the
+    // supply-chain-critical `semgrep` binary itself hash-verified.
+    const hashFlags = hashes.map((h) => `    --hash=${h}`).join(" \\\n");
+    writeFileSync(reqsFile, `semgrep==${version} \\\n${hashFlags}\n`, "utf8");
+
+    const installSemgrep = spawnSync(
+      pip,
+      [
+        "install",
+        "--quiet",
+        "--disable-pip-version-check",
+        "--require-hashes",
+        "--no-deps",
+        "-r",
+        reqsFile,
+      ],
+      { stdio: "inherit" }
+    );
+    if (installSemgrep.status !== 0) {
+      throw new Error(
+        `hash-pinned pip install ${semgrepPin} failed (exit ${installSemgrep.status})`
+      );
+    }
 
     const install = spawnSync(
       pip,
@@ -155,7 +225,7 @@ function resolveRegistryRules(semgrepPin) {
       { stdio: "inherit" }
     );
     if (install.status !== 0) {
-      throw new Error(`pip install ${semgrepPin} failed (exit ${install.status})`);
+      throw new Error(`pip install ${semgrepPin} (dependencies) failed (exit ${install.status})`);
     }
 
     // A throwaway target file gives semgrep something to "scan" so it
@@ -196,6 +266,7 @@ function resolveRegistryRules(semgrepPin) {
     rmSync(venvDir, { recursive: true, force: true });
     rmSync(targetDir, { recursive: true, force: true });
     rmSync(semgrepHome, { recursive: true, force: true });
+    rmSync(dirname(reqsFile), { recursive: true, force: true });
   }
 }
 

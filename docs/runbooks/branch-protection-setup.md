@@ -56,31 +56,32 @@ node scripts/check-required-contexts.mjs
 
 ## 3. Applying Branch Protection (GitHub API / CLI)
 
-### 3a. Via GitHub CLI (recommended)
+The platform ships **no `apply-branch-protection` script** — branch protection
+is applied directly with `gh api` against the values in `main-protection.json`.
+Read that contract first, then `PUT` the protection:
+
+### 3a. Read the current protection
 
 ```bash
-# Apply the ruleset from main-protection.json
-node scripts/apply-branch-protection.mjs --dry-run   # preview changes
-node scripts/apply-branch-protection.mjs --apply     # apply
+gh api repos/<OWNER>/<REPO>/branches/main/protection
 ```
 
-### 3b. Manual via GitHub API
+### 3b. Apply protection via `gh api`
 
 ```bash
-# Read the current protection
-gh api repos/<OWNER>/<REPO>/branches/main/protection
-
-# Apply protection — adjust required_status_checks.contexts to match main-protection.json
+# Apply protection — adjust required_status_checks.contexts to match
+# main-protection.json (the single aggregator context, e.g. ci-required).
 gh api repos/<OWNER>/<REPO>/branches/main/protection \
   --method PUT \
-  --field required_status_checks[strict]=false \
-  --field "required_status_checks[contexts][]=ci-required" \
+  --raw-field required_status_checks='{"strict":false,"contexts":["ci-required"]}' \
   --field enforce_admins=false \
-  --field required_pull_request_reviews=null \
-  --field restrictions=null
+  --raw-field required_pull_request_reviews=null \
+  --raw-field restrictions=null
 ```
 
-> **Note:** `required_pull_request_reviews` and `restrictions` are only available on GitHub Pro/Team/Enterprise. On the free plan, set both to `null`.
+> **Note:** `required_pull_request_reviews` and `restrictions` are only available on GitHub Pro/Team/Enterprise. On the free plan, set both to `null` (as above).
+>
+> The `contexts` array must match `main-protection.json#requiredStatusChecks`. Because this is the single-aggregator model, that array holds exactly the one aggregator context — never individual upstream job names.
 
 ### 3c. Via GitHub Ruleset (GitHub Pro+)
 
