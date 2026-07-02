@@ -33,6 +33,58 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-01 — Reusable `uptime-apply.yml` + shared Better Stack monitor schema/apply unit
+
+**Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix
+§7, roadmap §2a.6) found the uptime row still triplicated: domio, athportal,
+and swarm-os each carried their own `uptime-apply.yml` caller plus Better
+Stack IaC under `infra/uptime/` — the same monitor-CRUD logic re-derived
+three times, with no shared contract for the schema, the diff semantics, or
+the graceful-degradation behaviour when `BETTERSTACK_API_TOKEN` isn't
+provisioned yet.
+
+**Decision.** Ship a reusable `.github/workflows/uptime-apply.yml`
+(`workflow_call`) on the same thin-caller model as `pr-quality.yml` /
+`deploy-cloudflare.yml`, wrapping a single shared unit,
+`scripts/apply-uptime-monitors.mjs` — pure, unit-tested config validation
+(`parseMonitorConfig`), a pure live-diff (`diffMonitors`, additive-only: it
+never deletes a monitor absent from the config, preserving a hand-created
+Better Stack monitor), and an injectable-fetch Better Stack API client
+(`createBetterStackClient`). swarm-os's implementation (Story #163) is the
+seed donor per standing decision #4 (best-of-breed seeding) — the newest and
+cleanest of the three. The secret surface is `BETTERSTACK_API_TOKEN` (apply
+credential) and `UPTIME_ALERT_EMAIL` (default alert contact); an absent
+token is a documented **skip-with-notice** (the job runs, exits 0, prints a
+notice) rather than an `if:`-skipped job (which renders as neither pass nor
+fail) or a hard failure — this preserves the graceful-degradation behaviour
+every existing per-consumer caller already relied on. A ready-to-copy caller
+ships at `templates/workflows/uptime-apply.yml`, materialized by
+`platform-sync` the same link-don't-copy way as `deploy-staging.yml`.
+
+**Consequences.** A consumer adopting Better Stack uptime monitoring needs
+only a monitor-config JSON file and the two secrets — no bespoke Better
+Stack API integration to write or maintain. Consumer cut-over (migrating
+domio/athportal/swarm-os off their own callers onto this thin caller) is
+explicitly **out of scope** here and tracked as three separate, per-consumer
+stories blocked on this one; likewise a non-Better-Stack provider is a new,
+separate unit, not an extension of this schema. Exercising the caller path
+from `dsj1984/mandrel-platform-smoke` — like the repo-ops consumers matrix
+flip below — requires a change in a repo outside this Story's PR boundary
+(a separate git remote this repo cannot push to); that repo currently only
+calls `pr-quality.yml@main` and `deploy-cloudflare.yml@main` (see
+`smoke-dispatch.yml`), so wiring `uptime-apply.yml@main` into its smoke run
+(with a dry-run-only `apply: 'false'` caller, since the smoke repo has no
+real Better Stack monitors to converge) is a follow-up in that repo, not a
+file this PR can land. The repo-ops consumers matrix §7 uptime row flip
+(◐ → ●) is likewise tracked in the sibling `repo-ops` planning repo
+(`mandrel-platform-consumers.md`), the same boundary the 2026-07-01
+repo-settings decision below documents — that repo is a separate git remote
+(`dsj1984/repo-ops`) outside this Story's PR boundary. Both follow-ups
+should be applied once this Story (mandrel-platform#180) merges, citing this
+decision entry and the shipped `uptime-apply.yml` /
+`scripts/apply-uptime-monitors.mjs` / `templates/workflows/uptime-apply.yml`
+as the now-existing contract.
+
 ## 2026-07-01 — Repo-settings baseline contract + GitHub-side check/apply, non-blocking by design
 
 **Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix

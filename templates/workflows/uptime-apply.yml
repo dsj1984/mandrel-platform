@@ -1,0 +1,54 @@
+name: uptime-apply
+
+# Canonical staging-deploy caller template (Story #180).
+#
+# > **Thin local caller.** The Better Stack monitor schema + apply logic
+# > (config validation, live-diff, create/update, graceful skip-with-notice
+# > when the secret isn't provisioned) lives in the shared
+# > `dsj1984/mandrel-platform` `uptime-apply.yml` reusable workflow — see
+# > https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#uptime-applyyml.
+# > This file only holds <PROJECT_NAME>-specific values (the monitor-config
+# > path and the apply trigger). When the apply PROCESS changes, that change
+# > lands upstream in mandrel-platform — not here.
+#
+# Replace every <PLACEHOLDER> with your project's real values:
+#   <MANDREL_PLATFORM_SHA>   the pinned mandrel-platform commit SHA (resolve
+#                             via `node scripts/platform-sync.mjs --ref
+#                             <release-tag>` from the consumer repo root, or
+#                             hand-resolve via `git ls-remote`).
+#   <MANDREL_PLATFORM_TAG>   the human-readable release tag matching the SHA
+#                             above (trailing `# <tag>` comment).
+#   <MONITOR_CONFIG_PATH>    path to this repo's monitor-config JSON, e.g.
+#                             "infra/uptime/monitors.json".
+#
+# See the full input/secret contract:
+# https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#uptime-applyyml
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uptime-apply
+  cancel-in-progress: false
+
+jobs:
+  uptime:
+    name: Uptime apply (shared uptime-apply.yml)
+    uses: dsj1984/mandrel-platform/.github/workflows/uptime-apply.yml@<MANDREL_PLATFORM_SHA> # <MANDREL_PLATFORM_TAG>
+    with:
+      monitor-config: <MONITOR_CONFIG_PATH>
+      # apply:'true' on push to main converges live Better Stack monitors to
+      # the checked-in config; a workflow_dispatch preview run can pass
+      # apply:'false' instead to dry-run without writing.
+      apply: ${{ github.event_name == 'push' && 'true' || 'false' }}
+    # Frozen secret surface: only these two cross into the shared workflow.
+    # Both are optional on the shared side — an absent BETTERSTACK_API_TOKEN
+    # is the documented graceful-degradation (skip-with-notice) path.
+    secrets:
+      BETTERSTACK_API_TOKEN: ${{ secrets.BETTERSTACK_API_TOKEN }}
+      UPTIME_ALERT_EMAIL: ${{ secrets.UPTIME_ALERT_EMAIL }}

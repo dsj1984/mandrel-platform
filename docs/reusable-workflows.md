@@ -10,11 +10,13 @@ Two workflows carry a stable public contract:
 - [`deploy-cloudflare.yml`](#deploy-cloudflareyml) — the defence-in-depth
   Cloudflare deploy.
 
-Four more are consumable but have a much smaller surface, covered briefly at
+Five more are consumable but have a much smaller surface, covered briefly at
 the end:
 
 - [`secret-scan-push.yml`](#secret-scan-pushyml) — full-history secret-scan
   signal on push to the default branch.
+- [`uptime-apply.yml`](#uptime-applyyml) — shared Better Stack uptime-monitor
+  schema + apply unit.
 - [`release-automation.yml`](#release-automationyml) — conventional-commit
   release lifecycle (version bump + changelog + tag) on push to the default
   branch.
@@ -1086,6 +1088,135 @@ It carries **no secrets contract** (`secrets: inherit` is harmless; the scan
 needs none) and does **not** replace the blocking PR-time scan — keep
 `enable-security: true` on `pr-quality.yml`. This is defence-in-depth on top of
 it.
+
+---
+
+## `uptime-apply.yml`
+
+> Story #180. Post-convergence triplication (validated 2026-07-01): domio,
+> athportal, and swarm-os each carried their own `uptime-apply.yml` + Better
+> Stack IaC (`infra/uptime/`). swarm-os's implementation (Story #163) was the
+> newest/cleanest and is the seed donor here per standing decision #4
+> (best-of-breed seeding) — thinned into a `workflow_call` target on the same
+> thin-caller model as [`pr-quality.yml`](#pr-qualityyml) and
+> [`deploy-cloudflare.yml`](#deploy-cloudflareyml). The monitor schema +
+> Better Stack apply logic is a **shared workflow-internal unit**
+> (`scripts/apply-uptime-monitors.mjs` on this repo) — a consumer ships only
+> its own monitor-config JSON file, not a re-derivation of the Better Stack
+> monitor-CRUD calls.
+
+### Minimal caller
+
+```yaml
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  uptime:
+    uses: dsj1984/mandrel-platform/.github/workflows/uptime-apply.yml@<sha> # <tag>
+    with:
+      monitor-config: infra/uptime/monitors.json
+      apply: ${{ github.event_name == 'push' && 'true' || 'false' }}
+    secrets:
+      BETTERSTACK_API_TOKEN: ${{ secrets.BETTERSTACK_API_TOKEN }}
+      UPTIME_ALERT_EMAIL: ${{ secrets.UPTIME_ALERT_EMAIL }}
+```
+
+A ready-to-copy version of this caller ships at
+[`templates/workflows/uptime-apply.yml`](../templates/workflows/uptime-apply.yml)
+and is materialized into a consumer's `.github/workflows/` by `platform-sync`
+(link-don't-copy, same semantics as the `deploy-staging.yml` template — see
+[README — Adoption CLI](../README.md#adoption-cli-platform-sync)).
+
+### Inputs
+
+| Input             | Type   | Default          | When to override                                                                                                    |
+| ----------------- | ------ | ---------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `monitor-config`  | string | *(required)*     | Path (relative to the caller repo root) to the JSON monitor-config file. See [Monitor config schema](#monitor-config-schema) below. |
+| `apply`           | string | `'false'`        | `'true'` applies the computed plan (create/update) against the Better Stack API. `'false'` (default) computes and prints the plan without writing — use for a PR-time preview, and reserve `'true'` for the production apply trigger (e.g. push to `main`). |
+| `runner`          | string | `'ubuntu-latest'`| Runs-on label for the apply job.                                                                                     |
+
+### Secrets
+
+| Secret                 | Required | Purpose                                                                                                  |
+| ----------------------- | -------- | --------------------------------------------------------------------------------------------------------- |
+| `BETTERSTACK_API_TOKEN` | No       | Better Stack API token. **Absent → skip-with-notice** (see below) — the graceful-degradation path for a consumer that hasn't provisioned Better Stack yet. |
+| `UPTIME_ALERT_EMAIL`    | No       | Default alert-contact email applied to any monitor-config entry that doesn't set its own `alertEmail`. A monitor with neither is created with no alert contact. |
+
+### Skip-with-notice (graceful degradation)
+
+This is the **acceptance-critical** behaviour carried over from the three
+per-consumer implementations this workflow replaces: when
+`BETTERSTACK_API_TOKEN` is not provisioned on the caller, the job **still
+runs** (never `if:`-skipped at the job level — a skipped job renders as
+neither pass nor fail in the checks UI, which is a strictly worse signal than
+a visible, explicit notice in the job log) and the shared
+`apply-uptime-monitors.mjs` script prints a skip notice and exits `0`. A
+consumer that hasn't set up Better Stack yet sees a green, no-op run — never a
+failure — until it provisions the secret.
+
+### Monitor config schema
+
+A JSON file, either a bare array of monitor entries or an object with a
+`monitors` array:
+
+```json
+[
+  {
+    "url": "https://api.example.com/health",
+    "name": "api",
+    "alertEmail": "oncall@example.com",
+    "checkFrequency": 30
+  }
+]
+```
+
+| Field            | Required | Meaning                                                                                     |
+| ----------------- | -------- | --------------------------------------------------------------------------------------------- |
+| `url`             | yes      | The `http(s)` URL Better Stack probes.                                                       |
+| `name`            | no       | Display name for the monitor. Defaults to the URL's host.                                    |
+| `alertEmail`      | no       | Per-monitor alert-contact email. Falls back to the `UPTIME_ALERT_EMAIL` secret when unset.   |
+| `checkFrequency`  | no       | Probe interval in seconds. Defaults to `30`.                                                 |
+
+**Validation is strict.** An entry missing a valid `url`, or with a
+wrong-typed `name` / `alertEmail` / `checkFrequency`, fails the job with a
+message naming the offending array index — it never silently skips a
+malformed entry.
+
+**Diff semantics are additive-only.** The script diffs the desired config
+against Better Stack's *live* monitor list by URL and only ever **creates** a
+missing monitor or **updates** a drifted one (name / alert email / check
+frequency). It never deletes a live monitor absent from the config — a
+monitor an operator created by hand in the Better Stack dashboard is left
+untouched.
+
+### The shared apply script
+
+`scripts/apply-uptime-monitors.mjs` on this repo is the single-homed
+implementation: config parsing/validation, the live-diff, and the Better
+Stack API client are all pure, unit-tested functions (see
+`scripts/apply-uptime-monitors.test.mjs`), and the workflow above is a thin
+wrapper that checks out the pinned script (sparse checkout at
+`github.job_workflow_sha`, the same resolved-ref pattern the SAST tier and
+`deploy-cloudflare.yml`'s deploy-summary job already use) and invokes it
+against the caller's monitor-config file. A future non-workflow consumer (or
+a local dry-run) can invoke the same script directly:
+
+```bash
+node scripts/apply-uptime-monitors.mjs --config infra/uptime/monitors.json --dry-run
+BETTERSTACK_API_TOKEN=<token> node scripts/apply-uptime-monitors.mjs --config infra/uptime/monitors.json --apply
+```
+
+### Out of scope
+
+- **Consumer cut-over.** This Story ships the reusable unit; migrating
+  domio/athportal/swarm-os off their own `uptime-apply.yml` + `infra/uptime/`
+  onto this thin caller is tracked as separate, per-consumer stories blocked
+  on this one.
+- **Non-Better-Stack providers.** The schema and client are Better-Stack-
+  specific; a different uptime provider is a new, separate unit.
 
 ---
 
