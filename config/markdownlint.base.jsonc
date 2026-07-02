@@ -1,0 +1,58 @@
+// markdownlint.base.jsonc — shared markdownlint rule base for
+// mandrel-platform consumers.
+//
+// Single-sources the fleet's common-core markdownlint content rules so the
+// three consumers stop hand-maintaining ~90%-identical rule sets that diverge
+// only by accretion. This is the union of the previously per-repo configs
+// (domio / athportal / swarm-os), keyed by the same underlying `markdownlint`
+// MDxxx rule IDs both `markdownlint-cli2` and classic `markdownlint` consume.
+//
+// CANONICAL RUNNER: markdownlint-cli2. Two of the three consumers already run
+// it; it is the maintained, recommended runner. New adopters standardize on it.
+//
+// ADOPTION (markdownlint-cli2): consumers reference this base via the
+// `extends` property in their own `.markdownlint.jsonc` /
+// `.markdownlint-cli2.jsonc` and keep only repo-local ignore globs there:
+//
+//   // .markdownlint.jsonc
+//   {
+//     "extends": "mandrel-platform/markdownlint.base.jsonc"
+//     // ...repo-specific rule overrides (rare)
+//   }
+//
+//   // .markdownlint-cli2.jsonc — ignores stay local (e.g. generated CHANGELOG.md)
+//   { "ignores": ["CHANGELOG.md"] }
+//
+// The base carries CONTENT rules only — it does NOT carry `ignores`. Ignore
+// globs are inherently repo-specific (generated files, vendored trees) and
+// stay consumer-tunable locally. Excluding the release-please `CHANGELOG.md`
+// in particular is documented in docs/reusable-workflows.md.
+//
+// This base is complementary to Prettier's markdown FORMATTING (line wrap,
+// list markers) — markdownlint gates CONTENT rules Prettier does not, and the
+// two are not substitutes.
+{
+  // Start from the full default rule set, then narrow.
+  "default": true,
+
+  // MD013 line-length: off. Prose reflow is Prettier's job; a hard line-length
+  // gate on hand-authored docs produces noise, not signal.
+  "MD013": false,
+
+  // MD024 no-duplicate-heading: allow same-text headings under DIFFERENT
+  // parents (siblings_only). Repeated "### Notes" under distinct sections is
+  // legitimate structure, not a mistake.
+  "MD024": { "siblings_only": true },
+
+  // MD033 no-inline-html: off. Docs legitimately embed <details>, <kbd>,
+  // <br>, and alignment attributes GitHub-flavored Markdown renders.
+  "MD033": false,
+
+  // MD041 first-line-heading: off. Files that open with front-matter, a
+  // badge row, or an admonition before the first heading are valid.
+  "MD041": false,
+
+  // MD060 (table column style / GFM table hygiene): off. Table formatting is
+  // owned by Prettier's GFM table reflow, not a markdownlint content gate.
+  "MD060": false
+}
