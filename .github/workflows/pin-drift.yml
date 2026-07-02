@@ -26,6 +26,21 @@
 # `⚠️ error` rows rather than failing the job (the dashboard is informational
 # by default; it does not gate).
 #
+# This job also composes two more GitHub-side drift dashboards, both sharing
+# the same consumer registry (scripts/pin-drift-consumers.json) and the same
+# non-blocking posture (standing decision #10 — report, never gate):
+#
+#   - scripts/check-repo-settings.mjs (Story #171): merge-method / squash-
+#     source / auto-merge / Actions-token-permission drift against
+#     docs/runbooks/repo-settings.json.
+#   - scripts/check-ruleset.mjs (Story #178): live branch-ruleset drift
+#     (PR-required, bypass actors, required status checks, linear history,
+#     force-push/deletion blocked) against docs/runbooks/main-protection.json.
+#
+# Together these three steps are the "GitHub-side drift" pass — everything
+# that lives in a consumer's GitHub API state rather than its checked-out
+# files.
+#
 # SHA-pinned third-party actions.
 name: Pin Drift Dashboard
 
@@ -80,3 +95,15 @@ jobs:
           else
             node scripts/check-pin-drift.mjs
           fi
+
+      - name: Repo-settings baseline dashboard (GitHub-side drift, Story #171)
+        env:
+          GH_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN || github.token }}
+        shell: bash
+        run: node scripts/check-repo-settings.mjs
+
+      - name: Branch-ruleset drift dashboard (GitHub-side drift, Story #178)
+        env:
+          GH_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN || github.token }}
+        shell: bash
+        run: node scripts/check-ruleset.mjs

@@ -12,6 +12,12 @@
  *      overrides preserved),
  *   4. idempotency + `--dry-run` non-mutation.
  *
+ * Also exercises the two GitHub-side drift-check modes, which short-circuit
+ * the local-checkout sync above and operate over the GitHub API instead:
+ *   5. `--check-settings` / `--apply-settings` (Story #171, repo settings).
+ *   6. `--check-ruleset` (Story #178, branch rulesets — report-only, no
+ *      `--apply-ruleset`).
+ *
  * Run: node scripts/platform-sync.test.mjs   (or `node --test scripts/`)
  */
 
@@ -431,6 +437,136 @@ test("--apply-settings --dry-run reports the plan without issuing any PATCH", ()
 test("--check-settings requires --consumer-repo", () => {
   assert.throws(() => {
     execFileSync("node", [CLI, "--check-settings"], { encoding: "utf8" });
+  }, /consumer-repo/);
+});
+
+// ---------------------------------------------------------------------------
+// --check-ruleset (Story #178) — report-only branch-ruleset drift check.
+//
+// Same fake-`gh`-on-PATH harness as --check-settings above. The pure
+// diff/classification logic is unit-tested in check-ruleset.test.mjs; this
+// suite exercises platform-sync's own argument wiring and the (deliberate)
+// absence of any mutating call — there is no --apply-ruleset.
+// ---------------------------------------------------------------------------
+
+const MAIN_PROTECTION_CONTRACT = {
+  branch: "main",
+  requiredStatusChecks: ["ci-required"],
+  requireLinearHistory: false,
+  allowForcePushes: false,
+  allowDeletions: false,
+};
+
+function compliantRulesetPayload() {
+  return {
+    id: 1,
+    enforcement: "active",
+    conditions: { ref_name: { include: ["refs/heads/main"] } },
+    bypass_actors: [],
+    rules: [
+      { type: "pull_request" },
+      {
+        type: "required_status_checks",
+        parameters: {
+          required_status_checks: [{ context: "ci-required" }],
+          strict_required_status_checks_policy: true,
+        },
+      },
+      { type: "non_fast_forward" },
+      { type: "deletion" },
+    ],
+  };
+}
+
+test("--check-ruleset reports no drift when the live ruleset matches the contract", () => {
+  writeFakeGh({
+    "repos/Beestera/swarm-os/rulesets": [{ id: 1 }],
+    "repos/Beestera/swarm-os/rulesets/1": compliantRulesetPayload(),
+  });
+  writeFileSync(join(settingsDir, "contract.json"), JSON.stringify(MAIN_PROTECTION_CONTRACT));
+  const out = JSON.parse(
+    runSettings([
+      "--check-ruleset",
+      "--consumer-repo",
+      "Beestera/swarm-os",
+      "--contract",
+      join(settingsDir, "contract.json"),
+      "--json",
+    ])
+  );
+  assert.equal(out.mode, "check-ruleset");
+  assert.equal(out.drift, false);
+  assert.deepEqual(out.mismatches, []);
+});
+
+test("--check-ruleset reports drift (bypass actor added) and issues no mutating call", () => {
+  writeFakeGh({
+    "repos/dsj1984/domio/rulesets": [{ id: 7 }],
+    "repos/dsj1984/domio/rulesets/7": { ...compliantRulesetPayload(), bypass_actors: [{ actor_id: 1 }] },
+  });
+  writeFileSync(join(settingsDir, "contract.json"), JSON.stringify(MAIN_PROTECTION_CONTRACT));
+  const out = JSON.parse(
+    runSettings([
+      "--check-ruleset",
+      "--consumer-repo",
+      "dsj1984/domio",
+      "--contract",
+      join(settingsDir, "contract.json"),
+      "--json",
+    ])
+  );
+  assert.equal(out.drift, true);
+  assert.deepEqual(out.mismatches, [{ field: "bypassActorsEmpty", expected: true, actual: false }]);
+  const calls = readFileSync(fakeGhLogPath, "utf8").trim().split("\n").filter(Boolean);
+  assert.ok(
+    calls.every((line) => !JSON.parse(line).includes("PATCH")),
+    "--check-ruleset never issues a PATCH — report-only, no --apply-ruleset exists"
+  );
+});
+
+test("--check-ruleset never fails the exit code on drift (non-blocking, standing decision #10)", () => {
+  writeFakeGh({
+    "repos/dsj1984/athportal/rulesets": [{ id: 1 }],
+    "repos/dsj1984/athportal/rulesets/1": {
+      ...compliantRulesetPayload(),
+      rules: compliantRulesetPayload().rules.filter((r) => r.type !== "non_fast_forward"),
+    },
+  });
+  writeFileSync(join(settingsDir, "contract.json"), JSON.stringify(MAIN_PROTECTION_CONTRACT));
+  assert.doesNotThrow(() => {
+    runSettings([
+      "--check-ruleset",
+      "--consumer-repo",
+      "dsj1984/athportal",
+      "--contract",
+      join(settingsDir, "contract.json"),
+      "--json",
+    ]);
+  });
+});
+
+test("--check-ruleset reports 'missing' when no active ruleset targets the branch", () => {
+  writeFakeGh({
+    "repos/owner/no-ruleset/rulesets": [],
+  });
+  writeFileSync(join(settingsDir, "contract.json"), JSON.stringify(MAIN_PROTECTION_CONTRACT));
+  const out = JSON.parse(
+    runSettings([
+      "--check-ruleset",
+      "--consumer-repo",
+      "owner/no-ruleset",
+      "--contract",
+      join(settingsDir, "contract.json"),
+      "--json",
+    ])
+  );
+  assert.equal(out.status, "missing");
+  assert.equal(out.drift, true);
+});
+
+test("--check-ruleset requires --consumer-repo", () => {
+  assert.throws(() => {
+    execFileSync("node", [CLI, "--check-ruleset"], { encoding: "utf8" });
   }, /consumer-repo/);
 });
 
