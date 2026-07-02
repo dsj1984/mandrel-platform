@@ -65,6 +65,18 @@
 # build-command stays (now secretless; build-env carries plaintext public values).
 #
 # SHA-pinned third-party actions.
+#
+# Wrangler version pinning (Story #202): EVERY wrangler invocation in this
+# workflow — the built-in D1 export/migrate, the deploy loop, the
+# `wrangler whoami` subdomain derivation, and the auto-rollback — runs the
+# CONSUMER'S OWN lockfile-pinned wrangler via `pnpm exec wrangler`, installed
+# by the Setup toolchain step (`pnpm install --frozen-lockfile`). This
+# workflow NEVER fetches a registry-latest wrangler at runtime (the previous
+# pnpx-style behaviour) with production Cloudflare credentials in scope.
+# Each call site preflights `pnpm exec wrangler --version` and fails LOUDLY
+# with an actionable message when wrangler is not a devDependency, so a
+# consumer that has not pinned wrangler is told to add it (`pnpm add -D
+# wrangler`) rather than silently deploying with a floating version.
 name: Deploy Cloudflare
 
 on:
@@ -616,7 +628,21 @@ jobs:
             #
             # In production workflows, callers should forward the dump to durable
             # storage (R2, GCS, S3) via an additional step using `secrets: inherit`.
-            pnpx wrangler d1 export $D1_DATABASE \
+            #
+            # Wrangler is invoked via the consumer's OWN lockfile-pinned binary
+            # (`pnpm exec wrangler`), installed by the Setup toolchain step
+            # (`pnpm install --frozen-lockfile`). This NEVER fetches an unpinned
+            # registry-latest wrangler at runtime with production Cloudflare
+            # credentials in scope. If wrangler is not a devDependency, the
+            # preflight below fails LOUDLY with an actionable message rather than
+            # letting pnpm silently resolve a floating version.
+            if ! pnpm exec wrangler --version >/dev/null 2>&1; then
+              echo "::error::wrangler is not installed from the consumer lockfile." \
+                "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
+                "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
+              exit 1
+            fi
+            pnpm exec wrangler d1 export $D1_DATABASE \
               --env "$DEPLOY_ENV" \
               --remote \
               --output "temp/${SNAPSHOT_KEY}.sql"
@@ -695,7 +721,16 @@ jobs:
             # empty, wrangler resolves it from the consumer's wrangler config
             # for the target --env. --skip-confirmation is the documented
             # non-interactive flag (the previous --yes was not a valid flag).
-            pnpx wrangler d1 migrations apply $D1_DATABASE \
+            #
+            # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — see the
+            # snapshot step for why registry-latest is never fetched at runtime.
+            if ! pnpm exec wrangler --version >/dev/null 2>&1; then
+              echo "::error::wrangler is not installed from the consumer lockfile." \
+                "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
+                "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
+              exit 1
+            fi
+            pnpm exec wrangler d1 migrations apply $D1_DATABASE \
               --env "$DEPLOY_ENV" \
               --remote \
               --skip-confirmation
@@ -832,6 +867,17 @@ jobs:
           fi
 
           # ----- Built-in root-level deploy loop (default) -----
+          # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
+          # by the Setup toolchain step. Fail LOUDLY before deploying anything if
+          # wrangler is not a devDependency, rather than fetching an unpinned
+          # registry-latest wrangler at runtime with production CF creds in scope.
+          if ! pnpm exec wrangler --version >/dev/null 2>&1; then
+            echo "::error::wrangler is not installed from the consumer lockfile." \
+              "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
+              "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
+            exit 1
+          fi
+
           IFS=',' read -ra WORKERS <<< "$WORKERS_CSV"
           deployed=()
           failed=()
@@ -844,7 +890,7 @@ jobs:
             # override the pinned value on every deploy, defeating the
             # wrangler-baseline compatibility_date staleness policy and risking
             # untested runtime-behaviour changes at deploy time.
-            if pnpx wrangler deploy \
+            if pnpm exec wrangler deploy \
               --name "$worker" \
               --env "$DEPLOY_ENV"; then
               echo "✅ $worker deployed"
@@ -936,7 +982,16 @@ jobs:
           SUBDOMAIN="$WORKERS_DEV_SUBDOMAIN"
           if [ -z "$SUBDOMAIN" ] && [ -z "$SMOKE_BASE_URL" ]; then
             echo "::group::Deriving workers.dev subdomain from wrangler whoami"
-            WHOAMI="$(pnpx wrangler whoami 2>/dev/null || true)"
+            # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
+            # by the Setup toolchain step. Fail LOUDLY if wrangler is not a
+            # devDependency instead of fetching registry-latest at runtime.
+            if ! pnpm exec wrangler --version >/dev/null 2>&1; then
+              echo "::error::wrangler is not installed from the consumer lockfile." \
+                "Add it as a devDependency (pnpm add -D wrangler), or pass workers_dev_subdomain /" \
+                "smoke_base_url — the shared workflow refuses to fetch registry-latest wrangler at runtime."
+              exit 1
+            fi
+            WHOAMI="$(pnpm exec wrangler whoami 2>/dev/null || true)"
             # wrangler whoami prints a table including the account's
             # workers.dev subdomain; extract the first *.workers.dev token.
             SUBDOMAIN="$(printf '%s\n' "$WHOAMI" \
@@ -1050,11 +1105,22 @@ jobs:
         run: |
           echo "::warning::Smoke test failed — initiating wrangler rollback for affected workers."
 
+          # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
+          # by the Setup toolchain step. Fail LOUDLY if wrangler is not a
+          # devDependency: a rollback that silently fell back to registry-latest
+          # would be running an unpinned binary with prod CF creds at the worst
+          # possible moment (mid-incident).
+          if ! pnpm exec wrangler --version >/dev/null 2>&1; then
+            echo "::error::wrangler is not installed from the consumer lockfile — cannot roll back." \
+              "Add it as a devDependency (pnpm add -D wrangler); manual rollback required for this run."
+            exit 1
+          fi
+
           while IFS= read -r worker; do
             worker="$(echo "$worker" | xargs)"
             [ -z "$worker" ] && continue
             echo "::group::Rolling back $worker"
-            pnpx wrangler rollback \
+            pnpm exec wrangler rollback \
               --name "$worker" \
               --env "$DEPLOY_ENV" \
               --message "Auto-rollback: smoke check returned non-200" \
