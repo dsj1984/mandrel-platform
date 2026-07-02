@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.19.1...mandrel-platform-v0.19.2) (2026-07-02)
+
+
+### Fixed
+
+* **deploy:** let the environments-isolation-audit use a PAT (audit-token) ([#213](https://github.com/dsj1984/mandrel-platform/issues/213)) ([fc2613c](https://github.com/dsj1984/mandrel-platform/commit/fc2613c52482a80d98800e74b5fc068289ed0082))
+
 ## [0.19.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.19.0...mandrel-platform-v0.19.1) (2026-07-02)
 
 
