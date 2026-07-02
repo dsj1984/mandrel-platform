@@ -1079,25 +1079,44 @@ jobs:
           # base; a shallow clone would miss commits introduced by the PR.
           fetch-depth: 0
 
-      # Resolve the gitleaks PR-diff commit range. On pull_request events the
-      # scan is scoped to the commits the PR introduces (merge-base..head); on
-      # push / other events it falls back to a full-tree scan.
+      # Resolve the gitleaks commit range so the scan is scoped to what the
+      # event INTRODUCED — pre-existing findings never block. On pull_request
+      # events the range is the commits the PR introduces (merge-base..head).
+      # On push events (Story #175 canonical `workflow_run` deploy trigger made
+      # push-to-main CI load-bearing — see also the SAST baseline below) the
+      # range is `event.before..sha`, the commits the push added; the pushed
+      # code already passed its PR's diff scan, so a full-tree re-scan on every
+      # push would block on unrelated pre-existing debt. Only when no ranged
+      # base is resolvable (no PR context, and no valid non-zero `event.before`
+      # ancestor — e.g. a branch-creation push) does it fall back to a
+      # full-tree scan. `fetch-depth: 0` on the checkout above makes the base
+      # commit reachable.
       - name: Resolve secret-scan range
         id: range
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          ZERO_SHA="0000000000000000000000000000000000000000"
           if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-            echo "mode=pr" >> "$GITHUB_OUTPUT"
+            echo "mode=range" >> "$GITHUB_OUTPUT"
             echo "range=${BASE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
             echo "PR-diff secret scan: ${BASE_SHA}..${HEAD_SHA}"
+          elif [ "${EVENT_NAME:-}" = "push" ] && [ -n "${BEFORE_SHA:-}" ] && \
+               [ "${BEFORE_SHA}" != "${ZERO_SHA}" ] && \
+               git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            echo "mode=range" >> "$GITHUB_OUTPUT"
+            echo "range=${BEFORE_SHA}..${PUSH_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "push-diff secret scan: ${BEFORE_SHA}..${PUSH_HEAD_SHA}"
           else
             echo "mode=full" >> "$GITHUB_OUTPUT"
             echo "range=" >> "$GITHUB_OUTPUT"
-            echo "Full-tree secret scan (no PR context)."
+            echo "Full-tree secret scan (no ranged base)."
           fi
 
       # Download + verify a PINNED gitleaks binary. Cross-platform asset
@@ -1172,8 +1191,8 @@ jobs:
           # --redact=100 (not bare --redact, whose optional uint would otherwise
           # swallow the trailing '.' path arg). Exit code 1 on a leak (gitleaks
           # default) fails this job.
-          if [ "$SCAN_MODE" = "pr" ]; then
-            echo "Scanning PR diff range: ${SCAN_RANGE}"
+          if [ "$SCAN_MODE" = "range" ]; then
+            echo "Scanning diff range: ${SCAN_RANGE}"
             "${tmp}/gitleaks" git --log-opts="${SCAN_RANGE}" --redact=100 --verbose --no-banner .
           else
             echo "Scanning full working tree."
@@ -1212,11 +1231,16 @@ jobs:
           path: _mandrel-platform-sast
           persist-credentials: false
 
-      # Resolve the Semgrep SAST baseline, mirroring the gitleaks PR-diff
+      # Resolve the Semgrep SAST baseline, mirroring the gitleaks range
       # scoping above. On pull_request events the baseline is the PR's merge
       # base (`base.sha`), so `--baseline-commit` makes Semgrep report only
       # findings INTRODUCED by the PR (pre-existing debt is suppressed). On
-      # push / schedule / other events the baseline is empty → full-tree scan.
+      # push events the baseline is `event.before` (the commits the push added),
+      # so a push-to-main CI run — load-bearing since the canonical
+      # `workflow_run` deploy trigger, Story #175 — reports only push-introduced
+      # findings instead of full-tree-blocking on pre-existing debt. Only when
+      # no baseline is resolvable (no PR context, no valid non-zero
+      # `event.before` ancestor) does it fall back to a full-tree scan.
       # `fetch-depth: 0` on the checkout above makes the base commit available.
       - name: Resolve SAST baseline
         id: sast-baseline
@@ -1224,14 +1248,22 @@ jobs:
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          ZERO_SHA="0000000000000000000000000000000000000000"
           if [ -n "${BASE_SHA:-}" ]; then
             echo "baseline=${BASE_SHA}" >> "$GITHUB_OUTPUT"
             echo "PR-diff SAST baseline: ${BASE_SHA}"
+          elif [ "${EVENT_NAME:-}" = "push" ] && [ -n "${BEFORE_SHA:-}" ] && \
+               [ "${BEFORE_SHA}" != "${ZERO_SHA}" ] && \
+               git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            echo "baseline=${BEFORE_SHA}" >> "$GITHUB_OUTPUT"
+            echo "push-diff SAST baseline: ${BEFORE_SHA}"
           else
             echo "baseline=" >> "$GITHUB_OUTPUT"
-            echo "Full-tree SAST (no PR context)."
+            echo "Full-tree SAST (no ranged base)."
           fi
 
       # SAST via Semgrep, installed from PyPI at a pinned version against the

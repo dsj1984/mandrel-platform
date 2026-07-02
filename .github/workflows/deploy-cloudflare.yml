@@ -473,7 +473,7 @@ jobs:
           ENVIRONMENTS_TO_AUDIT: ${{ inputs.environments-to-audit }}
 
       - name: Audit deployment branch policies
-        uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@17868b84fa1491e506172bac8426737b0cf99092
+        uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@cdeac8328e3f0b6803dcced49b374a04bcaf9b9f # v0.19.0
         with:
           environments: ${{ steps.resolve-envs.outputs.environments }}
           allowed-branch: ${{ inputs.isolation-audit-branch }}
