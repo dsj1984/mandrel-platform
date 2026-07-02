@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.19.0...mandrel-platform-v0.19.1) (2026-07-02)
+
+
+### Fixed
+
+* restore push-to-main CI + staging deploys (SAST push-scoping + isolation-audit pin) ([#211](https://github.com/dsj1984/mandrel-platform/issues/211)) ([b519c85](https://github.com/dsj1984/mandrel-platform/commit/b519c85440395a042d69610e1071d48a9564f194))
+
 ## [0.19.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.18.0...mandrel-platform-v0.19.0) (2026-07-02)
 
 
