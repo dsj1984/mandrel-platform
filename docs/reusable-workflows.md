@@ -1109,19 +1109,32 @@ lockfile-pinned wrangler** via `pnpm exec wrangler`, installed by the shared
 | Built-in D1 export (snapshot step) | `migration`             | `pnpm exec wrangler d1 export …`     |
 | Built-in D1 migrate (apply step)   | `migration`             | `pnpm exec wrangler d1 migrations apply …` |
 | Built-in per-worker deploy loop    | `deploy`                | `pnpm exec wrangler deploy …`        |
+| Worker-secrets provisioning        | `deploy`                | `pnpm exec wrangler versions …`      |
 | workers.dev subdomain derivation   | `boot-smoke`            | `pnpm exec wrangler whoami`          |
 | Auto-rollback on smoke failure     | `boot-smoke`            | `pnpm exec wrangler rollback …`      |
 
 The workflow **never** fetches a registry-latest wrangler at runtime (the
 previous `pnpx wrangler` behaviour) while production Cloudflare credentials
-are in scope. Each call site preflights `pnpm exec wrangler --version` and
-**fails loudly** with an actionable message when wrangler is not installed
-from the lockfile, so a consumer that has not pinned it is told to add it
-rather than silently deploying with a floating version:
+are in scope. The is-wrangler-installed preflight is **single-sourced** in
+`setup-toolchain`'s `require-wrangler` input (Story #231): each job passes
+`require-wrangler` with an expression matching exactly the conditions under
+which its built-in steps invoke wrangler, and the preflight runs
+`pnpm exec wrangler --version` immediately after the install, **failing
+loudly** with one authoritative, actionable message when wrangler is not
+installed from the lockfile — so a consumer that has not pinned it is told
+to add it rather than silently deploying with a floating version:
 
 ```console
 pnpm add -D wrangler
 ```
+
+The auto-rollback step is the one wrangler call site not always covered by
+an up-front preflight: when a consumer supplies `smoke-command` (or an
+explicit `workers_dev_subdomain` / `smoke_base_url`), requiring a root
+wrangler install for every smoke run would fail callers that legitimately
+have none, so on rollback a missing wrangler surfaces through the
+per-worker `manual rollback required` fallback instead (`pnpm exec` never
+falls back to a registry fetch either way).
 
 Because the pin comes from the consumer's own `pnpm-lock.yaml`, the deployed
 wrangler version is exactly the one the consumer tests against locally and in
@@ -1131,6 +1144,34 @@ commands (`snapshot-command`, `migrate-command`, `deploy-command`,
 `smoke-command`) own their own wrangler invocation and are unaffected by this
 pinning; a consumer using those seams should pin wrangler the same way in the
 command it supplies.
+
+### Extracted deploy scripts (boot-smoke, worker-secrets)
+
+> Story #231. The boot-smoke probe and the worker-secrets provisioning loop
+> live as versioned, unit-tested platform scripts —
+> `scripts/deploy-boot-smoke.mjs` and `scripts/deploy-worker-secrets.mjs` —
+> sparse-checked out of `dsj1984/mandrel-platform` at
+> `github.job_workflow_sha` (the exact commit the caller's
+> `deploy-cloudflare.yml@<ref>` pin resolved to), so the script version
+> always travels in lockstep with the workflow pin. Same model as
+> [`uptime-apply.yml`](#uptime-applyyml) → `apply-uptime-monitors.mjs`. The
+> per-worker deploy loop and the rollback loop stay inline (short,
+> branch-free bash whose extraction would add a checkout dependency to the
+> hot deploy path without materially improving testability).
+
+Two behavioural refinements shipped with the extraction:
+
+- **`smoke_base_url` de-duplication.** The inline predecessor probed
+  `${smoke_base_url}${path}` once **per worker**, so with a shared base URL
+  and N workers each path was requested N times and a failure was
+  misattributed to whichever worker's loop iteration hit it. With
+  `smoke_base_url` set, each path is now probed exactly **once** — and
+  because a shared-host failure cannot be attributed to an individual
+  worker, it explicitly marks **all** deployed workers for rollback.
+- **JSON version parsing.** `verify-commit-sha` now parses the health
+  response as JSON and asserts its **top-level** `version` field (the
+  former grep/sed extraction could match a `version` key nested anywhere in
+  the body).
 
 ### Environments isolation audit
 
@@ -1394,7 +1435,7 @@ jobs:
 | `deploy-command`             | string  | `''`        | Replaces the built-in per-worker `wrangler deploy` loop. Use for pnpm-workspace monorepos with no root wrangler config (deploy each worker from its package dir). |
 | `smoke`                      | boolean | `true`      | Run the built-in boot-smoke + auto-rollback job. Set `false` to run your own post-deploy verification (auto-rollback is also skipped).                       |
 | `smoke-command`              | string  | `''`        | Replaces the built-in workers.dev probe (multi-route / custom-host consumers). A non-zero exit fails the run and triggers the same `wrangler rollback`.       |
-| `smoke_base_url`             | string  | `''`        | Base URL for the built-in probe (e.g. `https://godomio.com`). Each smoke path is appended to this base instead of the derived workers.dev host. No trailing slash. |
+| `smoke_base_url`             | string  | `''`        | Base URL for the built-in probe (e.g. `https://godomio.com`). Each smoke path is appended to this base instead of the derived workers.dev host and probed exactly **once** (shared host); a failure rolls back **all** deployed workers. No trailing slash. See [Extracted deploy scripts](#extracted-deploy-scripts-boot-smoke-worker-secrets). |
 | `smoke_paths`                | string  | `'/health'` | Comma-separated paths the built-in probe requests against each target (e.g. `"/,/portal,/api/health"`). Each must start with a leading slash.                |
 | `workers_dev_subdomain`      | string  | `''`        | workers.dev account **subdomain slug** (e.g. `"dsj1984"`) used to build the probe URL. Empty derives it from `wrangler whoami`. **Never** pass the account ID. |
 | `verify-commit-sha`          | boolean | `false`     | Opt-in (Story #176). When `true`, the built-in probe additionally asserts the health response's `version` field equals `github.sha`. A mismatch fails smoke and triggers rollback. Ignored when `smoke-command` is set. See [Commit-SHA verification](#commit-sha-verification-opt-in) below. |
