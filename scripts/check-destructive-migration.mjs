@@ -36,6 +36,7 @@
  *   node scripts/check-destructive-migration.mjs \
  *     --changed-files <file-with-one-path-per-line> \
  *     [--label-present] \
+ *     [--override-label <name>] \
  *     [--migration-glob '**​/migrations/**,**​/drizzle/**'] \
  *     [--repo-root <dir>]
  *
@@ -45,9 +46,17 @@
  *   • --label-present   Pass when the override acknowledgement label is on the
  *                       PR. Overrides a destructive finding (exit 0 with a
  *                       warning) instead of blocking.
+ *   • --override-label  The acknowledgement label NAME to cite in messages and
+ *                       the step summary (behaviour is still driven solely by
+ *                       --label-present). Default `migration:destructive-ok`.
  *   • --migration-glob  Comma-separated migration path globs. Default
  *                       `**​/migrations/**,**​/drizzle/**`.
  *   • --repo-root       Root to resolve changed-file paths against. Default cwd.
+ *
+ * When `GITHUB_STEP_SUMMARY` is set (i.e. running inside a GitHub Actions
+ * step) and a destructive finding exists, a markdown summary block (ALLOWED
+ * via override / BLOCKED) is appended to that file — the same job-summary
+ * surface the previous in-workflow bash implementation wrote.
  *
  * Exit codes:
  *   0 — no destructive migration in the changed set, OR a destructive
@@ -60,7 +69,7 @@
  * docs/reusable-workflows.md (`pr-quality.yml` → migration guard).
  */
 
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 // The override acknowledgement label. Documented in docs/reusable-workflows.md.
@@ -205,14 +214,47 @@ export function detectDestructiveMigrations({ changedFiles, readFile, globs = DE
   return { destructive: findings.length > 0, findings };
 }
 
+/**
+ * Render the GitHub job-summary markdown block for a destructive finding —
+ * the same summary surface the previous in-workflow bash implementation
+ * appended to `GITHUB_STEP_SUMMARY`. Only called when findings exist.
+ *
+ * @param {object} opts
+ * @param {Array<{file: string, signals: string[]}>} opts.findings
+ * @param {boolean} opts.labelPresent
+ * @param {string} opts.overrideLabel
+ * @returns {string}  Markdown, trailing-newline-terminated.
+ */
+export function formatStepSummary({ findings, labelPresent, overrideLabel }) {
+  const list = findings
+    .map((f) => `  • ${f.file} → ${f.signals.join(", ")}`)
+    .join("\n");
+  if (labelPresent) {
+    return (
+      "### Destructive-migration guard — ALLOWED via override\n\n" +
+      `Override label \`${overrideLabel}\` is present. Findings:\n\n` +
+      `${list}\n`
+    );
+  }
+  return (
+    "### ❌ Destructive-migration guard — BLOCKED\n\n" +
+    "A destructive migration was detected and the override label\n" +
+    `\`${overrideLabel}\` is NOT applied. Findings:\n\n` +
+    `${list}\n\n` +
+    `A reviewer must apply the \`${overrideLabel}\` label to\n` +
+    "acknowledge the destructive change, then re-run this check.\n"
+  );
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const opts = {
     changedFiles: null,
     labelPresent: false,
+    overrideLabel: DEFAULT_OVERRIDE_LABEL,
     globs: DEFAULT_MIGRATION_GLOBS,
     repoRoot: process.cwd(),
   };
@@ -222,6 +264,8 @@ function parseArgs(argv) {
       opts.changedFiles = argv[++i];
     } else if (a === "--label-present") {
       opts.labelPresent = true;
+    } else if (a === "--override-label" && argv[i + 1]) {
+      opts.overrideLabel = argv[++i];
     } else if (a === "--migration-glob" && argv[i + 1]) {
       opts.globs = argv[++i]
         .split(",")
@@ -252,7 +296,8 @@ function main() {
   if (opts.help) {
     process.stdout.write(
       "Usage: node scripts/check-destructive-migration.mjs --changed-files <path|-> " +
-        "[--label-present] [--migration-glob <csv>] [--repo-root <dir>]\n"
+        "[--label-present] [--override-label <name>] [--migration-glob <csv>] " +
+        "[--repo-root <dir>]\n"
     );
     process.exit(0);
   }
@@ -290,18 +335,35 @@ function main() {
     .map((f) => `  • ${f.file} → ${f.signals.join(", ")}`)
     .join("\n");
 
+  // Inside a GitHub Actions step, mirror the finding onto the job summary —
+  // the same surface the previous in-workflow bash implementation wrote.
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      appendFileSync(
+        process.env.GITHUB_STEP_SUMMARY,
+        formatStepSummary({
+          findings,
+          labelPresent: opts.labelPresent,
+          overrideLabel: opts.overrideLabel,
+        })
+      );
+    } catch {
+      // Best-effort: the exit code below is the gate, the summary is cosmetic.
+    }
+  }
+
   if (opts.labelPresent) {
     process.stdout.write(
       `⚠️ Destructive migration detected, but the override label ` +
-        `'${DEFAULT_OVERRIDE_LABEL}' is applied — allowing.\n${summary}\n`
+        `'${opts.overrideLabel}' is applied — allowing.\n${summary}\n`
     );
     process.exit(0);
   }
 
   process.stderr.write(
     `❌ Destructive migration detected and the override label ` +
-      `'${DEFAULT_OVERRIDE_LABEL}' is NOT applied — blocking.\n${summary}\n\n` +
-      `To proceed, a reviewer must apply the '${DEFAULT_OVERRIDE_LABEL}' label ` +
+      `'${opts.overrideLabel}' is NOT applied — blocking.\n${summary}\n\n` +
+      `To proceed, a reviewer must apply the '${opts.overrideLabel}' label ` +
       `to acknowledge the destructive change, then re-run this check.\n`
   );
   process.exit(1);
