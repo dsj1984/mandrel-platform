@@ -111,6 +111,18 @@ jobs:
   release-please:
     name: Run release-please
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    # Reusable-side release-train serialization: two quick pushes to the
+    # caller's main running release-please concurrently is a known source of
+    # duplicate/conflicting release PRs and 422s. Job-level (not workflow-
+    # level) because a called workflow's workflow-level `concurrency` is not
+    # evaluated — its jobs run inside the CALLER's run. `github.ref` resolves
+    # to the caller's ref, so each consumer branch serializes independently.
+    # cancel-in-progress stays false: an in-flight release run must finish,
+    # not be cancelled; the follow-up run queues behind it.
+    concurrency:
+      group: release-please-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
       pull-requests: write

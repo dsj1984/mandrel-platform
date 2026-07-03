@@ -474,6 +474,7 @@ jobs:
   environments-isolation-audit:
     name: Environments isolation audit
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     if: ${{ inputs.enable-environments-isolation-audit == true }}
     permissions:
       contents: read
@@ -538,6 +539,7 @@ jobs:
   require-ci-green:
     name: Require CI-green (${{ inputs.environment }})
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     steps:
       - name: Evaluate CI-green gate
         shell: bash
@@ -563,6 +565,7 @@ jobs:
   secret-isolation-audit:
     name: Secret isolation audit
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     needs: [environments-isolation-audit, require-ci-green]
     if: >-
       ${{ always() &&
@@ -628,6 +631,7 @@ jobs:
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     needs: secret-isolation-audit
     steps:
       - name: Validate required secrets
@@ -689,6 +693,7 @@ jobs:
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
     needs: check-env
     if: ${{ inputs.migrate == true }}
     steps:
@@ -783,6 +788,7 @@ jobs:
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
     needs: pre-migration-snapshot
     if: ${{ inputs.migrate == true }}
     steps:
@@ -859,6 +865,7 @@ jobs:
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
     needs:
       - check-env
       - migrate
@@ -1145,6 +1152,7 @@ jobs:
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
     needs: deploy
     if: ${{ needs.deploy.result == 'success' && inputs.smoke == true }}
     steps:
@@ -1362,6 +1370,7 @@ jobs:
   deploy-summary:
     name: Deploy summary (${{ inputs.environment }})
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
     needs:
       - deploy
       - boot-smoke

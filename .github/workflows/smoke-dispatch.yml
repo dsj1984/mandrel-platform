@@ -64,3 +64,26 @@ jobs:
             --ref main \
             -f sha="${SHA}"
           echo "Triggered smoke (workflow_dispatch) for ${SHA}"
+
+      # Fail-closed stays fail-closed, but loudly: without this, a failed
+      # dispatch (expired SMOKE_DISPATCH_TOKEN, renamed smoke repo, …) strands
+      # the `smoke/cross-repo` status at `pending` forever — release-please's
+      # await-smoke gate then blocks with zero failure signal on the commit.
+      # Flip the status to `failure` pointing at this run so the wedge is
+      # visible and diagnosable from the commit itself.
+      - name: Mark commit failed on dispatch failure (built-in token)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${REPO}/statuses/${SHA}" \
+            -f state=failure \
+            -f context=smoke/cross-repo \
+            -f description="smoke dispatch failed — see dispatch run" \
+            -f target_url="${RUN_URL}" >/dev/null
+          echo "smoke/cross-repo set failure on ${SHA} (dispatch run: ${RUN_URL})"
