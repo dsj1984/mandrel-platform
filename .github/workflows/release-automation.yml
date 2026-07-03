@@ -68,8 +68,8 @@ on:
       config-file:
         description: >
           Path to a release-please config JSON. Optional — when omitted the
-          action runs in single-package mode driven by 'release-type' and
-          'package-name'. Supply this for a monorepo or to pin
+          action runs in single-package mode driven by 'release-type'.
+          Supply this for a monorepo, for per-package naming, or to pin
           changelog-sections to the platform's git-conventions.md mapping.
         required: false
         type: string
@@ -78,14 +78,6 @@ on:
         description: >
           Path to a release-please manifest JSON. Required when 'config-file' is
           set (manifest + config are a matched pair); ignored otherwise.
-        required: false
-        type: string
-        default: ''
-      package-name:
-        description: >
-          Package name release-please uses in the release PR title and tag.
-          Defaults to empty (release-please reads it from package.json for the
-          'node' release-type). Set explicitly for non-Node release-types.
         required: false
         type: string
         default: ''
@@ -159,12 +151,12 @@ jobs:
         with:
           token: ${{ secrets.release-token || github.token }}
           target-branch: ${{ inputs.target-branch }}
-          # release-type / package-name drive single-package mode. When the
-          # caller supplies a config-file (and matched manifest-file), the
-          # config file owns per-package release-type, so release-type MUST NOT
-          # be forced here — passing it would shadow the config. We therefore
-          # send an empty release-type/package-name in config-file mode and the
-          # single-package input otherwise.
+          # release-type drives single-package mode. When the caller supplies
+          # a config-file (and matched manifest-file), the config file owns
+          # per-package release-type, so release-type MUST NOT be forced here
+          # — passing it would shadow the config. We therefore send an empty
+          # release-type in config-file mode and the single-package input
+          # otherwise.
           #
           # The branch order matters: GitHub Actions `A && B || C` returns
           # operand *values* with `''` treated as falsy, so `config-file != ''
@@ -173,6 +165,5 @@ jobs:
           # being EMPTY so the truthy branch carries the value we want to keep:
           # single-package → inputs.release-type; config-file mode → ''.
           release-type: ${{ inputs.config-file == '' && inputs.release-type || '' }}
-          package-name: ${{ inputs.config-file == '' && inputs.package-name || '' }}
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}
