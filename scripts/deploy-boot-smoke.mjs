@@ -53,7 +53,9 @@
  *   WORKERS_DEV_SUBDOMAIN  explicit workers.dev slug (optional)
  *   VERIFY_COMMIT_SHA      'true' to assert the health JSON version field
  *   EXPECTED_SHA           the SHA verify-commit-sha asserts (github.sha)
- *   SMOKE_FAILED_FILE      rollback-list path (default /tmp/smoke-failed-workers.txt)
+ *   SMOKE_FAILED_FILE      rollback-list path (default: a freshly-created
+ *                          private temp dir via mkdtemp — never a predictable
+ *                          world-writable path; CI sets this explicitly)
  *   GITHUB_ENV             GitHub Actions env file (smoke_failed=true flag)
  *
  * Exit codes:
@@ -62,7 +64,9 @@
  *       not be resolved (no subdomain derivable — no rollback list).
  */
 
-import { writeFileSync, appendFileSync } from "node:fs";
+import { writeFileSync, appendFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
@@ -321,8 +325,24 @@ function defaultWhoami() {
 // CLI entry
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve the rollback-list path. When SMOKE_FAILED_FILE is set (CI always
+ * sets it), it wins verbatim. Otherwise fall back to a file inside a
+ * freshly-created private temp directory (`mkdtemp` — mode 0700, unique
+ * per-invocation name) rather than the fixed, predictable, world-writable
+ * `/tmp/smoke-failed-workers.txt`. A predictable path in a shared temp dir is
+ * pre-creatable / symlink-swappable by a co-tenant on a reused runner
+ * (CWE-377); mkdtemp closes that seam by owning a private directory no other
+ * process can pre-stage.
+ */
+export function resolveFailedFile(env, mkdtempImpl = mkdtempSync) {
+  const explicit = (env.SMOKE_FAILED_FILE ?? "").trim();
+  if (explicit) return explicit;
+  return join(mkdtempImpl(join(tmpdir(), "deploy-boot-smoke-")), "smoke-failed-workers.txt");
+}
+
 async function main() {
-  const failedFile = process.env.SMOKE_FAILED_FILE || "/tmp/smoke-failed-workers.txt";
+  const failedFile = resolveFailedFile(process.env);
   const { exitCode, failedWorkers } = await runSmoke(process.env);
 
   if (failedWorkers.length > 0) {
