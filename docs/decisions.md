@@ -470,3 +470,39 @@ spans CI, decomposition, and release. Cost: consumers that publish to a registry
 must supply their own publish job (the unit deliberately stops at tag/release),
 and the platform now maintains two release-please surfaces (internal publish +
 reusable consumer unit) that must not drift on the release-please-action pin.
+
+## 2026-07-03 — Dogfood the security gates via a required pr-quality self-call, not an advisory caller
+
+**Context.** Story [#236](https://github.com/dsj1984/mandrel-platform/issues/236):
+the platform shipped a blocking PR-time secret scan + SAST (the `pr-quality.yml`
+security tier) and a post-merge full-history secret scan (`secret-scan-push.yml`)
+to every consumer but ran neither on itself, despite carrying checksum maps,
+token docs, and consumer registry data. Two shapes were on the table for the
+PR-time gate: a standalone **advisory** caller whose result is never required
+(zero branch-protection risk, but a red gate nobody must fix), or wiring the
+security tier **into the required set**. The repo's single required context is
+`ci-required`, emitted by `ci.yml`'s own aggregator.
+
+**Decision.** Wire it into the required set — but through the **existing**
+aggregator, not a new required context. `ci.yml` gains a `security` job that
+self-calls `./.github/workflows/pr-quality.yml` (relative `uses:` is legitimate
+in a caller; the portability lint bans it only inside reusable workflows) with
+every tier except the security tier disabled, and that job is a `needs:` of
+`ci.yml`'s `ci-required`. Branch protection is untouched: the required context
+list stays exactly `ci-required`, so `check-required-contexts.mjs` needs no
+contract change. The push-to-main history scan lands as the separate
+`secret-scan.yml` caller — inherently non-blocking (the reusable workflow is
+signal-only by design). OSV/lint/test tiers stay disabled in the self-call:
+this repo is a dependency-free npm scripts package whose lint/tests already run
+in `ci.yml`'s `node-scripts` job.
+
+**Consequences.** The platform's own PRs are now blocked by the same
+gitleaks/Semgrep gate consumers inherit, and the `workflow_call` interface has
+permanent in-repo execution coverage on top of the external smoke repo. Both
+blocking scans are diff-scoped (merge-base..head / event.before..sha), so
+pre-existing history never blocks — historical leaks surface via the
+secret-scan signal artifact instead. Cost: a security-tier regression in a PR
+now fails that PR's own `ci-required` (self-gating is the point, but it means
+workflow edits are tested by their own edit), and the self-call's SAST needs
+`.semgrep` excluded (the vendored ruleset snapshot would otherwise be scanned
+as a target).

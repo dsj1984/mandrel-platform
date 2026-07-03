@@ -15,6 +15,14 @@
 # ship green here and break every consumer. The lint asserts both invariants
 # statically (see the #24 → #29 → #30 → #32 blocker chain that motivated it).
 #
+# Dogfood (Story #236): the `security` job below self-calls the shared
+# pr-quality.yml with every tier except the security tier disabled, so the
+# platform's own PRs get the same blocking gitleaks + Semgrep gate it ships to
+# every consumer — and the reusable interface gains permanent in-repo execution
+# coverage on top of the external smoke repo's. It is a `needs:` of the
+# `ci-required` aggregator, so the tier is load-bearing through the repo's
+# existing single required context (no branch-protection change needed).
+#
 # Consumer adoption:
 #   Copy scripts/check-required-contexts.mjs and scripts/check-workflow-portability.mjs
 #   into your project's scripts/ directory, then add the steps below to your CI:
@@ -175,6 +183,49 @@ jobs:
           # -color forces the annotated output even though stdout is not a TTY.
           "${tmp}/actionlint" -color
 
+  # ── Security tier (dogfood self-call of pr-quality.yml, Story #236) ───────
+  #
+  # The platform ships a blocking PR-time secret scan + SAST to every consumer
+  # via pr-quality.yml's security tier, but historically never ran it on
+  # itself. This job self-calls the reusable workflow — a same-repo RELATIVE
+  # `uses:` ref, which is legitimate in a CALLER (the portability lint's ban
+  # targets relative refs INSIDE reusable workflows, where they break
+  # cross-repo consumers) and self-updating: each run executes the
+  # pr-quality.yml copy on the same commit, so a PR that edits the security
+  # tier is gated by its own edit.
+  #
+  # Tier selection: only the security tier (gitleaks PR-diff secret scan +
+  # Semgrep SAST) applies here. The lint/typecheck/unit/contract/e2e tiers
+  # assume a pnpm consumer app (this repo is a dependency-free npm scripts
+  # package — its lint/tests run in `node-scripts` above), and the OSV tier is
+  # disabled because this repo's only runtime dependency surface is already
+  # covered by Renovate + the consumer-facing lockfile checks; enabling it
+  # here would gate the platform's PRs on advisory timing rather than code.
+  #
+  # Both scans are DIFF-SCOPED by design (merge-base..head on PRs,
+  # event.before..sha on push), so pre-existing findings in history never
+  # block; the full-history sweep is the secret-scan.yml signal caller.
+  # `.semgrep` is excluded from SAST: it is the vendored ruleset snapshot
+  # itself — pattern strings inside it are scan *rules*, not scan *targets*
+  # (the built-in `.agents` exclude already drops the vendored framework tree).
+  security:
+    uses: ./.github/workflows/pr-quality.yml
+    with:
+      enable-lint: false
+      enable-typecheck: false
+      enable-unit: false
+      enable-contract: false
+      enable-e2e: false
+      enable-osv-scan: false
+      sast-exclude: '.semgrep'
+    permissions:
+      contents: read
+      # pr-quality.yml declares `actions: write` for its opt-in fail-fast
+      # cancel step (unused here — fail-fast defaults to false). Granted so
+      # the called workflow's declared permissions never exceed the caller's
+      # grant.
+      actions: write
+
   # ── Aggregator: single required branch-protection context ─────────────────
   #
   # Mirrors the ci-required pattern from pr-quality.yml: a single stable
@@ -188,6 +239,11 @@ jobs:
     needs:
       - node-scripts
       - actionlint
+      # Dogfood security tier (Story #236): the pr-quality.yml self-call. Its
+      # result is the called workflow's overall result, so a gitleaks/Semgrep
+      # finding fails this aggregator — the security gate is load-bearing on
+      # the platform's own PRs through the existing required context.
+      - security
     steps:
       # Self-maintaining aggregator: results are derived from `toJSON(needs)`,
       # so the `needs:` array above is the single source of truth — adding a
