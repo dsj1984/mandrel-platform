@@ -1845,7 +1845,13 @@ jobs:
   # name drift — the job name is defined exactly once here.
   ci-required:
     name: ci-required
-    runs-on: ubuntu-latest
+    # Honor the `runner` input like every tier job above (it is a trivial bash
+    # results-aggregator, safe on any runner). Hardcoding ubuntu-latest here
+    # left a single GitHub-hosted job in an otherwise fully self-hosted run, so
+    # a self-hosted consumer whose GitHub-hosted minutes are unavailable (e.g. a
+    # billing/spending-limit block) could get every tier green yet still fail
+    # the required aggregate. Defaults to ubuntu-latest via the input default.
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
     if: always()
     needs:
