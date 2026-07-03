@@ -83,6 +83,18 @@ jobs:
 
 With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 
+> **In-repo reference example (dogfood).** This repo runs the workflow on its
+> own PRs: the `security` job in
+> [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) self-calls
+> `./.github/workflows/pr-quality.yml` with every tier except the security
+> tier disabled, wired into the repo's required `ci-required` aggregator
+> ([#236](https://github.com/dsj1984/mandrel-platform/issues/236)). It is the
+> live, always-exercised example of a partial-tier caller — copy its `with:`
+> block shape when you only want a subset of tiers. Note one deliberate
+> difference from your caller: it uses a same-repo **relative** `uses:` ref
+> (legitimate in a caller, and self-updating); a consumer must use the
+> SHA-pinned cross-repo ref shown above.
+
 ### Inputs
 
 | Input              | Type    | Default          | When to override                                                                                                                              |
@@ -1502,6 +1514,14 @@ jobs:
     uses: dsj1984/mandrel-platform/.github/workflows/secret-scan-push.yml@<sha> # <tag>
     secrets: inherit
 ```
+
+> **In-repo reference example (dogfood).** This repo runs the scan on its own
+> pushes to `main` via
+> [`.github/workflows/secret-scan.yml`](../.github/workflows/secret-scan.yml)
+> ([#236](https://github.com/dsj1984/mandrel-platform/issues/236)) — a live
+> copy of this minimal caller, differing only in its same-repo **relative**
+> `uses:` ref (legitimate in a caller; consumers use the SHA-pinned cross-repo
+> ref above) and in omitting `secrets: inherit` (the scan needs no secrets).
 
 ### Inputs
 
