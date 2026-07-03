@@ -1042,6 +1042,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
+          # by the Setup toolchain step's `pnpm install --frozen-lockfile`.
+          # Preflight fails LOUDLY when wrangler is not a devDependency, rather
+          # than fetching an unpinned registry-latest wrangler at runtime with
+          # production CF creds in scope and plaintext secret values on stdin.
+          if ! pnpm exec wrangler --version >/dev/null 2>&1; then
+            echo "::error::wrangler is not installed from the consumer lockfile." \
+              "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
+              "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
+            exit 1
+          fi
+
           # Worker list: the deploy step's resolved output (built-in loop OR
           # deploy-command both set deployed_workers), same targeting the
           # downstream smoke / rollback uses.
@@ -1088,7 +1100,7 @@ jobs:
               # non-interactive path as `wrangler secret put`) and creates a NEW
               # version WITHOUT deploying it. This write is immune to error 10215
               # even when active ≠ latest-uploaded.
-              printf '%s' "$value" | pnpx wrangler versions secret put "$name" \
+              printf '%s' "$value" | pnpm exec wrangler versions secret put "$name" \
                 --name "$worker" \
                 --env "$DEPLOY_ENV"
               echo "::endgroup::"
@@ -1100,7 +1112,7 @@ jobs:
             # the current secret values the ACTIVE version boot-smoke probes and
             # realigns active = latest so no residual 10215-inducing split
             # remains. `-y` selects the non-interactive default (latest @ 100%).
-            pnpx wrangler versions deploy \
+            pnpm exec wrangler versions deploy \
               --name "$worker" \
               --env "$DEPLOY_ENV" \
               --message "In-pipeline worker-secrets provisioning (Story #170)" \
