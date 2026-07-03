@@ -60,6 +60,32 @@ on:
         type: string
         default: '[1]'
 
+      # Opt-in fail-fast (Story #223). When true, the FIRST tier-job failure
+      # cancels the whole run via the Actions API, so doomed sibling tiers stop
+      # consuming runner capacity (GitHub-hosted minutes, or a small self-hosted
+      # runner pool — the swarm-os run 28666023203 failure mode). Default false
+      # is byte-for-byte today's behaviour: every tier runs to completion.
+      # Correctness under cancellation is carried by the `ci-required`
+      # aggregator below: it runs `if: always()` and counts `cancelled` as
+      # non-success, so branch protection stays red after a fail-fast cancel.
+      # NOTE: cross-tier `needs:` gating was REJECTED as the mechanism — needs:
+      # edges are static and cannot be toggled by a workflow_call input. The
+      # cancel call needs `actions: write` on the token (declared below;
+      # callers with restricted default token permissions must grant it — see
+      # docs/reusable-workflows.md).
+      fail-fast:
+        description: >
+          Cancel the entire run on the first tier-job failure. Opt-in: default
+          false preserves full run-to-completion tier parallelism (identical
+          behaviour to before this input existed). When true, each tier job's
+          final step cancels the current run on that tier's failure, freeing
+          runner capacity that cannot change the outcome. Requires the
+          caller's GITHUB_TOKEN to allow the declared actions write permission
+          (see docs/reusable-workflows.md).
+        required: false
+        type: boolean
+        default: false
+
       # Per-tier enable toggles.
       enable-lint:
         description: 'Enable the lint + format-check tier.'
@@ -452,8 +478,15 @@ on:
 
 # Permissions: callers inherit the calling workflow's token permissions.
 # We declare the minimum needed here; callers may narrow further.
+# `actions: write` exists solely for the opt-in fail-fast cancel step
+# (Story #223) — a reusable workflow cannot elevate beyond what the caller's
+# token grants, so callers with restricted default token permissions must
+# grant it at the caller level (see docs/reusable-workflows.md). The cancel
+# step itself fails loud-but-non-fatal (::warning::) when the grant is
+# missing, so a permission gap can never mask a real tier failure.
 permissions:
   contents: read
+  actions: write
 
 # Cancel superseded runs on the same ref so stale PR pushes don't queue up.
 concurrency:
@@ -533,6 +566,46 @@ jobs:
           fi
           node "${script}" "${args[@]}"
 
+      # Opt-in fail-fast (Story #223): on this tier's failure, cancel the whole
+      # run so doomed sibling tiers stop consuming runner capacity. MUST be the
+      # LAST step of the job, so `if: always()` steps (artifact uploads) finish
+      # before the run-wide cancel signal lands. Correctness under cancellation
+      # is carried by `ci-required`: it runs `if: always()` and counts
+      # `cancelled` as non-success, so branch protection stays red. Loud but
+      # NON-FATAL: any cancel failure (typically the caller's token lacking
+      # `actions: write`) surfaces as a ::warning:: and exits 0, so a
+      # permission gap can never mask this tier's own failure result. The same
+      # step is replicated verbatim on every tier job below — GitHub Actions
+      # has no cross-job step reuse short of a composite action, and a
+      # composite would hide the `if:` gate from the workflow surface.
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
+
   # ── Tier 2: Typecheck ─────────────────────────────────────────────────────
   typecheck:
     name: Typecheck
@@ -561,6 +634,37 @@ jobs:
         env:
           TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
           TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
+      # tier's step of the same name for the full rationale (must be the LAST
+      # step; loud-but-non-fatal; ci-required counts cancelled as non-success).
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
 
   # ── Tier 3: Unit tests ────────────────────────────────────────────────────
   unit:
@@ -706,6 +810,37 @@ jobs:
             **/coverage/
           retention-days: 7
 
+      # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
+      # tier's step of the same name for the full rationale (must be the LAST
+      # step; loud-but-non-fatal; ci-required counts cancelled as non-success).
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
+
   # ── Tier 4: Contract tests ────────────────────────────────────────────────
   contract:
     name: Contract (${{ matrix.shard }}/${{ inputs.shards }})
@@ -746,6 +881,37 @@ jobs:
           name: contract-results-${{ matrix.shard }}
           path: '**/test-results/'
           retention-days: 7
+
+      # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
+      # tier's step of the same name for the full rationale (must be the LAST
+      # step; loud-but-non-fatal; ci-required counts cancelled as non-success).
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
 
   # ── Tier 5: E2E / Smoke (Playwright) ─────────────────────────────────────
   e2e:
@@ -814,6 +980,37 @@ jobs:
             **/test-results/
           retention-days: 14
 
+      # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
+      # tier's step of the same name for the full rationale (must be the LAST
+      # step; loud-but-non-fatal; ci-required counts cancelled as non-success).
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
+
   # ── Destructive-migration label guard (Story #111) ───────────────────────
   #
   # Platformizes the destructive-migration guard domio and athportal each
@@ -847,6 +1044,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      # Job-level permissions REPLACE the workflow-level block, so the
+      # fail-fast cancel grant (Story #223) must be re-declared here.
+      actions: write
     steps:
       - name: Harden runner (egress audit)
         if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
@@ -1028,6 +1228,37 @@ jobs:
           echo "::error::Destructive migration detected without the '${OVERRIDE_LABEL}' override label." >&2
           exit 1
 
+      # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
+      # tier's step of the same name for the full rationale (must be the LAST
+      # step; loud-but-non-fatal; ci-required counts cancelled as non-success).
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
+
   # ── Tier 6: Security (PR-diff secret scan + SAST) ─────────────────────────
   #
   # Private-repo-capable security tier (Story #65 / MP-10). Both sub-steps run
@@ -1065,6 +1296,9 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      # Job-level permissions REPLACE the workflow-level block, so the
+      # fail-fast cancel grant (Story #223) must be re-declared here.
+      actions: write
     steps:
       - name: Harden runner (egress audit)
         if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
@@ -1434,6 +1668,37 @@ jobs:
           fi
           echo "✅ Semgrep found no blocking findings."
 
+      # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
+      # tier's step of the same name for the full rationale (must be the LAST
+      # step; loud-but-non-fatal; ci-required counts cancelled as non-success).
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
+
   # ── Tier 7: OSV-scanner advisory scan ─────────────────────────────────────
   #
   # Dependency-advisory tier (Story #114). Renovate bumps versions but never
@@ -1471,6 +1736,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      # Job-level permissions REPLACE the workflow-level block, so the
+      # fail-fast cancel grant (Story #223) must be re-declared here.
+      actions: write
     steps:
       - name: Harden runner (egress audit)
         if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
@@ -1836,6 +2104,37 @@ jobs:
           );
           process.exit(0);
           NODE
+
+      # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
+      # tier's step of the same name for the full rationale (must be the LAST
+      # step; loud-but-non-fatal; ci-required counts cancelled as non-success).
+      - name: Cancel run on tier failure (fail-fast)
+        if: ${{ failure() && inputs.fail-fast }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
+          if command -v gh >/dev/null 2>&1; then
+            if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
+              echo "Cancellation requested via gh run cancel."
+              exit 0
+            fi
+            echo "gh run cancel failed; falling back to the REST cancel endpoint."
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${REPO}/actions/runs/${RUN_ID}/cancel" || true)"
+          if [ "${status}" = "202" ]; then
+            echo "Cancellation requested via REST (HTTP 202)."
+            exit 0
+          fi
+          echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
+          exit 0
 
   # ── Aggregator: single required branch-protection context ─────────────────
   #
