@@ -10,6 +10,7 @@ import {
   uniqueSorted,
   probeUrl,
   runSmoke,
+  resolveFailedFile,
 } from "./deploy-boot-smoke.mjs";
 
 // ---------------------------------------------------------------------------
@@ -337,4 +338,44 @@ test("runSmoke derives the subdomain from whoami output when not provided", asyn
   );
   assert.equal(result.exitCode, 0);
   assert.deepEqual(probed, ["https://api.dsj1984.workers.dev/health"]);
+});
+
+// ---------------------------------------------------------------------------
+// resolveFailedFile — rollback-list path resolution (CWE-377 hardening)
+// ---------------------------------------------------------------------------
+
+test("resolveFailedFile honours an explicit SMOKE_FAILED_FILE verbatim (no mkdtemp)", () => {
+  let mkdtempCalls = 0;
+  const path = resolveFailedFile({ SMOKE_FAILED_FILE: "/tmp/smoke-failed-workers.txt" }, () => {
+    mkdtempCalls++;
+    return "/should/not/be/used";
+  });
+  assert.equal(path, "/tmp/smoke-failed-workers.txt");
+  assert.equal(mkdtempCalls, 0);
+});
+
+test("resolveFailedFile trims a whitespace-only SMOKE_FAILED_FILE and falls back to mkdtemp", () => {
+  const seen = [];
+  const path = resolveFailedFile({ SMOKE_FAILED_FILE: "   " }, (prefix) => {
+    seen.push(prefix);
+    return "/var/folders/xyz/deploy-boot-smoke-Abc123";
+  });
+  // Fell through to the private-temp-dir branch, not the predictable path.
+  assert.equal(seen.length, 1);
+  assert.equal(path, "/var/folders/xyz/deploy-boot-smoke-Abc123/smoke-failed-workers.txt");
+});
+
+test("resolveFailedFile creates a private temp dir when SMOKE_FAILED_FILE is unset", () => {
+  const seen = [];
+  const path = resolveFailedFile({}, (prefix) => {
+    seen.push(prefix);
+    return "/var/folders/xyz/deploy-boot-smoke-Zzz999";
+  });
+  // The mkdtemp prefix is scoped under the OS temp dir and carries our label,
+  // and the returned path lives INSIDE the freshly-created dir — never the
+  // fixed, world-writable /tmp/smoke-failed-workers.txt.
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].includes("deploy-boot-smoke-"), "mkdtemp prefix carries the script label");
+  assert.equal(path, "/var/folders/xyz/deploy-boot-smoke-Zzz999/smoke-failed-workers.txt");
+  assert.notEqual(path, "/tmp/smoke-failed-workers.txt");
 });
