@@ -13,11 +13,10 @@
 #
 # Runner (Story #222): every job's `runs-on:` reads the optional `runner`
 # input (default 'ubuntu-latest'), mirroring secret-scan-push.yml /
-# pr-quality.yml. EXCEPTION: the secret-isolation-audit job's gitleaks
-# download step always fetches the linux_x64 asset regardless of `runner` —
-# it does not mirror secret-scan-push.yml's darwin/linux arm64/x64 asset
-# map. See that job's inline comment for the rationale; a `runner` override
-# to a non-Linux self-hosted label will need that map added first.
+# pr-quality.yml. The secret-isolation-audit job's gitleaks download is
+# runner-portable (Story #229): the shared gitleaks-scan composite action's
+# cross-platform asset selector resolves the darwin/linux arm64/x64 asset
+# for whatever platform `runner` lands on.
 #
 # CI-green gate (Story #175, slimmed in Story #237): `github.event` inside a
 # reusable workflow is the CALLER's event, so this workflow owns the CI-green
@@ -118,10 +117,7 @@ on:
         description: >
           Runs-on label for every job in this workflow. Single string (e.g.
           'ubuntu-latest') or a JSON-encoded label array string (e.g.
-          '["self-hosted","domio-runner"]'). Defaults to ubuntu-latest. NOTE:
-          the secret-isolation-audit job's gitleaks download always resolves
-          the linux_x64 asset regardless of this input — see that job's
-          inline comment for the reason.
+          '["self-hosted","domio-runner"]'). Defaults to ubuntu-latest.
         required: false
         type: string
         default: 'ubuntu-latest'
@@ -586,44 +582,26 @@ jobs:
         # The gitleaks-action rejects the `workflow_run` event ("The
         # [workflow_run] event is not yet supported"), which breaks any deploy
         # gated on CI-green via a `workflow_run` trigger (swarm-os is the first
-        # consumer to exercise the shared deploy that way). Invoke the gitleaks
-        # CLI directly instead — it is event-agnostic and preserves the
-        # secret-in-tree guarantee on every trigger (push / PR / workflow_run /
-        # dispatch / schedule). Pinned by version + SHA-256 for supply-chain
-        # safety; `dir` scans the checked-out tree, matching this job's intent.
+        # consumer to exercise the shared deploy that way). The shared
+        # gitleaks-scan composite invokes the gitleaks CLI directly instead —
+        # it is event-agnostic and preserves the secret-in-tree guarantee on
+        # every trigger (push / PR / workflow_run / dispatch / schedule).
+        # Pinned by version + SHA-256 for supply-chain safety (the map is
+        # single-homed in the composite); `dir` scans the checked-out tree,
+        # matching this job's intent. Runner-portable (Story #229): the
+        # composite's cross-platform asset selector replaced this step's
+        # former fixed-linux_x64 download, so a darwin/arm64 self-hosted
+        # `runner` override resolves the right binary for free. Blocking scan:
+        # a non-zero exit (leak found) fails this job and, via the downstream
+        # `needs:`, the whole deploy.
         #
-        # NOTE (`runner` input, Story #222): this job's `runs-on:` DOES read
-        # `${{ inputs.runner }}` like every other job in this workflow, but
-        # this download step's asset selection is intentionally NOT
-        # `runner`-aware — it always fetches the linux_x64 gitleaks binary,
-        # unlike secret-scan-push.yml's full `uname`-based darwin/linux
-        # arm64/x64 asset map. Rationale: this job only needs to run
-        # BEFORE any deploy step touches Cloudflare credentials, has no
-        # dependency on the consumer's target platform, and every known
-        # consumer's `runner` override to date has stayed Linux
-        # (GitHub-hosted `ubuntu-latest` or Linux self-hosted). If a future
-        # consumer sets `runner` to a darwin/arm64 self-hosted label, this
-        # step's fixed linux_x64 binary will fail to execute — mirror
-        # secret-scan-push.yml's asset map at that point rather than
-        # widening the platform matrix speculatively today.
-        env:
-          GITLEAKS_VERSION: '8.30.1'
-          GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
-        run: |
-          set -euo pipefail
-          # Fixed linux_x64 asset regardless of inputs.runner — see the
-          # step-level comment above for the rationale.
-          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
-          tmp="$(mktemp -d)"
-          curl -fsSL "$url" -o "${tmp}/${asset}"
-          echo "${GITLEAKS_SHA256}  ${tmp}/${asset}" | sha256sum -c -
-          tar -xzf "${tmp}/${asset}" -C "${tmp}" gitleaks
-          chmod +x "${tmp}/gitleaks"
-          "${tmp}/gitleaks" version
-          # Blocking scan of the checked-out tree (`dir`); a non-zero exit fails
-          # this job and, via the downstream `needs:`, the whole deploy.
-          "${tmp}/gitleaks" dir --no-banner --redact=100 --exit-code 1 .
+        # PIN NOTE (Story #229, same lockstep model as setup-toolchain / #162):
+        # pinned to the intra-PR commit that introduced the composite — the
+        # first SHA whose tree contains it. Bump to the next release SHA in
+        # the post-release pin-bump follow-up.
+        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@e5851e6176d38d5387d8c97d328835b3ce57aaec
+        with:
+          mode: dir
 
   # ---------------------------------------------------------------------------
   # 2. Environment gate

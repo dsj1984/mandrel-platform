@@ -105,7 +105,6 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
 | `semgrep-config`   | string  | `'vendored'`     | Semgrep ruleset for the SAST sub-step. Default `'vendored'` resolves to this reusable workflow's own checked-out, platform-controlled snapshot at `.semgrep/rules.json` (see [SAST ruleset provenance](#sast-ruleset-provenance-and-update-process)) — NOT the live registry. Override with a registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.** |
 | `sast-exclude`     | string  | `''`             | Extra Semgrep `--exclude` globs, space- or comma-separated (e.g. `'dist coverage tests/fixtures'`), **appended** to the built-in `.agents` exclude. Set to drop generated code / fixtures from the SAST target set. |
-| `gitleaks-version` | string  | `'8.30.1'`       | Pinned gitleaks release version (no leading `v`) for the secret scan. Bump deliberately; the per-platform asset checksum is pinned to match.    |
 | `toolchain-cache`  | string  | `'true'`         | Passed through to `setup-toolchain`'s `cache` input. Set `'false'` on self-hosted runners with a warm pnpm store.                              |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
 | `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
@@ -205,8 +204,12 @@ no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
 - **Secret scan** — a pinned `gitleaks` binary over the PR diff (blocking). On
   `pull_request` events the scan is scoped to the commits the PR introduces
   (merge-base..head); on push / other events it falls back to a full-tree
-  scan. The binary asset is selected per platform (darwin/linux × amd64/arm64)
-  and verified against a pinned SHA-256 before execution.
+  scan. The installer is the shared first-party `gitleaks-scan` composite
+  action (`.github/actions/gitleaks-scan`), which owns the pinned version +
+  per-platform SHA-256 checksum map and selects the binary asset per platform
+  (darwin/linux × arm64/x64), verifying it before execution. Bumping the
+  gitleaks release is a single edit inside that composite — there is no
+  per-workflow version input or checksum copy.
 - **SAST** — pinned Semgrep. On `pull_request` events it is scoped to the PR
   diff via a baseline commit, so only findings **introduced** by the PR block;
   on push / schedule it scans the full tree.
@@ -1228,21 +1231,16 @@ proceeds once the isolation audit has cleared or was skipped
 ### Secret isolation audit and the `runner` input
 
 Every job in this workflow, including `secret-isolation-audit`, honors the
-`runner` input for its `runs-on:` label (Story #222). The one deliberate
-exception is **inside** that job: the "Run Gitleaks secret scan" step always
-downloads the `linux_x64` gitleaks release asset, regardless of what `runner`
-is set to. This does **not** mirror
-[`secret-scan-push.yml`](#secret-scan-pushyml)'s `uname`-based darwin/linux
-arm64/x64 asset map with per-platform pinned checksums.
-
-Rationale: this job only needs to complete before any deploy step touches
-Cloudflare credentials, has no dependency on the consumer's target deploy
-platform, and every known `deploy-cloudflare.yml` consumer's `runner`
-override to date has stayed Linux (GitHub-hosted `ubuntu-latest` or a Linux
-self-hosted label). A consumer that sets `runner` to a darwin/arm64
-self-hosted label will need this job's asset selector widened to the full
-`uname`-based map first — mirror `secret-scan-push.yml`'s "Install pinned
-gitleaks" step rather than assuming the fixed `linux_x64` binary will run.
+`runner` input for its `runs-on:` label (Story #222). Since Story #229 the
+"Run Gitleaks secret scan" step is **runner-portable**: it runs the shared
+first-party `gitleaks-scan` composite action
+(`.github/actions/gitleaks-scan`), whose `uname`-based cross-platform asset
+selector resolves the right pinned, checksum-verified gitleaks binary for
+darwin/linux × arm64/x64 — the same installer
+[`secret-scan-push.yml`](#secret-scan-pushyml) and the `pr-quality.yml`
+security tier use. A consumer may point `runner` at a darwin/arm64
+self-hosted label without any workflow change (the former fixed-`linux_x64`
+download this section used to document is gone).
 
 ### Commit-SHA verification (opt-in)
 
@@ -1399,7 +1397,7 @@ jobs:
 | Input                        | Type    | Default     | When to override                                                                                                                                          |
 | ---------------------------- | ------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `environment`                | string  | *(required)*| Target Cloudflare environment label (e.g. `staging`, `production`). Maps to `wrangler --env`.                                                              |
-| `runner`                     | string  | `'ubuntu-latest'` | Runs-on label for every job in this workflow. Single string or a JSON-encoded label array string (e.g. `'["self-hosted","domio-runner"]'`). **Exception:** the `secret-isolation-audit` job's gitleaks download always fetches the `linux_x64` asset regardless of this input — see [Secret isolation audit](#secret-isolation-audit-and-the-runner-input) below. |
+| `runner`                     | string  | `'ubuntu-latest'` | Runs-on label for every job in this workflow. Single string or a JSON-encoded label array string (e.g. `'["self-hosted","domio-runner"]'`). The `secret-isolation-audit` job's gitleaks download is runner-portable — see [Secret isolation audit](#secret-isolation-audit-and-the-runner-input) below. |
 | `workers`                    | string  | *(required)*| Comma-separated Worker names to deploy (e.g. `"api,worker-cron"`). Each name must match a `wrangler.toml` `[env.<environment>]` section.                   |
 | `gh-environment`             | string  | `''`        | GitHub **Deployment Environment** name attached to every secret-touching job, for secret scoping and protection rules. See [gh-environment model](#the-gh-environment-model). |
 | `migrate`                    | boolean | `false`     | Run migrations. When `true`, a pre-migration snapshot runs first. Defaults to D1 tooling; override the command seams for non-D1.                           |
@@ -1508,12 +1506,12 @@ jobs:
 | Input              | Type   | Default          | When to override                                                                 |
 | ------------------ | ------ | ---------------- | ------------------------------------------------------------------------------- |
 | `runner`           | string | `'ubuntu-latest'`| Runs-on label. The post-merge scan does not need the consumer's PR runner — `ubuntu-latest` is recommended even for self-hosted consumers. |
-| `gitleaks-version` | string | `'8.30.1'`       | Pinned gitleaks release (no leading `v`). Must have a matching SHA-256 in the workflow's checksum map. |
 
 ### Where findings surface
 
 The same pinned, checksum-verified gitleaks binary as the `pr-quality` security
-tier scans the whole history. Findings surface three ways, in order of
+tier (installed by the shared `gitleaks-scan` composite action, which owns the
+version + checksum map) scans the whole history. Findings surface three ways, in order of
 applicability:
 
 1. **`gitleaks-history-sarif` build artifact** — uploaded on every run, so
