@@ -1864,38 +1864,30 @@ jobs:
       - security
       - osv-scan
     steps:
-      - name: Check all tier results
+      # Self-maintaining aggregator: results are derived from `toJSON(needs)`,
+      # so the `needs:` array above is the single source of truth — adding a
+      # job to `needs:` is the ONLY edit required to include it in the gate.
+      # Pass on `success`/`skipped`; fail on anything else, INCLUDING
+      # `cancelled` (load-bearing for the fail-fast design: a tier cancelled
+      # by a sibling's failure must not read as green). Requires `jq` on the
+      # runner (preinstalled on GitHub-hosted images). Guarded by
+      # scripts/check-ci-required-aggregator.test.mjs — do not reintroduce a
+      # hardcoded per-job env/loop list here.
+      - name: Check all required job results
         shell: bash
         env:
-          LINT_RESULT: ${{ needs.lint.result }}
-          TYPECHECK_RESULT: ${{ needs.typecheck.result }}
-          UNIT_RESULT: ${{ needs.unit.result }}
-          CONTRACT_RESULT: ${{ needs.contract.result }}
-          E2E_RESULT: ${{ needs.e2e.result }}
-          MIGRATION_GUARD_RESULT: ${{ needs.migration-guard.result }}
-          SECURITY_RESULT: ${{ needs.security.result }}
-          OSV_SCAN_RESULT: ${{ needs.osv-scan.result }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          failed=()
-          for tier_result in \
-            "lint:${LINT_RESULT}" \
-            "typecheck:${TYPECHECK_RESULT}" \
-            "unit:${UNIT_RESULT}" \
-            "contract:${CONTRACT_RESULT}" \
-            "e2e:${E2E_RESULT}" \
-            "migration-guard:${MIGRATION_GUARD_RESULT}" \
-            "security:${SECURITY_RESULT}" \
-            "osv-scan:${OSV_SCAN_RESULT}"; do
-            tier="${tier_result%%:*}"
-            result="${tier_result##*:}"
-            if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
-              failed+=("${tier}(${result})")
-            fi
-          done
+          failed="$(jq -r '
+            to_entries
+            | map(select(.value.result != "success" and .value.result != "skipped"))
+            | map("\(.key)(\(.value.result))")
+            | join(" ")
+          ' <<<"${NEEDS_JSON}")"
 
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "❌ Failed tiers: ${failed[*]}" >&2
+          if [ -n "${failed}" ]; then
+            echo "❌ Failed jobs: ${failed}" >&2
             exit 1
           fi
 
-          echo "✅ All enabled tiers passed."
+          echo "✅ All required jobs passed (success or skipped)."

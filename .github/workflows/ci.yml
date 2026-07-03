@@ -231,32 +231,30 @@ jobs:
       - actionlint
       - unit-tests
     steps:
-      - name: Check all job results
+      # Self-maintaining aggregator: results are derived from `toJSON(needs)`,
+      # so the `needs:` array above is the single source of truth — adding a
+      # job to `needs:` is the ONLY edit required to include it in the gate.
+      # Pass on `success`/`skipped`; fail on anything else, INCLUDING
+      # `cancelled` (load-bearing for the fail-fast design: a tier cancelled
+      # by a sibling's failure must not read as green). Requires `jq` on the
+      # runner (preinstalled on GitHub-hosted images). Guarded by
+      # scripts/check-ci-required-aggregator.test.mjs — do not reintroduce a
+      # hardcoded per-job env/loop list here.
+      - name: Check all required job results
         shell: bash
         env:
-          CTX_RESULT: ${{ needs.check-required-contexts.result }}
-          PORT_RESULT: ${{ needs.check-workflow-portability.result }}
-          PINS_RESULT: ${{ needs.check-action-pins.result }}
-          ACTIONLINT_RESULT: ${{ needs.actionlint.result }}
-          UNIT_TESTS_RESULT: ${{ needs.unit-tests.result }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          failed=()
-          for job_result in \
-            "check-required-contexts:${CTX_RESULT}" \
-            "check-workflow-portability:${PORT_RESULT}" \
-            "check-action-pins:${PINS_RESULT}" \
-            "actionlint:${ACTIONLINT_RESULT}" \
-            "unit-tests:${UNIT_TESTS_RESULT}"; do
-            job="${job_result%%:*}"
-            result="${job_result##*:}"
-            if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
-              failed+=("${job}(${result})")
-            fi
-          done
+          failed="$(jq -r '
+            to_entries
+            | map(select(.value.result != "success" and .value.result != "skipped"))
+            | map("\(.key)(\(.value.result))")
+            | join(" ")
+          ' <<<"${NEEDS_JSON}")"
 
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "❌ Failed jobs: ${failed[*]}" >&2
+          if [ -n "${failed}" ]; then
+            echo "❌ Failed jobs: ${failed}" >&2
             exit 1
           fi
 
-          echo "✅ All jobs passed."
+          echo "✅ All required jobs passed (success or skipped)."
