@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.22.0...mandrel-platform-v0.22.1) (2026-07-03)
+
+
+### Fixed
+
+* **ci:** drop tracking-issue upsert from runner-fleet health monitor (refs [#258](https://github.com/dsj1984/mandrel-platform/issues/258)) ([#265](https://github.com/dsj1984/mandrel-platform/issues/265)) ([8eafb13](https://github.com/dsj1984/mandrel-platform/commit/8eafb13f2f06ffb0df1b064cfc67e6bb83b3df49))
+
 ## [0.22.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.21.1...mandrel-platform-v0.22.0) (2026-07-03)
 
 
