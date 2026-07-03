@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.20.0...mandrel-platform-v0.20.1) (2026-07-03)
+
+
+### Fixed
+
+* **ci:** route pr-quality ci-required aggregator to inputs.runner ([#220](https://github.com/dsj1984/mandrel-platform/issues/220)) ([7e3e196](https://github.com/dsj1984/mandrel-platform/commit/7e3e196e050d8283f455677ffb60a0491008da7d))
+
 ## [0.20.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.19.2...mandrel-platform-v0.20.0) (2026-07-02)
 
 
