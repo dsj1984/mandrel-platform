@@ -532,7 +532,7 @@ jobs:
           ENVIRONMENTS_TO_AUDIT: ${{ inputs.environments-to-audit }}
 
       - name: Audit deployment branch policies
-        uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@cdeac8328e3f0b6803dcced49b374a04bcaf9b9f # v0.19.0
+        uses: dsj1984/mandrel-platform/.github/actions/environments-isolation-audit@b48be232f44cba7fb759a69808cf50fffb42895d # v0.21.0
         with:
           environments: ${{ steps.resolve-envs.outputs.environments }}
           allowed-branch: ${{ inputs.isolation-audit-branch }}
@@ -614,7 +614,7 @@ jobs:
         # pinned to the intra-PR commit that introduced the composite — the
         # first SHA whose tree contains it. Bump to the next release SHA in
         # the post-release pin-bump follow-up.
-        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@e5851e6176d38d5387d8c97d328835b3ce57aaec
+        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@b48be232f44cba7fb759a69808cf50fffb42895d
         with:
           mode: dir
 
@@ -715,7 +715,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
         with:
           cache: 'true'
           # Single-sourced wrangler preflight (Story #231): the built-in D1
@@ -872,7 +872,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
         with:
           cache: 'true'
           # Single-sourced wrangler preflight (Story #231): the built-in
@@ -1087,7 +1087,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
         with:
           cache: 'true'
           # Single-sourced wrangler preflight (Story #231): the built-in probe

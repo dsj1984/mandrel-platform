@@ -27,12 +27,12 @@
 # SHA-pinned third-party actions.
 # setup-toolchain MUST use an absolute cross-repo reference — GitHub prohibits
 # relative `uses:` paths in reusable workflows called from another repository.
-# Pinned to mandrel-platform-v0.17.0 (05f8a84), whose action.yml manifest
-# defines the trust-lockfile input (default: 'false') and is expression-clean.
+# Pinned to mandrel-platform-v0.21.0 (b48be23), whose action.yml manifest
+# defines the trust-lockfile + require-wrangler inputs and is expression-clean.
 # The pin is kept in lockstep with this workflow's own release so trust-lockfile
 # threaded through the workflow_call surface actually reaches the install step
-# (bumped from v0.3.0/869bbbf, whose manifest predated trust-lockfile — refs
-# #162). This pin is guarded by scripts/check-workflow-portability.mjs (Rule 3):
+# (bumped from v0.17.0/05f8a84, whose manifest predated require-wrangler — refs
+# #162, #252). This pin is guarded by scripts/check-workflow-portability.mjs (Rule 3):
 # if it ever lags onto a commit whose manifest carries a `${{ }}` footgun, CI
 # fails before release (the #35 failure mode).
 name: PR Quality
@@ -537,7 +537,7 @@ jobs:
 
       - &setup-toolchain
         name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -1053,7 +1053,7 @@ jobs:
       # first SHA whose tree contains it. Bump to the next release SHA in the
       # post-release pin-bump follow-up.
       - name: Secret scan (pinned gitleaks, blocking)
-        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@e5851e6176d38d5387d8c97d328835b3ce57aaec
+        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@b48be232f44cba7fb759a69808cf50fffb42895d
         with:
           # 'range' mode from the resolver maps to a range-scoped git-history
           # scan; the no-ranged-base fallback stays a full working-tree scan.
