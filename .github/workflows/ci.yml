@@ -142,7 +142,7 @@ jobs:
   # PIN HYGIENE: actionlint is pinned to a release version and the linux_amd64
   # release archive is verified against its pinned SHA-256 before extraction —
   # the same download-and-verify posture this repo uses for the pinned gitleaks
-  # binary in secret-scan-push.yml. Bump ACTIONLINT_VERSION and ACTIONLINT_SHA256
+  # binary in the gitleaks-scan composite action. Bump ACTIONLINT_VERSION and ACTIONLINT_SHA256
   # in lockstep (checksums:
   # https://github.com/rhysd/actionlint/releases/download/v<version>/actionlint_<version>_checksums.txt).
   actionlint:
