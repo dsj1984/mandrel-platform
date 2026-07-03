@@ -19,10 +19,8 @@ import { test } from "node:test";
 import {
   buildReport,
   classifyRunners,
-  closeTrackingIssueIfOpen,
   fetchQueuedRuns,
   fetchRunners,
-  findOpenTrackingIssue,
   hasUnhealthy,
   isRepoHealthy,
   isStaleQueuedRun,
@@ -30,9 +28,6 @@ import {
   renderReport,
   runCli,
   runnerMatchesLabels,
-  syncTrackingIssues,
-  trackingIssueTitle,
-  upsertTrackingIssue,
 } from "./check-runner-health.mjs";
 
 // ---------------------------------------------------------------------------
@@ -43,23 +38,12 @@ test("parseArgv defaults to the fleet consumer config", () => {
   const opts = parseArgv([]);
   assert.equal(opts.config, "scripts/runner-fleet-consumers.json");
   assert.equal(opts.json, false);
-  assert.equal(opts.noIssues, false);
-  assert.equal(opts.trackingRepo, null);
 });
 
-test("parseArgv parses --config, --json, --no-issues, --tracking-repo", () => {
-  const opts = parseArgv([
-    "--config",
-    "custom.json",
-    "--json",
-    "--no-issues",
-    "--tracking-repo",
-    "acme/ops",
-  ]);
+test("parseArgv parses --config and --json", () => {
+  const opts = parseArgv(["--config", "custom.json", "--json"]);
   assert.equal(opts.config, "custom.json");
   assert.equal(opts.json, true);
-  assert.equal(opts.noIssues, true);
-  assert.equal(opts.trackingRepo, "acme/ops");
 });
 
 // ---------------------------------------------------------------------------
@@ -250,14 +234,6 @@ test("renderReport surfaces a fetch error row", () => {
 });
 
 // ---------------------------------------------------------------------------
-// trackingIssueTitle
-// ---------------------------------------------------------------------------
-
-test("trackingIssueTitle is the exact dedup key", () => {
-  assert.equal(trackingIssueTitle("domio"), "Runner fleet: domio degraded");
-});
-
-// ---------------------------------------------------------------------------
 // fetchRunners / fetchQueuedRuns (injectable runGh)
 // ---------------------------------------------------------------------------
 
@@ -305,107 +281,6 @@ test("fetchQueuedRuns returns [] on a 404", () => {
     throw new Error("gh: Not Found (HTTP 404)");
   };
   assert.deepEqual(fetchQueuedRuns("dsj1984/domio", runGh), []);
-});
-
-// ---------------------------------------------------------------------------
-// Tracking-issue upsert / close
-// ---------------------------------------------------------------------------
-
-test("findOpenTrackingIssue returns the exact-title match's number", () => {
-  const runGh = () =>
-    JSON.stringify({ items: [{ number: 7, title: "Runner fleet: domio degraded" }] });
-  const n = findOpenTrackingIssue("dsj1984/mandrel-platform", "Runner fleet: domio degraded", runGh);
-  assert.equal(n, 7);
-});
-
-test("findOpenTrackingIssue returns null when no exact-title match exists", () => {
-  const runGh = () => JSON.stringify({ items: [] });
-  const n = findOpenTrackingIssue("dsj1984/mandrel-platform", "Runner fleet: domio degraded", runGh);
-  assert.equal(n, null);
-});
-
-test("upsertTrackingIssue creates a new issue when none is open", () => {
-  const calls = [];
-  const runGh = (args) => {
-    calls.push(args);
-    if (args[1] === "search/issues?q=repo%3Adsj1984%2Fmandrel-platform%20is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Runner%20fleet%3A%20domio%20degraded%22") {
-      return JSON.stringify({ items: [] });
-    }
-    if (args.includes("repos/dsj1984/mandrel-platform/issues") && args.includes("-X") === false) {
-      return JSON.stringify({ number: 99 });
-    }
-    return JSON.stringify({ number: 99 });
-  };
-  const result = upsertTrackingIssue("dsj1984/mandrel-platform", "domio", "body text", runGh);
-  assert.equal(result.action, "created");
-  assert.equal(result.issue, 99);
-});
-
-test("upsertTrackingIssue updates the existing open issue's body", () => {
-  const runGh = (args) => {
-    if (args[1] && args[1].startsWith("search/issues")) {
-      return JSON.stringify({ items: [{ number: 5, title: "Runner fleet: domio degraded" }] });
-    }
-    return "";
-  };
-  const result = upsertTrackingIssue("dsj1984/mandrel-platform", "domio", "body text", runGh);
-  assert.equal(result.action, "updated");
-  assert.equal(result.issue, 5);
-});
-
-test("closeTrackingIssueIfOpen closes an open issue and no-ops when none exists", () => {
-  let closed = false;
-  const runGhWithOpen = (args) => {
-    if (args[1] && args[1].startsWith("search/issues")) {
-      return JSON.stringify({ items: [{ number: 5, title: "Runner fleet: domio degraded" }] });
-    }
-    if (args.includes("-X") && args.includes("PATCH")) {
-      closed = true;
-      return "";
-    }
-    return "";
-  };
-  const result = closeTrackingIssueIfOpen("dsj1984/mandrel-platform", "Runner fleet: domio degraded", runGhWithOpen);
-  assert.equal(result.action, "closed");
-  assert.equal(result.issue, 5);
-  assert.equal(closed, true);
-
-  const runGhNoOpen = () => JSON.stringify({ items: [] });
-  const noop = closeTrackingIssueIfOpen("dsj1984/mandrel-platform", "Runner fleet: domio degraded", runGhNoOpen);
-  assert.equal(noop.action, "noop");
-  assert.equal(noop.issue, null);
-});
-
-test("syncTrackingIssues upserts for unhealthy repos and closes for recovered ones", () => {
-  const report = {
-    results: [
-      {
-        name: "domio",
-        repo: "dsj1984/domio",
-        healthy: false,
-        verdict: { matchingOnline: 1, shortfall: 2, offline: [], hasOffline: false, hasShortfall: true },
-        staleRuns: [],
-      },
-      { name: "athportal", repo: "dsj1984/athportal", healthy: true },
-    ],
-  };
-  const calls = [];
-  const runGh = (args) => {
-    calls.push(args);
-    if (args[1] && args[1].startsWith("search/issues")) {
-      return JSON.stringify({ items: [] });
-    }
-    if (args.includes("repos/dsj1984/mandrel-platform/issues")) {
-      return JSON.stringify({ number: 11 });
-    }
-    return "";
-  };
-  const actions = syncTrackingIssues(report, "dsj1984/mandrel-platform", runGh);
-  assert.equal(actions.length, 2);
-  const domioAction = actions.find((a) => a.repo === "domio");
-  const athportalAction = actions.find((a) => a.repo === "athportal");
-  assert.equal(domioAction.action, "created");
-  assert.equal(athportalAction.action, "noop");
 });
 
 // ---------------------------------------------------------------------------
@@ -484,7 +359,7 @@ test("runCli exits 0 for a healthy fleet and 1 for a degraded one", () => {
       throw new Error(`unexpected ${path}`);
     };
     const code = runCli({
-      argv: ["--config", configPath, "--no-issues"],
+      argv: ["--config", configPath],
       cwd: process.cwd(),
       stdout,
       stderr,

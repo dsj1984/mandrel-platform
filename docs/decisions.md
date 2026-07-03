@@ -33,6 +33,27 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-03 — Runner-fleet alerting: drop the tracking-issue upsert, keep only the native failed-workflow notification
+
+**Context.** The initial runner-fleet monitor (below) alerted through two
+channels: a non-zero exit (native failed-workflow notification) and a deduped
+tracking issue (`Runner fleet: <repo> degraded`) upserted/auto-closed in this
+repo. In practice the issue channel added noise without adding signal — the
+failed run's job summary already carries the full dashboard — and a
+misconfigured token (404s on the consumer repos' runner APIs) had the monitor
+filing degraded-fleet issues while the runners were actually healthy.
+
+**Decision.** Remove the tracking-issue upsert entirely.
+`check-runner-health.mjs` now alerts only by exiting non-zero;
+`runner-fleet-health.yml` drops `issues: write`. The `--no-issues` /
+`--tracking-repo` flags and the issue-sync helpers are deleted rather than
+kept dormant.
+
+**Consequences.** One alert channel (the native failed-workflow
+notification), zero GitHub issues created by automation. The dashboard detail
+lives solely on the run's job summary. A Slack/PagerDuty push remains the
+open follow-up if the native notification proves insufficient.
+
 ## 2026-07-03 — Scheduled runner-fleet health monitor, alert-only via native failure + deduped issue upsert
 
 **Context.** All nine self-hosted runners across the fleet (`domio`,

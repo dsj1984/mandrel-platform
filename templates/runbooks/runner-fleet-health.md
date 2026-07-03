@@ -65,30 +65,38 @@ provisions (`secrets.PIN_DRIFT_TOKEN`), falling back to the built-in
 access to the workflow's own repo — cross-repo rows then surface as `⚠️
 error` rather than hard-failing this repo's own row).
 
-`PIN_DRIFT_TOKEN` must additionally carry **`actions:read`** on all three
-repos, including `Beestera/swarm-os` (a separate org — confirm the
-fine-grained PAT's resource-owner selection includes it, not just
-`dsj1984`'s repos). Without `actions:read`, `GET .../actions/runners` 403s
-and that repo's row degrades to `⚠️ error` (still surfaced, but distinct from
-a genuine offline-runner degrade).
+For the runner reads, `PIN_DRIFT_TOKEN` must carry, on all three consumer
+repos:
+
+- **Administration: read** — required by `GET .../actions/runners` (the
+  self-hosted runner list is an admin-surface endpoint; `actions:read` is
+  NOT sufficient for it).
+- **Actions: read** — required by `GET .../actions/runs` (the stale-queue
+  check).
+
+Resource-owner caveat: a fine-grained PAT is bound to a **single** resource
+owner, so one fine-grained PAT cannot cover both `dsj1984/*` and
+`Beestera/swarm-os`. To cover the whole roster with the one secret the
+workflow reads, use a classic PAT with `repo` scope from an account with
+admin access to all three repos.
+
+When the token lacks visibility, GitHub returns **404** (not 403) and the
+script treats the empty runner list as a real shortfall — the repo's row
+reads `❌ degraded` with `0/N` online even when the runners are healthy. A
+fleet-wide `0/N` across every repo is the token-misconfiguration signature;
+check the secret before touching the runner host.
 
 ## Alert semantics
 
 Alert-only by design (no host-side remediation) — the monitor never touches
-the runner host itself. Two channels fire together on an unhealthy repo,
-deliberately without adding a new external dependency:
+the runner host itself. One channel fires on an unhealthy repo, deliberately
+without adding a new external dependency:
 
-1. **Native GitHub failed-workflow notification.** The job script exits
-   non-zero when any repo is unhealthy, so GitHub's own email/notification
-   settings fire the standard "workflow run failed" alert to whoever
-   watches this repo.
-2. **Deduped tracking issue.** The script upserts a single issue titled
-   `Runner fleet: <repo> degraded` in **this repo** (`mandrel-platform`, the
-   fleet operator's home, not each consumer) carrying the dashboard detail for
-   that repo. Re-running while still degraded updates the existing issue's
-   body rather than piling up duplicates. When the repo recovers on a
-   subsequent run, the monitor auto-closes the tracking issue with a recovery
-   comment.
+- **Native GitHub failed-workflow notification.** The job script exits
+  non-zero when any repo is unhealthy, so GitHub's own email/notification
+  settings fire the standard "workflow run failed" alert to whoever
+  watches this repo. No tracking issues are filed — the dashboard detail
+  lives on the failed run's job summary.
 
 A future Slack/PagerDuty push could layer on top of this later — deliberately
 deferred (see the Story's Out of Scope) to avoid a new external dependency for
@@ -96,12 +104,11 @@ the initial alert-only default.
 
 ## Operator response
 
-When a tracking issue (`Runner fleet: <repo> degraded`) opens, or the
-scheduled workflow run fails:
+When the scheduled workflow run fails:
 
-1. **Read the dashboard** in the issue body / the workflow run's job summary
-   — it names which signal fired (offline runner, count shortfall, or stale
-   queued run) and for which repo.
+1. **Read the dashboard** on the workflow run's job summary — it names which
+   signal fired (offline runner, count shortfall, or stale queued run) and
+   for which repo.
 2. **Wake or reboot the Mac** if it's asleep, powered off, or unresponsive
    over SSH.
 3. **Check disk space** (`df -h`) — a full disk is a common launchd-runner
@@ -113,8 +120,8 @@ scheduled workflow run fails:
    ./svc.sh status          # expect: Started · running
    ```
 5. **Re-run the monitor** (`workflow_dispatch` from the Actions tab, or wait
-   for the next 15-minute tick) to confirm recovery — the tracking issue
-   auto-closes once the repo reports healthy again.
+   for the next 15-minute tick) to confirm recovery — a green run means the
+   fleet reports healthy again.
 
 ## Out of scope (Story #258)
 
@@ -123,8 +130,8 @@ scheduled workflow run fails:
   hand.
 - Host disk-usage monitoring — not exposable via the runners API anyway, and
   tracked separately.
-- External paging integrations beyond the native failed-workflow notification
-  + issue-upsert default.
+- External paging integrations beyond the native failed-workflow
+  notification.
 - Cross-repo runner isolation / ephemeral-runner questions — explicitly
   deferred.
 
