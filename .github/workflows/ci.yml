@@ -44,47 +44,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Branch-protection context lint ────────────────────────────────────────
+  # ── Node-script checks (contract, portability, pins, unit tests) ──────────
   #
-  # Validates that every context in docs/runbooks/main-protection.json
-  # is actually emitted by a workflow job in this repo. Exits non-zero on a
-  # phantom check. This is the canonical self-test for the contract; consumers
-  # copy scripts/check-required-contexts.mjs and run the same step in their CI.
-  check-required-contexts:
-    name: Lint branch-protection contract
+  # One job, one checkout, one Node setup, one step per script. These four
+  # checks were previously four separate jobs, each paying ~30-45s of
+  # checkout/setup for seconds of actual work — the majority of the
+  # workflow's runner minutes on every PR and push (Story #238). Only the
+  # `ci-required` aggregator is a required branch-protection context, so
+  # per-job granularity bought log grouping, not protection; per-STEP
+  # granularity in this job preserves the same at-a-glance failure signal.
+  # No path filters: required contexts wedge as "Expected" when path-filtered.
+  #
+  # The steps, in order:
+  #
+  # 1. Branch-protection context lint — validates that every context in
+  #    docs/runbooks/main-protection.json is actually emitted by a workflow
+  #    job in this repo. Exits non-zero on a phantom check. Canonical
+  #    self-test for the contract; consumers copy
+  #    scripts/check-required-contexts.mjs and run the same step.
+  #
+  # 2. Cross-repo portability lint — statically asserts the invariants GitHub
+  #    only enforces at cross-repo call / action-load time: no relative
+  #    `uses: ./` paths in reusable workflows; no `${{ }}` expressions in
+  #    workflow_call input/secret descriptions or input defaults (and
+  #    composite-action input defaults); and no internal SHA pin lagging onto
+  #    a manifest that still carries one of those footguns. These produce a
+  #    silent "workflow file issue / 0 jobs" or a "Set up job" load failure
+  #    for consumers but pass naive in-repo CI — the exact failure modes of
+  #    #30, #32 and #35. Consumers copy scripts/check-workflow-portability.mjs.
+  #
+  # 3. Third-party action-pin ratchet — walks every workflow and composite
+  #    action.yml and FAILS if any third-party `uses:` is pinned to anything
+  #    other than a full 40-char commit SHA (a single `owner/repo@v4`
+  #    slipping past review re-introduces mutable-tag risk with 3× blast
+  #    radius across the consumer fleet, Story #112). First-party
+  #    self-references (dsj1984/mandrel-platform/*) are exempt — governed by
+  #    the portability lint's pin-lag guard (Rule 3). Algorithm unit-tested
+  #    in scripts/check-action-pins.{mjs,test.mjs}; consumers copy the script.
+  #
+  # 4. Unit tests — the repo's own `npm test` suite
+  #    (`node --test "scripts/**/*.test.mjs"`, Story #192): ~2,800 LOC of
+  #    guardrail + edge-security tests over the very scripts consumers copy
+  #    into their CI. Dependency-free (Node's built-in test runner), so the
+  #    job needs only a Node runtime, not a package install.
+  #
+  # fetch-depth: 0 is REQUIRED so the portability lint's pin-lag guard
+  # (Rule 3) can resolve the manifest at each pinned SHA via `git show`.
+  # Without full history the guard degrades to a non-fatal skipped NOTE.
+  node-scripts:
+    name: Node-script checks (contract, portability, pins, tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: .nvmrc
-
-      - name: Lint branch-protection contract
-        run: node scripts/check-required-contexts.mjs
-
-  # ── Cross-repo portability lint ───────────────────────────────────────────
-  #
-  # Statically asserts the invariants GitHub only enforces at cross-repo
-  # call / action-load time: no relative `uses: ./` paths in reusable
-  # workflows; no `${{ }}` expressions in workflow_call input/secret
-  # descriptions or input defaults (and composite-action input defaults);
-  # and no internal SHA pin lagging onto a manifest that still carries one
-  # of those footguns. These produce a silent "workflow file issue / 0 jobs"
-  # or a "Set up job" load failure for consumers but pass naive in-repo CI —
-  # the exact failure modes of #30, #32 and #35. Consumers copy
-  # scripts/check-workflow-portability.mjs and run the same step.
-  #
-  # fetch-depth: 0 is REQUIRED so the pin-lag guard (Rule 3) can resolve the
-  # manifest at each pinned SHA via `git show`. Without full history the guard
-  # degrades to a non-fatal skipped NOTE.
-  check-workflow-portability:
-    name: Lint workflow portability
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -96,37 +106,17 @@ jobs:
         with:
           node-version-file: .nvmrc
 
+      - name: Lint branch-protection contract
+        run: node scripts/check-required-contexts.mjs
+
       - name: Lint workflow portability
         run: node scripts/check-workflow-portability.mjs
 
-  # ── Third-party action-pin ratchet ────────────────────────────────────────
-  #
-  # Third-party actions in the shared workflows are SHA-pinned by convention,
-  # but nothing ENFORCED it until now: a single `uses: owner/repo@v4` slipping
-  # past review re-introduces mutable-tag risk, and because pr-quality.yml is
-  # inherited by every consumer, a tag-pinned regression has 3× blast radius
-  # across all three consumer repos (Story #112). This ratchet walks every
-  # workflow and composite action.yml and FAILS if any third-party `uses:` is
-  # pinned to anything other than a full 40-char commit SHA. First-party
-  # self-references (dsj1984/mandrel-platform/*) are exempt — they are governed
-  # by the portability lint's pin-lag guard (Rule 3) above. The algorithm is
-  # unit-tested in scripts/check-action-pins.{mjs,test.mjs}; consumers copy the
-  # script into their own scripts/ and run the same step.
-  check-action-pins:
-    name: Lint third-party action pins
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: .nvmrc
-
       - name: Lint third-party action pins
         run: node scripts/check-action-pins.mjs
+
+      - name: Run unit tests
+        run: npm test
 
   # ── Workflow lint (actionlint + embedded shellcheck) ──────────────────────
   #
@@ -185,35 +175,6 @@ jobs:
           # -color forces the annotated output even though stdout is not a TTY.
           "${tmp}/actionlint" -color
 
-  # ── Unit tests (node --test) ──────────────────────────────────────────────
-  #
-  # The platform ships ~2,800 LOC of guardrail + edge-security tests
-  # (scripts/**/*.test.mjs) that no workflow executed until now (Story #192),
-  # so a regression in the very scripts consumers copy into their CI could
-  # merge green here. This job runs the repo's own `npm test` suite
-  # (`node --test "scripts/**/*.test.mjs"`) on every PR and push to main and
-  # feeds the ci-required aggregator, closing that blind spot.
-  #
-  # The suite is dependency-free (Node's built-in test runner, no third-party
-  # test framework), so — like the lint jobs above — this needs only a Node
-  # runtime, not a full `pnpm install`. setup-node reads .nvmrc so the runner
-  # matches the repo's pinned Node version.
-  unit-tests:
-    name: Unit tests (node --test)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version-file: .nvmrc
-
-      - name: Run unit tests
-        run: npm test
-
   # ── Aggregator: single required branch-protection context ─────────────────
   #
   # Mirrors the ci-required pattern from pr-quality.yml: a single stable
@@ -225,11 +186,8 @@ jobs:
     timeout-minutes: 5
     if: always()
     needs:
-      - check-required-contexts
-      - check-workflow-portability
-      - check-action-pins
+      - node-scripts
       - actionlint
-      - unit-tests
     steps:
       # Self-maintaining aggregator: results are derived from `toJSON(needs)`,
       # so the `needs:` array above is the single source of truth — adding a

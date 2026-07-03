@@ -86,6 +86,17 @@ jobs:
     name: uptime-apply
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
+    # Reusable-side apply serialization: the caller template provides a
+    # concurrency group, but a hand-rolled caller that omits it can run two
+    # applies against the live Better Stack monitor set at once. Job-level
+    # (not workflow-level) because a called workflow's workflow-level
+    # `concurrency` is not evaluated — its jobs run inside the CALLER's run.
+    # `github.repository` resolves to the caller, so each consumer serializes
+    # its own applies without cross-consumer contention. cancel-in-progress
+    # stays false: never cancel a mid-flight monitor diff apply.
+    concurrency:
+      group: uptime-apply-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - name: Checkout (shared script)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -98,6 +109,7 @@ jobs:
           ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
           sparse-checkout: |
             scripts/apply-uptime-monitors.mjs
+            .nvmrc
           sparse-checkout-cone-mode: false
           path: _mandrel-platform-uptime
           persist-credentials: false
@@ -108,10 +120,14 @@ jobs:
           path: _caller
           persist-credentials: false
 
+      # Node pin sourced from the platform's canonical .nvmrc (sparse-checked
+      # out above at the same job_workflow_sha as the apply script) so this
+      # workflow's runtime cannot drift onto an EOL line independently of the
+      # platform-wide pin (the hardcoded '20' it replaced went EOL 2026-04-30).
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version-file: _mandrel-platform-uptime/.nvmrc
 
       - name: Apply uptime monitors
         shell: bash

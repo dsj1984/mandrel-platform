@@ -1,8 +1,8 @@
 name: Release Please
 
-# Action pinning: third-party `uses:` refs are pinned to full 40-char commit
-# SHAs with a `# vX.Y.Z` comment. First-party `actions/*` remain on
-# major-version tags — GitHub controls those refs and rotates signing keys.
+# Action pinning: every `uses:` ref — first-party `actions/*` included — is
+# pinned to a full 40-char commit SHA with a `# vX.Y.Z` comment, matching the
+# repo-wide pin ratchet enforced by ci.yml's check-action-pins job.
 #
 # Token preference: RELEASE_PLEASE_TOKEN (PAT or GitHub App installation
 # token) over the default GITHUB_TOKEN. The default token does NOT trigger
@@ -21,10 +21,20 @@ permissions:
   pull-requests: write
   issues: write
 
+# Serialize the release train (same posture as platform-sync-repair.yml):
+# two quick pushes to main running release-please concurrently is a known
+# source of duplicate/conflicting release PRs and 422s. cancel-in-progress
+# stays false — an in-flight release run must finish, not be cancelled;
+# the follow-up run queues behind it.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release-please:
     name: Run release-please
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Root package at `.` emits un-prefixed outputs (`release_created`,
     # `tag_name`). There is no `.--release_created` output for the root path.
     outputs:
@@ -82,6 +92,7 @@ jobs:
     needs: [release-please, await-smoke]
     if: ${{ needs.release-please.outputs.root_release_created == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # `id-token: write` is load-bearing: it mints the short-lived OIDC token
     # the npm CLI exchanges for a publish credential under npm trusted
     # publishing (no long-lived NPM_TOKEN). The same OIDC context drives the
