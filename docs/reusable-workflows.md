@@ -927,6 +927,19 @@ Do **not** register the individual tier jobs (`Lint & format`, `Typecheck`,
 `Unit (1/3)`, …) as required — their names change with shard count and toggle
 state, which is exactly the drift `ci-required` exists to absorb.
 
+The aggregator is **self-maintaining**: it derives its verdict from
+`${{ toJSON(needs) }}` (iterated with `jq`), so the job's `needs:` array is
+the single source of truth — adding a tier to `needs:` is the only edit
+required to include it in the gate. There is no per-tier env/loop bookkeeping
+to keep in sync, and a regression test
+(`scripts/check-ci-required-aggregator.test.mjs`) asserts that no hardcoded
+tier-name list reappears and that the `pr-quality.yml` / `ci.yml` copies stay
+textually identical. Semantics are frozen: pass when every needed job ends
+`success` or `skipped`; fail on anything else, **including `cancelled`**
+(load-bearing for the fail-fast design — a tier cancelled by a sibling's
+failure must not read as green). Failure output names each failing tier as
+`tier(result)`.
+
 ### Canonical caller naming (the `ci.yml` / `CI` / `ci` triplet)
 
 `ci-required` fixes the required-**check** name, but it does not fix the
