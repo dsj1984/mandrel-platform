@@ -130,6 +130,17 @@ test("probeUrl returns the first non-transient response without retrying", async
   assert.equal(calls, 1);
 });
 
+test("probeUrl never follows redirects (curl-without--L parity: a 302 is a failure)", async () => {
+  let seenOptions;
+  const fetchImpl = async (url, options) => {
+    seenOptions = options;
+    return { status: 302, text: async () => "" };
+  };
+  const res = await probeUrl("https://x.example/health", { fetchImpl, sleep: async () => {} });
+  assert.equal(seenOptions.redirect, "manual");
+  assert.equal(res.status, 302); // surfaces as non-200 → smoke failure
+});
+
 test("probeUrl does not retry a non-200 non-transient status (e.g. 404)", async () => {
   let calls = 0;
   const fetchImpl = async () => {

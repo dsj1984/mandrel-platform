@@ -164,7 +164,10 @@ export async function probeUrl(url, { fetchImpl = fetch, retries = 3, retryDelay
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) await sleep(retryDelayMs);
     try {
-      const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), redirect: "follow" });
+      // redirect: "manual" — parity with the inline predecessor's plain curl
+      // (no -L): a 301/302 from a health endpoint is a non-200 smoke FAILURE,
+      // never silently followed to whatever the redirect target returns.
+      const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), redirect: "manual" });
       last = { status: res.status, body: await res.text() };
     } catch {
       last = { status: 0, body: "" };
