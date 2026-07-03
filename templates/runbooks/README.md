@@ -54,3 +54,16 @@ node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref mandrel-platf
 
 > Placeholder convention: `<UPPER_SNAKE>` between angle brackets. Search for
 > `<` after copying to find everything that still needs a value.
+
+## Self-contained runbooks (not stubs)
+
+One template in this directory is a **full runbook**, not a thin stub — it
+has no canonical `docs/runbooks/` counterpart to link and carries the entire
+process inline (placeholders included):
+
+| Runbook | Scope |
+|---------|-------|
+| `runner-provisioning.md` | provision a persistent self-hosted runner with the [`templates/runner/`](../runner/) hygiene kit (job-start cleanup hook + runner-scoped `.env`) |
+
+Adopt it the same way as a stub (copy into `docs/runbooks/`, fill the
+placeholders); `platform-sync.mjs` materializes it alongside the stubs.
