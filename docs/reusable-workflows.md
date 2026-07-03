@@ -1002,30 +1002,36 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 `workflow_call` target. The jobs run in this order:
 
 ```text
-(environments-isolation-audit, require-ci-green) → secret-isolation-audit → check-env → pre-migration-snapshot → migrate → deploy → boot-smoke → deploy-summary
+environments-isolation-audit → secret-isolation-audit → check-env → migration → deploy → boot-smoke → deploy-summary
 ```
 
 `environments-isolation-audit` only runs when
 `enable-environments-isolation-audit: true` (default `false` — opt-in, see
 [Environments isolation audit](#environments-isolation-audit) below).
-`pre-migration-snapshot` and `migrate` only run when `migrate: true`;
-`boot-smoke` only runs when `smoke: true` (the default). When `worker-secrets`
+`migration` (pre-migration snapshot + apply, named steps in one job) only
+runs when `migrate: true`; `boot-smoke` only runs when `smoke: true` (the
+default); `deploy-summary` runs on every **attempted** deploy outcome
+(`always() && needs.deploy.result != 'skipped'`), so an all-skipped chain —
+e.g. a red-upstream run stopped by the [CI-green guard](#ci-green-guard)
+below — boots no summary runner either. When `worker-secrets`
 is set (opt-in), the `deploy` job additionally provisions those named runtime
 secrets in-pipeline — after the deploy step, before `boot-smoke` — via the
 versions secret API; see [In-pipeline worker secrets](#in-pipeline-worker-secrets-opt-in).
 
-> **Migrate-path deploy safety.** On the built-in D1 path the
-> `pre-migration-snapshot` export is **blocking**: it runs under
-> `set -euo pipefail` with no warning fallback, and the snapshot artifact
-> upload uses `if-no-files-found: error`, so a failed or empty export fails
-> the run before any migration. The `deploy` job only proceeds when `migrate`
-> **succeeded**, or when it was legitimately skipped because `migrate: false`
-> (`needs.migrate.result == 'success' || (inputs.migrate == false &&
-> needs.migrate.result == 'skipped')`). This matters because a failed
-> `pre-migration-snapshot` or `migrate` also reports the `migrate` job as
-> `skipped`; gating the `skipped` branch on `migrate: false` ensures a
-> `migrate: true` pipeline whose snapshot or migration failed **never**
-> deploys — the recovery point is guaranteed for every migrate run.
+> **Migrate-path deploy safety.** On the built-in D1 path the `migration`
+> job's snapshot step is **blocking**: it runs under `set -euo pipefail`
+> with no warning fallback, and the snapshot artifact upload uses
+> `if-no-files-found: error` and runs **before** the apply step, so a failed
+> or empty export fails the run before any migration. The `deploy` job only
+> proceeds when `migration` **succeeded** or was **skipped**
+> (`needs.migration.result == 'success' || needs.migration.result ==
+> 'skipped'`). The `skipped` branch is unambiguous since Story #237 merged
+> snapshot + apply into the single `migration` job: a failed snapshot now
+> **fails** that job (it can no longer surface as a downstream sibling's
+> `skipped`), so — given `check-env` succeeded — `migration` reports
+> `skipped` if and only if `migrate: false`. A `migrate: true` pipeline
+> whose snapshot or migration failed **never** deploys; the recovery point
+> is guaranteed for every migrate run.
 
 ### Wrangler version pinning
 
@@ -1036,8 +1042,8 @@ lockfile-pinned wrangler** via `pnpm exec wrangler`, installed by the shared
 
 | Call site                          | Job                     | Invocation                          |
 | ---------------------------------- | ----------------------- | ----------------------------------- |
-| Built-in D1 export (snapshot)      | `pre-migration-snapshot`| `pnpm exec wrangler d1 export …`     |
-| Built-in D1 migrate                | `migrate`               | `pnpm exec wrangler d1 migrations apply …` |
+| Built-in D1 export (snapshot step) | `migration`             | `pnpm exec wrangler d1 export …`     |
+| Built-in D1 migrate (apply step)   | `migration`             | `pnpm exec wrangler d1 migrations apply …` |
 | Built-in per-worker deploy loop    | `deploy`                | `pnpm exec wrangler deploy …`        |
 | workers.dev subdomain derivation   | `boot-smoke`            | `pnpm exec wrangler whoami`          |
 | Auto-rollback on smoke failure     | `boot-smoke`            | `pnpm exec wrangler rollback …`      |
@@ -1087,20 +1093,34 @@ command it supplies.
 | `environments-to-audit`                 | string  | `''`    | Additional environment names to audit beyond `gh-environment` (comma-separated, deduplicated). Set this when `gh-environment` is empty or you want to audit an environment the deploy itself doesn't attach to. |
 | `isolation-audit-branch`                | string  | `'main'`| The single branch each audited environment must restrict deploys to. |
 
-### CI-green guard (`require-ci-green`)
+### CI-green guard
 
 > Story #175 (operator decision 2026-07-01, D4: one paved road — every
-> consumer converges on `workflow_run` for staging).
+> consumer converges on `workflow_run` for staging). Slimmed in Story #237:
+> the former dedicated `require-ci-green` job is now a job-level `if:`
+> expression, so a red upstream run spins up **zero** runners.
 
 `github.event` inside a reusable workflow is the **caller's** event, so this
 workflow can own the CI-green guard even though it cannot own the caller's
-`on:` block. The first job, `require-ci-green`, evaluates that event:
+`on:` block. The guard is the expression
 
-- **`workflow_run` events** — skip-with-notice (every downstream job reports
-  `skipped`) unless `github.event.workflow_run.conclusion == 'success'`.
-  `workflow_run` fires on **both** a successful and a failed upstream run, so
-  this guard is load-bearing: without it, a red CI run on `main` would still
-  trigger a deploy.
+```text
+github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+```
+
+carried in the job-level `if:` of the two entry jobs
+(`environments-isolation-audit` and `secret-isolation-audit`); every later
+job then skips through the `needs:` chain:
+
+- **`workflow_run` events** — the whole chain reports `skipped` (with no
+  runner ever assigned) unless
+  `github.event.workflow_run.conclusion == 'success'`. `workflow_run` fires
+  on **both** a successful and a failed upstream run, so this guard is
+  load-bearing: without it, a red CI run on `main` would still trigger a
+  deploy. (Story #175's gate job emitted a skip **notice**; Story #237
+  trades that annotation for the zero-runner skipped chain — the
+  all-skipped run is itself the unambiguous signal, and this workflow fires
+  on every CI completion on `main`, the hottest trigger path.)
 - **Every other event** (`workflow_dispatch`, `push`, `pull_request`, …) —
   passes through unconditionally. These triggers are operator- or
   branch-protection-intentional and carry no upstream conclusion to gate on.
@@ -1114,11 +1134,11 @@ caller template, which `platform-sync` materializes into a consumer's
 `.github/workflows/` (link-don't-copy, same semantics as the runbook stubs —
 see [`scripts/platform-sync.mjs`](../README.md#adoption-cli-platform-sync)).
 
-`environments-isolation-audit` and `require-ci-green` run as independent
-sibling jobs — one gates on GitHub Environments branch-policy hygiene, the
-other on the caller's upstream CI conclusion — and `secret-isolation-audit`
-only proceeds once both have cleared (`needs: [environments-isolation-audit,
-require-ci-green]`).
+`environments-isolation-audit` gates on GitHub Environments branch-policy
+hygiene (opt-in) and `secret-isolation-audit` on plaintext secrets; both
+carry the CI-green expression directly, and `secret-isolation-audit` only
+proceeds once the isolation audit has cleared or was skipped
+(`needs: [environments-isolation-audit]`).
 
 ### Secret isolation audit and the `runner` input
 
@@ -1258,8 +1278,10 @@ why the in-pipeline provisioning is the durable fix here.
 
 ### Resolved-ref deploy summary (single source of truth)
 
-> Story #110. The final `deploy-summary` job (`if: always()`) emits the
-> **runtime-resolved** ref of this reusable workflow into
+> Story #110. The final `deploy-summary` job
+> (`if: always() && needs.deploy.result != 'skipped'` — it runs on every
+> **attempted** deploy outcome but not for an all-skipped chain, Story #237)
+> emits the **runtime-resolved** ref of this reusable workflow into
 > `GITHUB_STEP_SUMMARY`: `github.job_workflow_sha` (the exact 40-hex commit the
 > caller's `uses: …/deploy-cloudflare.yml@<ref>` pin resolved to) and
 > `github.workflow_ref` (the full ref path). This is the **single source of
@@ -1300,7 +1322,7 @@ jobs:
 | `d1-database`                | string  | `''`        | D1 database name passed **positionally** to the built-in `wrangler d1 export` / `wrangler d1 migrations apply` (both target `--remote`). Only consulted on the built-in D1 path. Empty lets wrangler resolve the database from the consumer's config for the target `--env`; set it when the config is ambiguous for the environment. |
 | `snapshot-command`           | string  | `''`        | Consumer pre-migration snapshot command. Replaces the built-in `wrangler d1 export` for non-D1 engines. `*.sql` it writes under `temp/` is uploaded as the snapshot artifact. |
 | `migrate-command`            | string  | `''`        | Consumer migrate command. Replaces `wrangler d1 migrations apply` for non-D1 engines. Runs after the snapshot and after `pre-migrate-assert-command`.       |
-| `pre-migrate-assert-command` | string  | `''`        | Optional host-guard hook run **before** migrate. A non-zero exit aborts the migrate job — use it to refuse migrating unless the resolved DB host matches an expected pattern. |
+| `pre-migrate-assert-command` | string  | `''`        | Optional host-guard hook run **before** migrate. A non-zero exit aborts the migration job — use it to refuse migrating unless the resolved DB host matches an expected pattern. |
 | `build-command`              | string  | `''`        | Optional build run in the deploy job **before** `wrangler deploy` (e.g. `"pnpm build"`). **Secretless** — only `build-env` plaintext + the frozen secret set are in scope. |
 | `build-env`                  | string  | `''`        | Build-time env passthrough, one `KEY=VALUE` per line, exported before `build-command`. For plaintext build-time values only — **never** secrets.            |
 | `build-artifact`             | string  | `''`        | Name of an artifact uploaded by the consumer's own build job earlier in the run. When set, it is downloaded into the deploy job and `build-command` is **skipped**. This is the consumer-side-build handoff. |
@@ -1368,7 +1390,7 @@ Leave `gh-environment` empty (the default) for repo-scoped / D1 consumers — an
 empty value attaches no GitHub Environment and behaviour is unchanged. Set it
 (e.g. `staging`, `production`) **only when** your `CLOUDFLARE_*` / `TURSO_*`
 secrets live in a GitHub Environment of that name (the recommended isolation
-pattern). When set, `check-env`, `pre-migration-snapshot`, `migrate`,
+pattern). When set, `check-env`, `migration`,
 `deploy`, and `boot-smoke` all run under that GitHub Environment, picking up
 its environment-scoped secrets and any required reviewers / wait timers.
 
