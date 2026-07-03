@@ -33,6 +33,37 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-03 — Scheduled runner-fleet health monitor, alert-only via native failure + deduped issue upsert
+
+**Context.** All nine self-hosted runners across the fleet (`domio`,
+`athportal`, `Beestera/swarm-os`) are co-resident on one operator Mac
+(2026-07-03 runner audit, repo-ops matrix §1a). Nothing watches the fleet:
+the Better Stack uptime unit (`uptime-apply.yml`) monitors deployed apps, not
+runners, and deploy pipelines are `workflow_run`-gated, so a wedged runner
+silently stalls every consumer's CI with no alert. Story #258.
+
+**Decision.** Add `.github/workflows/runner-fleet-health.yml`, a scheduled
+(~every 15 min) `ubuntu-latest` workflow modeled on `pin-drift.yml`'s
+cross-consumer, config-driven, `GITHUB_STEP_SUMMARY`-rendering shape, backed
+by a new gate script `scripts/check-runner-health.mjs` and a data-driven
+roster `scripts/runner-fleet-consumers.json`. It reads
+`GET /repos/{owner}/{repo}/actions/runners` for each configured repo via
+`secrets.PIN_DRIFT_TOKEN || github.token`, and flags offline runners, a count
+shortfall against the expected roster, and stale queued/waiting workflow runs
+with no matching online runner. Alerting deliberately avoids a new external
+dependency: the job exits non-zero on any degraded repo (native GitHub
+failed-workflow notification) AND upserts/auto-closes a single deduped
+tracking issue (`Runner fleet: <repo> degraded`) in this repo.
+
+**Consequences.** A wedged fleet is caught within ~15 minutes instead of
+silently stalling CI/deploys indefinitely. The monitor stays GitHub-hosted so
+it keeps running when the Mac itself is down. It is intentionally alert-only
+(no host-side remediation, no disk-usage monitoring, no external paging) —
+the operator runbook (`templates/runbooks/runner-fleet-health.md`) documents
+the manual wake/reboot/restart response. A Slack/PagerDuty push remains an
+open decision, deferred until the native + issue-upsert default proves
+insufficient.
+
 ## 2026-07-01 — Reusable `uptime-apply.yml` + shared Better Stack monitor schema/apply unit
 
 **Context.** The 2026-07-01 settings-level audit (repo-ops consumers matrix
