@@ -3,7 +3,7 @@ name: deploy-staging
 # Canonical staging-deploy caller template (Story #175).
 #
 # > **Thin local caller.** The defence-in-depth deploy core (secret-isolation
-# > audit -> CF env gate -> pre-migration snapshot -> migrate -> deploy ->
+# > audit -> CF env gate -> migration (snapshot + apply) -> deploy ->
 # > boot-smoke + auto-rollback) AND the CI-green guard both live in the shared
 # > `dsj1984/mandrel-platform` `deploy-cloudflare.yml` reusable workflow — see
 # > https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#deploy-cloudflareyml.
@@ -16,11 +16,13 @@ name: deploy-staging
 # `conclusion == 'success'`. `workflow_run` fires on BOTH a successful AND a
 # failed upstream run, so a caller-side guard against a red run used to be
 # REQUIRED here — every consumer hand-copied the same `preflight` job (see
-# mandrel-platform Story #175 context). That guard is now a `require-ci-green`
-# job INSIDE `deploy-cloudflare.yml` itself (`github.event` inside a reusable
-# workflow is the CALLER's event, so the shared workflow can see and gate on
-# the `workflow_run` conclusion even though it cannot own this file's `on:`
-# block). This template needs NO caller-side preflight guard as a result —
+# mandrel-platform Story #175 context). That guard now lives INSIDE
+# `deploy-cloudflare.yml` itself as a job-level `if:` on its entry jobs
+# (`github.event` inside a reusable workflow is the CALLER's event, so the
+# shared workflow can see and gate on the `workflow_run` conclusion even
+# though it cannot own this file's `on:` block); a red upstream run skips
+# the whole chain with zero runner spin-ups (mandrel-platform Story #237).
+# This template needs NO caller-side preflight guard as a result —
 # copy it as-is and fill in the placeholders below.
 #
 # Replace every <PLACEHOLDER> with your project's real values:
@@ -46,8 +48,9 @@ name: deploy-staging
 
 on:
   # CI-green gate: fires when <CI_WORKFLOW_NAME> finishes on main. The shared
-  # deploy-cloudflare.yml's require-ci-green job skips-with-notice unless the
-  # upstream conclusion was 'success' — no caller-side guard needed.
+  # deploy-cloudflare.yml's job-level CI-green gate skips the entire job
+  # chain (zero runners) unless the upstream conclusion was 'success' — no
+  # caller-side guard needed.
   workflow_run:
     workflows: [<CI_WORKFLOW_NAME>]
     branches: [main]

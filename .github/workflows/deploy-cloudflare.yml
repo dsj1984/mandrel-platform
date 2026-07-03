@@ -19,6 +19,16 @@
 # map. See that job's inline comment for the rationale; a `runner` override
 # to a non-Linux self-hosted label will need that map added first.
 #
+# CI-green gate (Story #175, slimmed in Story #237): `github.event` inside a
+# reusable workflow is the CALLER's event, so this workflow owns the CI-green
+# guard even though it cannot own the caller's `on:` block. The gate is a
+# job-level `if:` expression on the two entry jobs (no dedicated gate job —
+# a red upstream `workflow_run` spins up ZERO runners; the whole chain
+# reports `skipped`):
+#
+#   github.event_name != 'workflow_run' ||
+#   github.event.workflow_run.conclusion == 'success'
+#
 # Defence-in-depth layers (in execution order):
 #   0. environments-isolation-audit — opt-in (enable-environments-isolation-audit),
 #                              audits GitHub Environments' deployment branch
@@ -27,24 +37,24 @@
 #   1. secret-isolation-audit — scans for plaintext secrets before any code runs.
 #   2. check-env             — validates required env/secrets exist for the target
 #                              environment; blocks deploy if any are absent.
-#   3. pre-migration-snapshot — when migrate:true, snapshots the database before
-#                              any forward-only migration runs (D1 by default;
-#                              overridable via snapshot-command for non-D1 engines).
+#   3. migration             — when migrate:true, snapshots the database before
+#                              any forward-only migration runs, then applies the
+#                              migrations — two named steps in ONE job (D1 by
+#                              default; overridable via snapshot-command /
+#                              migrate-command for non-D1 engines, gated by an
+#                              optional pre-migrate-assert-command host guard).
 #                              The built-in D1 export is BLOCKING: a failed export
 #                              (or an empty snapshot artifact) fails the run so no
 #                              migrate:true pipeline proceeds without a recovery
 #                              point. The D1 database name is passed positionally
 #                              via the optional d1-database input (falls back to
 #                              wrangler config resolution when empty).
-#   4. migrate               — applies migrations after the snapshot (D1 by
-#                              default; overridable via migrate-command, gated by
-#                              an optional pre-migrate-assert-command host guard).
-#   5. deploy                — optionally runs build-command (with build-env),
+#   4. deploy                — optionally runs build-command (with build-env),
 #                              then deploys each worker via wrangler deploy, or
 #                              runs a consumer-supplied deploy-command (for
 #                              pnpm-workspace monorepos with no root wrangler
 #                              config) that replaces the built-in deploy loop.
-#   5b. worker-secrets       — opt-in (worker-secrets input). After deploy and
+#   4b. worker-secrets       — opt-in (worker-secrets input). After deploy and
 #                              BEFORE boot-smoke, writes each named runtime
 #                              secret onto every deployed worker via the
 #                              VERSIONS secret API (wrangler versions secret
@@ -54,7 +64,7 @@
 #                              secret values and any active≠latest split from a
 #                              prior rollback self-heals (Story #170). Default
 #                              off → skipped, byte-identical to today.
-#   6. boot-smoke            — HTTP health-check against each deployed worker, or
+#   5. boot-smoke            — HTTP health-check against each deployed worker, or
 #                              a consumer-supplied smoke-command. Non-200 fails
 #                              the run AND triggers wrangler rollback. The
 #                              workers.dev host is derived from the account
@@ -190,7 +200,7 @@ on:
       pre-migrate-assert-command:
         description: >
           Optional host-guard hook command run BEFORE migrate (and before the
-          snapshot is consumed). A non-zero exit aborts the migrate job, so a
+          snapshot is consumed). A non-zero exit aborts the migration job, so a
           consumer can refuse to migrate unless the resolved DB host matches an
           expected pattern (defence-in-depth against migrating the wrong DB).
         required: false
@@ -475,7 +485,12 @@ jobs:
     name: Environments isolation audit
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
-    if: ${{ inputs.enable-environments-isolation-audit == true }}
+    # Opt-in gate AND the CI-green gate (see the header comment): on a
+    # `workflow_run` trigger with a non-success upstream conclusion this job —
+    # like every job in the workflow — is skipped before a runner is assigned.
+    if: >-
+      ${{ inputs.enable-environments-isolation-audit == true &&
+          (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
     permissions:
       contents: read
     steps:
@@ -518,64 +533,54 @@ jobs:
           GH_TOKEN: ${{ secrets.audit-token || github.token }}
 
   # ---------------------------------------------------------------------------
-  # 0b. CI-green guard (Story #175)
-  #    `github.event` inside a reusable workflow is the CALLER's event, so this
-  #    workflow can own the CI-green guard even though it cannot own the
-  #    caller's `on:` block. Consumers gating staging on CI (`workflow_run`)
-  #    previously hand-copied this exact guard as a caller-side `preflight`
-  #    job (athportal, swarm-os) — `workflow_run` fires on BOTH success and
+  # 1. Secret isolation audit
+  #    Scans the checkout for hardcoded secrets BEFORE any deploy step runs.
+  #    Fails fast so a secret-in-source-tree never reaches Cloudflare.
+  #
+  #    CI-green guard (Story #175, slimmed in Story #237): `github.event`
+  #    inside a reusable workflow is the CALLER's event, so this workflow can
+  #    own the CI-green guard even though it cannot own the caller's `on:`
+  #    block. Consumers gating staging on CI (`workflow_run`) previously
+  #    hand-copied this exact guard as a caller-side `preflight` job
+  #    (athportal, swarm-os) — `workflow_run` fires on BOTH success and
   #    failure, so without the guard a red upstream run would still deploy.
   #    Centralizing it here means a `workflow_run`-triggered caller needs no
   #    caller-side preflight guard at all; see the canonical
   #    `templates/workflows/deploy-staging.yml` caller template.
   #
-  #    - `workflow_run` events: skip-with-notice unless the upstream run's
-  #      conclusion was `success`.
+  #    The guard is a job-level `if:` expression (not a dedicated gate job —
+  #    Story #237 dropped the former `require-ci-green` job, which booted a
+  #    runner on EVERY upstream CI completion just to evaluate this pure
+  #    expression):
+  #
+  #    - `workflow_run` events: this job is skipped unless the upstream run's
+  #      conclusion was `success`; every downstream job then skips through
+  #      the `needs:` chain, so a red upstream run spins up ZERO runners.
+  #      (This trades Story #175's skip-with-notice annotation for a
+  #      zero-runner skipped chain — the all-skipped run is itself the
+  #      unambiguous signal; see Story #237.)
   #    - Every other event (`workflow_dispatch`, `push`, `pull_request`, …):
-  #      pass through unconditionally — those triggers are operator- or
+  #      passes through unconditionally — those triggers are operator- or
   #      branch-protection-intentional and carry no upstream conclusion to
   #      gate on.
-  # ---------------------------------------------------------------------------
-  require-ci-green:
-    name: Require CI-green (${{ inputs.environment }})
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 10
-    steps:
-      - name: Evaluate CI-green gate
-        shell: bash
-        run: |
-          if [ "$EVENT_NAME" = "workflow_run" ] && [ "$CONCLUSION" != "success" ]; then
-            echo "::notice::Skipping deploy — upstream workflow_run concluded '${CONCLUSION}' (not 'success')."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-        id: gate
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-    outputs:
-      skip: ${{ steps.gate.outputs.skip }}
-
-  # ---------------------------------------------------------------------------
-  # 1. Secret isolation audit
-  #    Scans the checkout for hardcoded secrets BEFORE any deploy step runs.
-  #    Fails fast so a secret-in-source-tree never reaches Cloudflare.
   # ---------------------------------------------------------------------------
   secret-isolation-audit:
     name: Secret isolation audit
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
-    needs: [environments-isolation-audit, require-ci-green]
+    needs: [environments-isolation-audit]
     if: >-
       ${{ always() &&
           (needs.environments-isolation-audit.result == 'success' || needs.environments-isolation-audit.result == 'skipped') &&
-          needs.require-ci-green.outputs.skip != 'true' }}
+          (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
     steps:
       - name: Checkout
+        # Shallow clone (the actions/checkout default): the scan below is
+        # `gitleaks dir` — a working-tree scan that never reads git history —
+        # so the former `fetch-depth: 0` full-history clone was pure waste on
+        # every deploy (Story #237). Full-HISTORY secret coverage lives in
+        # secret-scan-push.yml (`gitleaks git` over fetch-depth: 0).
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
 
       - name: Run Gitleaks secret scan
         # The gitleaks-action rejects the `workflow_run` event ("The
@@ -681,19 +686,35 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
-  # 3. Pre-migration snapshot
-  #    Only runs when migrate:true. Snapshots the database BEFORE any
-  #    forward-only migration is applied so a recovery point always exists.
-  #    Defaults to "wrangler d1 export"; a consumer-supplied snapshot-command
-  #    replaces it for non-D1 engines.
+  # 3. Migration (snapshot + apply, one job — Story #237)
+  #    Only runs when migrate:true. Named steps preserve per-stage UI
+  #    visibility, in this exact order:
+  #      1. Pre-migration snapshot  — snapshots the database BEFORE any
+  #         forward-only migration is applied so a recovery point always
+  #         exists. Defaults to "wrangler d1 export"; a consumer-supplied
+  #         snapshot-command replaces it for non-D1 engines.
+  #      2. Upload snapshot artifact — BLOCKING (if-no-files-found: error);
+  #         the artifact is durably uploaded before any migration touches
+  #         the database.
+  #      3. Pre-migrate host-guard assertion — optional
+  #         pre-migrate-assert-command hook (non-zero aborts).
+  #      4. Apply migrations — defaults to "wrangler d1 migrations apply";
+  #         a consumer-supplied migrate-command replaces it.
+  #    Formerly two sequential jobs (pre-migration-snapshot → migrate) with
+  #    identical gating and environment: — merging them drops one runner
+  #    spin-up plus a duplicate checkout + frozen install per migrate deploy,
+  #    and removes the ambiguous 'skipped' cause the deploy job's if: had to
+  #    defend against. Timeout is 30 (was 20+20): the two stages share ONE
+  #    checkout + toolchain install now, so 30 covers the combined worst case
+  #    with headroom.
   # ---------------------------------------------------------------------------
-  pre-migration-snapshot:
-    name: Pre-migration snapshot (${{ inputs.environment }})
+  migration:
+    name: Migration (${{ inputs.environment }})
     # GitHub Deployment Environment (distinct from the Cloudflare --env label).
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     needs: check-env
     if: ${{ inputs.migrate == true }}
     steps:
@@ -772,33 +793,9 @@ jobs:
           retention-days: 7
           # Blocking: an empty snapshot artifact means the D1 export produced no
           # dump — fail the run so a migrate:true pipeline never proceeds without
-          # a recovery point.
+          # a recovery point. This upload runs BEFORE the apply step below, so
+          # the recovery point is durably stored before any migration runs.
           if-no-files-found: error
-
-  # ---------------------------------------------------------------------------
-  # 4. Migrate
-  #    Applies migrations AFTER the snapshot. Only runs when migrate:true.
-  #    Defaults to "wrangler d1 migrations apply"; a consumer-supplied
-  #    migrate-command replaces it for non-D1 engines. An optional
-  #    pre-migrate-assert-command host-guard runs first (non-zero aborts).
-  # ---------------------------------------------------------------------------
-  migrate:
-    name: Migrate (${{ inputs.environment }})
-    # GitHub Deployment Environment (distinct from the Cloudflare --env label).
-    # Empty (the default) attaches no Environment — behaviour is unchanged.
-    environment: ${{ inputs.gh-environment }}
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 20
-    needs: pre-migration-snapshot
-    if: ${{ inputs.migrate == true }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
-        with:
-          cache: 'true'
 
       - name: Pre-migrate host-guard assertion
         if: ${{ inputs.pre-migrate-assert-command != '' }}
@@ -854,10 +851,10 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
 
   # ---------------------------------------------------------------------------
-  # 5. Deploy workers
+  # 4. Deploy workers
   #    Optionally runs build-command (with build-env exported) BEFORE deploy,
   #    then deploys each worker listed in the `workers` csv input.
-  #    Runs after check-env (no-migrate path) or migrate (migrate:true path).
+  #    Runs after check-env (no-migrate path) or migration (migrate:true path).
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy workers (${{ inputs.environment }})
@@ -868,22 +865,19 @@ jobs:
     timeout-minutes: 30
     needs:
       - check-env
-      - migrate
-    # Run when check-env passes AND either:
-    #   - migrate succeeded, OR
-    #   - migrate was legitimately skipped BECAUSE this is a no-migrate run
-    #     (inputs.migrate == false → needs.migrate is 'skipped').
-    # A 'skipped' migrate result is ONLY safe to deploy on when migrate is off.
-    # When migrate:true, a failing pre-migration-snapshot (or migrate) reports
-    # the migrate job as 'skipped' too — accepting that 'skipped' unconditionally
-    # would deploy a pipeline whose snapshot/migration never ran, defeating the
-    # recovery-point guarantee. Gating the 'skipped' branch on
-    # inputs.migrate == false closes that hole.
+      - migration
+    # Run when check-env passes AND migration succeeded or was skipped.
+    # 'skipped' is unambiguous here (Story #237): snapshot + apply are steps
+    # of the single migration job, so a failed snapshot FAILS that job rather
+    # than reporting a downstream sibling as 'skipped'. Given
+    # check-env == 'success', migration is 'skipped' if and only if
+    # inputs.migrate == false — the recovery-point guarantee holds without a
+    # separate inputs.migrate guard.
     if: >-
       always() &&
       needs.check-env.result == 'success' &&
-      (needs.migrate.result == 'success' ||
-       (inputs.migrate == false && needs.migrate.result == 'skipped'))
+      (needs.migration.result == 'success' ||
+       needs.migration.result == 'skipped')
     outputs:
       deployed_workers: ${{ steps.deploy-step.outputs.deployed_workers }}
     steps:
@@ -1139,7 +1133,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
-  # 6. Boot-smoke + auto-rollback
+  # 5. Boot-smoke + auto-rollback
   #    When smoke:true (default), verifies each deployed worker, then rolls
   #    back any that fail. The workers.dev host is derived from the account
   #    SUBDOMAIN SLUG (never the account ID); smoke_base_url / smoke_paths
@@ -1355,7 +1349,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
-  # 7. Deploy summary (resolved-ref single source of truth)
+  # 6. Deploy summary (resolved-ref single source of truth)
   #    Emits the RESOLVED ref of THIS reusable workflow into the job summary
   #    (Story #110). `github.job_workflow_sha` is the exact commit SHA GitHub
   #    resolved the caller's `uses: …/deploy-cloudflare.yml@<ref>` pin to, and
@@ -1364,8 +1358,12 @@ jobs:
   #    deploy-summary string — makes the resolved ref the single source of
   #    truth: a consumer can read it off the job summary instead of carrying a
   #    stale `deploy-cloudflare.yml@<sha>` literal that the pin-drift lint then
-  #    has to flag (the athportal stale-literal residual). Runs on every deploy
-  #    outcome so the resolved ref is always recorded.
+  #    has to flag (the athportal stale-literal residual). Runs on every
+  #    ATTEMPTED deploy outcome (success, failure, cancelled) so the resolved
+  #    ref is always recorded for a run that did anything — but NOT when the
+  #    deploy job was skipped (Story #237): an all-skipped chain (red-upstream
+  #    CI-green gate, or a failed upstream gate job) previously still booted a
+  #    runner just to echo a table for a pipeline that never ran.
   # ---------------------------------------------------------------------------
   deploy-summary:
     name: Deploy summary (${{ inputs.environment }})
@@ -1374,7 +1372,7 @@ jobs:
     needs:
       - deploy
       - boot-smoke
-    if: ${{ always() }}
+    if: ${{ always() && needs.deploy.result != 'skipped' }}
     steps:
       - name: Emit resolved platform-ref summary
         shell: bash
