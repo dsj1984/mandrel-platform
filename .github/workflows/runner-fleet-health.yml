@@ -1,0 +1,77 @@
+# Scheduled runner-fleet health monitor + offline alerting (Story #258).
+#
+# All nine self-hosted runners across the fleet (domio, athportal, swarm-os)
+# are co-resident on ONE operator Mac (2026-07-03 runner audit, repo-ops
+# matrix §1a). If that host sleeps, reboots for an OS update, fills its disk,
+# or a launchd service dies, every consumer's CI and deploy-trigger jobs
+# silently queue ("waiting for a runner") with no alert — nothing watches the
+# fleet today. The Better Stack uptime unit monitors the deployed APPS, not
+# the runners, and deploy pipelines are `workflow_run`-gated, so a wedged
+# runner can silently stall staging.
+#
+# Modeled on pin-drift.yml: a scheduled, GitHub-hosted (ubuntu-latest)
+# cross-consumer workflow that reads all three repos via
+# secrets.PIN_DRIFT_TOKEN (falling back to github.token) and renders a
+# human-readable dashboard on GITHUB_STEP_SUMMARY. Two differences: this runs
+# FREQUENTLY (~every 15 min, not weekly) and it ALERTS (not just dashboards) —
+# it exits non-zero on any degraded repo (native GitHub failed-workflow
+# notification) and upserts/auto-closes a deduped tracking issue
+# (`Runner fleet: <repo> degraded`) in this repo. It stays GitHub-hosted
+# deliberately so it keeps running when the Mac is down.
+#
+# The gate script (scripts/check-runner-health.mjs) reads each repo's live
+# self-hosted runner list AND its queued/waiting workflow runs over the
+# GitHub API via the `gh` CLI. The built-in GITHUB_TOKEN only grants read
+# access to THIS repo, so reading the other two consumer repos' runners
+# requires the same fine-grained PAT (PIN_DRIFT_TOKEN) pin-drift.yml already
+# uses, scoped additionally to `actions:read` on each repo (see
+# templates/runbooks/runner-fleet-health.md). When the secret is absent the
+# run still completes for THIS repo; cross-repo rows surface as `⚠️ error`.
+#
+# Alert-only by design (Story #258 Out of Scope): no host-side remediation,
+# no host disk-usage monitoring, no external paging integration beyond the
+# native failed-workflow notification + issue upsert.
+#
+# SHA-pinned third-party actions.
+name: Runner Fleet Health
+
+on:
+  # Every 15 minutes — frequent because the whole point is catching an
+  # offline fleet fast, unlike pin-drift.yml's weekly cadence.
+  schedule:
+    - cron: "*/15 * * * *"
+  # On-demand: run the monitor from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: runner-fleet-health-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  runner-fleet-health:
+    name: runner-fleet-health
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Runner-fleet health dashboard + alerting
+        env:
+          # Cross-repo runner reads need a PAT; fall back to the built-in
+          # token so the workflow is valid even before the secret is
+          # provisioned (cross-repo rows then surface as errors rather than
+          # hard-failing the checkout of this repo's own row).
+          GH_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN || github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: node scripts/check-runner-health.mjs

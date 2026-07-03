@@ -12,10 +12,11 @@ artifact, and its own repo dog-foods every one of them:
   (tiered PR CI), `deploy-cloudflare.yml` (defence-in-depth Cloudflare deploy),
   `secret-scan-push.yml`, `codeql.yml`, `release-automation.yml`,
   `uptime-apply.yml`, and the platform-internal `smoke-dispatch.yml`. The
-  remaining workflows (`ci.yml`, `pin-drift.yml`, `platform-sync-repair.yml`,
-  `release-please.yml`, `issue-body-conformance.yml`) are this repo's own
-  standing checks and release automation. The public `workflow_call` input and
-  secret contracts are documented in [`reusable-workflows.md`](reusable-workflows.md).
+  remaining workflows (`ci.yml`, `pin-drift.yml`, `runner-fleet-health.yml`,
+  `platform-sync-repair.yml`, `release-please.yml`,
+  `issue-body-conformance.yml`) are this repo's own standing checks and
+  release automation. The public `workflow_call` input and secret contracts
+  are documented in [`reusable-workflows.md`](reusable-workflows.md).
 - **Shared config exports** (`config/`) — base configs re-exported through the
   `package.json` `exports` map so a consumer extends them by package specifier
   instead of vendoring a copy: `tsconfig.base.json`, `biome.base.json`,
@@ -34,9 +35,11 @@ artifact, and its own repo dog-foods every one of them:
 - **Guardrail scripts** (`scripts/`) — the fail-closed checks that enforce the
   platform's invariants (SHA-pinned actions, no phantom required contexts, CVE
   policy, cross-repo pin drift, workflow portability, Wrangler baseline,
-  destructive-migration guard, repo-settings / ruleset baseline). Each ships
-  with a `node:test` sibling (`*.test.mjs`). `platform-sync.mjs` /
-  `platform-repair.mjs` drive the fleet convergence loop.
+  destructive-migration guard, repo-settings / ruleset baseline,
+  scheduled runner-fleet health with offline alerting via
+  `check-runner-health.mjs`). Each ships with a `node:test` sibling
+  (`*.test.mjs`). `platform-sync.mjs` / `platform-repair.mjs` drive the fleet
+  convergence loop.
 - **Operator runbook templates** (`templates/runbooks/`) plus starter workflows
   (`templates/workflows/`) — copy-in operator procedures (deploy promotion,
   post-deploy smoke, incident response, backup/restore, environment
