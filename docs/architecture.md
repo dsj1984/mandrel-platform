@@ -41,7 +41,11 @@ artifact, and its own repo dog-foods every one of them:
   (`templates/workflows/`) — copy-in operator procedures (deploy promotion,
   post-deploy smoke, incident response, backup/restore, environment
   provisioning, branch-protection setup, observability, dependency update) that
-  a consumer localizes into its own `docs/runbooks/`.
+  a consumer localizes into its own `docs/runbooks/`. The self-hosted runner
+  hygiene kit (`templates/runner/` — a parameterized job-start cleanup hook
+  plus a runner-scoped `.env.example`) and its provisioning runbook
+  (`templates/runbooks/runner-provisioning.md`) ship here too; the operator
+  applies them to runner hosts by hand.
 - **Docs** (`docs/`) — this mandatory-read set (architecture, data-dictionary,
   patterns, decisions), the reusable-workflow contract reference, and the
   filled-in operator runbooks for this repo (`docs/runbooks/`).
