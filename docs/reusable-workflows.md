@@ -90,6 +90,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `runner`           | string  | `'ubuntu-latest'`| Runs-on label for all jobs. Pass a JSON-encoded array string (e.g. `'["self-hosted","domio-runner"]'`) to target a self-hosted runner.        |
 | `shards`           | number  | `1`              | Number of parallel shards for the test tiers (unit, contract, e2e). Raise for large suites; **must agree with `shard-matrix`**.               |
 | `shard-matrix`     | string  | `'[1]'`          | JSON-encoded array of shard indices driving the test matrix. Must match `shards` (e.g. `shards: 3` → `shard-matrix: '[1,2,3]'`).               |
+| `fail-fast`        | boolean | `false`          | **Opt-in.** Cancel the entire run on the first tier-job failure, freeing runner capacity that cannot change the outcome. Default `false` is byte-for-byte today's run-to-completion behaviour. Requires `actions: write` on the caller's token. See [Fail-fast run cancellation](#fail-fast-run-cancellation-fail-fast). |
 | `enable-lint`      | boolean | `true`           | Set `false` to skip the lint + format-check tier.                                                                                              |
 | `enable-typecheck` | boolean | `true`           | Set `false` to skip the typecheck tier.                                                                                                        |
 | `enable-unit`      | boolean | `true`           | Set `false` to skip the unit-test tier.                                                                                                        |
@@ -127,6 +128,69 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 > (`'ubuntu-latest'`). Multi-label / self-hosted targets must be a
 > **JSON-encoded string** (`'["self-hosted","domio-runner"]'`), not a YAML
 > sequence.
+
+### Fail-fast run cancellation (`fail-fast`)
+
+The tier jobs run fully in parallel with no cross-tier `needs:` edges. By
+default, when one tier fails every other tier still runs to completion even
+though `ci-required` is already destined to fail — doomed tiers bill full
+GitHub-hosted minutes, and on a small self-hosted pool they occupy runners
+and queue other PRs' CI behind work that cannot change the outcome (the
+swarm-os run 28666023203 failure mode). The `fail-fast: false` inside the
+test tiers is matrix-**shard** scoped and does not help across tiers.
+
+`fail-fast: true` opts into **cancel-on-first-failure**: each tier job
+carries a final step, gated `if: failure() && inputs.fail-fast`, that cancels
+the current run via the Actions API (`gh run cancel`, falling back to the
+REST `POST …/actions/runs/{run_id}/cancel` endpoint) with the workflow's
+`GITHUB_TOKEN`.
+
+```yaml
+jobs:
+  ci:
+    permissions:
+      contents: read
+      actions: write # required for fail-fast's run-cancel call
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      fail-fast: true
+    secrets: inherit
+```
+
+Semantics and caveats:
+
+- **Default off, unchanged behaviour.** With the input unset (or `false`)
+  every tier runs to completion, exactly as before the input existed. Adopt
+  it per-caller: cost/throughput-sensitive consumers (self-hosted, limited
+  runners) set `true`; latency-sensitive hosted consumers that want every
+  tier's signal on one push keep the default.
+- **Branch protection stays sound under cancellation.** `ci-required` runs
+  `if: always()`, so it still executes after a fail-fast cancel, and its
+  aggregator counts `cancelled` as non-success — a cancelled tier can never
+  read as green.
+- **`actions: write` is required — and declared by the workflow.**
+  `pr-quality.yml` declares `permissions: { contents: read, actions: write }`
+  (the cancel endpoint needs `actions: write`). A reusable workflow's token
+  permissions can only be *maintained or reduced* relative to the caller's,
+  never elevated — so a caller whose token is restricted (an org/repo
+  read-only default, or an explicit narrow `permissions:` block on the
+  caller) must grant `actions: write` at the caller level, as in the snippet
+  above.
+- **A permission gap cannot mask the real failure.** The cancel step is loud
+  but non-fatal: when the cancel call fails (missing grant, API error) it
+  emits a `::warning::` and exits `0`. The tier's own failure result — the
+  signal that matters — is already recorded, and `ci-required` fails on it
+  regardless of whether the cancellation succeeded.
+- **Why not dependency gating?** Cross-tier `needs:` edges were rejected as
+  the mechanism: `needs:` is static in GitHub Actions and cannot be toggled
+  by a `workflow_call` input, so an "opt-in" gate would require either
+  duplicating every expensive tier job or imposing the lint/typecheck
+  happy-path latency on **all** consumers unconditionally. Cancellation
+  preserves full tier parallelism on the green path for everyone.
+- **In-flight work stops mid-step.** A fail-fast cancel interrupts sibling
+  tiers wherever they are; their `if: always()` steps (artifact uploads) may
+  not complete. The failing tier's own uploads do complete — the cancel step
+  is deliberately the *last* step of each tier job.
 
 ### Security tier (`enable-security` / `enable-sast`)
 
