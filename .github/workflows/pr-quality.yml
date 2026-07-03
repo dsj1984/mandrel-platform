@@ -701,16 +701,38 @@ jobs:
 
       # ── Optional coverage floor (Story #109) ──────────────────────────────
       #
-      # Off by default: when `coverage-threshold` is 0 the step prints a skip
-      # note and exits 0, so non-adopters keep today's behaviour. When set, it
-      # reads the EXISTING `**/coverage/coverage-summary.json` (the same
-      # json-summary output uploaded below) and FAILS the unit job — which is a
-      # `needs:` of ci-required — when measured `total.<metric>.pct` is below the
-      # floor. A set floor with NO coverage summary also fails (never a silent
-      # pass on missing data). The logic is inlined as a dependency-free Node
-      # script so a consumer needs NO extra file in its checkout; the platform's
-      # own scripts/check-coverage-threshold.{mjs,test.mjs} are the
-      # self-test of the identical algorithm.
+      # Off by default: when `coverage-threshold` is 0 both steps are skipped,
+      # so non-adopters keep today's behaviour. When set, the gate reads the
+      # EXISTING `**/coverage/coverage-summary.json` (the same json-summary
+      # output uploaded below) and FAILS the unit job — which is a `needs:` of
+      # ci-required — when measured `total.<metric>.pct` is below the floor. A
+      # set floor with NO coverage summary also fails (never a silent pass on
+      # missing data).
+      #
+      # The gate logic is the platform's own unit-tested
+      # scripts/check-coverage-threshold.mjs, delivered via a sparse
+      # side-checkout of mandrel-platform at `github.job_workflow_sha` — the
+      # same resolved-ref mechanism the SAST vendored-ruleset step below uses
+      # (Story #230; replaces the inlined heredoc copy whose drift #163
+      # documented). A script fetched at `job_workflow_sha` is exactly as
+      # version-locked as inline YAML: the consumer always runs the script
+      # that shipped with the workflow version it pinned, with zero drift risk.
+      - name: Checkout gate scripts (mandrel-platform@resolved-sha)
+        if: ${{ inputs.coverage-threshold != 0 }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field that
+          # actionlint's pinned context type model does not list, so it is
+          # read through the `fromJSON(toJSON(github))` escape hatch (typed
+          # `any`) — same pattern as the SAST vendored-ruleset checkout.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-scripts
+          persist-credentials: false
+
       - name: Coverage threshold gate
         if: ${{ inputs.coverage-threshold != 0 }}
         shell: bash
@@ -718,87 +740,10 @@ jobs:
           COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
           COVERAGE_METRIC: ${{ inputs.coverage-metric }}
         run: |
-          node --input-type=module - <<'NODE'
-          import { readFileSync, readdirSync, existsSync } from "node:fs";
-          import { join, resolve } from "node:path";
-
-          const threshold = Number(process.env.COVERAGE_THRESHOLD || "0");
-          const metric = (process.env.COVERAGE_METRIC || "lines").trim().toLowerCase();
-          const VALID = ["lines", "statements", "functions", "branches"];
-          if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
-            console.error(`[coverage-threshold] ❌ invalid threshold "${process.env.COVERAGE_THRESHOLD}"`);
-            process.exit(1);
-          }
-          if (!VALID.includes(metric)) {
-            console.error(`[coverage-threshold] ❌ invalid metric "${metric}" (expected: ${VALID.join(", ")})`);
-            process.exit(1);
-          }
-
-          // Discover every coverage-summary.json regardless of its parent
-          // directory's name — matching a directory literally named
-          // `coverage/` (the single-workspace shape) AND per-workspace
-          // fan-out layouts like `coverage/web/coverage-summary.json`. The
-          // match condition is "this directory contains a coverage-summary.json
-          // file", not "this directory is named coverage". node_modules +
-          // dotted dirs (.git, .agents, …) are pruned.
-          //
-          // SSOT: this is an inlined port of findCoverageSummaries() in
-          // scripts/check-coverage-threshold.mjs (fixed in #158). It is
-          // intentionally duplicated so this reusable workflow stays
-          // dependency-free for consumer checkouts that have not adopted that
-          // script. Keep the two in sync — see #163 for the drift that a
-          // literal-`coverage`-name match caused here.
-          function find(root) {
-            const out = [];
-            const walk = (dir) => {
-              let entries;
-              try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
-              const f = join(dir, "coverage-summary.json");
-              if (existsSync(f)) out.push(f);
-              for (const e of entries) {
-                if (!e.isDirectory()) continue;
-                if (e.name === "node_modules" || e.name.startsWith(".")) continue;
-                walk(join(dir, e.name));
-              }
-            };
-            walk(resolve(root));
-            return out;
-          }
-
-          const files = find(process.cwd());
-          if (files.length === 0) {
-            console.error(
-              "[coverage-threshold] ❌ threshold is set but no coverage-summary.json " +
-              "was found — ensure the test step emits a json-summary reporter " +
-              "(a set floor must not pass on missing data)."
-            );
-            process.exit(1);
-          }
-
-          let failed = false;
-          for (const file of files) {
-            let pct = null;
-            try {
-              const total = JSON.parse(readFileSync(file, "utf8"))?.total;
-              const entry = total && total[metric];
-              if (entry && typeof entry.pct === "number" && Number.isFinite(entry.pct)) pct = entry.pct;
-            } catch { /* unreadable → treated as a failure below */ }
-            if (pct === null) {
-              console.error(`[coverage-threshold] ❌ ${file}: no "${metric}" total.pct in summary`);
-              failed = true;
-            } else if (pct >= threshold) {
-              console.log(`[coverage-threshold] ✅ ${file}: ${metric} ${pct}% (floor ${threshold}%)`);
-            } else {
-              console.error(`[coverage-threshold] ❌ ${file}: ${metric} ${pct}% < floor ${threshold}%`);
-              failed = true;
-            }
-          }
-          if (failed) {
-            console.error(`[coverage-threshold] ❌ ${metric} coverage is below the ${threshold}% floor.`);
-            process.exit(1);
-          }
-          console.log(`[coverage-threshold] ✅ ${metric} coverage meets the ${threshold}% floor.`);
-          NODE
+          set -euo pipefail
+          node _mandrel-platform-scripts/scripts/check-coverage-threshold.mjs \
+            --threshold "${COVERAGE_THRESHOLD}" \
+            --metric "${COVERAGE_METRIC}"
 
       - name: Upload test results
         if: always()
@@ -1032,11 +977,15 @@ jobs:
   # changed migration files, it does NOT introspect a live database, and it
   # does not touch the snapshot/rollback flow in deploy-cloudflare.yml.
   #
-  # The detection signal set is the same union codified — and unit-tested —
-  # in scripts/check-destructive-migration.mjs /
-  # scripts/check-destructive-migration.test.mjs on the platform repo; this job
-  # is the portable in-workflow implementation so a consumer needs no
-  # consumer-side script copy to inherit the gate.
+  # The gate logic is the platform's own unit-tested
+  # scripts/check-destructive-migration.mjs (see its sibling
+  # check-destructive-migration.test.mjs), delivered via a sparse
+  # side-checkout of mandrel-platform at `github.job_workflow_sha` — the same
+  # resolved-ref mechanism the SAST vendored-ruleset step below uses (Story
+  # #230; replaces a ~120-line in-workflow bash re-implementation of the same
+  # contract). A consumer still needs no consumer-side script copy to inherit
+  # the gate, and always runs the script that shipped with the workflow
+  # version it pinned.
   migration-guard:
     name: Destructive-migration guard
     if: ${{ inputs.enable-migration-guard }}
@@ -1060,173 +1009,60 @@ jobs:
           # Full history so the merge-base diff resolves the PR's changed set.
           fetch-depth: 0
 
-      # Resolve the changed migration files for this PR. On pull_request events
-      # we diff merge-base..head (the commits the PR introduces); on other
-      # events the guard has no PR context and is a no-op pass.
-      - name: Resolve changed migration files
-        id: changed
+      # Fetch the tested gate script at the exact SHA the caller's
+      # `uses: …/pr-quality.yml@<ref>` pin resolved to — the same
+      # `job_workflow_sha` side-checkout mechanism the SAST vendored-ruleset
+      # step uses (full rationale on that step, in the security job below).
+      - name: Checkout gate scripts (mandrel-platform@resolved-sha)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field that
+          # actionlint's pinned context type model does not list, so it is
+          # read through the `fromJSON(toJSON(github))` escape hatch (typed
+          # `any`) — same pattern as the SAST vendored-ruleset checkout.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-scripts
+          persist-credentials: false
+
+      # Resolve the PR's changed files and run the guard. On pull_request
+      # events we diff base..head (the commits the PR introduces); on other
+      # events the guard has no PR context and is a no-op pass. The script
+      # filters the changed set to migration files (`migration-guard-globs`
+      # plus an always-on `*.sql` tail), strips SQL/JS comments before
+      # matching, treats a DELETED migration file as destructive by itself,
+      # honours the override label, and writes the job-summary block — the
+      # exit code is the gate.
+      - name: Scan for destructive migrations
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GLOBS: ${{ inputs.migration-guard-globs }}
+          OVERRIDE_LABEL: ${{ inputs.migration-guard-label }}
+          # Exact-element match of the override label against the PR's label
+          # names — `contains()` on an ARRAY operand compares whole elements,
+          # so there is no substring-collision false positive here (that risk
+          # only exists for `contains()` on a string operand).
+          LABEL_PRESENT: ${{ contains(github.event.pull_request.labels.*.name, inputs.migration-guard-label) }}
         run: |
           set -euo pipefail
           if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
             echo "No pull_request context — destructive-migration guard is a no-op."
-            echo "migration_files=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # `--diff-filter` keeps Added/Copied/Modified/Renamed/Deleted; a
           # DELETED migration is itself a destructive signal, so we keep D.
-          # `mapfile` is a bash4+ builtin; self-hosted macOS runners ship
-          # Apple's frozen bash 3.2, so build the array with a portable
-          # `while read -r` loop instead (same pattern as the prior bash-3.2
-          # compatibility fixes for the Semgrep SAST tier).
-          changed=()
-          while IFS= read -r line; do
-            changed+=("$line")
-          done < <(git diff --name-only --diff-filter=ACMRD "${BASE_SHA}" "${HEAD_SHA}")
-
-          # Build a regex of `migration-guard-globs` (comma-separated), where
-          # `**`→`.*` and `*`→`[^/]*`, plus an always-on `\.sql$` tail. Only
-          # paths matching are inspected.
-          glob_to_re() {
-            local g="$1" out="" i c
-            for (( i=0; i<${#g}; i++ )); do
-              c="${g:$i:1}"
-              if [ "$c" = "*" ]; then
-                if [ "${g:$((i+1)):1}" = "*" ]; then
-                  out+=".*"; i=$((i+1))
-                  [ "${g:$((i+1)):1}" = "/" ] && i=$((i+1))
-                else
-                  out+="[^/]*"
-                fi
-              elif [[ "$c" =~ [.+^\$\(\)\|\[\]\\] ]]; then
-                out+="\\$c"
-              else
-                out+="$c"
-              fi
-            done
-            printf '^%s$' "$out"
-          }
-
-          migration_files=()
-          IFS=',' read -ra glob_arr <<< "${GLOBS}"
-          for f in "${changed[@]}"; do
-            [ -z "$f" ] && continue
-            keep=""
-            if [[ "$f" =~ \.sql$ ]]; then keep="yes"; fi
-            if [ -z "$keep" ]; then
-              for g in "${glob_arr[@]}"; do
-                g="$(echo "$g" | xargs)"   # trim
-                [ -z "$g" ] && continue
-                re="$(glob_to_re "$g")"
-                if [[ "$f" =~ $re ]]; then keep="yes"; break; fi
-              done
-            fi
-            [ -n "$keep" ] && migration_files+=("$f")
-          done
-
-          if [ ${#migration_files[@]} -eq 0 ]; then
-            echo "No changed migration files in this PR — guard passes."
-            echo "migration_files=" >> "$GITHUB_OUTPUT"
-          else
-            printf 'Changed migration files:\n'
-            printf '  %s\n' "${migration_files[@]}"
-            # Newline-join into a heredoc-delimited multiline output.
-            {
-              echo "migration_files<<__MIGEOF__"
-              printf '%s\n' "${migration_files[@]}"
-              echo "__MIGEOF__"
-            } >> "$GITHUB_OUTPUT"
+          args=(--changed-files - --migration-glob "${GLOBS}" --override-label "${OVERRIDE_LABEL}")
+          if [ "${LABEL_PRESENT}" = "true" ]; then
+            args+=(--label-present)
           fi
-
-      # Scan the changed migration files for a destructive signal. The signal
-      # set mirrors scripts/check-destructive-migration.mjs (DROP / ALTER … DROP
-      # / TRUNCATE / drizzle drop-ops), with SQL/JS comments stripped first so a
-      # commented-out DROP does not trip the guard. The override label, when
-      # present on the PR, downgrades a finding from a block to a warning.
-      - name: Scan for destructive migrations
-        if: ${{ steps.changed.outputs.migration_files != '' }}
-        shell: bash
-        env:
-          MIGRATION_FILES: ${{ steps.changed.outputs.migration_files }}
-          OVERRIDE_LABEL: ${{ inputs.migration-guard-label }}
-          # PR labels as a JSON array string. We parse + match exactly with jq
-          # (jq ships on ubuntu-latest and the self-hosted runners), avoiding
-          # both substring-collision false positives from a `contains()` match
-          # and the YAML fragility of an embedded-newline join.
-          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-        run: |
-          set -euo pipefail
-
-          # Strip `--`, `//`, and inline `/* */` comments from a line.
-          strip_comments() {
-            sed -E 's:/\*.*\*/: :g; s:--.*$::; s://.*$::'
-          }
-
-          findings=""
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            if [ ! -f "$f" ]; then
-              # Deleted migration file — destructive by itself.
-              findings+="  • ${f} → deleted migration file"$'\n'
-              continue
-            fi
-            sigs=""
-            stripped="$(strip_comments < "$f")"
-            echo "$stripped" | grep -qiE '\bALTER[[:space:]]+TABLE\b.*\bDROP\b'              && sigs+="ALTER TABLE … DROP; "
-            echo "$stripped" | grep -qiE '\bDROP[[:space:]]+(TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|DATABASE|TYPE|SEQUENCE|TRIGGER|FUNCTION)\b' && sigs+="DROP statement; "
-            echo "$stripped" | grep -qiE '\bTRUNCATE\b'                                      && sigs+="TRUNCATE; "
-            echo "$stripped" | grep -qE  '\.(dropTable|dropColumn|dropIndex|dropConstraint|dropForeignKey|dropPrimaryKey|dropUnique)[[:space:]]*\(' && sigs+="drizzle destructive op; "
-            [ -n "$sigs" ] && findings+="  • ${f} → ${sigs%; }"$'\n'
-          done <<< "${MIGRATION_FILES}"
-
-          if [ -z "$findings" ]; then
-            echo "✅ No destructive migration detected in the changed files."
-            exit 0
-          fi
-
-          # A destructive signal is present. Honour the override label: exact
-          # match of OVERRIDE_LABEL against the PR's label-name array.
-          if printf '%s' "${PR_LABELS_JSON}" \
-            | jq -e --arg l "${OVERRIDE_LABEL}" 'any(.[]?; . == $l)' >/dev/null 2>&1; then
-            label_present="yes"
-          else
-            label_present="no"
-          fi
-
-          echo "Destructive migration signal(s):"
-          printf '%s' "$findings"
-
-          if [ "$label_present" = "yes" ]; then
-            echo "⚠️ Override label '${OVERRIDE_LABEL}' is applied — allowing the destructive migration."
-            {
-              echo "### Destructive-migration guard — ALLOWED via override"
-              echo ""
-              echo "Override label \`${OVERRIDE_LABEL}\` is present. Findings:"
-              echo ""
-              printf '%s' "$findings"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          {
-            echo "### ❌ Destructive-migration guard — BLOCKED"
-            echo ""
-            echo "A destructive migration was detected and the override label"
-            echo "\`${OVERRIDE_LABEL}\` is NOT applied. Findings:"
-            echo ""
-            printf '%s' "$findings"
-            echo ""
-            echo "A reviewer must apply the \`${OVERRIDE_LABEL}\` label to"
-            echo "acknowledge the destructive change, then re-run this check."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "::error::Destructive migration detected without the '${OVERRIDE_LABEL}' override label." >&2
-          exit 1
+          git diff --name-only --diff-filter=ACMRD "${BASE_SHA}" "${HEAD_SHA}" \
+            | node _mandrel-platform-scripts/scripts/check-destructive-migration.mjs "${args[@]}"
 
       # Opt-in fail-fast (Story #223) — replicated cancel step; see the lint
       # tier's step of the same name for the full rationale (must be the LAST

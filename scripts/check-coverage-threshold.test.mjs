@@ -481,63 +481,46 @@ test("formatVerdict renders a skip line for the disabled gate", () => {
 });
 
 // ---------------------------------------------------------------------------
-// pr-quality.yml Coverage threshold gate — inline step regression (#163)
+// pr-quality.yml Coverage threshold gate — workflow-step parity (#163, #230)
 //
-// The workflow step embeds its OWN copy of the discovery logic (it must stay
-// dependency-free for consumer checkouts that have not adopted
-// check-coverage-threshold.mjs). #158 fixed only the standalone script; this
-// suite's `findCoverageSummaries` tests above cannot catch a regression in the
-// workflow file's embedded JS. These tests extract that embedded node script
-// straight out of pr-quality.yml and run it against real fixture trees, so the
-// exact #163 bug (matching a directory literally named `coverage`, missing
-// `coverage/<workspace>/coverage-summary.json`) cannot survive a refactor.
+// The workflow's "Coverage threshold gate" step no longer embeds a copy of
+// this script (Story #230): it sparse-side-checkouts mandrel-platform at
+// `github.job_workflow_sha` into `_mandrel-platform-scripts/` and runs
+// `scripts/check-coverage-threshold.mjs` directly. These tests exercise that
+// exact invocation shape — the real script, run from the side-checkout path,
+// with the workflow's `--threshold` / `--metric` args and the consumer
+// checkout as cwd — against real fixture trees, so the original #163 bug
+// (matching a directory literally named `coverage`, missing
+// `coverage/<workspace>/coverage-summary.json`) still cannot regress, and a
+// drift between "what the workflow runs" and "what these tests run" is
+// structurally impossible.
 // ---------------------------------------------------------------------------
 
-// Pull the embedded `node --input-type=module - <<'NODE' … NODE` script body
-// out of the "Coverage threshold gate" step, de-indenting the YAML block
-// scalar so it runs as a standalone ES module.
-function extractGateScript() {
-  const yaml = readFileSync(
-    join(__dirname, "..", ".github", "workflows", "pr-quality.yml"),
-    "utf8",
-  );
-  const lines = yaml.split(/\r?\n/);
-  const startIdx = lines.findIndex((l) =>
-    /node --input-type=module - <<'NODE'\s*$/.test(l),
-  );
-  assert.ok(
-    startIdx !== -1,
-    "expected an embedded `<<'NODE'` heredoc in pr-quality.yml",
-  );
-  // The heredoc opener carries the block-scalar indent; every body line shares
-  // at least that indent, and the closing `NODE` sentinel sits at the same
-  // indent. Strip it uniformly.
-  const indent = lines[startIdx].match(/^(\s*)/)[1];
-  const body = [];
-  for (let i = startIdx + 1; i < lines.length; i += 1) {
-    if (lines[i].trim() === "NODE") return body.join("\n");
-    body.push(
-      lines[i].startsWith(indent) ? lines[i].slice(indent.length) : lines[i],
-    );
-  }
-  throw new Error("unterminated `NODE` heredoc in pr-quality.yml gate step");
-}
+const WORKFLOW_FILE = join(__dirname, "..", ".github", "workflows", "pr-quality.yml");
+const GATE_SCRIPT = join(__dirname, "check-coverage-threshold.mjs");
 
-// Run the extracted gate script with COVERAGE_THRESHOLD / COVERAGE_METRIC set
-// and cwd pointed at `treeRoot`. Returns { status, stdout, stderr }.
+// Mirror the workflow step: materialize the side-checkout layout
+// (`_mandrel-platform-scripts/scripts/check-coverage-threshold.mjs`) inside
+// the fixture tree, then run the script exactly as the workflow does.
 function runGateStep(treeRoot, { threshold = "0", metric = "lines" } = {}) {
-  const scriptPath = join(treeRoot, "__gate-step.mjs");
-  writeFileSync(scriptPath, extractGateScript());
+  const sideCheckout = join(treeRoot, "_mandrel-platform-scripts", "scripts");
+  mkdirSync(sideCheckout, { recursive: true });
+  writeFileSync(
+    join(sideCheckout, "check-coverage-threshold.mjs"),
+    readFileSync(GATE_SCRIPT, "utf8"),
+  );
   try {
-    const stdout = execFileSync("node", [scriptPath], {
-      cwd: treeRoot,
-      env: {
-        ...process.env,
-        COVERAGE_THRESHOLD: threshold,
-        COVERAGE_METRIC: metric,
-      },
-      encoding: "utf8",
-    });
+    const stdout = execFileSync(
+      "node",
+      [
+        join("_mandrel-platform-scripts", "scripts", "check-coverage-threshold.mjs"),
+        "--threshold",
+        threshold,
+        "--metric",
+        metric,
+      ],
+      { cwd: treeRoot, env: { ...process.env }, encoding: "utf8" },
+    );
     return { status: 0, stdout, stderr: "" };
   } catch (err) {
     return {
@@ -547,6 +530,28 @@ function runGateStep(treeRoot, { threshold = "0", metric = "lines" } = {}) {
     };
   }
 }
+
+test("pr-quality.yml runs the side-checkout script — no inline coverage heredoc remains (#230)", () => {
+  const yaml = readFileSync(WORKFLOW_FILE, "utf8");
+  // The gate step invokes the platform script from the side-checkout…
+  assert.match(
+    yaml,
+    /node _mandrel-platform-scripts\/scripts\/check-coverage-threshold\.mjs/,
+    "the Coverage threshold gate must run scripts/check-coverage-threshold.mjs from the side-checkout",
+  );
+  // …and the migration guard does the same.
+  assert.match(
+    yaml,
+    /node _mandrel-platform-scripts\/scripts\/check-destructive-migration\.mjs/,
+    "the migration guard must run scripts/check-destructive-migration.mjs from the side-checkout",
+  );
+  // The old inlined coverage-discovery copy (the #163 drift class) is gone.
+  assert.doesNotMatch(
+    yaml,
+    /findCoverageSummaries|intentionally duplicated|keep the two in sync/i,
+    "no inlined copy of the coverage gate may remain in pr-quality.yml",
+  );
+});
 
 test("pr-quality gate step discovers a per-workspace coverage/<ws>/ layout (#163 regression)", () => {
   const dir = mkdtempSync(join(tmpdir(), "gate-step-fanout-"));

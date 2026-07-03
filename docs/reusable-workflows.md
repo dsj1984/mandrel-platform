@@ -294,6 +294,18 @@ single-source-of-truth primitive already used by `deploy-cloudflare.yml`'s
 `deploy-summary` job (Story #110) — so "which workflow ran" and "which
 ruleset it scanned with" can never drift apart.
 
+The same side-checkout mechanism also delivers `pr-quality.yml`'s gate
+*scripts* (Story #230): the
+[coverage threshold gate](#coverage-threshold-gate-coverage-threshold) and the
+[destructive-migration guard](#destructive-migration-guard-enable-migration-guard)
+each sparse-checkout `scripts/` at `github.job_workflow_sha` (into
+`_mandrel-platform-scripts/`) and run the platform's unit-tested
+`check-coverage-threshold.mjs` / `check-destructive-migration.mjs` directly,
+instead of carrying inline re-implementations in the workflow YAML. A script
+fetched at the resolved workflow SHA is exactly as version-locked as inline
+YAML — the consumer always runs the script that shipped with the workflow
+version it pinned — with zero drift risk and real unit-test coverage.
+
 **Bumping the ruleset is a reviewable PR**, mirroring the
 [action-pin ratchet](#the-action-pin-ratchet)'s "bump is a PR" discipline and
 the [OSV-scanner version pin](#osv-advisory-tier-enable-osv-scan):
@@ -883,12 +895,15 @@ signal on changed files is sufficient for the gate.
 > `migration-guard-globs` only when your repo uses a different label name or
 > migration directory layout.
 
-> **Reference detection contract.** The exact destructive-signal set is
-> codified and unit-tested in
-> `scripts/check-destructive-migration.mjs` /
-> `scripts/check-destructive-migration.test.mjs` on the platform repo. The
-> in-workflow job is the portable implementation of that same contract, so an
-> opt-in consumer needs **no** consumer-side script copy to inherit the gate.
+> **Detection contract.** The destructive-signal set is codified and
+> unit-tested in `scripts/check-destructive-migration.mjs` /
+> `scripts/check-destructive-migration.test.mjs` on the platform repo, and the
+> `migration-guard` job runs that script **directly** — fetched via the
+> [`job_workflow_sha` side-checkout](#sast-ruleset-provenance-and-update-process)
+> mechanism, so the
+> consumer always runs the script version that shipped with the workflow it
+> pinned. An opt-in consumer needs **no** consumer-side script copy to inherit
+> the gate.
 
 ### Coverage threshold gate (`coverage-threshold`)
 
@@ -909,7 +924,10 @@ unchanged).
   output — specifically `coverage-summary.json` (the standard Istanbul / c8 /
   vitest `json-summary` reporter). Your test step must already emit that file
   (the same one uploaded as the unit artifact); no extra dependency or
-  consumer-side script is required.
+  consumer-side script is required. The gate logic itself is the platform's
+  unit-tested `scripts/check-coverage-threshold.mjs`, fetched via the
+  [`job_workflow_sha` side-checkout](#sast-ruleset-provenance-and-update-process)
+  mechanism — nothing is added to your repo.
 - **Fails closed on missing data.** If the floor is set but **no**
   `coverage-summary.json` is found under any `**/coverage/` directory, the gate
   **fails** rather than passing silently — a set floor must never be a no-op
