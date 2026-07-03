@@ -927,6 +927,19 @@ Do **not** register the individual tier jobs (`Lint & format`, `Typecheck`,
 `Unit (1/3)`, …) as required — their names change with shard count and toggle
 state, which is exactly the drift `ci-required` exists to absorb.
 
+The aggregator is **self-maintaining**: it derives its verdict from
+`${{ toJSON(needs) }}` (iterated with `jq`), so the job's `needs:` array is
+the single source of truth — adding a tier to `needs:` is the only edit
+required to include it in the gate. There is no per-tier env/loop bookkeeping
+to keep in sync, and a regression test
+(`scripts/check-ci-required-aggregator.test.mjs`) asserts that no hardcoded
+tier-name list reappears and that the `pr-quality.yml` / `ci.yml` copies stay
+textually identical. Semantics are frozen: pass when every needed job ends
+`success` or `skipped`; fail on anything else, **including `cancelled`**
+(load-bearing for the fail-fast design — a tier cancelled by a sibling's
+failure must not read as green). Failure output names each failing tier as
+`tier(result)`.
+
 ### Canonical caller naming (the `ci.yml` / `CI` / `ci` triplet)
 
 `ci-required` fixes the required-**check** name, but it does not fix the
@@ -1615,7 +1628,17 @@ the version from `package.json` and writes `CHANGELOG.md`.
 | `release-type`  | string | `'node'` | release-please strategy. `'node'` reads/writes `package.json` + `CHANGELOG.md`. Use `'simple'` for a non-Node version file, etc. Ignored when `config-file` is set. |
 | `config-file`   | string | `''`     | Path to a release-please config JSON. Omit for single-package mode; supply for a monorepo or to pin `changelog-sections` to the platform's `git-conventions.md` mapping. |
 | `manifest-file` | string | `''`     | Path to the release-please manifest JSON. Required when `config-file` is set (config + manifest are a matched pair); ignored otherwise.                       |
-| `package-name`  | string | `''`     | Package name used in the release PR title and tag. Defaults to empty (the `node` type reads it from `package.json`); set explicitly for non-Node types.       |
+
+> **Need an explicit package name?** There is no `package-name` input.
+> `googleapis/release-please-action` v4+ no longer declares one (naming moved
+> into the config file), so a forwarded `package-name` was a silent no-op.
+> Route per-package naming through `config-file` mode instead: set
+> `package-name` on the package entry in your `release-please-config.json`
+> (e.g. `"packages": { ".": { "package-name": "my-lib" } }`) and pass
+> `config-file` + `manifest-file`. **Migration note:** any caller still
+> passing `package-name:` must drop the line — GitHub rejects undeclared
+> inputs at `workflow_call` time (the value itself changed nothing, since the
+> action already ignored it).
 
 ### Secrets
 
@@ -1739,7 +1762,7 @@ and matches how mandrel-platform versions itself
 `0.x`** — i.e. behave like a post-1.0 repo before actually cutting `1.0.0` —
 sets `bump-minor-pre-major: true` (and optionally
 `bump-patch-for-minor-pre-major: true`) in its own `config-file`; the
-`release-type`/`package-name` single-package inputs on this workflow don't
+`release-type` single-package input on this workflow doesn't
 expose those flags directly, so a consumer that needs them supplies
 `config-file` + `manifest-file` instead of the bare `release-type` default.
 
