@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.21.0...mandrel-platform-v0.21.1) (2026-07-03)
+
+
+### Fixed
+
+* **ci:** bump composite-action pins to v0.21.0 — activate require-wrangler + gitleaks-scan (refs [#252](https://github.com/dsj1984/mandrel-platform/issues/252)) ([#257](https://github.com/dsj1984/mandrel-platform/issues/257)) ([eb0fe4d](https://github.com/dsj1984/mandrel-platform/commit/eb0fe4d91e3fed9c61a38c58007dd58825d33bf5))
+* **release:** add force_publish recovery lever for interrupted npm publish ([#255](https://github.com/dsj1984/mandrel-platform/issues/255)) ([5f25f20](https://github.com/dsj1984/mandrel-platform/commit/5f25f200b144eb332401d0eeb32de8f40240ad4f))
+
 ## [0.21.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.20.1...mandrel-platform-v0.21.0) (2026-07-03)
 
 
