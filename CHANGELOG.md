@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.21.1...mandrel-platform-v0.22.0) (2026-07-03)
+
+
+### Added
+
+* **ci:** scheduled runner-fleet health monitor + offline alerting (refs [#258](https://github.com/dsj1984/mandrel-platform/issues/258)) ([#259](https://github.com/dsj1984/mandrel-platform/issues/259)) ([17971f3](https://github.com/dsj1984/mandrel-platform/commit/17971f3f5051fd460a6de042bfb9f4716fbfe7dd))
+
 ## [0.21.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.21.0...mandrel-platform-v0.21.1) (2026-07-03)
 
 
