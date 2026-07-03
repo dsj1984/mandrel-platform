@@ -1,6 +1,7 @@
 # Scheduled runner-fleet health monitor + offline alerting (Story #258).
 #
-# All nine self-hosted runners across the fleet (domio, athportal, swarm-os)
+# All nine self-hosted runners across the fleet (domio, athportal, and the
+# unrostered Beestera/swarm-os — see the roster JSON's $comment_swarm_os)
 # are co-resident on ONE operator Mac (2026-07-03 runner audit, repo-ops
 # matrix §1a). If that host sleeps, reboots for an OS update, fills its disk,
 # or a launchd service dies, every consumer's CI and deploy-trigger jobs
@@ -10,14 +11,14 @@
 # runner can silently stall staging.
 #
 # Modeled on pin-drift.yml: a scheduled, GitHub-hosted (ubuntu-latest)
-# cross-consumer workflow that reads all three repos via
+# cross-consumer workflow that reads the rostered repos via
 # secrets.PIN_DRIFT_TOKEN (falling back to github.token) and renders a
 # human-readable dashboard on GITHUB_STEP_SUMMARY. Two differences: this runs
 # FREQUENTLY (~every 15 min, not weekly) and it ALERTS (not just dashboards) —
-# it exits non-zero on any degraded repo (native GitHub failed-workflow
-# notification) and upserts/auto-closes a deduped tracking issue
-# (`Runner fleet: <repo> degraded`) in this repo. It stays GitHub-hosted
-# deliberately so it keeps running when the Mac is down.
+# it exits non-zero on any degraded repo, so GitHub's native failed-workflow
+# notification fires. That is the only alert channel; no tracking issues are
+# filed. It stays GitHub-hosted deliberately so it keeps running when the Mac
+# is down.
 #
 # The gate script (scripts/check-runner-health.mjs) reads each repo's live
 # self-hosted runner list AND its queued/waiting workflow runs over the
@@ -30,7 +31,7 @@
 #
 # Alert-only by design (Story #258 Out of Scope): no host-side remediation,
 # no host disk-usage monitoring, no external paging integration beyond the
-# native failed-workflow notification + issue upsert.
+# native failed-workflow notification.
 #
 # SHA-pinned third-party actions.
 name: Runner Fleet Health
@@ -45,7 +46,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: runner-fleet-health-${{ github.ref }}

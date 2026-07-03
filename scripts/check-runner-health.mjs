@@ -27,14 +27,10 @@
  *      (a wedged fleet accepts jobs into the queue but never claims them).
  *   4. Renders a per-repo dashboard to `GITHUB_STEP_SUMMARY`.
  *
- * Alerting (Story #258 acceptance criteria — no external dependency,
- * on-ethos default):
- *   - The CLI exits non-zero when any repo is unhealthy, so GitHub's native
- *     failed-workflow notification fires.
- *   - `syncTrackingIssues` upserts a single deduped tracking issue per
- *     unhealthy repo (`Runner fleet: <repo> degraded`) in the mandrel-platform
- *     repo (this repo — the fleet's operator lives here, not in each
- *     consumer), and auto-closes it when health recovers.
+ * Alerting (no external dependency, on-ethos default): the CLI exits
+ * non-zero when any repo is unhealthy, so GitHub's native failed-workflow
+ * notification fires. That is the only alert channel — no tracking issues
+ * are filed.
  *
  * GitHub access is via the `gh` CLI (`gh api`), through the same injectable
  * `runGh` seam `check-pin-drift.mjs` uses (`scripts/lib/gh-json.mjs`), so the
@@ -44,7 +40,6 @@
  *   node scripts/check-runner-health.mjs
  *   node scripts/check-runner-health.mjs --config scripts/runner-fleet-consumers.json
  *   node scripts/check-runner-health.mjs --json          # machine-readable envelope
- *   node scripts/check-runner-health.mjs --no-issues      # skip the tracking-issue upsert (local/dry runs)
  *
  * Exit codes:
  *   0 — every repo healthy.
@@ -66,13 +61,11 @@ import { defaultGhRunner, ghApiJson, isNotFound } from "./lib/gh-json.mjs";
 
 /**
  * @param {string[]} argv
- * @returns {{ config: string, json: boolean, noIssues: boolean, trackingRepo: string | null }}
+ * @returns {{ config: string, json: boolean }}
  */
 export function parseArgv(argv = []) {
   let config = "scripts/runner-fleet-consumers.json";
   let json = false;
-  let noIssues = false;
-  let trackingRepo = null;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--config") {
@@ -83,17 +76,9 @@ export function parseArgv(argv = []) {
       }
     } else if (a === "--json") {
       json = true;
-    } else if (a === "--no-issues") {
-      noIssues = true;
-    } else if (a === "--tracking-repo") {
-      const next = argv[i + 1];
-      if (next && !next.startsWith("--")) {
-        trackingRepo = next;
-        i += 1;
-      }
     }
   }
-  return { config, json, noIssues, trackingRepo };
+  return { config, json };
 }
 
 // ---------------------------------------------------------------------------
@@ -284,20 +269,8 @@ export function renderReport(report) {
   return out.join("\n");
 }
 
-/**
- * Build the tracking-issue title for a degraded repo (Story #258). Kept as a
- * pure helper so the upsert search and the create/close paths agree on the
- * exact dedup key.
- *
- * @param {string} repoName
- * @returns {string}
- */
-export function trackingIssueTitle(repoName) {
-  return `Runner fleet: ${repoName} degraded`;
-}
-
 // ---------------------------------------------------------------------------
-// GitHub access — runners + workflow runs + tracking-issue upsert.
+// GitHub access — runners + workflow runs.
 // ---------------------------------------------------------------------------
 
 /**
@@ -353,131 +326,6 @@ export function fetchQueuedRuns(repo, runGh) {
     ? waitingObj.workflow_runs
     : [];
   return [...queued, ...waiting];
-}
-
-/**
- * Search the tracking repo for an existing OPEN issue matching the degraded
- * repo's dedup title. Returns the issue number, or null when none exists.
- *
- * @param {string} trackingRepo  "owner/name" of the repo tracking issues live in.
- * @param {string} title
- * @param {(args: string[]) => string} runGh
- * @returns {number | null}
- */
-export function findOpenTrackingIssue(trackingRepo, title, runGh) {
-  const q = `repo:${trackingRepo} is:issue is:open in:title "${title}"`;
-  let obj;
-  try {
-    obj = ghApiJson(`search/issues?q=${encodeURIComponent(q)}`, runGh);
-  } catch (err) {
-    if (isNotFound(err)) return null;
-    throw err;
-  }
-  const items = Array.isArray(obj?.items) ? obj.items : [];
-  const exact = items.find((it) => it.title === title);
-  return exact ? exact.number : null;
-}
-
-/**
- * Search the tracking repo for an existing OPEN issue and close it (recovery
- * path). No-op when none is open.
- *
- * @param {string} trackingRepo
- * @param {string} title
- * @param {(args: string[]) => string} runGh
- * @returns {{ action: "closed" | "noop", issue: number | null }}
- */
-export function closeTrackingIssueIfOpen(trackingRepo, title, runGh) {
-  const issue = findOpenTrackingIssue(trackingRepo, title, runGh);
-  if (issue === null) return { action: "noop", issue: null };
-  runGh([
-    "api",
-    "-X",
-    "PATCH",
-    `repos/${trackingRepo}/issues/${issue}`,
-    "-f",
-    "state=closed",
-  ]);
-  runGh([
-    "api",
-    `repos/${trackingRepo}/issues/${issue}/comments`,
-    "-f",
-    "body=✅ Runner fleet recovered — auto-closing. See the latest `runner-fleet-health.yml` run for the healthy dashboard.",
-  ]);
-  return { action: "closed", issue };
-}
-
-/**
- * Upsert the deduped tracking issue for a degraded repo: update the body on an
- * existing open issue, or create a new one.
- *
- * @param {string} trackingRepo
- * @param {string} repoName
- * @param {string} bodyMarkdown
- * @param {(args: string[]) => string} runGh
- * @returns {{ action: "created" | "updated", issue: number }}
- */
-export function upsertTrackingIssue(trackingRepo, repoName, bodyMarkdown, runGh) {
-  const title = trackingIssueTitle(repoName);
-  const existing = findOpenTrackingIssue(trackingRepo, title, runGh);
-  if (existing !== null) {
-    runGh([
-      "api",
-      "-X",
-      "PATCH",
-      `repos/${trackingRepo}/issues/${existing}`,
-      "-f",
-      `body=${bodyMarkdown}`,
-    ]);
-    return { action: "updated", issue: existing };
-  }
-  const raw = runGh([
-    "api",
-    `repos/${trackingRepo}/issues`,
-    "-X",
-    "POST",
-    "-f",
-    `title=${title}`,
-    "-f",
-    `body=${bodyMarkdown}`,
-    "-f",
-    "labels[]=ops::runner-fleet",
-  ]);
-  const created = JSON.parse(raw);
-  return { action: "created", issue: created.number };
-}
-
-/**
- * Sync tracking issues for the fleet: upsert one for every unhealthy repo,
- * auto-close the ones for repos that recovered.
- *
- * @param {{ results: Array<{ name: string, repo: string, healthy?: boolean, error?: string }> }} report
- * @param {string} trackingRepo
- * @param {(args: string[]) => string} runGh
- * @returns {Array<{ repo: string, action: string, issue: number | null }>}
- */
-export function syncTrackingIssues(report, trackingRepo, runGh) {
-  const actions = [];
-  for (const r of report.results) {
-    const title = trackingIssueTitle(r.name);
-    if (r.error || r.healthy === false) {
-      const body = [
-        `Auto-filed by \`runner-fleet-health.yml\` (Story #258).`,
-        "",
-        r.error
-          ? `Health check errored for \`${r.repo}\`: ${r.error}`
-          : renderReport({ results: [r] }),
-        "",
-        "See `templates/runbooks/runner-fleet-health.md` for the operator response.",
-      ].join("\n");
-      const result = upsertTrackingIssue(trackingRepo, r.name, body, runGh);
-      actions.push({ repo: r.name, ...result });
-    } else {
-      const result = closeTrackingIssueIfOpen(trackingRepo, title, runGh);
-      actions.push({ repo: r.name, ...result });
-    }
-  }
-  return actions;
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +404,6 @@ export function hasUnhealthy(report) {
  *   runGh?: (args: string[]) => string,
  *   summaryPath?: string | undefined,
  *   nowMs?: number,
- *   trackingRepo?: string,
  * }} [opts]
  * @returns {number} exit code
  */
@@ -568,12 +415,9 @@ export function runCli({
   runGh = defaultGhRunner,
   summaryPath = process.env.GITHUB_STEP_SUMMARY,
   nowMs = Date.now(),
-  trackingRepo = process.env.GITHUB_REPOSITORY || "dsj1984/mandrel-platform",
 } = {}) {
-  const { config: configRel, json, noIssues, trackingRepo: cliTrackingRepo } =
-    parseArgv(argv);
+  const { config: configRel, json } = parseArgv(argv);
   const configPath = resolve(cwd, configRel);
-  const effectiveTrackingRepo = cliTrackingRepo || trackingRepo;
 
   let config;
   try {
@@ -607,16 +451,6 @@ export function runCli({
           `[runner-health] ⚠ could not write job summary: ${err instanceof Error ? err.message : String(err)}\n`,
         );
       }
-    }
-  }
-
-  if (!noIssues) {
-    try {
-      syncTrackingIssues(report, effectiveTrackingRepo, runGh);
-    } catch (err) {
-      stderr.write(
-        `[runner-health] ⚠ tracking-issue sync failed: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
     }
   }
 

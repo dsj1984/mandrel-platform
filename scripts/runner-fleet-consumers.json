@@ -1,5 +1,6 @@
 {
-  "$comment": "Data-driven expected roster for scripts/check-runner-health.mjs (Story #258). Each entry is one repo whose self-hosted runner fleet the scheduled runner-fleet-health.yml workflow monitors. Adding/removing a runner needs only an edit here — the checker reads GET /repos/{owner}/{repo}/actions/runners and compares live status against `expectedCount` + `labels`. All nine runners are co-resident on one operator Mac (2026-07-03 runner audit, repo-ops matrix §1a); if that host sleeps, reboots, fills its disk, or a launchd service dies, every listed repo's CI silently queues with no alert until this monitor catches it.",
+  "$comment": "Data-driven expected roster for scripts/check-runner-health.mjs (Story #258). Each entry is one repo whose self-hosted runner fleet the scheduled runner-fleet-health.yml workflow monitors. Adding/removing a runner needs only an edit here — the checker reads GET /repos/{owner}/{repo}/actions/runners and compares live status against `expectedCount` + `labels`. All nine runners (including Beestera/swarm-os's three) are co-resident on one operator Mac (2026-07-03 runner audit, repo-ops matrix §1a); if that host sleeps, reboots, fills its disk, or a launchd service dies, every listed repo's CI silently queues with no alert until this monitor catches it.",
+  "$comment_swarm_os": "Beestera/swarm-os is deliberately NOT listed: no dsj1984-owned PAT can read another org's runner API (fine-grained PATs are bound to one resource owner; the Beestera org rejects classic PATs), so its row would permanently false-positive as 0/3 degraded. Host-level coverage is retained regardless — its runners share the Mac with the rows below, so a wedged host still trips domio/athportal. What is NOT covered: swarm-os's individual launchd services dying while the host stays healthy, and its stale-queue check. Re-add the entry if a Beestera-owned credential (fine-grained PAT or GitHub App) plus per-repo token support ever lands.",
   "$comment_staleQueuedMinutes": "A queued/waiting workflow run older than this many minutes with no online runner matching its labels is flagged as a queue-staleness signal (optional per-repo override via `staleQueuedMinutes`).",
   "defaultStaleQueuedMinutes": 20,
   "repos": [
@@ -14,12 +15,6 @@
       "repo": "dsj1984/athportal",
       "expectedCount": 3,
       "labels": ["self-hosted", "macOS", "ARM64", "athportal-runner"]
-    },
-    {
-      "name": "swarm-os",
-      "repo": "Beestera/swarm-os",
-      "expectedCount": 3,
-      "labels": ["self-hosted", "macOS", "ARM64", "swarm-os-runner"]
     }
   ]
 }
