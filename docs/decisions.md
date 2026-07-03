@@ -33,6 +33,29 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-07-03 — Runner-fleet roster: drop `Beestera/swarm-os` (cross-org token boundary)
+
+**Context.** The runner-fleet monitor reads each rostered repo's runner API
+with the single `PIN_DRIFT_TOKEN` secret. That token can now see the
+`dsj1984` repos (Administration:read + Actions:read), but no `dsj1984`-owned
+token can reach `Beestera/swarm-os`: a fine-grained PAT is bound to one
+resource owner, and the Beestera org rejects classic PATs. The swarm-os row
+therefore 404s and permanently false-positives as `0/3` degraded, failing
+every 15-minute run.
+
+**Decision.** Remove `Beestera/swarm-os` from
+`scripts/runner-fleet-consumers.json` rather than plumb per-repo tokens or a
+GitHub App. Host-level coverage survives: all nine runners (swarm-os's three
+included) are co-resident on the one operator Mac, so a wedged host still
+trips the `domio`/`athportal` rows.
+
+**Consequences.** The monitor can go green and a failure means something
+again. Unwatched: a swarm-os-only launchd service death while the host stays
+healthy, and swarm-os queue staleness. Re-adding the row requires a
+Beestera-owned credential (org-approved fine-grained PAT or a GitHub App)
+plus per-repo token support in `check-runner-health.mjs` — recorded in the
+roster JSON's `$comment_swarm_os`.
+
 ## 2026-07-03 — Runner-fleet alerting: drop the tracking-issue upsert, keep only the native failed-workflow notification
 
 **Context.** The initial runner-fleet monitor (below) alerted through two

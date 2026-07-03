@@ -23,6 +23,15 @@ runner") with no alert. Nothing else watches this:
   stall staging indefinitely — no failed job, no notification, just a queue
   that never drains.
 
+> **Roster note:** `Beestera/swarm-os` is monitored only *indirectly*. No
+> `dsj1984`-owned token can read another org's runner API (fine-grained PATs
+> are bound to one resource owner; the Beestera org rejects classic PATs), so
+> its roster entry would permanently false-positive as `0/3` degraded.
+> Because its runners share the Mac with the rostered repos, a wedged
+> **host** still trips the `domio`/`athportal` rows; what goes unwatched is a
+> swarm-os-only launchd service death and its stale queue. See
+> `$comment_swarm_os` in `scripts/runner-fleet-consumers.json`.
+
 `runner-fleet-health.yml` is the standing check that catches this fast.
 
 ## What it checks
@@ -65,8 +74,7 @@ provisions (`secrets.PIN_DRIFT_TOKEN`), falling back to the built-in
 access to the workflow's own repo — cross-repo rows then surface as `⚠️
 error` rather than hard-failing this repo's own row).
 
-For the runner reads, `PIN_DRIFT_TOKEN` must carry, on all three consumer
-repos:
+For the runner reads, `PIN_DRIFT_TOKEN` must carry, on every rostered repo:
 
 - **Administration: read** — required by `GET .../actions/runners` (the
   self-hosted runner list is an admin-surface endpoint; `actions:read` is
@@ -75,10 +83,11 @@ repos:
   check).
 
 Resource-owner caveat: a fine-grained PAT is bound to a **single** resource
-owner, so one fine-grained PAT cannot cover both `dsj1984/*` and
-`Beestera/swarm-os`. To cover the whole roster with the one secret the
-workflow reads, use a classic PAT with `repo` scope from an account with
-admin access to all three repos.
+owner, and the Beestera org rejects classic PATs — which is exactly why
+`Beestera/swarm-os` is off the roster (see the roster note above). Every
+rostered repo must be readable by the ONE token this workflow gets; a repo
+the token cannot see 404s and false-positives as degraded, so extend the
+roster only together with a credential that covers the new repo.
 
 When the token lacks visibility, GitHub returns **404** (not 403) and the
 script treats the empty runner list as a real shortfall — the repo's row
