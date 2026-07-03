@@ -41,6 +41,12 @@ name: release-automation
 on:
   workflow_call:
     inputs:
+      runner:
+        description: >
+          Runs-on label for the release-please job. Default 'ubuntu-latest'.
+        required: false
+        type: string
+        default: 'ubuntu-latest'
       target-branch:
         description: >
           Branch release-please maintains the release PR against. Defaults to
@@ -112,7 +118,7 @@ permissions:
 jobs:
   release-please:
     name: Run release-please
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: write
       pull-requests: write

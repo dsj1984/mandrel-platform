@@ -11,6 +11,14 @@
 #         migrate: true
 #       secrets: inherit
 #
+# Runner (Story #222): every job's `runs-on:` reads the optional `runner`
+# input (default 'ubuntu-latest'), mirroring secret-scan-push.yml /
+# pr-quality.yml. EXCEPTION: the secret-isolation-audit job's gitleaks
+# download step always fetches the linux_x64 asset regardless of `runner` —
+# it does not mirror secret-scan-push.yml's darwin/linux arm64/x64 asset
+# map. See that job's inline comment for the rationale; a `runner` override
+# to a non-Linux self-hosted label will need that map added first.
+#
 # Defence-in-depth layers (in execution order):
 #   0. environments-isolation-audit — opt-in (enable-environments-isolation-audit),
 #                              audits GitHub Environments' deployment branch
@@ -96,6 +104,17 @@ on:
         description: 'Target Cloudflare environment (e.g. staging, production)'
         required: true
         type: string
+      runner:
+        description: >
+          Runs-on label for every job in this workflow. Single string (e.g.
+          'ubuntu-latest') or a JSON-encoded label array string (e.g.
+          '["self-hosted","domio-runner"]'). Defaults to ubuntu-latest. NOTE:
+          the secret-isolation-audit job's gitleaks download always resolves
+          the linux_x64 asset regardless of this input — see that job's
+          inline comment for the reason.
+        required: false
+        type: string
+        default: 'ubuntu-latest'
       gh-environment:
         description: >
           GitHub Deployment Environment name to attach to every
@@ -454,7 +473,7 @@ jobs:
   # ---------------------------------------------------------------------------
   environments-isolation-audit:
     name: Environments isolation audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     if: ${{ inputs.enable-environments-isolation-audit == true }}
     permissions:
       contents: read
@@ -518,7 +537,7 @@ jobs:
   # ---------------------------------------------------------------------------
   require-ci-green:
     name: Require CI-green (${{ inputs.environment }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     steps:
       - name: Evaluate CI-green gate
         shell: bash
@@ -543,7 +562,7 @@ jobs:
   # ---------------------------------------------------------------------------
   secret-isolation-audit:
     name: Secret isolation audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     needs: [environments-isolation-audit, require-ci-green]
     if: >-
       ${{ always() &&
@@ -564,12 +583,28 @@ jobs:
         # secret-in-tree guarantee on every trigger (push / PR / workflow_run /
         # dispatch / schedule). Pinned by version + SHA-256 for supply-chain
         # safety; `dir` scans the checked-out tree, matching this job's intent.
+        #
+        # NOTE (`runner` input, Story #222): this job's `runs-on:` DOES read
+        # `${{ inputs.runner }}` like every other job in this workflow, but
+        # this download step's asset selection is intentionally NOT
+        # `runner`-aware — it always fetches the linux_x64 gitleaks binary,
+        # unlike secret-scan-push.yml's full `uname`-based darwin/linux
+        # arm64/x64 asset map. Rationale: this job only needs to run
+        # BEFORE any deploy step touches Cloudflare credentials, has no
+        # dependency on the consumer's target platform, and every known
+        # consumer's `runner` override to date has stayed Linux
+        # (GitHub-hosted `ubuntu-latest` or Linux self-hosted). If a future
+        # consumer sets `runner` to a darwin/arm64 self-hosted label, this
+        # step's fixed linux_x64 binary will fail to execute — mirror
+        # secret-scan-push.yml's asset map at that point rather than
+        # widening the platform matrix speculatively today.
         env:
           GITLEAKS_VERSION: '8.30.1'
           GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
         run: |
           set -euo pipefail
-          # runs-on: ubuntu-latest, so the linux_x64 asset is the only target.
+          # Fixed linux_x64 asset regardless of inputs.runner — see the
+          # step-level comment above for the rationale.
           asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
           tmp="$(mktemp -d)"
@@ -592,7 +627,7 @@ jobs:
     # GitHub Deployment Environment (distinct from the Cloudflare --env label).
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     needs: secret-isolation-audit
     steps:
       - name: Validate required secrets
@@ -653,7 +688,7 @@ jobs:
     # GitHub Deployment Environment (distinct from the Cloudflare --env label).
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     needs: check-env
     if: ${{ inputs.migrate == true }}
     steps:
@@ -747,7 +782,7 @@ jobs:
     # GitHub Deployment Environment (distinct from the Cloudflare --env label).
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     needs: pre-migration-snapshot
     if: ${{ inputs.migrate == true }}
     steps:
@@ -823,7 +858,7 @@ jobs:
     # GitHub Deployment Environment (distinct from the Cloudflare --env label).
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     needs:
       - check-env
       - migrate
@@ -1097,7 +1132,7 @@ jobs:
     # GitHub Deployment Environment (distinct from the Cloudflare --env label).
     # Empty (the default) attaches no Environment — behaviour is unchanged.
     environment: ${{ inputs.gh-environment }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     needs: deploy
     if: ${{ needs.deploy.result == 'success' && inputs.smoke == true }}
     steps:
@@ -1314,7 +1349,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy-summary:
     name: Deploy summary (${{ inputs.environment }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     needs:
       - deploy
       - boot-smoke

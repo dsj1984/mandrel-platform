@@ -1107,6 +1107,25 @@ other on the caller's upstream CI conclusion — and `secret-isolation-audit`
 only proceeds once both have cleared (`needs: [environments-isolation-audit,
 require-ci-green]`).
 
+### Secret isolation audit and the `runner` input
+
+Every job in this workflow, including `secret-isolation-audit`, honors the
+`runner` input for its `runs-on:` label (Story #222). The one deliberate
+exception is **inside** that job: the "Run Gitleaks secret scan" step always
+downloads the `linux_x64` gitleaks release asset, regardless of what `runner`
+is set to. This does **not** mirror
+[`secret-scan-push.yml`](#secret-scan-pushyml)'s `uname`-based darwin/linux
+arm64/x64 asset map with per-platform pinned checksums.
+
+Rationale: this job only needs to complete before any deploy step touches
+Cloudflare credentials, has no dependency on the consumer's target deploy
+platform, and every known `deploy-cloudflare.yml` consumer's `runner`
+override to date has stayed Linux (GitHub-hosted `ubuntu-latest` or a Linux
+self-hosted label). A consumer that sets `runner` to a darwin/arm64
+self-hosted label will need this job's asset selector widened to the full
+`uname`-based map first — mirror `secret-scan-push.yml`'s "Install pinned
+gitleaks" step rather than assuming the fixed `linux_x64` binary will run.
+
 ### Commit-SHA verification (opt-in)
 
 > Story #176. `GIT_COMMIT_SHA` injection at deploy is per-consumer
@@ -1260,6 +1279,7 @@ jobs:
 | Input                        | Type    | Default     | When to override                                                                                                                                          |
 | ---------------------------- | ------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `environment`                | string  | *(required)*| Target Cloudflare environment label (e.g. `staging`, `production`). Maps to `wrangler --env`.                                                              |
+| `runner`                     | string  | `'ubuntu-latest'` | Runs-on label for every job in this workflow. Single string or a JSON-encoded label array string (e.g. `'["self-hosted","domio-runner"]'`). **Exception:** the `secret-isolation-audit` job's gitleaks download always fetches the `linux_x64` asset regardless of this input — see [Secret isolation audit](#secret-isolation-audit-and-the-runner-input) below. |
 | `workers`                    | string  | *(required)*| Comma-separated Worker names to deploy (e.g. `"api,worker-cron"`). Each name must match a `wrangler.toml` `[env.<environment>]` section.                   |
 | `gh-environment`             | string  | `''`        | GitHub **Deployment Environment** name attached to every secret-touching job, for secret scoping and protection rules. See [gh-environment model](#the-gh-environment-model). |
 | `migrate`                    | boolean | `false`     | Run migrations. When `true`, a pre-migration snapshot runs first. Defaults to D1 tooling; override the command seams for non-D1.                           |
@@ -1590,6 +1610,7 @@ the version from `package.json` and writes `CHANGELOG.md`.
 
 | Input           | Type   | Default  | When to override                                                                                                                                              |
 | --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `runner`        | string | `'ubuntu-latest'` | Runs-on label for the `release-please` job.                                                                                                          |
 | `target-branch` | string | `'main'` | Branch release-please maintains the release PR against. Set to your release branch if you cut releases off a branch other than the default.                   |
 | `release-type`  | string | `'node'` | release-please strategy. `'node'` reads/writes `package.json` + `CHANGELOG.md`. Use `'simple'` for a non-Node version file, etc. Ignored when `config-file` is set. |
 | `config-file`   | string | `''`     | Path to a release-please config JSON. Omit for single-package mode; supply for a monorepo or to pin `changelog-sections` to the platform's `git-conventions.md` mapping. |
