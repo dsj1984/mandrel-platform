@@ -1,0 +1,226 @@
+# Shared gitleaks-scan composite action (Story #229).
+#
+# Single source of truth for the pinned-gitleaks installer + scan. Before this
+# action, the "download pinned gitleaks release, verify SHA-256, extract, run"
+# logic existed as three independent copies — pr-quality.yml (security tier),
+# secret-scan-push.yml (full-history signal), and deploy-cloudflare.yml
+# (secret-isolation audit, a linux_x64-only variant) — that had already
+# drifted. This composite owns the ONE version + per-platform checksum map
+# (see GITLEAKS_VERSION below — the single place to bump on a gitleaks
+# release) and the cross-platform asset selector (darwin/linux × arm64/x64,
+# bash-3.2-compatible for macOS self-hosted runners).
+#
+# Pinning the BINARY (not the gitleaks-action) is what makes the scan work on
+# a private repo with no GHAS and no license: the action's org features
+# require GITLEAKS_LICENSE, the binary does not. The gitleaks-action also
+# rejects the `workflow_run` event, which would break CI-green-gated deploys.
+#
+# Usage (blocking working-tree scan — deploy-cloudflare secret-isolation):
+#   - name: Run Gitleaks secret scan
+#     uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
+#
+# Usage (blocking range-scoped history scan — pr-quality PR-diff gate):
+#   - name: Secret scan (pinned gitleaks, blocking)
+#     uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
+#     with:
+#       mode: git
+#       log-opts: ${{ steps.range.outputs.range }}
+#       verbose: 'true'
+#
+# Usage (non-blocking full-history signal scan — secret-scan-push):
+#   - name: Scan full history (signal, non-blocking)
+#     uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
+#     with:
+#       mode: git
+#       non-blocking: 'true'
+#       report-format: sarif
+#       report-path: gitleaks.sarif
+#
+# Cross-repo portability contract (scripts/check-workflow-portability.mjs):
+# no `${{ }}` expressions in input descriptions/defaults; reusable workflows
+# reference this action by absolute `owner/repo/path@<sha>` form only.
+name: Gitleaks Secret Scan
+description: >
+  Download a pinned, SHA-256-verified gitleaks binary (cross-platform asset
+  selector, darwin/linux arm64/x64) and run a secret scan over the working
+  tree (dir mode) or git history (git mode, optionally range-scoped via
+  log-opts). The pinned version and its per-platform checksum map live in
+  this action — the single place to bump on a gitleaks release.
+
+inputs:
+  mode:
+    description: >
+      Scan mode. 'dir' (default) scans the checked-out working tree and never
+      reads git history; 'git' scans git history — every commit reachable
+      from the checkout, or only the log-opts range when provided.
+    required: false
+    default: 'dir'
+  log-opts:
+    description: >
+      git-log options passed to gitleaks via --log-opts (e.g. a 'base..head'
+      range). Only meaningful with mode 'git'; empty (default) scans the full
+      reachable history. Ignored in 'dir' mode.
+    required: false
+    default: ''
+  redact:
+    description: >
+      Redaction percentage for matched secret values in gitleaks output,
+      passed as --redact=<value>. Default '100' (fully redacted — never echo
+      a secret into CI logs).
+    required: false
+    default: '100'
+  verbose:
+    description: >
+      Pass --verbose to gitleaks when 'true' (per-finding detail in the job
+      log, redacted per the redact input). Default 'false'.
+    required: false
+    default: 'false'
+  report-format:
+    description: >
+      Optional gitleaks --report-format (e.g. 'sarif'). Empty (default)
+      writes no report file. Set report-path alongside.
+    required: false
+    default: ''
+  report-path:
+    description: >
+      Optional gitleaks --report-path, resolved relative to the workspace.
+      Required when report-format is set.
+    required: false
+    default: ''
+  non-blocking:
+    description: >
+      When 'true', a leak finding (or scan error) never fails this step —
+      the scan is a post-hoc signal, not a gate (secret-scan-push posture).
+      Download/checksum/extract failures ALWAYS fail the step regardless: a
+      supply-chain integrity failure is never a soft signal. Default 'false'
+      (a finding fails the step via gitleaks' non-zero exit).
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # Download + verify the PINNED gitleaks binary. Cross-platform asset
+    # selector maps uname OS/arch → the release asset slug, then verifies the
+    # archive against the pinned SHA-256 for that slug before extraction.
+    # Supports self-hosted darwin/linux (arm64 + x64) and ubuntu-latest. The
+    # checksum map uses a case statement instead of `declare -A` to remain
+    # compatible with bash 3.2 (the system shell on macOS self-hosted
+    # runners); `shasum -a 256` (not sha256sum) for the same reason — it is
+    # present on both macOS and the GitHub-hosted Linux images.
+    - name: Install pinned gitleaks
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # ── Single bump point ────────────────────────────────────────────
+        # Pinned gitleaks release + per-platform SHA-256 checksums. On a
+        # gitleaks version bump, update GITLEAKS_VERSION and ALL FOUR slug
+        # checksums together (release checksums:
+        # https://github.com/gitleaks/gitleaks/releases/download/v<version>/gitleaks_<version>_checksums.txt).
+        # This map is the only place in the repo that carries gitleaks
+        # checksum literals — consumers inherit the bump via this action.
+        GITLEAKS_VERSION="8.30.1"
+
+        os="$(uname -s)"
+        arch="$(uname -m)"
+        case "$os" in
+          Darwin) gl_os="darwin" ;;
+          Linux)  gl_os="linux" ;;
+          *) echo "::error::Unsupported OS for gitleaks asset selector: $os"; exit 1 ;;
+        esac
+        case "$arch" in
+          arm64|aarch64) gl_arch="arm64" ;;
+          x86_64|amd64)  gl_arch="x64" ;;
+          *) echo "::error::Unsupported arch for gitleaks asset selector: $arch"; exit 1 ;;
+        esac
+
+        slug="${GITLEAKS_VERSION}_${gl_os}_${gl_arch}"
+        case "$slug" in
+          "8.30.1_darwin_arm64") expected="b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5" ;;
+          "8.30.1_darwin_x64")   expected="dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709" ;;
+          "8.30.1_linux_arm64")  expected="e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080" ;;
+          "8.30.1_linux_x64")    expected="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" ;;
+          *) expected="" ;;
+        esac
+        if [ -z "$expected" ]; then
+          echo "::error::No pinned checksum for gitleaks $slug — update the SHA256 map for this version/platform."
+          exit 1
+        fi
+
+        asset="gitleaks_${GITLEAKS_VERSION}_${gl_os}_${gl_arch}.tar.gz"
+        url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+        tmp="$(mktemp -d)"
+        echo "Downloading pinned gitleaks: ${url}"
+        curl -fsSL "$url" -o "${tmp}/${asset}"
+
+        # Verify the pinned SHA-256 before trusting the binary.
+        actual="$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')"
+        if [ "$actual" != "$expected" ]; then
+          echo "::error::gitleaks checksum mismatch for ${asset}: expected ${expected}, got ${actual}"
+          exit 1
+        fi
+        echo "✅ gitleaks ${asset} checksum verified."
+
+        tar -xzf "${tmp}/${asset}" -C "${tmp}" gitleaks
+        chmod +x "${tmp}/gitleaks"
+        echo "GITLEAKS_BIN=${tmp}/gitleaks" >> "$GITHUB_ENV"
+        "${tmp}/gitleaks" version
+
+    # Run the scan. gitleaks exits non-zero on a leak (default exit code 1);
+    # in blocking mode (default) that fails this step and therefore the job.
+    # In non-blocking mode the exit code is swallowed with a ::warning:: so
+    # the scan stays a signal (report/summary carry the findings) — but the
+    # install step above has already hard-failed on any integrity problem.
+    - name: Run gitleaks scan
+      shell: bash
+      env:
+        SCAN_MODE: ${{ inputs.mode }}
+        LOG_OPTS: ${{ inputs.log-opts }}
+        REDACT: ${{ inputs.redact }}
+        VERBOSE: ${{ inputs.verbose }}
+        REPORT_FORMAT: ${{ inputs.report-format }}
+        REPORT_PATH: ${{ inputs.report-path }}
+        NON_BLOCKING: ${{ inputs.non-blocking }}
+      run: |
+        set -euo pipefail
+
+        case "$SCAN_MODE" in
+          dir|git) ;;
+          *) echo "::error::Unknown gitleaks-scan mode '$SCAN_MODE' (expected 'dir' or 'git')."; exit 1 ;;
+        esac
+        if [ -n "$REPORT_FORMAT" ] && [ -z "$REPORT_PATH" ]; then
+          echo "::error::report-format is set but report-path is empty — both are required together."
+          exit 1
+        fi
+
+        args=( "--redact=${REDACT}" --no-banner )
+        if [ "$VERBOSE" = "true" ]; then
+          args=( "${args[@]}" --verbose )
+        fi
+        if [ -n "$REPORT_FORMAT" ]; then
+          args=( "${args[@]}" --report-format "$REPORT_FORMAT" --report-path "$REPORT_PATH" )
+        fi
+
+        code=0
+        if [ "$SCAN_MODE" = "git" ]; then
+          if [ -n "$LOG_OPTS" ]; then
+            echo "Scanning git history range: ${LOG_OPTS}"
+            "$GITLEAKS_BIN" git "--log-opts=${LOG_OPTS}" "${args[@]}" . || code=$?
+          else
+            echo "Scanning full reachable git history."
+            "$GITLEAKS_BIN" git "${args[@]}" . || code=$?
+          fi
+        else
+          echo "Scanning working tree (dir mode)."
+          "$GITLEAKS_BIN" dir "${args[@]}" . || code=$?
+        fi
+
+        if [ "$code" -ne 0 ]; then
+          if [ "$NON_BLOCKING" = "true" ]; then
+            echo "::warning::gitleaks exited ${code} (non-blocking signal mode — findings surface via the report/summary, not this step's status)."
+            exit 0
+          fi
+          exit "$code"
+        fi
+        echo "✅ No secrets detected."
