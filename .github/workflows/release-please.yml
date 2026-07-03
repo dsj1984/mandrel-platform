@@ -15,6 +15,18 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force_publish:
+        description: >-
+          Recovery lever: publish the current package.json version to npm even
+          when release-please reports no new release (root_release_created is
+          false because the release was already tagged). Use when a release was
+          cut but its npm-publish was interrupted — e.g. the await-smoke gate
+          was cancelled/timed out. The operator asserts the cross-repo smoke
+          already passed for the release commit; this path bypasses the
+          (already-satisfied) smoke gate.
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -90,7 +102,16 @@ jobs:
   npm-publish:
     name: Publish to npm
     needs: [release-please, await-smoke]
-    if: ${{ needs.release-please.outputs.root_release_created == 'true' }}
+    # Normal path: publish when release-please cut a release AND the await-smoke
+    # gate passed. Recovery path: a manual workflow_dispatch with
+    # force_publish=true republishes an already-tagged release whose publish was
+    # interrupted, bypassing the (already-satisfied) smoke gate. `!cancelled()`
+    # lets it run on the recovery path even though await-smoke is skipped there.
+    if: >-
+      ${{ !cancelled()
+          && ( (github.event_name == 'workflow_dispatch' && inputs.force_publish)
+               || (needs.release-please.outputs.root_release_created == 'true'
+                   && needs.await-smoke.result == 'success') ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # `id-token: write` is load-bearing: it mints the short-lived OIDC token
