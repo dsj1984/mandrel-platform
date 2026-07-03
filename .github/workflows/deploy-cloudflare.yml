@@ -95,15 +95,30 @@
 #
 # Wrangler version pinning (Story #202): EVERY wrangler invocation in this
 # workflow — the built-in D1 export/migrate, the deploy loop, the
-# `wrangler whoami` subdomain derivation, and the auto-rollback — runs the
-# CONSUMER'S OWN lockfile-pinned wrangler via `pnpm exec wrangler`, installed
-# by the Setup toolchain step (`pnpm install --frozen-lockfile`). This
-# workflow NEVER fetches a registry-latest wrangler at runtime (the previous
-# pnpx-style behaviour) with production Cloudflare credentials in scope.
-# Each call site preflights `pnpm exec wrangler --version` and fails LOUDLY
-# with an actionable message when wrangler is not a devDependency, so a
-# consumer that has not pinned wrangler is told to add it (`pnpm add -D
-# wrangler`) rather than silently deploying with a floating version.
+# worker-secrets provisioning, the `wrangler whoami` subdomain derivation,
+# and the auto-rollback — runs the CONSUMER'S OWN lockfile-pinned wrangler
+# via `pnpm exec wrangler`, installed by the Setup toolchain step
+# (`pnpm install --frozen-lockfile`). This workflow NEVER fetches a
+# registry-latest wrangler at runtime (the previous pnpx-style behaviour)
+# with production Cloudflare credentials in scope. The is-wrangler-installed
+# preflight is SINGLE-SOURCED in setup-toolchain's `require-wrangler` input
+# (Story #231): each job that runs wrangler passes require-wrangler with an
+# expression matching exactly the conditions under which its built-in steps
+# invoke wrangler, and the preflight fails LOUDLY with one authoritative,
+# actionable message (`pnpm add -D wrangler`) when wrangler is not a
+# devDependency — replacing the five message-drifting per-call-site copies.
+#
+# Extracted deploy scripts (Story #231): the boot-smoke probe
+# (scripts/deploy-boot-smoke.mjs) and the worker-secrets provisioning loop
+# (scripts/deploy-worker-secrets.mjs) live as versioned, unit-tested platform
+# scripts, sparse-checked out of dsj1984/mandrel-platform at
+# `github.job_workflow_sha` — the exact commit the caller's
+# `deploy-cloudflare.yml@<ref>` pin resolved to — so the script version
+# always travels in lockstep with the workflow pin (same model as
+# uptime-apply.yml → apply-uptime-monitors.mjs). The per-worker deploy loop
+# and the rollback loop stay inline: each is a short, branch-free bash loop
+# whose extraction would add a checkout dependency to the hot deploy path
+# without materially improving testability.
 name: Deploy Cloudflare
 
 on:
@@ -703,6 +718,12 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
         with:
           cache: 'true'
+          # Single-sourced wrangler preflight (Story #231): the built-in D1
+          # export / migrations-apply branches run `pnpm exec wrangler`, so
+          # require it whenever EITHER built-in branch is active (a consumer
+          # that supplies BOTH snapshot-command and migrate-command owns its
+          # own tooling and is exempt, matching the former inline preflights).
+          require-wrangler: ${{ (inputs.snapshot-command == '' || inputs.migrate-command == '') && 'true' || 'false' }}
 
       - name: Pre-migration snapshot (backup before migration)
         shell: bash
@@ -737,17 +758,10 @@ jobs:
             #
             # Wrangler is invoked via the consumer's OWN lockfile-pinned binary
             # (`pnpm exec wrangler`), installed by the Setup toolchain step
-            # (`pnpm install --frozen-lockfile`). This NEVER fetches an unpinned
+            # (`pnpm install --frozen-lockfile`) and preflighted by its
+            # require-wrangler input. This NEVER fetches an unpinned
             # registry-latest wrangler at runtime with production Cloudflare
-            # credentials in scope. If wrangler is not a devDependency, the
-            # preflight below fails LOUDLY with an actionable message rather than
-            # letting pnpm silently resolve a floating version.
-            if ! pnpm exec wrangler --version >/dev/null 2>&1; then
-              echo "::error::wrangler is not installed from the consumer lockfile." \
-                "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
-                "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
-              exit 1
-            fi
+            # credentials in scope.
             pnpm exec wrangler d1 export ${D1_DATABASE:+"$D1_DATABASE"} \
               --env "$DEPLOY_ENV" \
               --remote \
@@ -805,14 +819,9 @@ jobs:
             # for the target --env. --skip-confirmation is the documented
             # non-interactive flag (the previous --yes was not a valid flag).
             #
-            # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — see the
+            # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`),
+            # preflighted by setup-toolchain's require-wrangler — see the
             # snapshot step for why registry-latest is never fetched at runtime.
-            if ! pnpm exec wrangler --version >/dev/null 2>&1; then
-              echo "::error::wrangler is not installed from the consumer lockfile." \
-                "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
-                "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
-              exit 1
-            fi
             pnpm exec wrangler d1 migrations apply ${D1_DATABASE:+"$D1_DATABASE"} \
               --env "$DEPLOY_ENV" \
               --remote \
@@ -866,6 +875,12 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
         with:
           cache: 'true'
+          # Single-sourced wrangler preflight (Story #231): the built-in
+          # per-worker deploy loop runs `pnpm exec wrangler deploy` (skipped
+          # when deploy-command replaces it), and the opt-in worker-secrets
+          # step runs `pnpm exec wrangler versions …` regardless of which
+          # deploy path ran — require wrangler whenever either applies.
+          require-wrangler: ${{ (inputs.deploy-command == '' || inputs.worker-secrets != '') && 'true' || 'false' }}
 
       # Consumer-side-build handoff (Story #56): when build-artifact is set,
       # download the prebuilt deploy-ready output the consumer's own build job
@@ -949,16 +964,9 @@ jobs:
 
           # ----- Built-in root-level deploy loop (default) -----
           # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
-          # by the Setup toolchain step. Fail LOUDLY before deploying anything if
-          # wrangler is not a devDependency, rather than fetching an unpinned
-          # registry-latest wrangler at runtime with production CF creds in scope.
-          if ! pnpm exec wrangler --version >/dev/null 2>&1; then
-            echo "::error::wrangler is not installed from the consumer lockfile." \
-              "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
-              "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
-            exit 1
-          fi
-
+          # by the Setup toolchain step and preflighted by its require-wrangler
+          # input, so a consumer without wrangler as a devDependency failed
+          # LOUDLY before anything deployed.
           IFS=',' read -ra WORKERS <<< "$WORKERS_CSV"
           deployed=()
           failed=()
@@ -1013,91 +1021,38 @@ jobs:
       # ACTIVE version that boot-smoke probes AND realigns any active/latest
       # split a prior rollback introduced (self-heal), breaking the
       # rollback ↔ secret-sync deadlock. When `worker-secrets` is empty (the
-      # default) the whole step is skipped and behaviour is byte-identical to
+      # default) both steps are skipped and behaviour is byte-identical to
       # today.
+      #
+      # The provisioning loop lives in the versioned, unit-tested platform
+      # script scripts/deploy-worker-secrets.mjs (Story #231), sparse-checked
+      # out below at `github.job_workflow_sha` — the exact commit the caller's
+      # `deploy-cloudflare.yml@<ref>` pin resolved to — so the script version
+      # travels in lockstep with the workflow pin (the uptime-apply.yml →
+      # apply-uptime-monitors.mjs model).
+      - name: Checkout (shared worker-secrets script)
+        if: ${{ inputs.worker-secrets != '' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field but is
+          # absent from actionlint's pinned context type model, so read it
+          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`)
+          # to keep the workflow lint-clean — same pattern as uptime-apply.yml.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts/deploy-worker-secrets.mjs
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-deploy
+          persist-credentials: false
+
       - name: Provision worker secrets in-pipeline (versions secret API)
         if: ${{ inputs.worker-secrets != '' }}
         shell: bash
-        run: |
-          set -euo pipefail
-
-          # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
-          # by the Setup toolchain step's `pnpm install --frozen-lockfile`.
-          # Preflight fails LOUDLY when wrangler is not a devDependency, rather
-          # than fetching an unpinned registry-latest wrangler at runtime with
-          # production CF creds in scope and plaintext secret values on stdin.
-          if ! pnpm exec wrangler --version >/dev/null 2>&1; then
-            echo "::error::wrangler is not installed from the consumer lockfile." \
-              "Add it as a devDependency (pnpm add -D wrangler) so this deploy runs a" \
-              "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
-            exit 1
-          fi
-
-          # Worker list: the deploy step's resolved output (built-in loop OR
-          # deploy-command both set deployed_workers), same targeting the
-          # downstream smoke / rollback uses.
-          IFS=',' read -ra WORKER_LIST <<< "$DEPLOYED_WORKERS"
-
-          # Secret NAMES to provision, one per line. Blank lines and leading '#'
-          # comment lines are ignored so a consumer can annotate the list.
-          mapfile -t RAW_NAMES <<< "$WORKER_SECRETS"
-          names=()
-          for n in "${RAW_NAMES[@]}"; do
-            n="$(echo "$n" | xargs)"  # trim whitespace
-            [ -z "$n" ] && continue
-            case "$n" in \#*) continue ;; esac
-            names+=("$n")
-          done
-
-          if [ "${#names[@]}" -eq 0 ]; then
-            echo "::notice::worker-secrets was set but resolved to zero names — nothing to provision."
-            exit 0
-          fi
-
-          # The inherited secrets context, as JSON, so each enumerated name can
-          # be looked up at runtime. GitHub redacts every secret VALUE in the
-          # logs; only names are ever echoed below.
-          SECRETS_JSON="$SECRETS_CONTEXT"
-
-          for worker in "${WORKER_LIST[@]}"; do
-            worker="$(echo "$worker" | xargs)"
-            [ -z "$worker" ] && continue
-
-            for name in "${names[@]}"; do
-              # Resolve the value for this name from the inherited secrets JSON.
-              # A missing / empty inherited secret is a hard error — a
-              # deploy-critical secret the consumer explicitly listed must exist.
-              value="$(printf '%s' "$SECRETS_JSON" \
-                | jq -er --arg k "$name" '.[$k] // empty')" || value=""
-              if [ -z "$value" ]; then
-                echo "::error::worker-secrets: '$name' is not present (or empty) in the inherited secrets — forward it via 'secrets: inherit' before listing it in worker-secrets."
-                exit 1
-              fi
-
-              echo "::group::Provisioning $name onto $worker (versions secret API)"
-              # `wrangler versions secret put` reads the value from stdin (same
-              # non-interactive path as `wrangler secret put`) and creates a NEW
-              # version WITHOUT deploying it. This write is immune to error 10215
-              # even when active ≠ latest-uploaded.
-              printf '%s' "$value" | pnpm exec wrangler versions secret put "$name" \
-                --name "$worker" \
-                --env "$DEPLOY_ENV"
-              echo "::endgroup::"
-            done
-
-            echo "::group::Promoting latest version of $worker to 100% (self-heal active=latest)"
-            # Deploy the latest-uploaded version (the one carrying the secrets
-            # just written) at 100% traffic, non-interactively. This both makes
-            # the current secret values the ACTIVE version boot-smoke probes and
-            # realigns active = latest so no residual 10215-inducing split
-            # remains. `-y` selects the non-interactive default (latest @ 100%).
-            pnpm exec wrangler versions deploy \
-              --name "$worker" \
-              --env "$DEPLOY_ENV" \
-              --message "In-pipeline worker-secrets provisioning (Story #170)" \
-              -y
-            echo "::endgroup::"
-          done
+        # Secret values are resolved inside the script from SECRETS_CONTEXT and
+        # passed to wrangler over STDIN — never argv, never logs (GitHub
+        # additionally redacts inherited secret values in log output).
+        run: node "${GITHUB_WORKSPACE}/_mandrel-platform-deploy/scripts/deploy-worker-secrets.mjs"
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
           DEPLOYED_WORKERS: ${{ steps.deploy-step.outputs.deployed_workers }}
@@ -1135,151 +1090,53 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@05f8a846267d35581875e5de5a3bb1c1f969267a
         with:
           cache: 'true'
+          # Single-sourced wrangler preflight (Story #231): the built-in probe
+          # only shells out to wrangler for the `whoami` subdomain derivation,
+          # which runs when no explicit subdomain / base URL is supplied and no
+          # consumer smoke-command replaces the probe. The auto-rollback step
+          # also uses wrangler, but only on smoke FAILURE — requiring it
+          # up-front here for every consumer would fail smoke-command callers
+          # that legitimately have no root wrangler install, so the rollback
+          # step keeps its per-worker "manual rollback required" fallback.
+          require-wrangler: ${{ (inputs.smoke-command == '' && inputs.workers_dev_subdomain == '' && inputs.smoke_base_url == '') && 'true' || 'false' }}
+
+      # The boot-smoke probe lives in the versioned, unit-tested platform
+      # script scripts/deploy-boot-smoke.mjs (Story #231), sparse-checked out
+      # at `github.job_workflow_sha` — the exact commit the caller's
+      # `deploy-cloudflare.yml@<ref>` pin resolved to — so the script version
+      # travels in lockstep with the workflow pin (the uptime-apply.yml →
+      # apply-uptime-monitors.mjs model). The script also fixes the former
+      # smoke_base_url duplication: with a shared base URL each path is probed
+      # exactly ONCE (not once per worker), and a shared-host failure marks
+      # ALL deployed workers for rollback explicitly, since per-worker
+      # attribution is impossible on a shared host. verify-commit-sha parses
+      # the health response as JSON and reads the TOP-LEVEL "version" field —
+      # no more grep/sed extraction that could match a nested version key.
+      - name: Checkout (shared boot-smoke script)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field but is
+          # absent from actionlint's pinned context type model, so read it
+          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`)
+          # to keep the workflow lint-clean — same pattern as uptime-apply.yml.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts/deploy-boot-smoke.mjs
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-deploy
+          persist-credentials: false
 
       - name: Smoke-test deployed workers
         id: smoke
         shell: bash
-        run: |
-          # Parse the deployed CSV into an array (WORKER_LIST). Kept distinct
-          # from the exported scalar WORKERS below so the consumer-facing env
-          # export never clobbers the array used for the rollback list.
-          IFS=',' read -ra WORKER_LIST <<< "$DEPLOYED_WORKERS"
-
-          # ----- Consumer-supplied smoke replaces the built-in probe -----
-          if [ -n "$SMOKE_COMMAND" ]; then
-            echo "::group::Running consumer smoke-command"
-            # Export the deployed csv + base url so the consumer command can
-            # build its own multi-route / custom-host probe.
-            export WORKERS="$DEPLOYED_WORKERS"
-            export SMOKE_BASE_URL="$SMOKE_BASE_URL"
-            if bash -c "$SMOKE_COMMAND"; then
-              echo "✅ consumer smoke-command passed"
-            else
-              echo "::error::Consumer smoke-command FAILED. Triggering rollback."
-              printf '%s\n' "${WORKER_LIST[@]}" >> /tmp/smoke-failed-workers.txt
-              echo "smoke_failed=true" >> "$GITHUB_ENV"
-              echo "::endgroup::"
-              exit 1
-            fi
-            echo "::endgroup::"
-            exit 0
-          fi
-
-          # ----- Built-in probe -----
-          # Resolve the workers.dev subdomain slug. NEVER use the account ID
-          # (a UUID) — workers.dev subdomains are keyed by the account
-          # name/slug. Prefer the explicit input, else derive from
-          # `wrangler whoami`, which prints the account's workers.dev subdomain.
-          SUBDOMAIN="$WORKERS_DEV_SUBDOMAIN"
-          if [ -z "$SUBDOMAIN" ] && [ -z "$SMOKE_BASE_URL" ]; then
-            echo "::group::Deriving workers.dev subdomain from wrangler whoami"
-            # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
-            # by the Setup toolchain step. Fail LOUDLY if wrangler is not a
-            # devDependency instead of fetching registry-latest at runtime.
-            if ! pnpm exec wrangler --version >/dev/null 2>&1; then
-              echo "::error::wrangler is not installed from the consumer lockfile." \
-                "Add it as a devDependency (pnpm add -D wrangler), or pass workers_dev_subdomain /" \
-                "smoke_base_url — the shared workflow refuses to fetch registry-latest wrangler at runtime."
-              exit 1
-            fi
-            WHOAMI="$(pnpm exec wrangler whoami 2>/dev/null || true)"
-            # wrangler whoami prints a table including the account's
-            # workers.dev subdomain; extract the first *.workers.dev token.
-            SUBDOMAIN="$(printf '%s\n' "$WHOAMI" \
-              | grep -oE '[A-Za-z0-9-]+\.workers\.dev' \
-              | head -n1 \
-              | sed 's/\.workers\.dev$//' || true)"
-            if [ -z "$SUBDOMAIN" ]; then
-              echo "::error::Could not derive workers.dev subdomain from 'wrangler whoami'." \
-                "Pass workers_dev_subdomain or smoke_base_url explicitly."
-              exit 1
-            fi
-            echo "::notice::Derived workers.dev subdomain: $SUBDOMAIN"
-            echo "::endgroup::"
-          fi
-
-          # Smoke paths (comma-separated); default "/health".
-          IFS=',' read -ra PATHS <<< "$SMOKE_PATHS"
-          failed=()
-
-          for worker in "${WORKER_LIST[@]}"; do
-            worker="$(echo "$worker" | xargs)"
-            [ -z "$worker" ] && continue
-
-            # Base for this worker: explicit smoke_base_url wins, else the
-            # corrected workers.dev subdomain host.
-            if [ -n "$SMOKE_BASE_URL" ]; then
-              base="${SMOKE_BASE_URL%/}"
-            else
-              base="https://${worker}.${SUBDOMAIN}.workers.dev"
-            fi
-
-            for p in "${PATHS[@]}"; do
-              p="$(echo "$p" | xargs)"
-              [ -z "$p" ] && continue
-              case "$p" in
-                /*) : ;;
-                *) p="/$p" ;;
-              esac
-              WORKER_URL="${base}${p}"
-
-              echo "::group::Smoke-testing $worker → $WORKER_URL"
-              RESPONSE_BODY_FILE="$(mktemp)"
-              HTTP_STATUS=$(curl --silent --output "$RESPONSE_BODY_FILE" \
-                --write-out "%{http_code}" \
-                --max-time 15 \
-                --retry 3 \
-                --retry-delay 5 \
-                "$WORKER_URL" || echo "000")
-              echo "HTTP status: $HTTP_STATUS"
-
-              if [ "$HTTP_STATUS" != "200" ]; then
-                echo "::error::Smoke check FAILED for $worker at $WORKER_URL (HTTP $HTTP_STATUS). Triggering rollback."
-                failed+=("$worker")
-                rm -f "$RESPONSE_BODY_FILE"
-                echo "::endgroup::"
-                continue
-              fi
-
-              echo "✅ $worker smoke check passed at $WORKER_URL (HTTP 200)"
-
-              # ----- verify-commit-sha (Story #176, opt-in) -----
-              # Assert the deployed worker's health response reports the SHA
-              # this run deployed (github.sha). Contract: docs/runbooks/
-              # post-deploy-smoke.md#3-health-endpoint-contract — the health
-              # endpoint returns a JSON body with a "version" field set to
-              # env.GIT_COMMIT_SHA. A mismatch or unparsable field fails the
-              # smoke check and triggers the same auto-rollback as an
-              # HTTP-status failure.
-              if [ "$VERIFY_COMMIT_SHA" = "true" ]; then
-                DEPLOYED_SHA="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$RESPONSE_BODY_FILE" \
-                  | head -n1 \
-                  | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
-
-                if [ -z "$DEPLOYED_SHA" ]; then
-                  echo "::error::verify-commit-sha FAILED for $worker at $WORKER_URL — response has no parsable \"version\" field. Triggering rollback."
-                  failed+=("$worker")
-                elif [ "$DEPLOYED_SHA" != "$EXPECTED_SHA" ]; then
-                  echo "::error::verify-commit-sha FAILED for $worker — deployed SHA '$DEPLOYED_SHA' does not match expected SHA '$EXPECTED_SHA'. Triggering rollback."
-                  failed+=("$worker")
-                else
-                  echo "✅ $worker reports expected commit SHA: $DEPLOYED_SHA"
-                fi
-              fi
-
-              rm -f "$RESPONSE_BODY_FILE"
-              echo "::endgroup::"
-            done
-          done
-
-          if [ "${#failed[@]}" -gt 0 ]; then
-            # De-duplicate (a worker may fail multiple paths).
-            printf '%s\n' "${failed[@]}" | sort -u >> /tmp/smoke-failed-workers.txt
-            echo "smoke_failed=true" >> "$GITHUB_ENV"
-            exit 1
-          fi
+        # On failure the script writes the rollback list (sorted, unique, one
+        # worker per line) to SMOKE_FAILED_FILE and appends smoke_failed=true
+        # to $GITHUB_ENV, then exits 1 — driving the rollback step below.
+        run: node "${GITHUB_WORKSPACE}/_mandrel-platform-deploy/scripts/deploy-boot-smoke.mjs"
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
+          SMOKE_FAILED_FILE: /tmp/smoke-failed-workers.txt
           DEPLOYED_WORKERS: ${{ needs.deploy.outputs.deployed_workers }}
           SMOKE_COMMAND: ${{ inputs.smoke-command }}
           SMOKE_BASE_URL: ${{ inputs.smoke_base_url }}
@@ -1297,16 +1154,13 @@ jobs:
           echo "::warning::Smoke test failed — initiating wrangler rollback for affected workers."
 
           # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
-          # by the Setup toolchain step. Fail LOUDLY if wrangler is not a
-          # devDependency: a rollback that silently fell back to registry-latest
-          # would be running an unpinned binary with prod CF creds at the worst
-          # possible moment (mid-incident).
-          if ! pnpm exec wrangler --version >/dev/null 2>&1; then
-            echo "::error::wrangler is not installed from the consumer lockfile — cannot roll back." \
-              "Add it as a devDependency (pnpm add -D wrangler); manual rollback required for this run."
-            exit 1
-          fi
-
+          # by the Setup toolchain step. `pnpm exec` never falls back to a
+          # registry fetch, so a missing devDependency surfaces through the
+          # per-worker "manual rollback required" fallback below rather than
+          # a silently-unpinned binary running with prod CF creds mid-incident.
+          # (The up-front preflight is single-sourced in setup-toolchain's
+          # require-wrangler and applies whenever the built-in probe needed
+          # wrangler for subdomain derivation — see the Setup toolchain step.)
           while IFS= read -r worker; do
             worker="$(echo "$worker" | xargs)"
             [ -z "$worker" ] && continue
