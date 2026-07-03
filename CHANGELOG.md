@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.21.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.20.1...mandrel-platform-v0.21.0) (2026-07-03)
+
+
+### Added
+
+* **ci:** add a runner input to deploy-cloudflare.yml and release-automation.yml (refs [#222](https://github.com/dsj1984/mandrel-platform/issues/222)) ([#224](https://github.com/dsj1984/mandrel-platform/issues/224)) ([3f28d8e](https://github.com/dsj1984/mandrel-platform/commit/3f28d8e7dc924b973362782a3d39943f87331149))
+* **ci:** dogfood — run the platform's own secret scan and security tier on itself (refs [#236](https://github.com/dsj1984/mandrel-platform/issues/236)) ([#250](https://github.com/dsj1984/mandrel-platform/issues/250)) ([931a1f5](https://github.com/dsj1984/mandrel-platform/commit/931a1f52d522b2c00a0f20887ac1f091848fa449))
+* **ci:** opt-in fail-fast for pr-quality.yml — cancel the run on first tier failure (refs [#223](https://github.com/dsj1984/mandrel-platform/issues/223)) ([#245](https://github.com/dsj1984/mandrel-platform/issues/245)) ([6bff2f3](https://github.com/dsj1984/mandrel-platform/commit/6bff2f33b3c89b9a692b921ed08bd3ad427ce997))
+* **ci:** single-source the pinned-gitleaks installer as a composite action ([#229](https://github.com/dsj1984/mandrel-platform/issues/229)) ([#251](https://github.com/dsj1984/mandrel-platform/issues/251)) ([f5cddc4](https://github.com/dsj1984/mandrel-platform/commit/f5cddc4bb5c880d72e9ec4fa0beda227aa0e2f45))
+* **runner:** ship generalized runner-scoped hygiene kit + provisioning runbook (refs [#226](https://github.com/dsj1984/mandrel-platform/issues/226)) ([#242](https://github.com/dsj1984/mandrel-platform/issues/242)) ([1f3c07d](https://github.com/dsj1984/mandrel-platform/commit/1f3c07dedaa7e57c29313d9c4d5023d27a7ad7d7))
+
+
+### Fixed
+
+* **ci:** make the ci-required aggregators toJSON(needs)-driven (refs [#234](https://github.com/dsj1984/mandrel-platform/issues/234)) ([#241](https://github.com/dsj1984/mandrel-platform/issues/241)) ([06199a2](https://github.com/dsj1984/mandrel-platform/commit/06199a25dd6a6fbe78879375fb7f1db69cfccaaf))
+* **deploy:** add timeout-minutes to every deploy-cloudflare job (refs [#232](https://github.com/dsj1984/mandrel-platform/issues/232)) ([#243](https://github.com/dsj1984/mandrel-platform/issues/243)) ([e2ad35e](https://github.com/dsj1984/mandrel-platform/commit/e2ad35e9078e9a3d94e31abab0643fcfe373c517))
+* **deploy:** pin worker-secrets step to lockfile wrangler via pnpm exec (refs [#228](https://github.com/dsj1984/mandrel-platform/issues/228)) ([#239](https://github.com/dsj1984/mandrel-platform/issues/239)) ([7c8dc61](https://github.com/dsj1984/mandrel-platform/commit/7c8dc61ae8817af053c4b1a1d446295351a0c487))
+* **release:** remove the dead package-name input from release-automation.yml (refs [#233](https://github.com/dsj1984/mandrel-platform/issues/233)) ([#240](https://github.com/dsj1984/mandrel-platform/issues/240)) ([71de87e](https://github.com/dsj1984/mandrel-platform/commit/71de87e609f30cc226ec59ad1a0b8125552ae3e4))
+
+
+### Changed
+
+* **ci:** pr-quality gates run the platform's tested scripts via job_workflow_sha side-checkout (refs [#230](https://github.com/dsj1984/mandrel-platform/issues/230)) ([#247](https://github.com/dsj1984/mandrel-platform/issues/247)) ([0417fb9](https://github.com/dsj1984/mandrel-platform/commit/0417fb920203f6eb6602487b90b46f4dc32e3e6d))
+* **ci:** pr-quality interface simplification — derive shard count, dedupe the tier preamble (refs [#235](https://github.com/dsj1984/mandrel-platform/issues/235)) ([#248](https://github.com/dsj1984/mandrel-platform/issues/248)) ([6cfb145](https://github.com/dsj1984/mandrel-platform/commit/6cfb14554da06b0626bdf0fc0b90d5076d2007e1))
+* **deploy:** extract deploy-cloudflare inline bash into versioned scripts; fold the wrangler preflight into setup-toolchain ([#231](https://github.com/dsj1984/mandrel-platform/issues/231)) ([#249](https://github.com/dsj1984/mandrel-platform/issues/249)) ([96a2320](https://github.com/dsj1984/mandrel-platform/commit/96a2320254fd02c0f8fd88ac60e215f7982dff07))
+* **deploy:** slim the deploy-cloudflare job topology (refs [#237](https://github.com/dsj1984/mandrel-platform/issues/237)) ([#246](https://github.com/dsj1984/mandrel-platform/issues/246)) ([d6e1cc3](https://github.com/dsj1984/mandrel-platform/commit/d6e1cc388341d67f0765fe0ddae7b46762a37857))
+
 ## [0.20.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.20.0...mandrel-platform-v0.20.1) (2026-07-03)
 
 
