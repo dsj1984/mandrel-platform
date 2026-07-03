@@ -28,6 +28,13 @@
 #     with:
 #       trust-lockfile: 'true'
 #
+# Usage (wrangler preflight — deploy jobs that run the consumer's
+# lockfile-pinned wrangler, Story #231):
+#   - name: Setup toolchain
+#     uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
+#     with:
+#       require-wrangler: 'true'
+#
 # SHA-pinned third-party actions.
 name: Setup Toolchain
 description: >
@@ -36,7 +43,9 @@ description: >
   maintain their own warm pnpm store. Pass pnpm-dest to override the pnpm
   shim install location (defaults to runner.temp/pnpm for concurrency safety).
   Pass trust-lockfile: 'true' to append --trust-lockfile to the install step
-  (default 'false' — unchanged behavior).
+  (default 'false' — unchanged behavior). Pass require-wrangler: 'true' to
+  preflight that wrangler is installed from the consumer lockfile after the
+  install step (default 'false' — no preflight).
 
 inputs:
   cache:
@@ -62,6 +71,17 @@ inputs:
       MINIMUM_RELEASE_AGE_VIOLATION) it has consciously accepted — not a
       permanent bypass. Default 'false' preserves today's behavior
       (plain `pnpm install --frozen-lockfile`, no trust override).
+    required: false
+    default: 'false'
+  require-wrangler:
+    description: >
+      When 'true', preflight (after the install step) that wrangler resolves
+      from the consumer's own lockfile-pinned install (pnpm exec wrangler
+      --version), failing loudly with one authoritative, actionable message
+      when it does not. This is the single-sourced replacement for the
+      per-call-site preflight blocks the shared deploy workflow used to
+      copy-paste before every wrangler invocation (Story #231). Default
+      'false' — no preflight, unchanged behavior.
     required: false
     default: 'false'
 
@@ -90,3 +110,22 @@ runs:
         else
           pnpm install --frozen-lockfile
         fi
+
+    # Wrangler preflight (opt-in, Story #231). The ONE authoritative
+    # is-wrangler-installed check the shared deploy workflow's jobs opt into,
+    # replacing the message-drifting copies that used to precede every
+    # `pnpm exec wrangler` call site. `pnpm exec` never falls back to a
+    # registry fetch, so a consumer without wrangler as a devDependency is
+    # told to pin it rather than deploying a floating version.
+    - name: Preflight lockfile-pinned wrangler
+      if: ${{ inputs.require-wrangler == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! pnpm exec wrangler --version >/dev/null 2>&1; then
+          echo "::error::wrangler is not installed from the consumer lockfile." \
+            "Add it as a devDependency (pnpm add -D wrangler) so this workflow runs a" \
+            "pinned version — the shared workflow refuses to fetch registry-latest wrangler at runtime."
+          exit 1
+        fi
+        echo "wrangler preflight OK: $(pnpm exec wrangler --version)"
