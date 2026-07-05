@@ -140,8 +140,15 @@ ruamel.yaml.clib==0.2.15 \
 semgrep==1.97.0 \
     --hash=sha256:996fe0b2bfac3a4d4511e470fdf5f3bca96b1f794f398e0336c8388802c218de
 
-setuptools==83.0.0 \
-    --hash=sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3
+# PINNED to 80.9.0 (the last release that still SHIPS `pkg_resources`):
+# setuptools 81+ removed the vendored `pkg_resources` module, but
+# semgrep 1.97.0's transitive `opentelemetry-instrumentation==0.46b0` imports
+# it at load. A py3.12 venv seeds no setuptools, so the lockfile must supply a
+# pkg_resources-bearing one — 83.0.0 broke the SAST step at runtime with
+# `ModuleNotFoundError: No module named 'pkg_resources'`. Do NOT bump past 80.x
+# without confirming pkg_resources is present (or bumping opentelemetry off it).
+setuptools==80.9.0 \
+    --hash=sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922
 
 tomli==2.0.2 \
     --hash=sha256:2ebe24485c53d303f690b0ec092806a085f07af5a5aa1464f3931eec36caaa38
