@@ -123,6 +123,13 @@ jobs:
       - name: Lint third-party action pins
         run: node scripts/check-action-pins.mjs
 
+      # Catches `gh` CLI flag combinations that pass actionlint/shellcheck but
+      # fail the gh CLI at RUNTIME (e.g. --slurp with --jq), which otherwise
+      # only surface when the step runs — for the release pipeline, at release
+      # time. Regression guard for the 0.25.0 await-smoke wedge.
+      - name: Lint gh CLI flag combinations
+        run: node scripts/check-workflow-gh-flags.mjs
+
       - name: Run unit tests
         run: npm test
 
