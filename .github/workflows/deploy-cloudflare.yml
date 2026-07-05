@@ -1257,15 +1257,24 @@ jobs:
           SMOKE_RESULT: ${{ needs.boot-smoke.result }}
 
   # ---------------------------------------------------------------------------
-  # 7. Require deploy ran (Story #268 — green must mean deployed)
+  # 7. Require deploy ran (Story #268 + #272 — green must mean deployed)
   #    Always-on terminal job: unlike every job above, it does NOT participate
   #    in the CI-green `if:` guard or the `needs:` skip chain, so it runs even
-  #    when layer 1 gated the whole chain off. It fails specifically when this
-  #    run's trigger was a `workflow_run` whose upstream conclusion was NOT
-  #    `success` — exactly the case where deploy/migrate/boot-smoke were all
-  #    skipped and would otherwise report an indistinguishable-from-real-deploy
-  #    green. Every other trigger, and every green-CI workflow_run, passes
-  #    through as a no-op (deploy actually ran).
+  #    when layer 1 gated the whole chain off. It fails in the two distinct
+  #    "green run that didn't deploy" cases, which are mutually exclusive so the
+  #    two steps never double-fire:
+  #      - #268 (red CI): a `workflow_run` whose upstream conclusion was NOT
+  #        `success` — the CI-green guard skips the whole chain.
+  #      - #272 (green CI, env jobs skipped): a `workflow_run` whose upstream
+  #        conclusion WAS `success` but `deploy` still resolved to `skipped`,
+  #        because a reusable workflow's `environment:`-gated jobs do not run on
+  #        `workflow_run` events (a documented GitHub limitation). The real fix
+  #        is to trigger the deploy via `workflow_dispatch` instead — see the
+  #        canonical templates/workflows/deploy-staging.yml (dispatcher) +
+  #        deploy-staging-run.yml — but this guard makes an un-migrated /
+  #        mis-wired consumer's non-deploy visibly RED instead of falsely green.
+  #    Every other trigger, and every green-CI workflow_run whose deploy
+  #    actually ran, passes through as a no-op.
   # ---------------------------------------------------------------------------
   require-deploy-ran:
     name: Require deploy ran (${{ inputs.environment }})
@@ -1284,3 +1293,13 @@ jobs:
           exit 1
         env:
           UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+
+      - name: Fail if a green-CI workflow_run deploy skipped (environment jobs skip on workflow_run)
+        if: >-
+          ${{ github.event_name == 'workflow_run' &&
+              github.event.workflow_run.conclusion == 'success' &&
+              needs.deploy.result == 'skipped' }}
+        shell: bash
+        run: |
+          echo "::error::Upstream CI was green but the deploy chain SKIPPED (deploy result='skipped'). A reusable workflow's environment:-gated jobs do not run on workflow_run events, so 0 workers deployed while this run would otherwise report green. Trigger the deploy via workflow_dispatch instead — see the canonical templates/workflows/deploy-staging.yml (CI-green dispatcher) + deploy-staging-run.yml. This run is intentionally red so a non-deploy is never mistaken for a success (refs #272)."
+          exit 1
