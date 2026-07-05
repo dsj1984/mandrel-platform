@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.23.0...mandrel-platform-v0.24.0) (2026-07-05)
+
+
+### Added
+
+* **ci:** make workflow_run staging deploy actually deploy (dispatcher template + [#272](https://github.com/dsj1984/mandrel-platform/issues/272) guard) (refs [#273](https://github.com/dsj1984/mandrel-platform/issues/273)) ([#274](https://github.com/dsj1984/mandrel-platform/issues/274)) ([abac1cd](https://github.com/dsj1984/mandrel-platform/commit/abac1cdb561de4d3389b8d646c7f83137ab2dd86))
+
 ## [0.23.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.22.1...mandrel-platform-v0.23.0) (2026-07-05)
 
 
