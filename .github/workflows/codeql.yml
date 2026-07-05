@@ -33,18 +33,23 @@ permissions:
   security-events: write
   actions: read
 
-# Rapid pushes to the same ref stack full analyses without this; superseded
-# runs are cancelled — only the newest commit's analysis matters.
-concurrency:
-  group: codeql-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   analyze:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
     # A hung analysis would otherwise hold a runner for GitHub's 6h default.
     timeout-minutes: 30
+    # L11: concurrency at JOB level, not workflow level. This workflow is
+    # consumable via `workflow_call`, and a called workflow's WORKFLOW-level
+    # `concurrency` is never evaluated (its jobs run inside the CALLER's run) —
+    # so consumers got no dedup and rapid pushes stacked full 30-min analyses.
+    # Job-level works for both the direct push/PR/schedule triggers here AND
+    # the workflow_call path. Rapid pushes to the same ref stack full analyses
+    # without this; superseded runs are cancelled — only the newest commit's
+    # analysis matters. Keyed by github.ref (the analyzed ref).
+    concurrency:
+      group: codeql-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       # Shallow clone: CodeQL analyzes the checked-out tree; it does not need
       # git history (fetch-depth: 0 only slowed the checkout down).

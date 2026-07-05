@@ -207,8 +207,17 @@ on:
           Consumer-supplied pre-migration snapshot command. When set, it
           replaces the built-in "wrangler d1 export" snapshot so a non-D1
           consumer (e.g. turso db shell .dump) can take its own recovery
-          point. Runs in the checkout root before migrate. Any *.sql files it
-          writes under temp/ are uploaded as the snapshot artifact.
+          point. Runs in the checkout root before migrate.
+          ARTIFACT CONTRACT (M13): any files this command writes under temp/
+          (glob temp/* — NOT only *.sql) are uploaded as the snapshot
+          artifact. Unlike the built-in D1 export — whose .sql dump IS the
+          recovery point and whose upload is BLOCKING — a consumer
+          snapshot-command that writes NO temp/ file is NOT an error: absence
+          is a loud warning, because your recovery reference may legitimately
+          live in the GitHub step summary or an external PITR system (e.g.
+          Turso point-in-time recovery) rather than a temp/ file. If you rely
+          on the uploaded artifact as your recovery point, ensure the command
+          writes it under temp/.
         required: false
         type: string
         default: ''
@@ -292,6 +301,23 @@ on:
           The deployed_workers output is set to the workers input so downstream
           smoke / rollback targeting keeps working. When unset, the built-in
           root-level deploy loop runs.
+        required: false
+        type: string
+        default: ''
+      rollback-command:
+        description: >
+          Optional rollback command run in the boot-smoke job when smoke fails
+          or is cancelled (M14 — symmetric to deploy-command). When set, it
+          REPLACES the built-in per-worker root-level "pnpm exec wrangler
+          rollback" loop. Use this for pnpm-workspace monorepos whose workers
+          were deployed from their own package dir (or via `wrangler deploy
+          --config dist/server/wrangler.json`), where the built-in root-level
+          rollback cannot address them — leaving the "auto-rollback" guarantee
+          silently void. It runs once in the checkout root with WORKERS (the
+          resolved rollback csv — the smoke-failed set, or every deployed
+          worker when smoke wedged before writing its failed-list), DEPLOY_ENV,
+          the Cloudflare creds, and the frozen {CLOUDFLARE_*, TURSO_*} secret
+          set exported. When unset, the built-in root-level rollback loop runs.
         required: false
         type: string
         default: ''
@@ -488,10 +514,15 @@ on:
 permissions:
   contents: read
 
-# One deploy per environment at a time — prevents race on wrangler rollback.
-concurrency:
-  group: deploy-cloudflare-${{ inputs.environment }}
-  cancel-in-progress: false
+# Serialization lives at the JOB level (migration / deploy / boot-smoke), NOT
+# here (H1, L11). A called workflow's WORKFLOW-level `concurrency` is never
+# evaluated — its jobs run inside the CALLER's run — so a workflow-level block
+# here would be dead code that promises a "one deploy per environment"
+# serialization it cannot deliver (this repo documents the same pitfall in
+# uptime-apply.yml). The real serialization is the job-level `concurrency`
+# on migration / deploy / boot-smoke, keyed by
+# `deploy-cf-${{ github.repository }}-${{ inputs.environment }}` with
+# `cancel-in-progress: false` (queue, never cancel a mid-apply migration).
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -644,6 +675,21 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     needs: secret-isolation-audit
+    # H0 un-poison: this job MUST carry an explicit `if:` with a status-check
+    # function (`!cancelled()`). Without one, GitHub's implicit `success()`
+    # evaluates the TRANSITIVE ancestor chain, not just direct needs — so the
+    # default-skipped opt-in `environments-isolation-audit` root
+    # (enable-environments-isolation-audit defaults false → always `skipped`)
+    # skip-poisons this job on EVERY trigger (actions/runner#2205), silently
+    # skipping check-env and cascading through migration/deploy/boot-smoke.
+    # `!cancelled()` scopes the gate to the DIRECT need
+    # (secret-isolation-audit == 'success') and the CI-green guard, so a
+    # skipped opt-in ancestor no longer poisons the chain while a genuinely
+    # failed/cancelled run still stops here.
+    if: >-
+      ${{ !cancelled() &&
+          needs.secret-isolation-audit.result == 'success' &&
+          (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
     steps:
       - name: Validate required secrets
         shell: bash
@@ -722,7 +768,25 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     needs: check-env
-    if: ${{ inputs.migrate == true }}
+    # H1: reusable-side per-environment serialization at JOB level (a called
+    # workflow's workflow-level concurrency is inert — see the top-of-file
+    # note). Keyed by caller repo + target environment; cancel-in-progress
+    # false so an in-flight `wrangler d1 migrations apply` is queued behind,
+    # never cancelled mid-apply (a half-applied forward-only migration is
+    # unrecoverable).
+    concurrency:
+      group: deploy-cf-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    # H0 un-poison: an explicit status-check function (`!cancelled()`) plus a
+    # direct-need result check, so the skipped opt-in
+    # environments-isolation-audit ancestor does not transitively skip-poison
+    # this job (actions/runner#2205). `inputs.migrate == true` keeps the
+    # no-migrate skip; the check-env result gate ensures we only migrate after
+    # a real environment validation.
+    if: >-
+      ${{ !cancelled() &&
+          needs.check-env.result == 'success' &&
+          inputs.migrate == true }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -790,7 +854,25 @@ jobs:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
 
-      - name: Upload snapshot artifact
+      # Snapshot-artifact upload — split by path (M13).
+      #
+      # The built-in D1 export and a consumer-supplied snapshot-command have
+      # DIFFERENT artifact contracts, so they upload separately:
+      #
+      #   • Built-in D1 path (snapshot-command empty): the .sql dump IS the
+      #     recovery point, so its upload stays BLOCKING — an absent
+      #     temp/*.sql means the export produced no dump, and a migrate:true
+      #     pipeline must not proceed without a recovery point.
+      #   • Consumer snapshot-command (snapshot-command set): the consumer owns
+      #     its recovery reference, which may legitimately live in the step
+      #     summary or an external PITR system (e.g. Turso PITR) rather than a
+      #     temp/ file. Uploading temp/*.sql with if-no-files-found: error here
+      #     converted every such consumer from silent-green to hard-red on
+      #     activation (M13, verified against both Turso consumers). So this
+      #     path globs temp/* (any artifact the command wrote, not only .sql)
+      #     and downgrades absence to a LOUD WARNING, never an error.
+      - name: Upload snapshot artifact (built-in D1 export — BLOCKING)
+        if: ${{ inputs.snapshot-command == '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: db-snapshot-${{ inputs.environment }}-${{ github.run_id }}
@@ -801,6 +883,20 @@ jobs:
           # a recovery point. This upload runs BEFORE the apply step below, so
           # the recovery point is durably stored before any migration runs.
           if-no-files-found: error
+
+      - name: Upload snapshot artifact (consumer snapshot-command — warn on absence)
+        if: ${{ inputs.snapshot-command != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: db-snapshot-${{ inputs.environment }}-${{ github.run_id }}
+          # Widened glob: upload any artifact the consumer snapshot-command
+          # wrote under temp/, not only *.sql (a non-D1 dump may be .md, .dump,
+          # .json, …). Absence is a LOUD WARNING, not an error: the consumer's
+          # recovery reference may live in the step summary or an external PITR
+          # system. See docs/reusable-workflows.md#snapshot-command-artifact-contract.
+          path: temp/*
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Pre-migrate host-guard assertion
         if: ${{ inputs.pre-migrate-assert-command != '' }}
@@ -866,6 +962,20 @@ jobs:
     needs:
       - check-env
       - migration
+    # H1: same per-environment serialization group as migration / boot-smoke,
+    # so a migration and its deploy queue as one unit against concurrent
+    # callers targeting the same environment. cancel-in-progress false —
+    # never cancel an in-flight deploy.
+    concurrency:
+      group: deploy-cf-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    # H3: `!cancelled()` (NOT `always()`). `always()` jobs execute even in a
+    # cancelled run, so a superseded run whose check-env/migration already
+    # passed would still start `deploy` after cancellation and race the
+    # replacement (old SHA landing after new SHA). `!cancelled()` is otherwise
+    # identical semantics but skips on cancellation. It also carries the H0
+    # direct-need result checks so a transitively-skipped ancestor cannot
+    # skip-poison this job.
     # Run when check-env passes AND migration succeeded or was skipped.
     # 'skipped' is unambiguous here (Story #237): snapshot + apply are steps
     # of the single migration job, so a failed snapshot FAILS that job rather
@@ -874,7 +984,7 @@ jobs:
     # inputs.migrate == false — the recovery-point guarantee holds without a
     # separate inputs.migrate guard.
     if: >-
-      always() &&
+      !cancelled() &&
       needs.check-env.result == 'success' &&
       (needs.migration.result == 'success' ||
        needs.migration.result == 'skipped')
@@ -1094,7 +1204,22 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     needs: deploy
-    if: ${{ needs.deploy.result == 'success' && inputs.smoke == true }}
+    # H1: same per-environment serialization group as migration / deploy.
+    concurrency:
+      group: deploy-cf-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    # M1 + H0: gate on deployed_workers, not deploy.result == 'success'. A
+    # partial multi-worker deploy failure (or a worker-secrets step failure
+    # AFTER a good deploy) exits the deploy job 1 → deploy.result == 'failure',
+    # which would skip smoke and leave the succeeded workers serving unverified
+    # new code with no rollback. Gating on `needs.deploy.outputs.deployed_workers
+    # != ''` runs smoke (and its rollback) whenever ANY worker was deployed,
+    # even on a partial failure. `!cancelled()` carries the H0 status-check
+    # function so a transitively-skipped ancestor cannot skip-poison this job.
+    if: >-
+      ${{ !cancelled() &&
+          needs.deploy.outputs.deployed_workers != '' &&
+          inputs.smoke == true }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -1103,15 +1228,19 @@ jobs:
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
         with:
           cache: 'true'
-          # Single-sourced wrangler preflight (Story #231): the built-in probe
-          # only shells out to wrangler for the `whoami` subdomain derivation,
-          # which runs when no explicit subdomain / base URL is supplied and no
-          # consumer smoke-command replaces the probe. The auto-rollback step
-          # also uses wrangler, but only on smoke FAILURE — requiring it
-          # up-front here for every consumer would fail smoke-command callers
-          # that legitimately have no root wrangler install, so the rollback
-          # step keeps its per-worker "manual rollback required" fallback.
-          require-wrangler: ${{ (inputs.smoke-command == '' && inputs.workers_dev_subdomain == '' && inputs.smoke_base_url == '') && 'true' || 'false' }}
+          # M14: the built-in probe NO LONGER needs root wrangler. Its
+          # workers.dev subdomain derivation now uses the Cloudflare REST
+          # endpoint (GET /accounts/{account_id}/workers/subdomain) with the
+          # in-scope CLOUDFLARE_* creds instead of `pnpm exec wrangler whoami`,
+          # so a pnpm-workspace consumer with wrangler only in an app
+          # sub-package (all three real consumers) no longer fails the smoke
+          # preflight after the worker already deployed. The auto-rollback step
+          # is the only wrangler call site left, and it fires only on smoke
+          # FAILURE with a per-worker "manual rollback required" fallback (or a
+          # consumer rollback-command seam), so requiring root wrangler up-front
+          # for every smoke run is wrong. Preflight is therefore off here — the
+          # built-in probe is wrangler-free.
+          require-wrangler: 'false'
 
       # The boot-smoke probe lives in the versioned, unit-tested platform
       # script scripts/deploy-boot-smoke.mjs (Story #231), sparse-checked out
@@ -1143,6 +1272,14 @@ jobs:
       - name: Smoke-test deployed workers
         id: smoke
         shell: bash
+        # M2: step-level timeout SMALLER than the 15-minute job budget. A
+        # wedged/hung probe would otherwise hold the runner up to the job
+        # timeout and, on the job-timeout cancellation, never reach the script's
+        # terminal SMOKE_FAILED_FILE write — leaving bad code deployed with no
+        # rollback. Capping the step at 10 min leaves 5 min of job headroom for
+        # the rollback step to run. The script also has its own per-request
+        # 15s fetch timeout + bounded retries; this is the outer backstop.
+        timeout-minutes: 10
         # On failure the script writes the rollback list (sorted, unique, one
         # worker per line) to SMOKE_FAILED_FILE and appends smoke_failed=true
         # to $GITHUB_ENV, then exits 1 — driving the rollback step below.
@@ -1160,38 +1297,89 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
+      # M2 + M14 + H3: fire on FAILURE or CANCELLATION.
+      #
+      # The former gate `failure() && env.smoke_failed == 'true'` never fired
+      # when the smoke step timed out / was cancelled or when
+      # deploy-boot-smoke.mjs died before its terminal SMOKE_FAILED_FILE write
+      # — leaving bad code deployed with no rollback (M2). This gate widens to
+      # `(failure() || cancelled())` and, when the failed-workers file is
+      # absent or empty (the smoke never got far enough to write it), falls
+      # back to rolling back EVERY worker in
+      # needs.deploy.outputs.deployed_workers. The script's terminal-write
+      # crash-path fix (deploy-boot-smoke.mjs) makes the file present in the
+      # common crash case; this fallback covers the harder timeout/cancel case.
       - name: Rollback failed workers
-        if: failure() && env.smoke_failed == 'true'
+        if: (failure() || cancelled()) && inputs.smoke == true
         shell: bash
         run: |
-          echo "::warning::Smoke test failed — initiating wrangler rollback for affected workers."
+          set -uo pipefail
+          echo "::warning::Smoke failed or was cancelled — initiating rollback for affected workers."
 
+          FAILED_FILE="/tmp/smoke-failed-workers.txt"
+
+          # Resolve the rollback target list. Prefer the smoke script's
+          # written list; when it is absent or empty (smoke wedged/cancelled
+          # before its terminal write, M2), fall back to every deployed worker.
+          if [ -s "$FAILED_FILE" ]; then
+            ROLLBACK_CSV="$(paste -sd, "$FAILED_FILE")"
+          else
+            echo "::warning::No smoke-failed-workers file — rolling back ALL deployed workers (smoke likely wedged/cancelled before writing it)."
+            ROLLBACK_CSV="$DEPLOYED_WORKERS"
+          fi
+
+          # ----- Consumer rollback-command seam (M14) -----
+          # For deploy-command / pnpm-workspace consumers whose workers were
+          # published from app sub-package dirs (or via
+          # `wrangler deploy --config dist/server/wrangler.json`), the built-in
+          # root-level `pnpm exec wrangler rollback` cannot address them — the
+          # "auto-rollback" guarantee was silently void. rollback-command
+          # (symmetric to deploy-command) lets the consumer roll back the same
+          # way it deployed. It runs once with WORKERS (the resolved rollback
+          # csv) + DEPLOY_ENV + the frozen {CLOUDFLARE_*, TURSO_*} secret set
+          # exported. When set, it REPLACES the built-in loop entirely.
+          if [ -n "$ROLLBACK_COMMAND" ]; then
+            echo "::group::Running consumer rollback-command"
+            export WORKERS="$ROLLBACK_CSV"
+            bash -c "$ROLLBACK_COMMAND" \
+              || echo "::error::Consumer rollback-command FAILED — manual rollback required."
+            echo "::endgroup::"
+            echo "::error::Deployment rolled back due to failed/cancelled boot-smoke. See logs above."
+            exit 1
+          fi
+
+          # ----- Built-in root-level rollback loop (default) -----
           # Consumer lockfile-pinned wrangler (`pnpm exec wrangler`) — installed
           # by the Setup toolchain step. `pnpm exec` never falls back to a
           # registry fetch, so a missing devDependency surfaces through the
-          # per-worker "manual rollback required" fallback below rather than
-          # a silently-unpinned binary running with prod CF creds mid-incident.
-          # (The up-front preflight is single-sourced in setup-toolchain's
-          # require-wrangler and applies whenever the built-in probe needed
-          # wrangler for subdomain derivation — see the Setup toolchain step.)
-          while IFS= read -r worker; do
+          # per-worker "manual rollback required" fallback below rather than a
+          # silently-unpinned binary running with prod CF creds mid-incident.
+          # (require-wrangler is off for the built-in probe now that it is
+          # wrangler-free — M14 — so this loop keeps its own fallback.)
+          IFS=',' read -ra ROLLBACK_WORKERS <<< "$ROLLBACK_CSV"
+          for worker in "${ROLLBACK_WORKERS[@]}"; do
             worker="$(echo "$worker" | xargs)"
             [ -z "$worker" ] && continue
             echo "::group::Rolling back $worker"
             pnpm exec wrangler rollback \
               --name "$worker" \
               --env "$DEPLOY_ENV" \
-              --message "Auto-rollback: smoke check returned non-200" \
+              --message "Auto-rollback: smoke check failed or was cancelled" \
               || echo "::error::wrangler rollback failed for $worker — manual rollback required."
             echo "::endgroup::"
-          done < /tmp/smoke-failed-workers.txt
+          done
 
-          echo "::error::Deployment rolled back due to failed boot-smoke. See logs above."
+          echo "::error::Deployment rolled back due to failed/cancelled boot-smoke. See logs above."
           exit 1
         env:
           DEPLOY_ENV: ${{ inputs.environment }}
+          DEPLOYED_WORKERS: ${{ needs.deploy.outputs.deployed_workers }}
+          ROLLBACK_COMMAND: ${{ inputs.rollback-command }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Frozen allowlist: TURSO_* (for consumer rollback-command seam).
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
 
   # ---------------------------------------------------------------------------
   # 6. Deploy summary (resolved-ref single source of truth)
@@ -1257,24 +1445,35 @@ jobs:
           SMOKE_RESULT: ${{ needs.boot-smoke.result }}
 
   # ---------------------------------------------------------------------------
-  # 7. Require deploy ran (Story #268 + #272 — green must mean deployed)
+  # 7. Require deploy ran (Story #268 + #272 + #283 — green must mean deployed)
   #    Always-on terminal job: unlike every job above, it does NOT participate
   #    in the CI-green `if:` guard or the `needs:` skip chain, so it runs even
-  #    when layer 1 gated the whole chain off. It fails in the two distinct
-  #    "green run that didn't deploy" cases, which are mutually exclusive so the
-  #    two steps never double-fire:
-  #      - #268 (red CI): a `workflow_run` whose upstream conclusion was NOT
-  #        `success` — the CI-green guard skips the whole chain.
-  #      - #272 (green CI, env jobs skipped): a `workflow_run` whose upstream
-  #        conclusion WAS `success` but `deploy` still resolved to `skipped`,
-  #        because a reusable workflow's `environment:`-gated jobs do not run on
-  #        `workflow_run` events (a documented GitHub limitation). The real fix
-  #        is to trigger the deploy via `workflow_dispatch` instead — see the
-  #        canonical templates/workflows/deploy-staging.yml (dispatcher) +
-  #        deploy-staging-run.yml — but this guard makes an un-migrated /
-  #        mis-wired consumer's non-deploy visibly RED instead of falsely green.
-  #    Every other trigger, and every green-CI workflow_run whose deploy
-  #    actually ran, passes through as a no-op.
+  #    when layer 1 gated the whole chain off. It fails in two distinct "green
+  #    run that didn't deploy" cases, which are mutually exclusive so the two
+  #    steps never double-fire:
+  #      - #268 (red CI, workflow_run only): a `workflow_run` whose upstream
+  #        conclusion was NOT `success` — the CI-green guard skips the whole
+  #        chain. This case is inherently workflow_run-specific (only a
+  #        workflow_run trigger carries an upstream conclusion to be red).
+  #      - #283 (all-skipped chain, EVERY trigger): `deploy` resolved to
+  #        `skipped` on a run whose CI was NOT red. This fires on ALL triggers,
+  #        not just workflow_run (H0 corollary 2 — athportal's dispatch-triggered
+  #        all-skipped chain was green today because the former step was
+  #        `workflow_run`-only).
+  #    REAL MECHANISM (H0 / L1 — corrects the #272 misdiagnosis): the skip is
+  #    NOT "environment: jobs do not run on workflow_run events (a documented
+  #    GitHub limitation)". That premise was false — the skip happened on
+  #    workflow_dispatch too. The actual cause was TRANSITIVE needs-chain
+  #    skip-poisoning (actions/runner#2205): the default-skipped opt-in
+  #    `environments-isolation-audit` root job skip-poisoned every downstream
+  #    job whose `if:` lacked a status-check function, because GitHub's implicit
+  #    `success()` evaluates the whole transitive ancestor chain, not just
+  #    direct needs. That root cause is now fixed at source (every chain job
+  #    carries `!cancelled()` + direct-need result checks), so a `skipped`
+  #    deploy on a non-red run means a genuine gate failure or misconfiguration
+  #    — and this guard makes it visibly RED instead of falsely green on every
+  #    trigger. Every other trigger, and every run whose deploy actually ran,
+  #    passes through as a no-op.
   # ---------------------------------------------------------------------------
   require-deploy-ran:
     name: Require deploy ran (${{ inputs.environment }})
@@ -1294,12 +1493,17 @@ jobs:
         env:
           UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
 
-      - name: Fail if a green-CI workflow_run deploy skipped (environment jobs skip on workflow_run)
+      - name: Fail if the deploy chain skipped on a non-red run (any trigger)
+        # Trigger-agnostic (H0 corollary 2): NO `github.event_name ==
+        # 'workflow_run'` condition — an all-skipped chain must fail on
+        # workflow_dispatch / push / schedule too. Excludes the red-CI
+        # workflow_run case (handled by the step above) so the two never
+        # double-fire.
         if: >-
-          ${{ github.event_name == 'workflow_run' &&
-              github.event.workflow_run.conclusion == 'success' &&
-              needs.deploy.result == 'skipped' }}
+          ${{ needs.deploy.result == 'skipped' &&
+              !(github.event_name == 'workflow_run' &&
+                github.event.workflow_run.conclusion != 'success') }}
         shell: bash
         run: |
-          echo "::error::Upstream CI was green but the deploy chain SKIPPED (deploy result='skipped'). A reusable workflow's environment:-gated jobs do not run on workflow_run events, so 0 workers deployed while this run would otherwise report green. Trigger the deploy via workflow_dispatch instead — see the canonical templates/workflows/deploy-staging.yml (CI-green dispatcher) + deploy-staging-run.yml. This run is intentionally red so a non-deploy is never mistaken for a success (refs #272)."
+          echo "::error::The deploy chain SKIPPED (deploy result='skipped') on a run whose CI was not red, so 0 workers deployed while this run would otherwise report green. The historical cause was TRANSITIVE needs-chain skip-poisoning (actions/runner#2205) from the default-skipped opt-in environments-isolation-audit root job — NOT the previously-claimed 'environment: jobs do not run on workflow_run' GitHub limitation, which was a misdiagnosis (the skip occurred on workflow_dispatch too). That root cause is now fixed (every chain job carries an explicit !cancelled() status-check + direct-need result checks), so a skipped deploy here means a genuine upstream gate failure or a misconfigured caller. This run is intentionally red so a non-deploy is never mistaken for a success (refs #283, #272)."
           exit 1
