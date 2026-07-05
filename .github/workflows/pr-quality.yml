@@ -1209,30 +1209,37 @@ jobs:
           persist-credentials: false
 
       # Resolve the Semgrep SAST baseline, mirroring the gitleaks range
-      # scoping above. On pull_request events the baseline is the PR's merge
-      # base (`base.sha`), so `--baseline-commit` makes Semgrep report only
-      # findings INTRODUCED by the PR (pre-existing debt is suppressed). On
-      # push events the baseline is `event.before` (the commits the push added),
-      # so a push-to-main CI run — load-bearing since the canonical
-      # `workflow_run` deploy trigger, Story #175 — reports only push-introduced
-      # findings instead of full-tree-blocking on pre-existing debt. Only when
-      # no baseline is resolvable (no PR context, no valid non-zero
-      # `event.before` ancestor) does it fall back to a full-tree scan.
-      # `fetch-depth: 0` on the checkout above makes the base commit available.
+      # scoping above. On pull_request events the baseline is the MERGE BASE of
+      # base..head (M8: `github.event.pull_request.base.sha` is the base
+      # branch TIP, which drifts past the fork point once main advances — the
+      # same base-tip-vs-merge-base drift the migration guard had; the audit
+      # flags this as the milder same-family SAST case). Using the merge base
+      # makes `--baseline-commit` report only findings INTRODUCED by the PR,
+      # never findings from commits merged into base by others. On push events
+      # the baseline is `event.before` (the commits the push added), so a
+      # push-to-main CI run — load-bearing since the canonical `workflow_run`
+      # deploy trigger, Story #175 — reports only push-introduced findings
+      # instead of full-tree-blocking on pre-existing debt. Only when no
+      # baseline is resolvable (no PR context, no valid non-zero `event.before`
+      # ancestor) does it fall back to a full-tree scan. `fetch-depth: 0` on
+      # the checkout above makes the merge base / base commit resolvable.
       - name: Resolve SAST baseline
         id: sast-baseline
         if: ${{ inputs.enable-sast }}
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           ZERO_SHA="0000000000000000000000000000000000000000"
-          if [ -n "${BASE_SHA:-}" ]; then
-            echo "baseline=${BASE_SHA}" >> "$GITHUB_OUTPUT"
-            echo "PR-diff SAST baseline: ${BASE_SHA}"
+          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            # M8: baseline on the merge base of base..head, not the base tip.
+            merge_base="$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")"
+            echo "baseline=${merge_base}" >> "$GITHUB_OUTPUT"
+            echo "PR-diff SAST baseline (merge-base of ${BASE_SHA}..${HEAD_SHA}): ${merge_base}"
           elif [ "${EVENT_NAME:-}" = "push" ] && [ -n "${BEFORE_SHA:-}" ] && \
                [ "${BEFORE_SHA}" != "${ZERO_SHA}" ] && \
                git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
