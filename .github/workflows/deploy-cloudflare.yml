@@ -1297,7 +1297,8 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      # M2 + M14 + H3: fire on FAILURE or CANCELLATION.
+      # M2 + M14 + H3: fire on FAILURE or CANCELLATION — but only once the
+      # smoke step ITSELF ran.
       #
       # The former gate `failure() && env.smoke_failed == 'true'` never fired
       # when the smoke step timed out / was cancelled or when
@@ -1309,8 +1310,20 @@ jobs:
       # needs.deploy.outputs.deployed_workers. The script's terminal-write
       # crash-path fix (deploy-boot-smoke.mjs) makes the file present in the
       # common crash case; this fallback covers the harder timeout/cancel case.
+      #
+      # `steps.smoke.conclusion != 'skipped'` is load-bearing (audit finding):
+      # steps 0–2 of this job (checkout, setup-toolchain, sparse-checkout of the
+      # probe script) run BEFORE the smoke step, so a transient failure in ANY
+      # of them makes `failure()` true while the smoke step is still `skipped` —
+      # without this guard the fallback would roll back an otherwise-healthy
+      # deploy that smoke never even evaluated. Scoping to a smoke step that
+      # actually reached `failure`/`cancelled` keeps the timeout/wedge coverage
+      # (smoke started but did not cleanly pass) while excluding pre-smoke setup
+      # flakiness. `steps.smoke.conclusion` is 'skipped' when an earlier step
+      # failed, and 'failure'/'cancelled' when the smoke step itself ran and
+      # did not pass.
       - name: Rollback failed workers
-        if: (failure() || cancelled()) && inputs.smoke == true
+        if: (failure() || cancelled()) && inputs.smoke == true && steps.smoke.conclusion != 'skipped'
         shell: bash
         run: |
           set -uo pipefail

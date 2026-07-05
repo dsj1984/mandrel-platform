@@ -1396,12 +1396,24 @@ jobs:
           # reliance on the shared `--user` site.
           venv_dir="$(mktemp -d)/semgrep-venv"
           python3 -m venv "${venv_dir}"
+          # The lockfile pins cp312-only native wheels, so the hash-pinned path
+          # is valid ONLY on a Linux interpreter whose ABI tag is cp312. Gating
+          # on `uname` alone is a fleet-wide time bomb: when `ubuntu-latest`
+          # rolls its default python3 to 3.13, cp312 wheels become
+          # ABI-incompatible, `--only-binary :all:` forbids an sdist fallback,
+          # and `--require-hashes` hard-fails ci-required across every consumer
+          # at once. Probe the actual interpreter version and fall back to the
+          # top-pin install (the same path the darwin branch uses) on any
+          # non-312 interpreter, so a Python roll-forward degrades to
+          # unpinned-but-green rather than fleet-red. Re-pin the lockfile to the
+          # new cpXY when the CI image moves (M7 lockfile-refresh follow-up).
+          pyver="$("${venv_dir}/bin/python" -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
           # `--retries 3` (L8): a PyPI/registry blip must not fail the whole
           # fleet's ci-required and force a manual re-run. `--require-hashes`
           # fails closed on any hash mismatch, so retries only widen the
           # availability window, never the trust boundary.
-          if [ "$(uname -s)" = "Linux" ] && [ -f "${LOCKFILE}" ]; then
-            echo "Installing hash-pinned Semgrep from ${LOCKFILE} (Linux, --require-hashes)."
+          if [ "$(uname -s)" = "Linux" ] && [ "${pyver}" = "312" ] && [ -f "${LOCKFILE}" ]; then
+            echo "Installing hash-pinned Semgrep from ${LOCKFILE} (Linux cp${pyver}, --require-hashes)."
             # `--require-hashes -r` installs semgrep + its ENTIRE transitive
             # closure (setuptools included) only if every artifact matches a
             # pinned sha256 in the lockfile — no floating transitive can slip

@@ -106,16 +106,23 @@ jobs:
             # the latest state per context across the whole commit — so a release
             # commit carrying more than one page (30) of statuses can still
             # surface smoke/cross-repo, which page-1-only paging (L9) could bury.
-            # `--paginate` walks every `statuses[]` page so a large context set is
-            # fully materialized before the jq select.
+            # `--paginate --slurp` walks every `statuses[]` page AND merges them
+            # into a single JSON array before the jq runs. `--slurp` is
+            # load-bearing (audit finding): with `--paginate` alone `gh` applies
+            # `--jq` PER PAGE and emits one result line per page, so a commit
+            # with >30 statuses (exactly the case this endpoint switch targets)
+            # yields a multi-line `state` that never matches the case arms below
+            # — silently re-burying smoke/cross-repo on page ≥2. `--slurp`
+            # produces a top-level array of page objects, so the jq flattens
+            # every page's `.statuses[]` before selecting the context.
             #
             # `|| echo none` (M10): under `set -euo pipefail` a transient `gh api`
             # non-zero (5xx, secondary rate limit) would otherwise abort the whole
             # poll on a single blip the 15-min budget exists to ride out. Swallow
             # it to "none" so the blip reads as one "no status yet" attempt,
             # bounded by MAX_ATTEMPTS, instead of killing the job.
-            state="$(gh api --paginate "repos/${REPO}/commits/${SHA}/status" \
-              --jq '.statuses | map(select(.context=="smoke/cross-repo")) | (first.state // "none")' \
+            state="$(gh api --paginate --slurp "repos/${REPO}/commits/${SHA}/status" \
+              --jq '[.[].statuses[]] | map(select(.context=="smoke/cross-repo")) | (first.state // "none")' \
               || echo none)"
             # A blank result (e.g. an empty combined-status body) also means
             # "no status yet"; normalize so the case-match below is well-defined.
