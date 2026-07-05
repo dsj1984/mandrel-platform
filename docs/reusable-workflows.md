@@ -1103,6 +1103,7 @@ A reusable Cloudflare deploy with defence-in-depth, consumable as a
 
 ```text
 environments-isolation-audit → secret-isolation-audit → check-env → migration → deploy → boot-smoke → deploy-summary
+                                                                                        └→ require-deploy-ran
 ```
 
 `environments-isolation-audit` only runs when
@@ -1280,6 +1281,28 @@ hygiene (opt-in) and `secret-isolation-audit` on plaintext secrets; both
 carry the CI-green expression directly, and `secret-isolation-audit` only
 proceeds once the isolation audit has cleared or was skipped
 (`needs: [environments-isolation-audit]`).
+
+### Require deploy ran (green must mean deployed)
+
+> Story #268. Before this job existed, a `workflow_run`-gated deploy whose
+> upstream CI concluded non-`success` was gated off by the guard above —
+> every job in the chain (`environments-isolation-audit` through
+> `deploy-summary`) reported `skipped`, and GitHub concluded the run
+> `success` because none of its jobs `failed`. That run was visually
+> identical to a real, successful deploy, even though nothing was built,
+> migrated, or deployed — masking 6 consecutive non-deploys behind 6 green
+> `deploy-staging` runs in one consumer before it was caught.
+
+`require-deploy-ran` is the one job in this workflow that deliberately does
+**not** participate in the CI-green `if:` guard or the `needs:` skip chain
+(`needs: [deploy]`, `if: always()`), so it runs even when the guard gated
+the rest of the chain off. Its single step fails — with an `::error::`
+annotation naming the upstream conclusion — exactly when this run's trigger
+was `workflow_run` and `github.event.workflow_run.conclusion != 'success'`:
+the case where the deploy chain was gated off. Every other trigger, and
+every green-CI `workflow_run`, passes through as a no-op costing one cheap
+runner; no additional runners are spun up for the build/migrate/deploy
+chain itself on a gated-off run.
 
 ### Secret isolation audit and the `runner` input
 

@@ -74,6 +74,19 @@
 #                              asserts the health response's "version" field
 #                              matches github.sha, failing smoke (and
 #                              triggering rollback) on a mismatch.
+#   6. require-deploy-ran    — always-on (Story #268), one cheap runner. Green
+#                              stops meaning "deployed" and starts also meaning
+#                              "silently did nothing" the moment a
+#                              `workflow_run`-gated caller's upstream CI goes
+#                              red: layer 1's CI-green guard skips the entire
+#                              chain, and an all-`skipped` run concludes
+#                              `success` — visually identical to a real deploy.
+#                              This job runs regardless of the guard and fails
+#                              LOUDLY exactly when the chain was gated off by
+#                              non-success upstream CI, so the run is honestly
+#                              red instead of falsely green. Every other
+#                              trigger (and every green-CI workflow_run) is
+#                              unaffected.
 #
 # Command seams (Story #41): the D1 export/apply, build, and workers.dev smoke
 # defaults are all overridable so non-D1 / build-step / custom-host consumers can
@@ -1242,3 +1255,32 @@ jobs:
           JOB_WORKFLOW_SHA: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           SMOKE_RESULT: ${{ needs.boot-smoke.result }}
+
+  # ---------------------------------------------------------------------------
+  # 7. Require deploy ran (Story #268 — green must mean deployed)
+  #    Always-on terminal job: unlike every job above, it does NOT participate
+  #    in the CI-green `if:` guard or the `needs:` skip chain, so it runs even
+  #    when layer 1 gated the whole chain off. It fails specifically when this
+  #    run's trigger was a `workflow_run` whose upstream conclusion was NOT
+  #    `success` — exactly the case where deploy/migrate/boot-smoke were all
+  #    skipped and would otherwise report an indistinguishable-from-real-deploy
+  #    green. Every other trigger, and every green-CI workflow_run, passes
+  #    through as a no-op (deploy actually ran).
+  # ---------------------------------------------------------------------------
+  require-deploy-ran:
+    name: Require deploy ran (${{ inputs.environment }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    needs: [deploy]
+    if: always()
+    steps:
+      - name: Fail if a workflow_run deploy was gated off by red CI
+        if: >-
+          ${{ github.event_name == 'workflow_run' &&
+              github.event.workflow_run.conclusion != 'success' }}
+        shell: bash
+        run: |
+          echo "::error::Upstream CI concluded '${UPSTREAM_CONCLUSION}'. Staging was NOT deployed — this run is intentionally red so a CI-gated-off deploy is never mistaken for a successful one."
+          exit 1
+        env:
+          UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
