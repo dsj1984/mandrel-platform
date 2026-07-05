@@ -83,6 +83,11 @@ jobs:
           # workflow is valid even before the secret is provisioned (cross-repo
           # rows then surface as errors rather than hard-failing).
           GH_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN || github.token }}
+          # Raw PIN_DRIFT_TOKEN so the script can tell a PROVIDED-but-dead PAT
+          # (expired → every cross-repo row errors → hard-fail) apart from the
+          # not-yet-provisioned bootstrap (absent → benign, exit 0). Empty when
+          # the secret is unset (M11).
+          PIN_DRIFT_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN }}
           STRICT: ${{ inputs.strict && '--strict' || '' }}
         shell: bash
         run: |

@@ -21,6 +21,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -32,6 +35,7 @@ import {
   parsePrNumberFromUrl,
   renderRepairPrBody,
   renderRepairReport,
+  runCli,
   runRepair,
 } from "./platform-repair.mjs";
 
@@ -269,6 +273,12 @@ function makeGh({ consumerWorkflow, npmVersion, openPrs = {}, calls }) {
 
 const noopGit = () => "";
 
+/** A minimal write-sink that records everything written, for stdout/stderr. */
+function capture() {
+  const chunks = [];
+  return { write: (s) => chunks.push(s), text: () => chunks.join("") };
+}
+
 function laggingConfig() {
   return {
     platformRepo: PLATFORM_REPO,
@@ -455,4 +465,107 @@ test("renderRepairReport tabulates outcomes and a repaired section", () => {
   assert.ok(text.includes("domio"));
   assert.ok(text.includes("Repaired (1)"));
   assert.ok(text.includes("#101"));
+});
+
+// ---------------------------------------------------------------------------
+// M11 — provided-but-dead read credential vs. not-yet-provisioned bootstrap.
+// The repair loop reads consumers with the SAME cross-repo PAT the dashboard
+// uses (PIN_DRIFT_TOKEN → GH_TOKEN). When that PAT is provided-but-dead every
+// detector row errors → every consumer classifies `error`/repairable-false,
+// which otherwise renders a reassuring green "no repairable drift". runCli must
+// hard-fail on that when the token was provided, and stay exit-0 when it was
+// absent (bootstrap). Mirrors scripts/check-runner-health.mjs error-row
+// handling. (temp/audits/workflow-robustness-review-2026-07-05.md M11)
+// ---------------------------------------------------------------------------
+
+/**
+ * A gh runner where the platform's own release resolution succeeds but EVERY
+ * cross-repo consumer read fails non-404 (auth/transport) — the shape of a dead
+ * cross-repo PAT. No PR surface is reached because every consumer errors out
+ * before repair.
+ */
+function makeAllConsumersFailGh() {
+  return (args) => {
+    const path = args[1];
+    if (args[0] !== "api") {
+      throw new Error(`unexpected non-api gh call under dead credential: ${args.join(" ")}`);
+    }
+    if (path === `repos/${PLATFORM_REPO}/releases/latest`) {
+      return JSON.stringify({ tag_name: "mandrel-platform-v1.2.3", published_at: "2020-01-01T00:00:00Z" });
+    }
+    if (path === `repos/${PLATFORM_REPO}/git/ref/tags/mandrel-platform-v1.2.3`) {
+      return JSON.stringify({ object: { sha: LATEST_SHA, type: "commit" } });
+    }
+    if (/\/contents\/\.github\/workflows/.test(path)) {
+      // 403 (not 404) → fail-closed error row, mirroring an expired PAT.
+      const err = new Error("gh: Forbidden (HTTP 403)");
+      err.stderr = "gh: Forbidden (HTTP 403)\n";
+      throw err;
+    }
+    if (/^repos\/[^/]+\/[^/]+$/.test(path)) {
+      return JSON.stringify({ default_branch: "main" });
+    }
+    throw new Error(`unexpected gh api path: ${path}`);
+  };
+}
+
+function deadCredConfigFile() {
+  const dir = mkdtempSync(join(tmpdir(), "platform-repair-dead-"));
+  const p = join(dir, "consumers.json");
+  writeFileSync(
+    p,
+    JSON.stringify({
+      platformRepo: PLATFORM_REPO,
+      consumers: [
+        { name: "domio", repo: "dsj1984/domio" },
+        { name: "athportal", repo: "dsj1984/athportal" },
+      ],
+    }),
+  );
+  return { dir, p };
+}
+
+test("runCli: PROVIDED-but-dead PIN_DRIFT_TOKEN (every consumer read errors) exits 1 with ::error::", () => {
+  const { dir, p } = deadCredConfigFile();
+  const stderr = capture();
+  try {
+    const code = runCli({
+      argv: ["--config", p],
+      env: { PIN_DRIFT_TOKEN: "ghp_expired" },
+      runGh: makeAllConsumersFailGh(),
+      runGit: noopGit,
+      runSync: () => {
+        throw new Error("must not sync under a dead credential");
+      },
+      stdout: capture(),
+      stderr,
+      summaryPath: undefined,
+    });
+    assert.equal(code, 1);
+    assert.match(stderr.text(), /::error::/);
+    assert.match(stderr.text(), /credential is dead/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCli: ABSENT PIN_DRIFT_TOKEN bootstrap (every consumer read errors, token unset) stays exit 0", () => {
+  const { dir, p } = deadCredConfigFile();
+  try {
+    const code = runCli({
+      argv: ["--config", p],
+      env: {}, // PIN_DRIFT_TOKEN absent → not-yet-provisioned bootstrap.
+      runGh: makeAllConsumersFailGh(),
+      runGit: noopGit,
+      runSync: () => {
+        throw new Error("must not sync during bootstrap");
+      },
+      stdout: capture(),
+      stderr: capture(),
+      summaryPath: undefined,
+    });
+    assert.equal(code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
