@@ -107,22 +107,28 @@ jobs:
             # commit carrying more than one page (30) of statuses can still
             # surface smoke/cross-repo, which page-1-only paging (L9) could bury.
             # `--paginate --slurp` walks every `statuses[]` page AND merges them
-            # into a single JSON array before the jq runs. `--slurp` is
-            # load-bearing (audit finding): with `--paginate` alone `gh` applies
-            # `--jq` PER PAGE and emits one result line per page, so a commit
-            # with >30 statuses (exactly the case this endpoint switch targets)
-            # yields a multi-line `state` that never matches the case arms below
-            # — silently re-burying smoke/cross-repo on page ≥2. `--slurp`
-            # produces a top-level array of page objects, so the jq flattens
-            # every page's `.statuses[]` before selecting the context.
+            # into a single JSON array, then an EXTERNAL `jq` flattens and
+            # selects. `--slurp` is load-bearing (audit finding): with
+            # `--paginate` alone `gh` applies `--jq` PER PAGE and emits one line
+            # per page, so a commit with >30 statuses (exactly the case this
+            # endpoint switch targets) yields a multi-line `state` that never
+            # matches the case arms below — silently re-burying smoke/cross-repo
+            # on page ≥2.
+            #
+            # CRITICAL: `--slurp` is NOT compatible with `gh`'s own `--jq`
+            # ("the --slurp option is not supported with --jq or --template").
+            # A prior revision combined them and every attempt failed instantly,
+            # so `|| echo none` made state="none" forever and EVERY release
+            # timed out. Pipe `--slurp`'s raw JSON to a standalone `jq -r`
+            # instead — the only supported way to slurp AND transform.
             #
             # `|| echo none` (M10): under `set -euo pipefail` a transient `gh api`
-            # non-zero (5xx, secondary rate limit) would otherwise abort the whole
-            # poll on a single blip the 15-min budget exists to ride out. Swallow
-            # it to "none" so the blip reads as one "no status yet" attempt,
-            # bounded by MAX_ATTEMPTS, instead of killing the job.
-            state="$(gh api --paginate --slurp "repos/${REPO}/commits/${SHA}/status" \
-              --jq '[.[].statuses[]] | map(select(.context=="smoke/cross-repo")) | (first.state // "none")' \
+            # (or jq) non-zero (5xx, secondary rate limit) would otherwise abort
+            # the whole poll on a single blip the 15-min budget exists to ride
+            # out. Swallow it to "none" so the blip reads as one "no status yet"
+            # attempt, bounded by MAX_ATTEMPTS, instead of killing the job.
+            state="$(gh api --paginate --slurp "repos/${REPO}/commits/${SHA}/status" 2>/dev/null \
+              | jq -r '[.[].statuses[]] | map(select(.context=="smoke/cross-repo")) | (first.state // "none")' \
               || echo none)"
             # A blank result (e.g. an empty combined-status body) also means
             # "no status yet"; normalize so the case-match below is well-defined.
@@ -180,26 +186,36 @@ jobs:
       # force_publish=true from a non-main branch, or from a main HEAD that has
       # advanced past the tagged release commit, would `npm publish` an
       # untagged/unreleased tree under the current package.json version — with a
-      # valid OIDC provenance attestation. This step fails the recovery path
-      # unless BOTH hold:
-      #   1. the ref is refs/heads/main, and
-      #   2. tag v<package.json version> exists AND resolves to github.sha.
-      # It runs ONLY on the force path; the normal release-created path already
-      # publishes a freshly-tagged release commit and is not re-gated here.
+      # valid OIDC provenance attestation. This step runs ONLY on the force
+      # path; the normal release-created path already publishes a freshly-tagged
+      # release commit and is not re-gated here.
       #
+      # It enforces:
+      #   1. the ref is refs/heads/main, and
+      #   2. the release tag for the current package.json version EXISTS.
+      # It then RESOLVES that tag's commit and hands it to the re-checkout step
+      # below, so force_publish publishes the exact TAGGED release tree rather
+      # than whatever HEAD currently is. That is strictly safer than the old
+      # "tag must equal HEAD" assertion AND actually recoverable: a recovery
+      # publish after main has advanced (the normal case — you fix something,
+      # merge, then recover the stuck release) no longer fails on a HEAD/tag
+      # mismatch, because the tag's tree is what gets published.
+      #
+      # Tag NAME is component-prefixed (`<pkg name>-v<version>`, per
+      # release-please-config.json `include-component-in-tag: true`), derived
+      # from package.json `name` so it tracks a rename — NOT the bare `v<version>`
+      # a prior revision hardcoded (which 404'd against the real
+      # `mandrel-platform-v<version>` tag and broke every force_publish).
       # Tag resolution goes through the GitHub API, NOT `git rev-parse`: the
-      # checkout above is shallow (fetch-depth 1) and tagless, so a bare
-      # `git rev-parse v<version>` would ALWAYS fail and block every legitimate
-      # recovery publish. `GET /repos/{repo}/git/ref/tags/{tag}` returns the tag
-      # object; we dereference annotated tags to the underlying commit so the
-      # SHA comparison holds whether the release tag is lightweight or annotated.
-      - name: Guard force_publish (ref + tag + sha)
+      # checkout above is shallow (fetch-depth 1) and tagless. Annotated tags are
+      # dereferenced to the underlying commit.
+      - name: Guard force_publish (ref + tag)
+        id: guard
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_publish }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           REF: ${{ github.ref }}
-          SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -210,12 +226,13 @@ jobs:
             fail "github.ref is '${REF}', expected 'refs/heads/main' — force_publish may only run on main."
           fi
 
-          # Resolve the version to publish and its expected tag.
+          # Resolve the version to publish and its component-prefixed release tag.
           VERSION="$(node -p "require('./package.json').version")"
-          TAG="v${VERSION}"
-          echo "Guarding force_publish for ${TAG} (package.json version ${VERSION}) at ${SHA}"
+          PKG_NAME="$(node -p "require('./package.json').name")"
+          TAG="${PKG_NAME}-v${VERSION}"
+          echo "Guarding force_publish for ${TAG} (package.json version ${VERSION})"
 
-          # Assertion 2a — tag v<version> must exist. Resolve via the GitHub API
+          # Assertion 2 — the release tag must exist. Resolve via the GitHub API
           # (the checkout is shallow+tagless). A 404 means no such tag.
           REF_JSON="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" 2>/dev/null || echo '')"
           if [ -z "${REF_JSON}" ]; then
@@ -232,12 +249,18 @@ jobs:
             TAG_SHA="${OBJ_SHA}"
           fi
 
-          # Assertion 2b — the tag must resolve to the dispatched commit.
-          if [ "${TAG_SHA}" != "${SHA}" ]; then
-            fail "tag '${TAG}' resolves to ${TAG_SHA}, not the dispatched github.sha ${SHA} — HEAD has moved past the tagged release commit; refusing to publish."
-          fi
+          echo "tag_sha=${TAG_SHA}" >> "$GITHUB_OUTPUT"
+          echo "✅ force_publish guard passed: ref=${REF}, ${TAG} → ${TAG_SHA} (will publish that tree)."
 
-          echo "✅ force_publish guard passed: ref=${REF}, ${TAG} → ${TAG_SHA} == github.sha."
+      # Re-checkout the TAGGED release tree on the force path, so npm publish
+      # ships exactly the tagged release — never the current HEAD. On the normal
+      # (release-created) path this step is skipped and the initial HEAD checkout
+      # (the freshly-tagged release commit) is what publishes.
+      - name: Checkout tagged release tree (force_publish recovery)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_publish }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.guard.outputs.tag_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
