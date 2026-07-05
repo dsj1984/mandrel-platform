@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.24.0...mandrel-platform-v0.25.0) (2026-07-05)
+
+
+### Added
+
+* Epic [#279](https://github.com/dsj1984/mandrel-platform/issues/279) ([#286](https://github.com/dsj1984/mandrel-platform/issues/286)) ([5667c4e](https://github.com/dsj1984/mandrel-platform/commit/5667c4e4935d4b9222c6a9d2cf5c58bb1781ebc6))
+
 ## [0.24.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.23.0...mandrel-platform-v0.24.0) (2026-07-05)
 
 
