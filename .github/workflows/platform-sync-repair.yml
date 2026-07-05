@@ -75,6 +75,11 @@ jobs:
           # valid before the secret is provisioned (unreadable consumers then
           # surface as `error` rows rather than hard-failing).
           GH_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN || github.token }}
+          # Raw PIN_DRIFT_TOKEN so the loop can tell a PROVIDED-but-dead read PAT
+          # (expired → every detector row errors → hard-fail) apart from the
+          # not-yet-provisioned bootstrap (absent → read-only, exit 0). Empty when
+          # the secret is unset (M11).
+          PIN_DRIFT_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN }}
           # WRITE token for opening repair PRs on the consumers. Least-privilege:
           # Contents: write + Pull requests: write on the consumer repos ONLY.
           # Absent → the loop runs read-only and reports would-open repairs.

@@ -68,7 +68,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildReport, isFullSha } from "./check-pin-drift.mjs";
+import {
+  allConsumersErrored,
+  buildReport,
+  isFullSha,
+  pinDriftTokenProvided,
+} from "./check-pin-drift.mjs";
 import { defaultGhRunner } from "./lib/gh-json.mjs";
 import { parseSemver } from "./lib/semver-duration.mjs";
 
@@ -602,6 +607,13 @@ export function runRepair({
 }) {
   // Reuse the detector to classify every consumer (single SSOT for drift).
   const report = buildReport(config, runGh, nowMs);
+  // M11: mirror check-pin-drift's dead-credential signal. When EVERY consumer
+  // row errored the detector could read no repo at all — the signature of a
+  // provided-but-dead PIN_DRIFT_TOKEN (an expired PAT). The caller pairs this
+  // with `tokenProvided` to fail the run instead of silently reporting a green
+  // "no repairable drift" (which is what an all-error sweep degrades to, since
+  // every error row classifies `repairable: false, reason: "error"`).
+  const allErrored = allConsumersErrored(report);
   const latestTag = report.latestRelease?.tag ?? null;
   const targetSha = report.latestRelease?.sha ?? null;
   // The pin target is the latest release tag (so the `# <ref>` annotation reads
@@ -648,7 +660,14 @@ export function runRepair({
     }
   }
 
-  return { ref: effectiveRef, targetSha, dryRun, hasToken: Boolean(token), rows };
+  return {
+    ref: effectiveRef,
+    targetSha,
+    dryRun,
+    hasToken: Boolean(token),
+    allErrored,
+    rows,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +761,23 @@ export function runCli({
         );
       }
     }
+  }
+
+  // M11: the repair loop reads consumers with the SAME cross-repo credential the
+  // dashboard uses (PIN_DRIFT_TOKEN → GH_TOKEN). When that token was PROVIDED
+  // but every detector row errored, the credential is dead (expired PAT) rather
+  // than not-yet-provisioned — every consumer degraded to `error` / repairable
+  // false, which otherwise renders a reassuring green "no repairable drift". Fail
+  // the run loudly so the dead credential is fixed. The absent-token bootstrap
+  // (pinDriftTokenProvided false) keeps its exit-0 read-only behavior.
+  if (pinDriftTokenProvided(env) && report.allErrored) {
+    stderr.write(
+      "::error::[platform-repair] PIN_DRIFT_TOKEN was provided but every " +
+        "cross-repo consumer read errored — the credential is dead (likely an " +
+        "expired fine-grained PAT), not a not-yet-provisioned bootstrap. Rotate " +
+        "the token. See docs/runbooks/pin-drift-dashboard.md.\n",
+    );
+    return 1;
   }
   return 0;
 }

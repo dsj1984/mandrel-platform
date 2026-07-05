@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  allConsumersErrored,
   buildReport,
   classifyNpmPin,
   classifyStaleLiterals,
@@ -34,6 +35,7 @@ import {
   isWithinReleaseAgeWindow,
   parseDurationMs,
   parseSemver,
+  pinDriftTokenProvided,
   renderReport,
   resolveLatestRelease,
   runCli,
@@ -879,6 +881,129 @@ test("runCli --strict DOES exit 1 once the held release ages out", () => {
       nowMs: NOW, // release is 5 days old → past the 3-day hold window.
     });
     assert.equal(code, 1);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// M11 — provided-but-dead PIN_DRIFT_TOKEN (expired PAT) vs. not-yet-provisioned
+// bootstrap. A dead credential can read NO consumer, so every row fails closed
+// to an `error` row; that must hard-fail EVEN without --strict (the scheduled
+// path can never pass --strict). The absent-token bootstrap — identical row
+// shape but token unset — must keep its benign exit-0.
+// (temp/audits/workflow-robustness-review-2026-07-05.md M11)
+// ---------------------------------------------------------------------------
+
+const DEAD_CRED_CONFIG = {
+  platformRepo: PLATFORM,
+  consumers: [
+    { name: "c1", repo: "o/c1", branch: "main" },
+    { name: "c2", repo: "o/c2", branch: "main" },
+  ],
+};
+
+/**
+ * A gh runner where the platform's own release resolution succeeds (that read
+ * uses the built-in token, which CAN read this repo) but EVERY cross-repo
+ * consumer workflow-listing call fails with a non-404 (auth/transport) — the
+ * exact shape of a dead cross-repo PAT. Every consumer therefore becomes an
+ * `error` row.
+ */
+function makeAllConsumersFailRunGh() {
+  return (args) => {
+    const path = args[1];
+    if (path === `repos/${PLATFORM}/releases/latest`) {
+      return JSON.stringify({ tag_name: TAG });
+    }
+    if (path === `repos/${PLATFORM}/git/ref/tags/${TAG}`) {
+      return JSON.stringify({ object: { sha: LATEST_SHA, type: "commit" } });
+    }
+    if (/\/contents\/\.github\/workflows/.test(path)) {
+      // 403/5xx (not 404) → fail-closed to an `error` row, mirroring an expired
+      // PAT that can no longer read the private consumer repo.
+      throw ghHttpError(403, "Forbidden");
+    }
+    throw new Error(`unexpected gh api path: ${path}`);
+  };
+}
+
+test("pinDriftTokenProvided: non-empty ⇒ true, empty/absent ⇒ false", () => {
+  assert.equal(pinDriftTokenProvided({ PIN_DRIFT_TOKEN: "ghp_live" }), true);
+  assert.equal(pinDriftTokenProvided({ PIN_DRIFT_TOKEN: "" }), false);
+  assert.equal(pinDriftTokenProvided({}), false);
+});
+
+test("allConsumersErrored: true only when every row errored and ≥1 consumer", () => {
+  const report = buildReport(DEAD_CRED_CONFIG, makeAllConsumersFailRunGh());
+  assert.equal(allConsumersErrored(report), true);
+  // A single clean row flips it back to false — that is drift/partial, not a
+  // dead credential.
+  assert.equal(
+    allConsumersErrored({ results: [{ error: "x" }, { drift: true }] }),
+    false,
+  );
+  assert.equal(allConsumersErrored({ results: [] }), false);
+});
+
+test("runCli: PROVIDED-but-dead PIN_DRIFT_TOKEN (all rows error) exits 1 with ::error:: even without --strict", () => {
+  cfgDir = mkdtempSync(join(tmpdir(), "pin-drift-dead-"));
+  const p = join(cfgDir, "consumers.json");
+  writeFileSync(p, JSON.stringify(DEAD_CRED_CONFIG));
+  const stderr = capture();
+  try {
+    const code = runCli({
+      argv: ["--config", p], // NOTE: no --strict.
+      env: { PIN_DRIFT_TOKEN: "ghp_expired" },
+      runGh: makeAllConsumersFailRunGh(),
+      stdout: capture(),
+      stderr,
+      summaryPath: undefined,
+    });
+    assert.equal(code, 1);
+    assert.match(stderr.text(), /::error::/);
+    assert.match(stderr.text(), /credential is dead/);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
+test("runCli: dead-credential also surfaces in the --json envelope (deadCredential:true)", () => {
+  cfgDir = mkdtempSync(join(tmpdir(), "pin-drift-dead-json-"));
+  const p = join(cfgDir, "consumers.json");
+  writeFileSync(p, JSON.stringify(DEAD_CRED_CONFIG));
+  const stdout = capture();
+  try {
+    const code = runCli({
+      argv: ["--config", p, "--json"],
+      env: { PIN_DRIFT_TOKEN: "ghp_expired" },
+      runGh: makeAllConsumersFailRunGh(),
+      stdout,
+      stderr: capture(),
+      summaryPath: undefined,
+    });
+    assert.equal(code, 1);
+    const envelope = JSON.parse(stdout.text());
+    assert.equal(envelope.deadCredential, true);
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
+test("runCli: ABSENT PIN_DRIFT_TOKEN bootstrap (all rows error, token unset) stays exit 0 — benign", () => {
+  cfgDir = mkdtempSync(join(tmpdir(), "pin-drift-bootstrap-"));
+  const p = join(cfgDir, "consumers.json");
+  writeFileSync(p, JSON.stringify(DEAD_CRED_CONFIG));
+  try {
+    const code = runCli({
+      argv: ["--config", p], // no --strict, no token.
+      env: {}, // PIN_DRIFT_TOKEN absent → not-yet-provisioned bootstrap.
+      runGh: makeAllConsumersFailRunGh(),
+      stdout: capture(),
+      stderr: capture(),
+      summaryPath: undefined,
+    });
+    assert.equal(code, 0);
   } finally {
     rmSync(cfgDir, { recursive: true, force: true });
   }

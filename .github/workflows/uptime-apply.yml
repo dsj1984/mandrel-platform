@@ -138,10 +138,21 @@ jobs:
           APPLY_FLAG: ${{ inputs.apply }}
         run: |
           set -euo pipefail
-          MODE_FLAG="--dry-run"
-          if [ "${APPLY_FLAG}" = "true" ]; then
-            MODE_FLAG="--apply"
-          fi
+          # The `apply` input is a string, so any value other than exactly
+          # 'true' or 'false' would silently fall through to the dry-run default:
+          # `apply: 'True'`, `apply: 'yes'`, or a typo would run green while
+          # never creating a monitor — the caller believes it applied but it did
+          # not. Reject any non-{true,false} value with a message naming the bad
+          # value instead of degrading to a permanently-green dry-run
+          # (L2, temp/audits/workflow-robustness-review-2026-07-05.md).
+          case "${APPLY_FLAG}" in
+            true) MODE_FLAG="--apply" ;;
+            false) MODE_FLAG="--dry-run" ;;
+            *)
+              echo "::error::uptime-apply: invalid \`apply\` input '${APPLY_FLAG}' — expected exactly 'true' or 'false'." >&2
+              exit 1
+              ;;
+          esac
           node "${GITHUB_WORKSPACE}/_mandrel-platform-uptime/scripts/apply-uptime-monitors.mjs" \
             --config "${GITHUB_WORKSPACE}/_caller/${MONITOR_CONFIG}" \
             "${MODE_FLAG}"
