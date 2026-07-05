@@ -71,10 +71,23 @@ jobs:
     name: Dispatch staging deploy on CI-green
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # CI-green gate: dispatch the deploy ONLY when the upstream CI run
-    # concluded 'success'. `workflow_run` fires on both success and failure, so
-    # this guard is load-bearing — without it a red main would still deploy.
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # CI-green gate — three load-bearing conditions, all required (Story #284):
+    #   1. `conclusion == 'success'` — `workflow_run` fires on both success and
+    #      failure; without this a red main would still deploy.
+    #   2. `event == 'push'` — the upstream CI run must itself have been a push
+    #      to the repo, not a `pull_request` run. `workflow_run.branches:
+    #      [main]` filters on the *head branch NAME*, so a fork PR whose head
+    #      branch is literally named `main` with green CI otherwise satisfies
+    #      the branch filter and the success guard (audit M3).
+    #   3. `head_repository.full_name == github.repository` — the CI run must
+    #      have originated from THIS repo, not a fork. Belt-and-suspenders with
+    #      condition 2: even a same-name fork branch cannot spoof same-repo
+    #      provenance, so an external contributor can no longer attacker-time a
+    #      staging deploy off their fork's green CI.
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_repository.full_name == github.repository }}
     steps:
       - name: Dispatch deploy-staging-run.yml (workflow_dispatch)
         env:
@@ -84,8 +97,54 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh workflow run deploy-staging-run.yml \
-            --repo "${REPO}" \
-            --ref main \
-            -f sha="${SHA}"
-          echo "Dispatched staging deploy for ${SHA} (deploy runs on workflow_dispatch so environment: jobs execute)."
+
+          # L3: the dispatch is otherwise fire-and-forget — a transient GitHub
+          # API 5xx fails `gh workflow run`, and the only signal is a red run in
+          # a low-visibility dispatcher while that green commit never reaches
+          # staging. Retry with backoff, then VERIFY a run was actually created
+          # (a 2xx from the dispatch API is not proof a run materialized).
+          dispatched=false
+          for attempt in 1 2 3; do
+            if gh workflow run deploy-staging-run.yml \
+              --repo "${REPO}" \
+              --ref main \
+              -f sha="${SHA}"; then
+              dispatched=true
+              break
+            fi
+            echo "::warning::gh workflow run attempt ${attempt} failed; retrying after backoff."
+            sleep $((attempt * 5))
+          done
+
+          if [ "${dispatched}" != "true" ]; then
+            echo "::error::Failed to dispatch deploy-staging-run.yml after 3 attempts for ${SHA}." >&2
+            exit 1
+          fi
+
+          # Verify a runner workflow run was actually created. The dispatch API
+          # returns before the run row is queryable, so poll `gh run list` for a
+          # recent workflow_dispatch run of the runner workflow. Fail loudly if
+          # none appears — a silent non-creation is exactly the failure mode
+          # this check exists to surface.
+          created=false
+          for attempt in 1 2 3 4 5; do
+            count="$(gh run list \
+              --repo "${REPO}" \
+              --workflow deploy-staging-run.yml \
+              --event workflow_dispatch \
+              --limit 5 \
+              --json databaseId --jq 'length' 2>/dev/null || echo 0)"
+            if [ "${count:-0}" -gt 0 ]; then
+              created=true
+              break
+            fi
+            echo "Run not visible yet (attempt ${attempt}); waiting for the run row to appear."
+            sleep $((attempt * 3))
+          done
+
+          if [ "${created}" != "true" ]; then
+            echo "::error::Dispatched deploy-staging-run.yml for ${SHA} but no runner workflow run appeared via 'gh run list'." >&2
+            exit 1
+          fi
+
+          echo "Dispatched and verified staging deploy for ${SHA} (deploy runs on workflow_dispatch so environment: jobs execute)."

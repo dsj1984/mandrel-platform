@@ -1334,21 +1334,62 @@ The two-file split exists solely because of the `workflow_run` + `environment:`
 limitation above:
 
 - **`deploy-staging.yml` (dispatcher)** — fires `on: workflow_run` when CI
-  completes on `main`, applies the CI-green gate
-  (`if: github.event.workflow_run.conclusion == 'success'`), and — only on
-  success — dispatches `deploy-staging-run.yml` via the `workflow_dispatch`
-  API. A red upstream run simply does not dispatch, so there is **no
+  completes on `main`, applies the CI-green gate, and — only on success —
+  dispatches `deploy-staging-run.yml` via the `workflow_dispatch` API. A red
+  upstream run simply does not dispatch, so there is **no
   green-but-didn't-deploy run at all**. No PAT is required: `workflow_dispatch`
   and `repository_dispatch` are the two events that **always create a workflow
   run even when triggered with the built-in `GITHUB_TOKEN`**, so the dispatcher
   needs only `permissions: actions: write`. (A cross-repo dispatch — as in
   [`smoke-dispatch.yml`](#dispatch-cross-repo-smoke) — still needs a PAT; a
-  same-repo dispatch does not.)
+  same-repo dispatch does not.) The dispatcher's job `if:` requires **three**
+  conditions, not just success (Story #284 / audit M3): `conclusion ==
+  'success'` **and** `workflow_run.event == 'push'` **and**
+  `workflow_run.head_repository.full_name == github.repository`. The last two
+  close a fork-forgeable-trigger gap: `workflow_run`'s `branches: [main]`
+  filter matches on the *head branch NAME*, so a fork PR whose head branch is
+  literally named `main` with green CI would otherwise pass the branch filter
+  and the success guard — the same-repo-push conditions reject it. The dispatch
+  step itself **retries ×3 with backoff** on a transient `gh workflow run`
+  failure and then **verifies a runner run was actually created** via `gh run
+  list`, failing loudly otherwise (audit L3): a fire-and-forget dispatch would
+  otherwise drop a green commit before it ever reached staging with only a red
+  run in a low-visibility dispatcher as the signal. The dispatcher keeps
+  `concurrency.cancel-in-progress: true` — cancelling a superseded *pending
+  dispatch* is safe.
 - **`deploy-staging-run.yml` (deploy)** — runs `on: workflow_dispatch` and
   `uses:` the shared `deploy-cloudflare.yml`. Because the trigger is
   `workflow_dispatch`, the `environment:`-gated deploy jobs execute normally
   and the deploy actually happens. Also usable for manual on-demand deploys
-  (UI "Run workflow" / `gh workflow run`).
+  (UI "Run workflow" / `gh workflow run`). Two robustness properties are wired
+  in (Story #284):
+  - A **`sha-drift-preflight` job** (audit M4) runs *before* the `uses:` deploy
+    job (`deploy` `needs: [sha-drift-preflight]`). Because a job with `uses:`
+    cannot carry `steps:`, the preflight is a **separate preceding job**, not a
+    step inside the deploy. When the `sha` input is supplied (the dispatcher
+    path), it checks out the `main` tip and **fails, naming both SHAs**, if
+    `git rev-parse HEAD` differs from `inputs.sha` — closing the TOCTOU race
+    where `main` advances past the CI-verified commit between CI-green and
+    deploy. A manual dispatch with no `sha` skips the assertion (the operator
+    is intentionally deploying the current tip).
+  - Its `concurrency` uses **`cancel-in-progress: false`** (audit H2): the
+    deploy half **queues, it does not cancel**. An in-flight `wrangler d1
+    migrations apply` must never be cancelled mid-apply by the next dispatch —
+    a half-applied forward-only migration has no automatic restore.
+
+> **Template hardening does not auto-propagate — existing consumers must
+> hand-port (Story #284).** `platform-sync` **never overwrites an existing
+> consumer workflow file** (it materializes link-don't-copy, never-clobber; a
+> version bump only re-pins the shared `deploy-cloudflare.yml` SHA, it does not
+> touch the caller templates). So the M3/M4/L3/H2 hardening above **will not
+> reach a consumer that has already adopted these files** — that consumer must
+> **manually port the deltas** into its own `.github/workflows/deploy-staging*.yml`
+> (athportal, which adopted the dispatcher pattern, needs this manual port).
+> And **dispatcher adoption is optional**: dispatch-only consumers that
+> deliberately run metered runners on manual/scheduled dispatch (swarm-os,
+> domio) are not required to adopt the dispatcher — these templates serve
+> consumers who *want* CI-green auto-deploy, and the pattern must never be
+> framed as mandatory.
 
 **Migrating an existing `workflow_run`-direct consumer** (athportal, swarm-os):
 replace the old single `deploy-staging.yml` (which called `deploy-cloudflare.yml`
