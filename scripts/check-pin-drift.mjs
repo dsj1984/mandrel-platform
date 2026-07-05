@@ -979,9 +979,50 @@ export function hasDrift(report) {
   return report.results.some((r) => r.error || r.drift);
 }
 
+/**
+ * Is EVERY configured consumer an `error` row (M11)? This is the signature of a
+ * dead cross-repo credential: a PIN_DRIFT_TOKEN that was *provided* but has
+ * expired (fine-grained PATs always expire) can no longer read ANY consumer, so
+ * every `fetchConsumerWorkflows` call fails closed to an `error` row. Contrast
+ * the not-yet-provisioned bootstrap case: there the token is *absent*, the run
+ * legitimately can't read the private consumers, and that benign state must keep
+ * its current exit-0 behavior. The caller distinguishes the two by whether the
+ * token was provided (see `runCli`'s `tokenProvided`); this predicate only
+ * answers "did every row error", which — given a provided token — means the
+ * credential died rather than "no drift".
+ *
+ * Requires at least one consumer (an empty registry is vacuously not a
+ * dead-credential signal).
+ *
+ * @param {{ results: Array<{ error?: string }> }} report
+ * @returns {boolean}
+ */
+export function allConsumersErrored(report) {
+  const results = Array.isArray(report.results) ? report.results : [];
+  return results.length > 0 && results.every((r) => Boolean(r.error));
+}
+
 // ---------------------------------------------------------------------------
 // CLI entry
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether the cross-repo `PIN_DRIFT_TOKEN` was PROVIDED (non-empty) to the run
+ * (M11). The scheduled/dispatch workflow reads consumers over the `gh` CLI with
+ * `GH_TOKEN: ${{ secrets.PIN_DRIFT_TOKEN || github.token }}` — the built-in
+ * `github.token` fallback can only read THIS repo, so cross-repo reads fail
+ * closed to `error` rows both when the token is absent (bootstrap) AND when it
+ * is provided-but-dead (expired PAT). This env var is the only signal that
+ * distinguishes the two: the workflow sets it to the raw secret so an empty
+ * value ⇒ absent (bootstrap, benign) and a non-empty value ⇒ provided (a
+ * total error sweep then means the credential died).
+ *
+ * @param {Record<string, string | undefined>} env
+ * @returns {boolean}
+ */
+export function pinDriftTokenProvided(env) {
+  return typeof env.PIN_DRIFT_TOKEN === "string" && env.PIN_DRIFT_TOKEN.length > 0;
+}
 
 /**
  * @param {{
@@ -989,8 +1030,10 @@ export function hasDrift(report) {
  *   cwd?: string,
  *   stdout?: { write: (s: string) => void },
  *   stderr?: { write: (s: string) => void },
+ *   env?: Record<string, string | undefined>,
  *   runGh?: (args: string[]) => string,
  *   summaryPath?: string | undefined,
+ *   tokenProvided?: boolean,
  *   nowMs?: number,
  * }} [opts]
  * @returns {number} exit code
@@ -1000,8 +1043,10 @@ export function runCli({
   cwd = process.cwd(),
   stdout = process.stdout,
   stderr = process.stderr,
+  env = process.env,
   runGh = defaultGhRunner,
   summaryPath = process.env.GITHUB_STEP_SUMMARY,
+  tokenProvided = pinDriftTokenProvided(env),
   nowMs = Date.now(),
 } = {}) {
   const { config: configRel, json, strict } = parseArgv(argv);
@@ -1025,9 +1070,19 @@ export function runCli({
 
   const report = buildReport(config, runGh, nowMs);
   const drift = hasDrift(report);
+  // M11: a PROVIDED-but-dead PIN_DRIFT_TOKEN (expired PAT) can no longer read
+  // ANY consumer, so every row fails closed to `error`. That is a credential
+  // failure, NOT the benign not-yet-provisioned bootstrap (token absent) — fail
+  // the run unconditionally (even without --strict, which the scheduled path
+  // can never pass) so the death is loud instead of a green no-op. The absent-
+  // token bootstrap keeps its current behavior: tokenProvided is false, so this
+  // branch never fires and the run exits per the drift/--strict rules below.
+  const deadCredential = tokenProvided && allConsumersErrored(report);
 
   if (json) {
-    stdout.write(`${JSON.stringify({ kind: "pin-drift-report", drift, ...report }, null, 2)}\n`);
+    stdout.write(
+      `${JSON.stringify({ kind: "pin-drift-report", drift, deadCredential, ...report }, null, 2)}\n`,
+    );
   } else {
     const text = renderReport(report);
     stdout.write(`${text}\n`);
@@ -1040,6 +1095,16 @@ export function runCli({
         );
       }
     }
+  }
+
+  if (deadCredential) {
+    stderr.write(
+      "::error::[pin-drift] PIN_DRIFT_TOKEN was provided but every cross-repo " +
+        "consumer read errored — the credential is dead (likely an expired " +
+        "fine-grained PAT), not a not-yet-provisioned bootstrap. Rotate the " +
+        "token. See docs/runbooks/pin-drift-dashboard.md.\n",
+    );
+    return 1;
   }
 
   if (strict && drift) {

@@ -51,16 +51,56 @@ on:
 permissions:
   contents: read
 
-# Serialize staging deploys: only the freshest dispatch should reach the
-# staging surfaces. The shared deploy-cloudflare.yml additionally serializes
-# per-environment.
+# Serialize staging deploys: QUEUE, don't cancel (Story #284 / audit H2). An
+# in-flight `wrangler d1 migrations apply` must never be cancelled mid-apply by
+# the next dispatch — a half-applied forward-only migration has no automatic
+# restore. `cancel-in-progress: false` lets a second dispatch wait for the
+# first to finish. (The dispatcher half keeps `cancel-in-progress: true`:
+# cancelling a superseded PENDING dispatch is safe.) The shared
+# deploy-cloudflare.yml additionally serializes per-environment.
 concurrency:
   group: deploy-staging-run
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  # M4: sha-drift preflight (Story #284). The CI-green gate is TOCTOU-racy — a
+  # commit A goes green and dispatches, but commit B (CI pending, possibly
+  # later red) may already be on main, so the deploy would ship B under A's
+  # green credential. When `sha` is supplied (dispatcher path), assert the main
+  # tip still equals it and FAIL loudly on drift, naming both SHAs. A job with
+  # `uses:` cannot carry `steps:`, so this preflight is a SEPARATE preceding
+  # job that the `uses:` deploy job `needs:`. Manual dispatches without `sha`
+  # skip the assertion (the operator is deploying the current tip on purpose).
+  sha-drift-preflight:
+    name: Sha-drift preflight (deploy what CI verified)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout main tip
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Assert HEAD matches the CI-verified sha
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${INPUT_SHA}" ]; then
+            echo "No sha input — manual dispatch deploying the current main tip; skipping sha-drift preflight."
+            exit 0
+          fi
+          head="$(git rev-parse HEAD)"
+          if [ "${head}" != "${INPUT_SHA}" ]; then
+            echo "::error::sha drift: main tip is ${head} but the dispatched (CI-verified) sha is ${INPUT_SHA}. main advanced after CI went green; refusing to deploy an unverified tip." >&2
+            exit 1
+          fi
+          echo "sha-drift preflight OK: main tip ${head} matches the CI-verified sha ${INPUT_SHA}."
+
   deploy:
     name: Staging deploy (shared deploy-cloudflare.yml)
+    needs: [sha-drift-preflight]
     uses: dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml@<MANDREL_PLATFORM_SHA> # <MANDREL_PLATFORM_TAG>
     with:
       environment: staging

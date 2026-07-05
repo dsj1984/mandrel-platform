@@ -157,6 +157,29 @@ jobs:
             secret. See docs/reusable-workflows.md § release-automation.yml → Secrets."
           fi
 
+      # Manifest-file contract preflight (L10). `manifest-file` is documented as
+      # "Required when 'config-file' is set (manifest + config are a matched
+      # pair)", but nothing enforced it: an empty `manifest-file` fell through to
+      # the action default, so a consumer that supplied a config-file but
+      # mislocated (or forgot) its manifest silently mis-versioned instead of
+      # failing fast. This step fails the run when config-file is non-empty and
+      # manifest-file is empty, naming BOTH inputs so the consumer knows exactly
+      # what to wire. The inverse (manifest without config) is a no-op — the
+      # action ignores manifest-file in single-package mode.
+      - name: Preflight — manifest-file required when config-file is set
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ inputs.config-file }}
+          MANIFEST_FILE: ${{ inputs.manifest-file }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CONFIG_FILE}" ] && [ -z "${MANIFEST_FILE}" ]; then
+            echo "::error::release-automation.yml: 'config-file' is set ('${CONFIG_FILE}') but 'manifest-file' is empty. \
+            release-please's config-file and manifest-file are a matched pair — supply the caller's 'manifest-file' input \
+            (e.g. .release-please-manifest.json) alongside 'config-file'. See docs/reusable-workflows.md § release-automation.yml."
+            exit 1
+          fi
+
       - name: Run release-please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
