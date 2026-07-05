@@ -64,6 +64,17 @@ test('lintFile flags the invalid combo across continuation lines', () => {
   assert.match(findings[0].rule, /slurp-with-jq/);
 });
 
+test('lintFile ignores COMMENTS that merely document the invalid combo (false-positive guard)', () => {
+  // A step comment describing the rule — must NOT be flagged (regression: this
+  // exact false positive failed CI on the guard's own PR).
+  const src = [
+    '      # Catches gh flag combos like --slurp with --jq that fail at runtime.',
+    '      - name: Lint gh CLI flag combinations',
+    '        run: node scripts/check-workflow-gh-flags.mjs',
+  ].join('\n');
+  assert.deepEqual(lintFile('.github/workflows/ci.yml', src), []);
+});
+
 test('lintFile is clean for the corrected release-please pattern', () => {
   const src = [
     '      - run: |',

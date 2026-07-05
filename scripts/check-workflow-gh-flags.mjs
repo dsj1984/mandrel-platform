@@ -37,6 +37,22 @@ import { join } from 'node:path';
 const WORKFLOW_DIRS = ['.github/workflows', 'templates/workflows'];
 
 /**
+ * Blank out full-line comments (YAML `#` lines and shell `#` comment lines
+ * inside `run:` blocks) while preserving line count, so the lint never
+ * analyzes PROSE — a workflow comment that merely *documents* an invalid flag
+ * combo (like this file's own header, or a step comment describing the rule)
+ * is not a `gh` command and must not be flagged. Only whole-line comments are
+ * stripped; an inline `#` inside real shell is left alone (it is rarely a
+ * comment there and never carries the flag pattern this lint targets).
+ */
+export function stripComments(source) {
+  return source
+    .split('\n')
+    .map((line) => (/^\s*#/.test(line) ? '' : line))
+    .join('\n');
+}
+
+/**
  * Collapse shell line-continuations (`\` + newline) so a multi-line `gh`
  * invocation becomes one logical line, WITHOUT losing the original line number
  * of where the command started. Returns an array of
@@ -101,7 +117,7 @@ export function lintSegment(segment) {
 /** Lint a single workflow file. Returns an array of finding objects. */
 export function lintFile(path, source) {
   const findings = [];
-  for (const { line, text } of collapseContinuations(source)) {
+  for (const { line, text } of collapseContinuations(stripComments(source))) {
     for (const segment of splitSegments(text)) {
       for (const rule of lintSegment(segment)) {
         findings.push({ path, line, rule });
