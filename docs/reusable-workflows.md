@@ -1121,9 +1121,12 @@ versions secret API; see [In-pipeline worker secrets](#in-pipeline-worker-secret
 
 > **Migrate-path deploy safety.** On the built-in D1 path the `migration`
 > job's snapshot step is **blocking**: it runs under `set -euo pipefail`
-> with no warning fallback, and the snapshot artifact upload uses
+> with no warning fallback, and the built-in-D1 snapshot artifact upload uses
 > `if-no-files-found: error` and runs **before** the apply step, so a failed
-> or empty export fails the run before any migration. The `deploy` job only
+> or empty export fails the run before any migration. (A consumer
+> `snapshot-command`'s upload is intentionally **non-blocking** — see the
+> [Snapshot-command artifact contract](#snapshot-command-artifact-contract).)
+> The `deploy` job only
 > proceeds when `migration` **succeeded** or was **skipped**
 > (`needs.migration.result == 'success' || needs.migration.result ==
 > 'skipped'`). The `skipped` branch is unambiguous since Story #237 merged
@@ -1147,8 +1150,16 @@ lockfile-pinned wrangler** via `pnpm exec wrangler`, installed by the shared
 | Built-in D1 migrate (apply step)   | `migration`             | `pnpm exec wrangler d1 migrations apply …` |
 | Built-in per-worker deploy loop    | `deploy`                | `pnpm exec wrangler deploy …`        |
 | Worker-secrets provisioning        | `deploy`                | `pnpm exec wrangler versions …`      |
-| workers.dev subdomain derivation   | `boot-smoke`            | `pnpm exec wrangler whoami`          |
-| Auto-rollback on smoke failure     | `boot-smoke`            | `pnpm exec wrangler rollback …`      |
+| Auto-rollback on smoke failure     | `boot-smoke`            | `pnpm exec wrangler rollback …` (or the `rollback-command` seam) |
+
+The one former wrangler call site now **removed** (M14): the workers.dev
+subdomain derivation in `boot-smoke`. It used `pnpm exec wrangler whoami`,
+which required a **root** wrangler install — but every real consumer is a
+pnpm workspace with wrangler in an app sub-package, so the derivation failed
+the smoke preflight *after* the worker had already deployed. It now uses the
+Cloudflare REST endpoint `GET /accounts/{account_id}/workers/subdomain` with
+the in-scope `CLOUDFLARE_*` creds and needs no wrangler at all, so
+`boot-smoke` no longer passes `require-wrangler: true` for the built-in probe.
 
 The workflow **never** fetches a registry-latest wrangler at runtime (the
 previous `pnpx wrangler` behaviour) while production Cloudflare credentials
@@ -1165,22 +1176,24 @@ to add it rather than silently deploying with a floating version:
 pnpm add -D wrangler
 ```
 
-The auto-rollback step is the one wrangler call site not always covered by
-an up-front preflight: when a consumer supplies `smoke-command` (or an
-explicit `workers_dev_subdomain` / `smoke_base_url`), requiring a root
-wrangler install for every smoke run would fail callers that legitimately
-have none, so on rollback a missing wrangler surfaces through the
-per-worker `manual rollback required` fallback instead (`pnpm exec` never
-falls back to a registry fetch either way).
+Since M14 removed the wrangler dependency from the built-in smoke probe
+(REST subdomain derivation), `boot-smoke` no longer passes
+`require-wrangler: true` at all — the built-in probe is wrangler-free. The
+auto-rollback step is therefore never covered by an up-front preflight: a
+missing root wrangler surfaces through the per-worker `manual rollback
+required` fallback instead (`pnpm exec` never falls back to a registry fetch
+either way), and a monorepo consumer whose workers were deployed from
+sub-package dirs should supply the `rollback-command` seam so rollback can
+reach them at all.
 
 Because the pin comes from the consumer's own `pnpm-lock.yaml`, the deployed
 wrangler version is exactly the one the consumer tests against locally and in
 CI — there is no `wrangler-version` input to keep in sync, and no way for a
 mid-incident rollback to run an untested binary. Consumer-supplied seam
 commands (`snapshot-command`, `migrate-command`, `deploy-command`,
-`smoke-command`) own their own wrangler invocation and are unaffected by this
-pinning; a consumer using those seams should pin wrangler the same way in the
-command it supplies.
+`rollback-command`, `smoke-command`) own their own wrangler invocation and are
+unaffected by this pinning; a consumer using those seams should pin wrangler
+the same way in the command it supplies.
 
 ### Extracted deploy scripts (boot-smoke, worker-secrets)
 
@@ -1196,7 +1209,7 @@ command it supplies.
 > branch-free bash whose extraction would add a checkout dependency to the
 > hot deploy path without materially improving testability).
 
-Two behavioural refinements shipped with the extraction:
+Behavioural refinements shipped with (and after) the extraction:
 
 - **`smoke_base_url` de-duplication.** The inline predecessor probed
   `${smoke_base_url}${path}` once **per worker**, so with a shared base URL
@@ -1209,6 +1222,19 @@ Two behavioural refinements shipped with the extraction:
   response as JSON and asserts its **top-level** `version` field (the
   former grep/sed extraction could match a `version` key nested anywhere in
   the body).
+- **REST subdomain derivation (M14).** The workers.dev subdomain is derived
+  via the Cloudflare REST endpoint
+  `GET /accounts/{account_id}/workers/subdomain` (with the in-scope
+  `CLOUDFLARE_*` creds), not `pnpm exec wrangler whoami` — so the built-in
+  probe needs **no** root wrangler and no longer fails a pnpm-workspace
+  consumer's smoke preflight after the worker already deployed.
+- **Crash-path rollback (M2).** If the probe crashes on an unhandled error
+  (not just a clean non-200), the script still writes the rollback list —
+  marking **every** deployed worker — and `smoke_failed=true` before exiting
+  non-zero, so the workflow's rollback step fires. The rollback step's gate
+  widened to `failure() || cancelled()` and, when the failed-list file is
+  absent (a wedged/cancelled probe never wrote it), falls back to rolling
+  back every deployed worker.
 
 ### Environments isolation audit
 
@@ -1541,7 +1567,7 @@ jobs:
 | `migrate`                    | boolean | `false`     | Run migrations. When `true`, a pre-migration snapshot runs first. Defaults to D1 tooling; override the command seams for non-D1.                           |
 | `db-engine`                  | string  | `'d1'`      | Engine label for default migrate/snapshot tooling. Any non-`d1` value **requires** `migrate-command` **and** `snapshot-command` (no built-in non-D1 tooling). |
 | `d1-database`                | string  | `''`        | D1 database name passed **positionally** to the built-in `wrangler d1 export` / `wrangler d1 migrations apply` (both target `--remote`). Only consulted on the built-in D1 path. Empty lets wrangler resolve the database from the consumer's config for the target `--env`; set it when the config is ambiguous for the environment. |
-| `snapshot-command`           | string  | `''`        | Consumer pre-migration snapshot command. Replaces the built-in `wrangler d1 export` for non-D1 engines. `*.sql` it writes under `temp/` is uploaded as the snapshot artifact. |
+| `snapshot-command`           | string  | `''`        | Consumer pre-migration snapshot command. Replaces the built-in `wrangler d1 export` for non-D1 engines. Any files it writes under `temp/` (glob `temp/*`, not only `*.sql`) are uploaded as the snapshot artifact; **absence is a loud warning, not an error** (M13 — your recovery reference may live in the step summary or an external PITR system). See [Snapshot-command artifact contract](#snapshot-command-artifact-contract). |
 | `migrate-command`            | string  | `''`        | Consumer migrate command. Replaces `wrangler d1 migrations apply` for non-D1 engines. Runs after the snapshot and after `pre-migrate-assert-command`.       |
 | `pre-migrate-assert-command` | string  | `''`        | Optional host-guard hook run **before** migrate. A non-zero exit aborts the migration job — use it to refuse migrating unless the resolved DB host matches an expected pattern. |
 | `build-command`              | string  | `''`        | Optional build run in the deploy job **before** `wrangler deploy` (e.g. `"pnpm build"`). **Secretless** — only `build-env` plaintext + the frozen secret set are in scope. |
@@ -1549,23 +1575,52 @@ jobs:
 | `build-artifact`             | string  | `''`        | Name of an artifact uploaded by the consumer's own build job earlier in the run. When set, it is downloaded into the deploy job and `build-command` is **skipped**. This is the consumer-side-build handoff. |
 | `build-artifact-path`        | string  | `''`        | Extraction path for the downloaded `build-artifact`. Empty extracts into the checkout root. Only consulted when `build-artifact` is set.                     |
 | `deploy-command`             | string  | `''`        | Replaces the built-in per-worker `wrangler deploy` loop. Use for pnpm-workspace monorepos with no root wrangler config (deploy each worker from its package dir). |
+| `rollback-command`           | string  | `''`        | Replaces the built-in per-worker `wrangler rollback` loop on smoke failure/cancellation (symmetric to `deploy-command`, M14). Use for monorepo consumers whose workers were deployed from app sub-package dirs, where the built-in root-level rollback cannot reach them. Runs with `WORKERS` (the rollback csv), `DEPLOY_ENV`, and the frozen secret set. |
 | `smoke`                      | boolean | `true`      | Run the built-in boot-smoke + auto-rollback job. Set `false` to run your own post-deploy verification (auto-rollback is also skipped).                       |
 | `smoke-command`              | string  | `''`        | Replaces the built-in workers.dev probe (multi-route / custom-host consumers). A non-zero exit fails the run and triggers the same `wrangler rollback`.       |
 | `smoke_base_url`             | string  | `''`        | Base URL for the built-in probe (e.g. `https://godomio.com`). Each smoke path is appended to this base instead of the derived workers.dev host and probed exactly **once** (shared host); a failure rolls back **all** deployed workers. No trailing slash. See [Extracted deploy scripts](#extracted-deploy-scripts-boot-smoke-worker-secrets). |
 | `smoke_paths`                | string  | `'/health'` | Comma-separated paths the built-in probe requests against each target (e.g. `"/,/portal,/api/health"`). Each must start with a leading slash.                |
-| `workers_dev_subdomain`      | string  | `''`        | workers.dev account **subdomain slug** (e.g. `"dsj1984"`) used to build the probe URL. Empty derives it from `wrangler whoami`. **Never** pass the account ID. |
+| `workers_dev_subdomain`      | string  | `''`        | workers.dev account **subdomain slug** (e.g. `"dsj1984"`) used to build the probe URL. Empty derives it from the Cloudflare REST endpoint `GET /accounts/{account_id}/workers/subdomain` (M14 — no wrangler needed). **Never** pass the account ID. |
 | `verify-commit-sha`          | boolean | `false`     | Opt-in (Story #176). When `true`, the built-in probe additionally asserts the health response's `version` field equals `github.sha`. A mismatch fails smoke and triggers rollback. Ignored when `smoke-command` is set. See [Commit-SHA verification](#commit-sha-verification-opt-in) below. |
 | `worker-secrets`             | string  | `''`        | Opt-in (Story #170). Newline-separated list of Worker runtime secret **names** to provision in-pipeline (via the versions secret API) after deploy and **before** boot-smoke, from values forwarded through `secrets: inherit`. Empty (the default) is a no-op — byte-identical to today. See [In-pipeline worker secrets](#in-pipeline-worker-secrets-opt-in) below. |
 
 > **Command seams.** `snapshot-command`, `migrate-command`, `build-command`,
-> `deploy-command`, and `smoke-command` are override seams: with **none** set,
-> behaviour is the built-in D1 path — `wrangler d1 export` / `wrangler d1
-> migrations apply` (both positional-database, `--remote`), the root-level
-> deploy loop, and the workers.dev smoke. Set the relevant seam to adopt the
-> workflow for non-D1 engines, monorepo deploys, or custom smoke targets
-> without losing the snapshot, migrate, build-env, or rollback safety nets.
-> The built-in deploy loop no longer injects a `--compatibility-date`: the
-> consumer's wrangler config owns `compatibility_date`.
+> `deploy-command`, `rollback-command`, and `smoke-command` are override
+> seams: with **none** set, behaviour is the built-in D1 path — `wrangler d1
+> export` / `wrangler d1 migrations apply` (both positional-database,
+> `--remote`), the root-level deploy loop, the built-in workers.dev smoke, and
+> the root-level `wrangler rollback` loop. Set the relevant seam to adopt the
+> workflow for non-D1 engines, monorepo deploys, custom smoke targets, or
+> monorepo rollback without losing the snapshot, migrate, build-env, smoke, or
+> rollback safety nets. `deploy-command` and `rollback-command` are a matched
+> pair: a consumer that deploys each worker from its own package dir should
+> supply **both**, so the built-in root-level rollback (which cannot reach a
+> sub-package worker) is not the only recovery path. The built-in deploy loop
+> no longer injects a `--compatibility-date`: the consumer's wrangler config
+> owns `compatibility_date`.
+
+<a id="snapshot-command-artifact-contract"></a>
+
+> **Snapshot-command artifact contract (M13).** The built-in D1 export and a
+> consumer `snapshot-command` have **different** artifact contracts, and the
+> `migration` job uploads them with different strictness:
+>
+> - **Built-in D1 export** (`snapshot-command` empty): the `.sql` dump **is**
+>   the recovery point, so its upload is **BLOCKING** (`path: temp/*.sql`,
+>   `if-no-files-found: error`). A migrate:true pipeline never proceeds
+>   without it.
+> - **Consumer `snapshot-command`** (`snapshot-command` set): the upload globs
+>   **`temp/*`** (any artifact the command wrote — `.md`, `.dump`, `.json`,
+>   …, not only `.sql`) and downgrades absence to a **loud warning**, never an
+>   error. Your recovery reference may legitimately live in
+>   `GITHUB_STEP_SUMMARY` or an external PITR system (e.g. Turso
+>   point-in-time recovery) rather than a `temp/` file. If you rely on the
+>   uploaded artifact as your recovery point, write it under `temp/`.
+>
+> This split un-breaks consumers whose `snapshot-command` writes no `.sql`
+> under `temp/` (verified against both Turso consumers): the former blanket
+> `path: temp/*.sql` + `if-no-files-found: error` failed their migration job
+> on activation, converting them silent-green → hard-red.
 
 > **`db-engine` guard.** When `migrate: true` and `db-engine` is not `d1`, the
 > `check-env` job fails fast unless both `migrate-command` and

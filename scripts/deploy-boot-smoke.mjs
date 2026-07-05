@@ -40,10 +40,15 @@
  * appended to $GITHUB_ENV so the workflow's `Rollback failed workers` step
  * fires. Exit code 1 on any smoke failure.
  *
- * Wrangler: the workers.dev subdomain derivation shells out to the
- * consumer's lockfile-pinned `pnpm exec wrangler whoami` (installed by
- * setup-toolchain, preflighted via its `require-wrangler` input). This
- * script never fetches a registry-latest wrangler.
+ * Subdomain derivation (M14): the workers.dev account subdomain is derived
+ * via the Cloudflare REST endpoint
+ * `GET /accounts/{account_id}/workers/subdomain` using the in-scope
+ * CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID — NOT `wrangler whoami`. This
+ * removes the root-wrangler dependency for probe-only consumers: every real
+ * consumer is a pnpm workspace with wrangler in an app sub-package (not the
+ * root), so the former `pnpm exec wrangler whoami` derivation failed the
+ * smoke preflight AFTER the worker already deployed. The REST call needs no
+ * wrangler at all.
  *
  * Environment contract (all read from process.env):
  *   DEPLOYED_WORKERS       csv of deployed worker names (required)
@@ -53,6 +58,8 @@
  *   WORKERS_DEV_SUBDOMAIN  explicit workers.dev slug (optional)
  *   VERIFY_COMMIT_SHA      'true' to assert the health JSON version field
  *   EXPECTED_SHA           the SHA verify-commit-sha asserts (github.sha)
+ *   CLOUDFLARE_API_TOKEN   CF API token for the subdomain REST derivation
+ *   CLOUDFLARE_ACCOUNT_ID  CF account id for the subdomain REST derivation
  *   SMOKE_FAILED_FILE      rollback-list path (default: a freshly-created
  *                          private temp dir via mkdtemp — never a predictable
  *                          world-writable path; CI sets this explicitly)
@@ -61,13 +68,16 @@
  * Exit codes:
  *   0 — every probe passed.
  *   1 — a probe failed (rollback list written), or the probe target could
- *       not be resolved (no subdomain derivable — no rollback list).
+ *       not be resolved (no subdomain derivable — no rollback list), or an
+ *       unhandled error crashed the run (terminal-write-before-exit — the
+ *       rollback file + smoke_failed=true flag are still written so the
+ *       workflow's rollback step fires, M2).
  */
 
 import { writeFileSync, appendFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
@@ -87,12 +97,28 @@ export function parseSmokePaths(csv) {
 }
 
 /**
- * Extract the workers.dev account subdomain slug from `wrangler whoami`
- * output (the first `<slug>.workers.dev` token). Returns null when absent.
+ * Extract the workers.dev account subdomain slug from a Cloudflare REST
+ * `GET /accounts/{account_id}/workers/subdomain` response body (M14). The API
+ * returns `{ success, result: { name: "<slug>" } }`; this reads the top-level
+ * `result.name`. Returns null when the body is not JSON, not the expected
+ * shape, unsuccessful, or the name is missing / not a non-empty string.
+ * Deliberately tolerant of a full `<slug>.workers.dev` value (some responses
+ * echo the host) by stripping a trailing `.workers.dev`.
  */
-export function extractSubdomain(whoamiOutput) {
-  const m = String(whoamiOutput ?? "").match(/([A-Za-z0-9-]+)\.workers\.dev/);
-  return m ? m[1] : null;
+export function extractSubdomain(responseBody) {
+  let parsed;
+  try {
+    parsed = JSON.parse(responseBody);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (parsed.success === false) return null;
+  const result = parsed.result;
+  if (result === null || typeof result !== "object" || Array.isArray(result)) return null;
+  const name = result.name;
+  if (typeof name !== "string" || name.length === 0) return null;
+  return name.replace(/\.workers\.dev$/, "");
 }
 
 /**
@@ -199,7 +225,7 @@ export async function runSmoke(env, deps = {}) {
     log = (line) => process.stdout.write(`${line}\n`),
     probe = probeUrl,
     runShell = defaultRunShell,
-    whoami = defaultWhoami,
+    deriveSubdomain = defaultDeriveSubdomain,
   } = deps;
 
   const workers = parseCsv(env.DEPLOYED_WORKERS);
@@ -228,15 +254,20 @@ export async function runSmoke(env, deps = {}) {
   // ----- Built-in probe -----
   // Resolve the workers.dev subdomain slug. NEVER the account ID (a UUID) —
   // workers.dev subdomains are keyed by the account name/slug. Prefer the
-  // explicit input, else derive from `wrangler whoami`.
+  // explicit input, else derive from the Cloudflare REST endpoint
+  // GET /accounts/{account_id}/workers/subdomain (M14 — no wrangler needed).
   let subdomain = (env.WORKERS_DEV_SUBDOMAIN ?? "").trim();
   if (!subdomain && !smokeBaseUrl) {
-    log("::group::Deriving workers.dev subdomain from wrangler whoami");
-    subdomain = extractSubdomain(whoami());
+    log("::group::Deriving workers.dev subdomain from the Cloudflare REST API");
+    subdomain = await deriveSubdomain({
+      accountId: (env.CLOUDFLARE_ACCOUNT_ID ?? "").trim(),
+      apiToken: (env.CLOUDFLARE_API_TOKEN ?? "").trim(),
+    });
     if (!subdomain) {
       log(
-        "::error::Could not derive workers.dev subdomain from 'wrangler whoami'. " +
-          "Pass workers_dev_subdomain or smoke_base_url explicitly."
+        "::error::Could not derive workers.dev subdomain from the Cloudflare REST API " +
+          "(GET /accounts/{account_id}/workers/subdomain). Check CLOUDFLARE_ACCOUNT_ID / " +
+          "CLOUDFLARE_API_TOKEN, or pass workers_dev_subdomain / smoke_base_url explicitly."
       );
       log("::endgroup::");
       // No rollback list: the target could not be resolved, so nothing was
@@ -306,18 +337,30 @@ function defaultRunShell(command, extraEnv) {
   return res.status ?? 1;
 }
 
-function defaultWhoami() {
-  // Consumer lockfile-pinned wrangler (`pnpm exec wrangler`), installed and
-  // preflighted by setup-toolchain (require-wrangler). Failure tolerated —
-  // an empty output falls through to the "could not derive" error above.
+/**
+ * Derive the workers.dev subdomain slug via the Cloudflare REST endpoint
+ * `GET /accounts/{account_id}/workers/subdomain` (M14). Uses the in-scope
+ * CLOUDFLARE_* creds — no wrangler. Any failure (missing creds, network
+ * error, non-2xx, unparsable body) is tolerated and returns null, which the
+ * caller surfaces as the "could not derive" error above. fetchImpl is
+ * injectable for the test suite.
+ */
+export async function defaultDeriveSubdomain({ accountId, apiToken }, fetchImpl = fetch) {
+  if (!accountId || !apiToken) return null;
+  const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/subdomain`;
   try {
-    return execFileSync("pnpm", ["exec", "wrangler", "whoami"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      maxBuffer: 8 * 1024 * 1024,
+    const res = await fetchImpl(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(15000),
     });
+    if (!res.ok) return null;
+    return extractSubdomain(await res.text());
   } catch {
-    return "";
+    return null;
   }
 }
 
@@ -341,18 +384,55 @@ export function resolveFailedFile(env, mkdtempImpl = mkdtempSync) {
   return join(mkdtempImpl(join(tmpdir(), "deploy-boot-smoke-")), "smoke-failed-workers.txt");
 }
 
+/**
+ * Write the rollback terminal state: the failed-worker list to `failedFile`
+ * (overwrite, never append) and `smoke_failed=true` to $GITHUB_ENV so the
+ * workflow's rollback step fires. No-op when `failedWorkers` is empty.
+ * Extracted so both the normal smoke-failure path AND the crash path (M2 —
+ * terminal-write-before-exit) share one writer, and so the write is
+ * unit-testable via injected fs seams.
+ *
+ * Overwrite rationale: a reused self-hosted runner may carry a stale list
+ * from a previous run, and rolling back workers this run never deployed would
+ * widen the blast radius.
+ */
+export function writeRollbackState(
+  failedFile,
+  failedWorkers,
+  { githubEnv, writeFile = writeFileSync, appendFile = appendFileSync } = {}
+) {
+  if (!failedWorkers || failedWorkers.length === 0) return;
+  writeFile(failedFile, `${failedWorkers.join("\n")}\n`);
+  if (githubEnv) {
+    appendFile(githubEnv, "smoke_failed=true\n");
+  }
+}
+
 async function main() {
   const failedFile = resolveFailedFile(process.env);
-  const { exitCode, failedWorkers } = await runSmoke(process.env);
-
-  if (failedWorkers.length > 0) {
-    // Overwrite (never append): a reused self-hosted runner may carry a
-    // stale list from a previous run, and rolling back workers this run
-    // never deployed would widen the blast radius.
-    writeFileSync(failedFile, `${failedWorkers.join("\n")}\n`);
-    if (process.env.GITHUB_ENV) {
-      appendFileSync(process.env.GITHUB_ENV, "smoke_failed=true\n");
-    }
+  let exitCode;
+  try {
+    const result = await runSmoke(process.env);
+    exitCode = result.exitCode;
+    writeRollbackState(failedFile, result.failedWorkers, {
+      githubEnv: process.env.GITHUB_ENV,
+    });
+  } catch (err) {
+    // Crash path (M2): an unhandled error must NOT leave a deployed worker
+    // serving unverified code with no rollback. Write the terminal rollback
+    // state — rolling back EVERY deployed worker, since the crash gives no
+    // per-worker attribution — BEFORE exiting non-zero, so the workflow's
+    // rollback step still fires. This is the terminal-write-before-exit
+    // guarantee the former (write-only-on-a-clean-return) shape lacked.
+    process.stdout.write(
+      `::error::deploy-boot-smoke crashed: ${err?.message ?? err}. ` +
+        "Marking every deployed worker for rollback.\n"
+    );
+    const deployed = uniqueSorted(parseCsv(process.env.DEPLOYED_WORKERS));
+    writeRollbackState(failedFile, deployed, {
+      githubEnv: process.env.GITHUB_ENV,
+    });
+    exitCode = 1;
   }
   process.exit(exitCode);
 }
