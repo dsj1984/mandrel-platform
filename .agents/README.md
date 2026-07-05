@@ -216,6 +216,47 @@ If your AI tool is not Claude Code, load
 [`instructions.md`](instructions.md) verbatim through that tool's own
 system-prompt mechanism (`.cursorrules`, Custom Instructions, etc.).
 
+### What to always-load vs read on-demand
+
+The always-loaded context is re-paid on every session **and every subagent
+spawn**, so the shipped set is kept deliberately lean. Load this core into your
+system prompt; read everything else only when the task engages it (the same
+read-when-relevant pattern skills use).
+
+**Always-load (the recommended core):**
+
+- [`instructions.md`](instructions.md) — the core agent protocol.
+- [`personas/engineer.md`](personas/engineer.md) — the default persona (swap in
+  another persona when the task calls for it).
+- [`rules/security-baseline.md`](rules/security-baseline.md) — inviolable
+  security MUSTs, relevant to every change.
+- [`rules/git-conventions.md`](rules/git-conventions.md) — every commit,
+  branch, and PR touches it.
+
+**Read on-demand (do the read before the matching work):**
+
+- [`rules/shell-conventions.md`](rules/shell-conventions.md) — before chaining
+  shell commands or writing cross-platform command strings.
+- [`rules/testing-standards.md`](rules/testing-standards.md) — before authoring
+  or restructuring tests.
+- [`rules/orchestration-error-handling.md`](rules/orchestration-error-handling.md)
+  — before writing or modifying orchestration scripts under
+  `.agents/scripts/**`.
+- The remaining domain rules
+  ([`rules/api-conventions.md`](rules/api-conventions.md),
+  [`rules/gherkin-standards.md`](rules/gherkin-standards.md),
+  [`rules/changelog-style.md`](rules/changelog-style.md),
+  [`rules/test-seams.md`](rules/test-seams.md)) — when the task is in that
+  domain.
+- Every `SKILL.md` under [`skills/`](skills/) — when the task hits its trigger.
+- [`docs/execution-reference.md`](docs/execution-reference.md) — log-level and
+  token-budget reference detail lifted out of `instructions.md`.
+
+Each on-demand rule opens with a one-line "this rule applies when…" scope
+header, so a quick skim of its first paragraph tells you whether it governs the
+task at hand. `instructions.md` § 1.F is the canonical in-prompt statement of
+this split.
+
 ---
 
 ## Interactive repo / project pickers
@@ -361,8 +402,8 @@ rule:
 > GitHub I/O, label transitions, JSON validators, NDJSON readers,
 > diff-vs-baseline gates, template renderers.
 >
-> **Prompt + judgment → make it a Skill.** Examples: composing a PRD
-> from an Epic body, classifying friction signals from a failed shell
+> **Prompt + judgment → make it a Skill.** Examples: composing a Tech
+> Spec from an Epic body, classifying friction signals from a failed shell
 > command, decomposing a Tech Spec into a ticket hierarchy.
 
 The rule is two-sided on purpose. "Has an LLM step adjacent" is *not*
@@ -377,9 +418,9 @@ judgment (Skill) or of a parseable transform (script).
 **split**: the deterministic halves stay as a script, the judgment middle
 moves to a Skill.
 
-- **`--emit-context`** (script half) — fetches the PRD and Tech Spec
-  bodies, scrapes project docs, emits a JSON envelope. Parseable in,
-  parseable out. Stays a script.
+- **`--emit-context`** (script half) — fetches the Epic body (which
+  carries the folded Tech Spec sections), scrapes project docs, emits a
+  JSON envelope. Parseable in, parseable out. Stays a script.
 - **Authoring middle** (Skill half) — given the envelope, author the
   ticket hierarchy JSON. Pure prompt + judgment. Migrates to a Skill
   under `.agents/skills/core/` so it ships with declarative

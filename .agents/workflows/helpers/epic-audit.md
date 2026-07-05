@@ -44,12 +44,15 @@ change-set selection. Both lens sources fire through the **same**
 2. Resolve `[EPIC_BRANCH]` — `epic/<epicId>`.
 3. Resolve `[BASE_BRANCH]` from `baseBranch` in `.agentrc.json` (default:
    `main`).
-4. Fetch the Epic ticket and identify linked context tickets:
-   - **PRD** — the `context::prd` ticket linked in the Epic body.
-   - **Tech Spec** — the `context::tech-spec` ticket linked in the Epic
-     body.
-5. Read both the PRD and Tech Spec fully to understand the intended scope,
-   selected lenses, and acceptance criteria.
+4. Fetch the Epic ticket — the Epic body is the single planning
+   document:
+   - **Narrative sections** — Context / Goal / Scope / User Stories /
+     Acceptance Criteria.
+   - **Tech Spec** — the folded Tech Spec sections (opening with
+     `## Delivery Slicing`) inside the body's managed region.
+5. Read the Epic body fully (including its Tech Spec sections) to
+   understand the intended
+   scope, selected lenses, and acceptance criteria.
 
 ## Step 1 — Prepare (`epic-audit-prepare.js`)
 
@@ -226,7 +229,7 @@ For each 🔴 / 🟠 finding, the host LLM MUST decide between two paths:
      (path 2) and record the attempt context in Step 4.
 2. **Escalate to the operator via Step 4.** Required when the finding
    falls into any of the following classes:
-   - `spec-deviation` — the change diverges from the PRD/Tech Spec.
+   - `spec-deviation` — the change diverges from the Epic/Tech Spec.
    - `secrets` — credentials, tokens, or PII surfaced in the diff.
    - `test-deletion` — coverage was removed without an explicit
      decision in the spec.
@@ -282,7 +285,7 @@ The body MUST include:
 
 - **Always** diff against `[BASE_BRANCH]`, not against individual Story
   branches. The audit examines the cumulative effect of the entire Epic.
-- **Always** read the PRD and Tech Spec before walking lenses. Findings
+- **Always** read the Epic body and Tech Spec before walking lenses. Findings
   without spec context are noise.
 - **Always** cap focused fixes at one attempt per finding (Step 3). The
   host LLM is the executor; there is no shared retry/anti-thrash module

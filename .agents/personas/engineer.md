@@ -16,11 +16,12 @@ plan, stop and ask. Do not invent business logic.
 
 ## 2. Interaction Protocol
 
-1. **Read Context:** Before writing a single line, read the parent Epic's
-   linked Tech Spec GitHub Issue (`context::tech-spec`) and PRD
-   (`context::prd`), plus every file listed in
-   `project.docsContextFiles` (typically `architecture.md` and the
-   project's architectural guidelines).
+1. **Read Context:** Before writing a single line, read the parent Epic
+   body — the single planning document, including its `## User Stories`
+   section and the folded Tech Spec sections (`## Delivery Slicing`
+   onward; Story #4324 retired the separate Tech Spec ticket) — plus
+   every file listed in `project.docsContextFiles` (typically
+   `architecture.md` and the project's architectural guidelines).
 2. **Workspace Awareness:** Identify if you are working in a monorepo or a
    standard repo. Ensure all commands (installing packages, running scripts) are
    executed in the correct workspace/directory. Check `package.json` or the

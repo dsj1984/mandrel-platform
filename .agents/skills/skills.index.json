@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-16T16:35:27.286Z",
+  "generatedAt": "2026-07-04T23:12:38.376Z",
   "generator": "generate-skills-index.js@1",
   "skills": [
     {
@@ -127,7 +127,7 @@
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/epic-plan-consolidate/SKILL.md",
-      "description": "Run a holistic, pre-persist consolidation pass over the draft Story ticket array an Epic's decompose phase produced. Use during Phase 8 of `/plan`, after `epic-plan-decompose-author` writes `temp/epic-<Epic_ID>/tickets.json` and before `epic-plan-decompose.js` validates and persists it. Reconciles the draft against the Tech Spec \"Delivery Slicing\" target via scope-preserving operations only.",
+      "description": "Run a holistic, pre-persist consolidation pass over the draft Story ticket array an Epic's decompose phase produced. Use during Phase 8 of `/plan`, after `epic-plan-decompose-author` writes `temp/epic-<Epic_ID>/tickets.json` and before `epic-plan-decompose.js` validates and persists it. Reconciles the draft against the Tech Spec \"Delivery Slicing\" ceiling via scope-preserving operations only.",
       "policyCapsuleBullets": 9,
       "allowedTools": ["Read", "Write", "Bash"],
       "vendor": null
@@ -147,7 +147,7 @@
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/epic-plan-premortem/SKILL.md",
-      "description": "Run a fresh-context, code-reading pre-mortem critic over the draft Story ticket array an Epic's decompose phase produced. Use during Phase 8 of `/plan`, after `epic-plan-decompose-author` / `epic-plan-consolidate` write `temp/epic-<Epic_ID>/tickets.json` and before `epic-plan-decompose.js` validates and persists it. Reads the PRD / Tech Spec AND the actual cited code surfaces, then emits predicted-rework findings before any GitHub write.",
+      "description": "Run a fresh-context, code-reading pre-mortem critic over the draft Story ticket array an Epic's decompose phase produced. Use during Phase 8 of `/plan`, after `epic-plan-decompose-author` / `epic-plan-consolidate` write `temp/epic-<Epic_ID>/tickets.json` and before `epic-plan-decompose.js` validates and persists it. Reads the sectioned Epic body AND the cited code surfaces, then emits predicted-rework findings before any GitHub write.",
       "policyCapsuleBullets": 7,
       "allowedTools": ["Read", "Write", "Bash", "Grep"],
       "vendor": null
@@ -157,8 +157,8 @@
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/epic-plan-spec-author/SKILL.md",
-      "description": "Author the PRD, Tech Spec, Acceptance Spec markdown, and risk-verdict JSON for an Epic from the planner authoring context emitted by `epic-plan-spec.js --emit-context`. Use during Phase 7 of `/plan` when the host LLM needs to write the four artifacts before `epic-plan-spec.js` persists them.",
-      "policyCapsuleBullets": 12,
+      "description": "Author the Tech Spec, Acceptance Table markdown, and risk-verdict JSON for an Epic from the planner authoring context emitted by `epic-plan-spec.js --emit-context`. Use during Phase 7 of `/plan` when the host LLM needs to write the three artifacts before `epic-plan-spec.js` folds them into the Epic body's managed sections.",
+      "policyCapsuleBullets": 13,
       "allowedTools": ["Read", "Write", "Bash"],
       "vendor": null
     },
@@ -187,7 +187,7 @@
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/hydrate-context/SKILL.md",
-      "description": "Hydrate a Task or Story ticket into a structured ContextEnvelope (or the legacy `{ prompt }` stdout wrapper). Reads the ticket body, parses Feature / Epic hierarchy, fetches the Tech Spec + PRD, and assembles named sections with provenance and section-aware elision. Successor to the retired mandrel MCP `context.hydrate` tool.",
+      "description": "Hydrate a Story ticket into a structured ContextEnvelope (or the legacy `{ prompt }` stdout wrapper). Reads the ticket body, resolves the parent Epic, embeds the sectioned Epic body (acceptance-table section stripped), and assembles named sections with provenance and section-aware elision. Successor to the retired mandrel MCP `context.hydrate` tool.",
       "policyCapsuleBullets": 7,
       "allowedTools": ["Read", "Bash"],
       "vendor": null
@@ -567,8 +567,8 @@
       "tier": "stack",
       "category": "qa",
       "path": ".agents/skills/stack/qa/qa-explore-driving/SKILL.md",
-      "description": "Conventions for agent-driven exploratory QA driving — how the agent itself drives a surface during `/qa-explore` (agent-led), as opposed to the human-led `/qa-assist`. Use when the agent explores a running app via the browser MCP (navigation-first, the default) or walks a static surface (the documented interim until consumer persona-seeding lands), under a strictly read-only capture invariant. The exploration procedure lives in `.agents/workflows/qa-explore.md`; this skill is the driving-conventions reference it leans on.",
-      "policyCapsuleBullets": 8,
+      "description": "Conventions for agent-driven exploratory QA driving — how the agent itself drives a surface during `/qa-explore` (agent-led), as opposed to the human-led `/qa-assist`. Use when the agent explores a running app via the browser MCP (navigation-first, the default) — including authenticated deployed surfaces reached through the resolved environment's sign-in seam — or walks a static surface (the documented interim where no seam resolves), under a strictly read-only capture invariant. The exploration procedure lives in `.agents/workflows/qa-explore.md`; this skill is the driving-conventions reference it leans on.",
+      "policyCapsuleBullets": 9,
       "allowedTools": null,
       "vendor": null
     },
