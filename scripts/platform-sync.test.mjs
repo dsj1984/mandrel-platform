@@ -570,22 +570,49 @@ test("--check-ruleset requires --consumer-repo", () => {
   }, /consumer-repo/);
 });
 
-test("apply materializes the canonical deploy-staging.yml workflow caller template", () => {
+test("apply materializes the canonical deploy-staging dispatcher + run templates (Story #272)", () => {
   const out = JSON.parse(run([]));
-  const stub = join(consumer, ".github", "workflows", "deploy-staging.yml");
-  assert.ok(existsSync(stub));
+  const dispatcher = join(consumer, ".github", "workflows", "deploy-staging.yml");
+  const runner = join(consumer, ".github", "workflows", "deploy-staging-run.yml");
+  assert.ok(existsSync(dispatcher), "deploy-staging.yml (dispatcher) materialized");
+  assert.ok(existsSync(runner), "deploy-staging-run.yml (deploy) materialized");
   assert.ok(
     out.workflowStubs.created.some((f) => f.endsWith("deploy-staging.yml")),
-    "deploy-staging.yml reported as created"
-  );
-  const body = readFileSync(stub, "utf8");
-  assert.ok(
-    body.includes("Canonical staging-deploy caller template"),
-    "materialized workflow carries the template marker"
+    "deploy-staging.yml (dispatcher) reported as created"
   );
   assert.ok(
-    body.includes("dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml"),
-    "template calls the shared deploy-cloudflare.yml reusable workflow"
+    out.workflowStubs.created.some((f) => f.endsWith("deploy-staging-run.yml")),
+    "deploy-staging-run.yml (deploy) reported as created"
+  );
+  const dispatcherBody = readFileSync(dispatcher, "utf8");
+  const runnerBody = readFileSync(runner, "utf8");
+  // Both halves carry the never-clobber template marker.
+  assert.ok(
+    dispatcherBody.includes("Canonical staging-deploy caller template"),
+    "dispatcher carries the template marker"
+  );
+  assert.ok(
+    runnerBody.includes("Canonical staging-deploy caller template"),
+    "run template carries the template marker"
+  );
+  // The dispatcher fires on CI-green (workflow_run) and DISPATCHES the run
+  // workflow — it must NOT call the deploy directly, since a workflow_run
+  // deploy skips every environment: job (Story #272).
+  assert.ok(
+    dispatcherBody.includes("workflow_run") &&
+      dispatcherBody.includes("gh workflow run deploy-staging-run.yml"),
+    "dispatcher fires on workflow_run and dispatches deploy-staging-run.yml"
+  );
+  assert.ok(
+    !dispatcherBody.includes("dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml"),
+    "dispatcher does NOT uses: deploy-cloudflare.yml directly (that would skip environment: jobs on workflow_run)"
+  );
+  // The deploy half runs on workflow_dispatch (where environment: jobs execute)
+  // and uses the shared reusable workflow.
+  assert.ok(
+    runnerBody.includes("workflow_dispatch") &&
+      runnerBody.includes("dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml"),
+    "run template deploys on workflow_dispatch via the shared deploy-cloudflare.yml"
   );
 });
 

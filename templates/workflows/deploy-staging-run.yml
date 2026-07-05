@@ -1,0 +1,77 @@
+name: deploy-staging-run
+
+# Canonical staging-deploy caller template — DEPLOY half (Story #272).
+#
+# > **Why this file runs on `workflow_dispatch`.** Its sibling
+# > `deploy-staging.yml` fires on CI-green (`workflow_run`) and DISPATCHES this
+# > workflow. The deploy lives here, on `workflow_dispatch`, because the shared
+# > `deploy-cloudflare.yml`'s `environment:`-gated jobs (`check-env` /
+# > `migration` / `deploy` / `boot-smoke`) are silently SKIPPED on a
+# > `workflow_run` event but run normally on `workflow_dispatch` (Story #272).
+# > Adopt this file together with `deploy-staging.yml`; `platform-sync`
+# > materializes both.
+#
+# > **Thin local caller.** The defence-in-depth deploy core lives in the shared
+# > `dsj1984/mandrel-platform` `deploy-cloudflare.yml` reusable workflow — see
+# > https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#deploy-cloudflareyml.
+# > This file only holds <PROJECT_NAME>-specific values (worker names, build
+# > step, secret mapping). When the deploy PROCESS changes, that change lands
+# > upstream in mandrel-platform — not here.
+#
+# Replace every <PLACEHOLDER> with your project's real values:
+#   <MANDREL_PLATFORM_SHA>   the pinned mandrel-platform commit SHA (resolve via
+#                            `node scripts/platform-sync.mjs --ref <release-tag>`
+#                            from the consumer repo root, or `git ls-remote`).
+#   <MANDREL_PLATFORM_TAG>   the human-readable release tag matching the SHA
+#                            above (trailing `# <tag>` comment).
+#   <WORKERS_CSV>            comma-separated Worker names for this env, e.g.
+#                            "api,web".
+#   <BUILD_COMMAND>          optional build command (omit build-command /
+#                            build-artifact entirely if the deploy job's default
+#                            checkout is build-ready).
+#
+# See the full input/secret contract:
+# https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#deploy-cloudflareyml
+
+on:
+  # Dispatched by deploy-staging.yml on CI-green, and available for manual
+  # on-demand deploys (UI "Run workflow" + `gh workflow run`). The optional sha
+  # input records the CI-verified commit; the deploy itself runs against the
+  # main tip (`--ref main`).
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: >
+          Commit SHA that passed CI (informational — the deploy runs against
+          the current main tip). Populated automatically when dispatched by
+          deploy-staging.yml.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize staging deploys: only the freshest dispatch should reach the
+# staging surfaces. The shared deploy-cloudflare.yml additionally serializes
+# per-environment.
+concurrency:
+  group: deploy-staging-run
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Staging deploy (shared deploy-cloudflare.yml)
+    uses: dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml@<MANDREL_PLATFORM_SHA> # <MANDREL_PLATFORM_TAG>
+    with:
+      environment: staging
+      gh-environment: staging
+      workers: <WORKERS_CSV>
+      migrate: true
+      # db-engine defaults to 'd1'. Set db-engine + migrate-command +
+      # snapshot-command for a non-D1 engine (e.g. Turso) — see the contract
+      # doc's "command seams" section.
+    # Frozen secret allowlist: only {CLOUDFLARE_*, TURSO_*} cross into the
+    # shared workflow. Map your project's secret NAMES onto these slots.
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

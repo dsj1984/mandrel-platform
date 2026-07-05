@@ -1269,12 +1269,23 @@ job then skips through the `needs:` chain:
 
 Before this guard existed, every consumer gating staging on CI hand-copied the
 same caller-side `preflight` job to re-implement this exact check (see
-athportal's / swarm-os's `deploy-staging.yml` history). A `workflow_run`
-caller now needs **no caller-side preflight guard at all** — see the
-canonical [`templates/workflows/deploy-staging.yml`](https://github.com/dsj1984/mandrel-platform/blob/main/templates/workflows/deploy-staging.yml)
-caller template, which `platform-sync` materializes into a consumer's
-`.github/workflows/` (link-don't-copy, same semantics as the runbook stubs —
-see [`scripts/platform-sync.mjs`](../README.md#adoption-cli-platform-sync)).
+athportal's / swarm-os's `deploy-staging.yml` history). The guard now lives
+inside this workflow, so a caller needs no hand-copied preflight job.
+
+> **⚠️ `workflow_run` cannot run the deploy directly (Story #272).** The
+> CI-green guard above is necessary but **not sufficient** to make a
+> `workflow_run`-triggered staging deploy work. A reusable workflow's
+> `environment:`-gated jobs (`check-env` / `migration` / `deploy` /
+> `boot-smoke`) are **silently skipped on a `workflow_run` event** — a
+> documented GitHub limitation, independent of the CI-green guard. So a caller
+> that invokes `deploy-cloudflare.yml` **directly** from `on: workflow_run`
+> passes the guard, skips every deploy job, and reports **green with 0 workers
+> deployed**. The canonical template therefore no longer calls the deploy from
+> `workflow_run`; it **dispatches** the deploy onto a `workflow_dispatch` event
+> (where the `environment:` jobs run). See
+> [Canonical staging-deploy template (dispatcher + run)](#canonical-staging-deploy-template-dispatcher--run)
+> below, and the [`require-deploy-ran`](#require-deploy-ran-green-must-mean-deployed)
+> guard that fails loudly if an un-migrated consumer still hits this.
 
 `environments-isolation-audit` gates on GitHub Environments branch-policy
 hygiene (opt-in) and `secret-isolation-audit` on plaintext secrets; both
@@ -1282,27 +1293,78 @@ carry the CI-green expression directly, and `secret-isolation-audit` only
 proceeds once the isolation audit has cleared or was skipped
 (`needs: [environments-isolation-audit]`).
 
+### Canonical staging-deploy template (dispatcher + run)
+
+> Story #175, reworked in Story #272. `platform-sync` materializes **two**
+> files into a consumer's `.github/workflows/` (link-don't-copy, never-clobber,
+> same semantics as the runbook stubs — see
+> [`scripts/platform-sync.mjs`](../README.md#adoption-cli-platform-sync)):
+> [`deploy-staging.yml`](https://github.com/dsj1984/mandrel-platform/blob/main/templates/workflows/deploy-staging.yml)
+> (dispatcher) and
+> [`deploy-staging-run.yml`](https://github.com/dsj1984/mandrel-platform/blob/main/templates/workflows/deploy-staging-run.yml)
+> (deploy).
+
+The two-file split exists solely because of the `workflow_run` + `environment:`
+limitation above:
+
+- **`deploy-staging.yml` (dispatcher)** — fires `on: workflow_run` when CI
+  completes on `main`, applies the CI-green gate
+  (`if: github.event.workflow_run.conclusion == 'success'`), and — only on
+  success — dispatches `deploy-staging-run.yml` via the `workflow_dispatch`
+  API. A red upstream run simply does not dispatch, so there is **no
+  green-but-didn't-deploy run at all**. No PAT is required: `workflow_dispatch`
+  and `repository_dispatch` are the two events that **always create a workflow
+  run even when triggered with the built-in `GITHUB_TOKEN`**, so the dispatcher
+  needs only `permissions: actions: write`. (A cross-repo dispatch — as in
+  [`smoke-dispatch.yml`](#dispatch-cross-repo-smoke) — still needs a PAT; a
+  same-repo dispatch does not.)
+- **`deploy-staging-run.yml` (deploy)** — runs `on: workflow_dispatch` and
+  `uses:` the shared `deploy-cloudflare.yml`. Because the trigger is
+  `workflow_dispatch`, the `environment:`-gated deploy jobs execute normally
+  and the deploy actually happens. Also usable for manual on-demand deploys
+  (UI "Run workflow" / `gh workflow run`).
+
+**Migrating an existing `workflow_run`-direct consumer** (athportal, swarm-os):
+replace the old single `deploy-staging.yml` (which called `deploy-cloudflare.yml`
+directly from `workflow_run`) with **both** new files, then delete the old
+inline `uses:` deploy job. Until a consumer migrates, its `workflow_run` deploys
+keep silently skipping — but now surface as a **red**
+[`require-deploy-ran`](#require-deploy-ran-green-must-mean-deployed) instead of
+false green.
+
 ### Require deploy ran (green must mean deployed)
 
-> Story #268. Before this job existed, a `workflow_run`-gated deploy whose
-> upstream CI concluded non-`success` was gated off by the guard above —
-> every job in the chain (`environments-isolation-audit` through
-> `deploy-summary`) reported `skipped`, and GitHub concluded the run
-> `success` because none of its jobs `failed`. That run was visually
-> identical to a real, successful deploy, even though nothing was built,
-> migrated, or deployed — masking 6 consecutive non-deploys behind 6 green
-> `deploy-staging` runs in one consumer before it was caught.
+> Story #268 + #272. A `workflow_run` deploy can report **green while nothing
+> deployed** in two distinct ways, both of which this job turns red:
+>
+> - **#268 (red CI):** the CI-green guard gated the whole chain off — every
+>   job (`environments-isolation-audit` through `deploy-summary`) `skipped`,
+>   and GitHub concluded the run `success` because none `failed`. Masked 6
+>   consecutive non-deploys behind green `deploy-staging` runs in one consumer.
+> - **#272 (green CI, env jobs skipped):** upstream CI was green, but because a
+>   reusable workflow's `environment:`-gated jobs don't run on `workflow_run`,
+>   `deploy` `skipped` anyway — 0 workers deployed, still green. Masked 40+
+>   consecutive non-deploys in another consumer.
 
 `require-deploy-ran` is the one job in this workflow that deliberately does
 **not** participate in the CI-green `if:` guard or the `needs:` skip chain
-(`needs: [deploy]`, `if: always()`), so it runs even when the guard gated
-the rest of the chain off. Its single step fails — with an `::error::`
-annotation naming the upstream conclusion — exactly when this run's trigger
-was `workflow_run` and `github.event.workflow_run.conclusion != 'success'`:
-the case where the deploy chain was gated off. Every other trigger, and
-every green-CI `workflow_run`, passes through as a no-op costing one cheap
-runner; no additional runners are spun up for the build/migrate/deploy
-chain itself on a gated-off run.
+(`needs: [deploy]`, `if: always()`), so it runs even when the rest of the
+chain was gated off or skipped. It carries **two mutually-exclusive steps** (so
+they never double-fire):
+
+- **red-CI (#268):** fails when `github.event_name == 'workflow_run'` and
+  `github.event.workflow_run.conclusion != 'success'`.
+- **green-CI-skipped (#272):** fails when `github.event_name == 'workflow_run'`
+  and `conclusion == 'success'` **and** `needs.deploy.result == 'skipped'` — the
+  environment-jobs-skip case. Its `::error::` points the operator at the
+  dispatcher template as the real fix.
+
+Every other trigger — including the canonical
+[`deploy-staging-run.yml`](#canonical-staging-deploy-template-dispatcher--run)
+path, which deploys on `workflow_dispatch` — and every green-CI `workflow_run`
+whose `deploy` actually ran, passes through as a no-op costing one cheap runner;
+no additional runners are spun up for the build/migrate/deploy chain itself on a
+non-deploy run.
 
 ### Secret isolation audit and the `runner` input
 

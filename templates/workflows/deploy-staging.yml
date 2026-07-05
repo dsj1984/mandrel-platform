@@ -1,89 +1,91 @@
 name: deploy-staging
 
-# Canonical staging-deploy caller template (Story #175).
+# Canonical staging-deploy caller template — DISPATCHER half (Story #175,
+# reworked for Story #272).
+#
+# > **Why two files (Story #272).** A reusable workflow's `environment:`-gated
+# > jobs (`deploy-cloudflare.yml`'s `check-env` / `migration` / `deploy` /
+# > `boot-smoke`) are **silently skipped on a `workflow_run` event** — a
+# > documented GitHub limitation. The previous single-file template called
+# > `deploy-cloudflare.yml` DIRECTLY from `on: workflow_run`, so those jobs
+# > skipped and **0 workers deployed while the run reported green** (all-skipped,
+# > none failed). One consumer hid 40+ consecutive non-deploys this way.
+# >
+# > The fix: this file is now a thin **dispatcher** that fires on CI-green and
+# > re-launches the deploy via **`workflow_dispatch`** — the event on which the
+# > `environment:` jobs DO run — against its sibling `deploy-staging-run.yml`.
+# > `workflow_dispatch` and `repository_dispatch` are the two events that
+# > "always create workflow runs" even when triggered with the built-in
+# > `GITHUB_TOKEN`, so **no PAT is required** for this same-repo dispatch — just
+# > `permissions: actions: write` below. (Cross-repo dispatch, like
+# > `smoke-dispatch.yml`, still needs a PAT; same repo does not.)
 #
 # > **Thin local caller.** The defence-in-depth deploy core (secret-isolation
 # > audit -> CF env gate -> migration (snapshot + apply) -> deploy ->
-# > boot-smoke + auto-rollback) AND the CI-green guard both live in the shared
+# > boot-smoke + auto-rollback) lives in the shared
 # > `dsj1984/mandrel-platform` `deploy-cloudflare.yml` reusable workflow — see
 # > https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#deploy-cloudflareyml.
-# > This file only holds <PROJECT_NAME>-specific values (worker names, build
-# > step, secret mapping). When the deploy PROCESS changes, that change lands
-# > upstream in mandrel-platform — not here.
+# > The <PROJECT_NAME>-specific values (worker names, build step, secret
+# > mapping) live in the sibling `deploy-staging-run.yml`. When the deploy
+# > PROCESS changes, that change lands upstream in mandrel-platform — not here.
 #
-# One paved road (operator decision 2026-07-01, D4): every consumer triggers
-# staging deploy via `workflow_run` on its own CI workflow, gated on
-# `conclusion == 'success'`. `workflow_run` fires on BOTH a successful AND a
-# failed upstream run, so a caller-side guard against a red run used to be
-# REQUIRED here — every consumer hand-copied the same `preflight` job (see
-# mandrel-platform Story #175 context). That guard now lives INSIDE
-# `deploy-cloudflare.yml` itself as a job-level `if:` on its entry jobs
-# (`github.event` inside a reusable workflow is the CALLER's event, so the
-# shared workflow can see and gate on the `workflow_run` conclusion even
-# though it cannot own this file's `on:` block); a red upstream run skips
-# the whole chain with zero runner spin-ups (mandrel-platform Story #237).
-# This template needs NO caller-side preflight guard as a result —
-# copy it as-is and fill in the placeholders below.
-#
-# Replace every <PLACEHOLDER> with your project's real values:
-#   <CI_WORKFLOW_NAME>        the `name:` of the workflow this deploy should
-#                              gate on (e.g. "quality", "CI", "PR Quality").
-#                              Must match EXACTLY — GitHub matches
-#                              `workflow_run.workflows` by workflow name, not
-#                              file path.
-#   <MANDREL_PLATFORM_SHA>     the pinned mandrel-platform commit SHA (resolve
-#                              via `node scripts/platform-sync.mjs --ref
-#                              <release-tag>` from the consumer repo root, or
-#                              hand-resolve via `git ls-remote`).
-#   <MANDREL_PLATFORM_TAG>     the human-readable release tag matching the SHA
-#                              above (trailing `# <tag>` comment).
-#   <WORKERS_CSV>              comma-separated Worker names for this env, e.g.
-#                              "api,web".
-#   <BUILD_COMMAND>            optional build command (omit build-command /
-#                              build-artifact entirely if the deploy job's
-#                              default checkout is build-ready).
+# Adopt BOTH files together: this `deploy-staging.yml` (dispatcher) and
+# `deploy-staging-run.yml` (the actual deploy). `platform-sync` materializes
+# both. Replace every <PLACEHOLDER>:
+#   <CI_WORKFLOW_NAME>   the `name:` of the workflow this deploy gates on (e.g.
+#                        "quality", "CI"). Must match EXACTLY — GitHub matches
+#                        `workflow_run.workflows` by workflow name, not path.
 #
 # See the full input/secret contract:
 # https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#deploy-cloudflareyml
 
 on:
-  # CI-green gate: fires when <CI_WORKFLOW_NAME> finishes on main. The shared
-  # deploy-cloudflare.yml's job-level CI-green gate skips the entire job
-  # chain (zero runners) unless the upstream conclusion was 'success' — no
-  # caller-side guard needed.
+  # CI-green gate: fires when <CI_WORKFLOW_NAME> completes on main. Unlike the
+  # old shape, this does NOT call the deploy directly — a `workflow_run` deploy
+  # would skip every `environment:` job. It only DISPATCHES the deploy (below)
+  # on success, so the actual deploy runs on `workflow_dispatch` where those
+  # jobs execute. A red upstream run simply does not dispatch — there is no
+  # green-but-didn't-deploy run at all.
   workflow_run:
     workflows: [<CI_WORKFLOW_NAME>]
     branches: [main]
     types: [completed]
-  # Manual on-demand trigger (UI "Run workflow" + `gh workflow run`).
-  # workflow_dispatch always passes the shared workflow's CI-green guard
-  # (operator-intentional, no upstream conclusion to gate on).
-  workflow_dispatch:
 
+# actions:write lets the built-in GITHUB_TOKEN dispatch deploy-staging-run.yml
+# via the workflow_dispatch API. No PAT needed for a same-repo dispatch —
+# workflow_dispatch always creates a run even from GITHUB_TOKEN.
 permissions:
   contents: read
+  actions: write
 
-# Cancel an in-flight staging deploy when a newer commit lands on main — only
-# the freshest tip of main should reach the staging surfaces. The shared
-# deploy-cloudflare.yml additionally serializes per-environment.
+# Only the freshest tip of main should reach staging: cancel an in-flight
+# DISPATCH when a newer CI run completes. (The deploy itself is serialized
+# separately in deploy-staging-run.yml and per-environment inside the shared
+# deploy-cloudflare.yml.)
 concurrency:
-  group: deploy-staging
+  group: deploy-staging-dispatch
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    name: Staging deploy (shared deploy-cloudflare.yml)
-    uses: dsj1984/mandrel-platform/.github/workflows/deploy-cloudflare.yml@<MANDREL_PLATFORM_SHA> # <MANDREL_PLATFORM_TAG>
-    with:
-      environment: staging
-      gh-environment: staging
-      workers: <WORKERS_CSV>
-      migrate: true
-      # db-engine defaults to 'd1'. Set db-engine + migrate-command +
-      # snapshot-command for a non-D1 engine (e.g. Turso) — see the contract
-      # doc's "command seams" section.
-    # Frozen secret allowlist: only {CLOUDFLARE_*, TURSO_*} cross into the
-    # shared workflow. Map your project's secret NAMES onto these slots.
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  dispatch:
+    name: Dispatch staging deploy on CI-green
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # CI-green gate: dispatch the deploy ONLY when the upstream CI run
+    # concluded 'success'. `workflow_run` fires on both success and failure, so
+    # this guard is load-bearing — without it a red main would still deploy.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Dispatch deploy-staging-run.yml (workflow_dispatch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run deploy-staging-run.yml \
+            --repo "${REPO}" \
+            --ref main \
+            -f sha="${SHA}"
+          echo "Dispatched staging deploy for ${SHA} (deploy runs on workflow_dispatch so environment: jobs execute)."
