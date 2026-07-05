@@ -72,7 +72,16 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.root_release_created == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Job timeout is a hard backstop set ABOVE the poll loop's own budget
+    # (MAX_ATTEMPTS * INTERVAL ≈ 15 min below), so the loop's clean
+    # `::error::Timed out … Re-run` message wins over GitHub's generic
+    # "operation was canceled" whenever the smoke never resolves — e.g. its
+    # deploy jobs are stuck `pending` behind deploy-cloudflare's
+    # cancel-in-progress:false concurrency groups, so the smoke `gate` (which
+    # `needs:` those jobs) never runs and never posts a status. The previous
+    # 60*25s loop matched the 25-min job timeout exactly, so the hard job
+    # cancel raced — and won — the loop's own recoverable message.
+    timeout-minutes: 18
     permissions:
       contents: read
       statuses: read
@@ -82,21 +91,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          # 44 sleeps * 20s ≈ 14.7 min of polling, comfortably under the
+          # 18-min job timeout so the loop self-terminates with a clean,
+          # recoverable error rather than being hard-cancelled mid-sleep.
+          MAX_ATTEMPTS: '45'
+          INTERVAL: '20'
         shell: bash
         run: |
           set -euo pipefail
-          echo "Waiting for smoke/cross-repo status on ${SHA} …"
-          for i in $(seq 1 60); do
+          echo "Waiting for smoke/cross-repo status on ${SHA} (up to ${MAX_ATTEMPTS} attempts, ${INTERVAL}s apart) …"
+          for i in $(seq 1 "${MAX_ATTEMPTS}"); do
             state="$(gh api "repos/${REPO}/commits/${SHA}/statuses" \
               --jq 'map(select(.context=="smoke/cross-repo")) | (first.state // "none")')"
-            echo "  attempt ${i}: smoke/cross-repo=${state}"
+            echo "  attempt ${i}/${MAX_ATTEMPTS}: smoke/cross-repo=${state}"
             case "${state}" in
               success) echo "✅ cross-repo smoke green — release may publish."; exit 0 ;;
               failure|error) echo "::error::cross-repo smoke ${state} for ${SHA} — blocking release."; exit 1 ;;
-              *) sleep 25 ;;
             esac
+            # Don't sleep after the final attempt — fail immediately once the
+            # budget is spent, instead of burning one last idle interval.
+            [ "${i}" -lt "${MAX_ATTEMPTS}" ] && sleep "${INTERVAL}"
           done
-          echo "::error::Timed out waiting for cross-repo smoke on ${SHA}. Re-run after the smoke is green."
+          echo "::error::Timed out waiting for cross-repo smoke on ${SHA} after ~$(( MAX_ATTEMPTS * INTERVAL / 60 )) min. The smoke never posted a terminal status (likely a wedged or queued smoke run — check dsj1984/mandrel-platform-smoke). Recover by re-running this workflow once the smoke is green, or dispatch release-please with force_publish=true if the smoke has already passed for ${SHA}."
           exit 1
 
   npm-publish:
