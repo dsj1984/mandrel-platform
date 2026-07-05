@@ -1046,8 +1046,9 @@ jobs:
   #   • Secret scan — pinned gitleaks binary over the PR diff (blocking).
   #   • SAST        — pinned Semgrep, `--error` fails the job on any finding
   #                   (blocking, no SARIF upload). On pull_request events it is
-  #                   scoped to the PR diff via `--baseline-commit <base.sha>`
-  #                   (mirroring the secret scan), so only findings INTRODUCED
+  #                   scoped to the PR diff via `--baseline-commit <merge-base>`
+  #                   (M8: the true fork point, not the base-branch tip, so
+  #                   base drift never surfaces phantom findings), so only INTRODUCED
   #                   by the PR block; on push / schedule it scans the full tree.
   #                   The vendored framework tree `.agents/` is ALWAYS excluded
   #                   (`--exclude '.agents'`): it is materialized from the pinned
