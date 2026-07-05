@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.26.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.25.0...mandrel-platform-v0.26.0) (2026-07-05)
+
+
+### Added
+
+* **ci:** lint gh CLI flag combinations in workflows (regression guard) ([#291](https://github.com/dsj1984/mandrel-platform/issues/291)) ([f1166a7](https://github.com/dsj1984/mandrel-platform/commit/f1166a7ac11f725f432b77ba0f4a011f86754da2))
+
+
+### Fixed
+
+* **release:** repair await-smoke poll and force_publish guard (regressions from [#279](https://github.com/dsj1984/mandrel-platform/issues/279)) ([#289](https://github.com/dsj1984/mandrel-platform/issues/289)) ([ae92cfa](https://github.com/dsj1984/mandrel-platform/commit/ae92cfa328af9998e0a598ccf791cc63cf07ab24))
+
 ## [0.25.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.24.0...mandrel-platform-v0.25.0) (2026-07-05)
 
 

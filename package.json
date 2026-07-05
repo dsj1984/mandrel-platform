@@ -1,6 +1,6 @@
 {
   "name": "mandrel-platform",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "description": "Shared CI/deploy workflows, composite toolchain action, npm config package, Renovate preset, and operator runbook templates.",
   "license": "MIT",
   "repository": {
