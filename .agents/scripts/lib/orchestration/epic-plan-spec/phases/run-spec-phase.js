@@ -82,15 +82,15 @@ async function setEpicLabel(provider, epicId, targetLabel) {
  *
  * @param {number} epicId
  * @param {import('../../../ITicketingProvider.js').ITicketingProvider} provider
- * @param {{ prdContent: string, techSpecContent: string, acceptanceSpecContent?: string|null }} artifacts
+ * @param {{ techSpecContent: string, acceptanceSpecContent?: string|null }} artifacts
  * @param {object} settings
  * @param {{ force?: boolean, forceReview?: boolean, steal?: boolean, config?: object, riskVerdict?: import('../../planning-risk.js').RiskVerdict }} [opts]
- * @returns {Promise<{ epicId: number, prdId: number|null, techSpecId: number|null, acceptanceSpecId: number|null, checkpoint: object, planningRisk: import('../../planning-risk.js').PlanningRiskEnvelope, reviewRouting: import('../../plan-review-routing.js').ReviewRoutingEnvelope }>}
+ * @returns {Promise<{ epicId: number, techSpecPersisted: boolean, acceptanceTable: 'persisted'|'waived'|'none', checkpoint: object, planningRisk: import('../../planning-risk.js').PlanningRiskEnvelope, reviewRouting: import('../../plan-review-routing.js').ReviewRoutingEnvelope }>}
  */
 export async function runSpecPhase(
   epicId,
   provider,
-  { prdContent, techSpecContent, acceptanceSpecContent = null },
+  { techSpecContent, acceptanceSpecContent = null },
   settings = {},
   {
     force = false,
@@ -153,7 +153,7 @@ export async function runSpecPhase(
   const planResult = await planEpic(
     epicId,
     provider,
-    { prdContent, techSpecContent, acceptanceSpecContent },
+    { techSpecContent, acceptanceSpecContent },
     settings,
     {
       force,
@@ -163,15 +163,13 @@ export async function runSpecPhase(
   const specChanged = planResult?.persisted !== false;
 
   const afterPlan = await provider.getEpic(epicId);
-  const prdId = afterPlan.linkedIssues?.prd ?? null;
-  const techSpecId = afterPlan.linkedIssues?.techSpec ?? null;
-  const acceptanceSpecId = afterPlan.linkedIssues?.acceptanceSpec ?? null;
 
   // Story #2635 — cross-validate the authored Tech Spec body against the
-  // base branch and surface any stale path-shaped references on the Tech
-  // Spec issue. Non-blocking: a missing base ref, an unreadable temp
-  // directory, or a provider failure downgrades to a warning so Phase 7
-  // never fails on the advisory check.
+  // base branch and surface any stale path-shaped references. Story #4324:
+  // with the Tech Spec folded into the Epic body, the advisory comment
+  // lands on the Epic itself. Non-blocking: a missing base ref, an
+  // unreadable temp directory, or a provider failure downgrades to a
+  // warning so Phase 7 never fails on the advisory check.
   const baseBranchRef = settings?.baseBranch ?? 'main';
   const tempRoot = path.resolve(
     PROJECT_ROOT,
@@ -179,7 +177,6 @@ export async function runSpecPhase(
   );
   const freshness = await runSpecFreshnessCheck({
     epicId,
-    techSpecId,
     techSpecContent,
     baseBranchRef,
     tempRoot,
@@ -220,9 +217,8 @@ export async function runSpecPhase(
       },
       spec: {
         ...currentState.spec,
-        prdId,
-        techSpecId,
-        acceptanceSpecId,
+        techSpecPersisted: planResult?.techSpecPersisted === true,
+        acceptanceTable: planResult?.acceptanceTable ?? 'none',
         completedAt: new Date().toISOString(),
       },
     },
@@ -256,13 +252,17 @@ export async function runSpecPhase(
   const cleanup = await cleanupPhaseTempFiles({ phase: 'spec', epicId });
 
   const acceptanceSummary =
-    acceptanceSpecId !== null ? `, Acceptance Spec #${acceptanceSpecId}` : '';
+    planResult?.acceptanceTable === 'persisted'
+      ? ' + ## Acceptance Table section'
+      : planResult?.acceptanceTable === 'waived'
+        ? ' (acceptance waived)'
+        : '';
   const freshnessSummary =
     freshness.stale > 0 || freshness.ambiguous > 0
       ? ` ⚠️ Spec freshness: ${freshness.stale} stale / ${freshness.ambiguous} ambiguous reference(s) — see ${freshness.reportPath ?? 'report'}.`
       : '';
   Logger.info(
-    `[epic-plan-spec] ✅ Spec phase complete for Epic #${epicId}. PRD #${prdId}, Tech Spec #${techSpecId}${acceptanceSummary}.${freshnessSummary}`,
+    `[epic-plan-spec] ✅ Spec phase complete for Epic #${epicId}. Tech Spec sections folded into the Epic body${acceptanceSummary}.${freshnessSummary}`,
   );
   if (cleanup.deleted.length > 0) {
     Logger.info(
@@ -272,9 +272,8 @@ export async function runSpecPhase(
 
   return {
     epicId,
-    prdId,
-    techSpecId,
-    acceptanceSpecId,
+    techSpecPersisted: planResult?.techSpecPersisted === true,
+    acceptanceTable: planResult?.acceptanceTable ?? 'none',
     checkpoint,
     cleanup,
     freshness,

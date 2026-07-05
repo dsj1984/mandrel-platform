@@ -32,14 +32,16 @@
  *   node .agents/scripts/epic-deliver-prepare.js --epic <epicId>
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { runAsCli } from './lib/cli-utils.js';
-import { getRunners, resolveConfig } from './lib/config-resolver.js';
+import { getPaths, getRunners, resolveConfig } from './lib/config-resolver.js';
 import { currentBranch as gitCurrentBranch } from './lib/git-branch-lifecycle.js';
 import { getEpicBranch, gitSpawn } from './lib/git-utils.js';
-import { parseLinkedIssues } from './lib/issue-link-parser.js';
 import { Logger } from './lib/Logger.js';
+import { buildDocsDigest } from './lib/orchestration/docs-digest.js';
 import {
   resolveOperator,
   runPrepareGuards,
@@ -144,8 +146,6 @@ function resolveGitUserEmail(cwd) {
  *   storyCount: number,
  *   concurrencyCap: number,
  *   stories: Array<{ storyId: number, title: string, worktree?: string }>,
- *   prdId: number|null,
- *   techSpecId: number|null,
  *   checkpointInitializedAt: string,
  * }>}
  */
@@ -289,6 +289,40 @@ function evaluatePrepareConcurrencyGate({
   return gate;
 }
 
+/**
+ * Build the per-Epic docs digest and write it to
+ * `<tempRoot>/epic-<id>/docs-digest.md`, returning its repo-relative path.
+ * Story #4338 — the parent threads this path into every child prompt so
+ * delivery sub-agents read one compact outline instead of re-ingesting the
+ * full `project.docsContextFiles` set per Story.
+ *
+ * Keyed off the **un-defaulted** config (`config.raw`): when the operator has
+ * not configured `project.docsContextFiles`, this returns `null` (no file
+ * written) rather than digesting the resolver's built-in default set — the
+ * digest is an opt-in surface for projects that curate their docs context.
+ *
+ * @param {{ epicId: number, cwd?: string, config: object }} args
+ * @returns {Promise<string|null>} repo-relative digest path, or null when
+ *   `project.docsContextFiles` is empty/unset (or every file is missing).
+ */
+async function writeDocsDigest({ epicId, cwd, config }) {
+  const rawFiles = config?.raw?.project?.docsContextFiles;
+  const docsContextFiles = Array.isArray(rawFiles) ? rawFiles : [];
+  if (docsContextFiles.length === 0) return null;
+
+  const paths = getPaths(config);
+  const root = path.resolve(cwd ?? process.cwd());
+  const docsRoot = path.resolve(root, paths.docsRoot);
+  const digest = await buildDocsDigest({ docsContextFiles, docsRoot });
+  if (digest == null) return null;
+
+  const relPath = path.join(paths.tempRoot, `epic-${epicId}`, 'docs-digest.md');
+  const absPath = path.resolve(root, relPath);
+  await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
+  await fs.promises.writeFile(absPath, digest, 'utf-8');
+  return relPath;
+}
+
 export async function runEpicDeliverPrepare({
   epicId,
   cwd,
@@ -377,45 +411,20 @@ export async function runEpicDeliverPrepare({
     });
   }
 
-  // Story #4253: resolve the Epic's PRD / Tech-Spec linkages ONCE here and
-  // surface them in the prepare envelope. The /deliver fan-out threads these
-  // into each per-Story `story-init.js --prd/--tech-spec`, collapsing the
-  // N per-Story `getEpic` round-trips to this single parent-side resolution.
-  // The Epic snapshot is already in hand (`state.epic`), so this adds no
-  // extra fetch; the body-parse fallback mirrors hierarchy-tracer's source.
-  const { prdId, techSpecId } = resolveEpicLinkages(state.epic);
+  const docsDigestPath = await writeDocsDigest({ epicId, cwd, config });
 
   return {
     epicId,
     storyCount: openStories.length,
     concurrencyCap,
     stories,
-    prdId,
-    techSpecId,
     checkpointInitializedAt:
       checkpointState.startedAt ??
       checkpointState.lastUpdatedAt ??
       new Date().toISOString(),
     concurrencyHazardsBypassed: gate.bypassed,
     preflightCache: cacheStatus,
-  };
-}
-
-/**
- * Resolve an Epic's linked PRD / Tech-Spec issue ids from the snapshot ticket.
- * Prefers the provider-supplied `linkedIssues` map and falls back to parsing
- * the Epic body's `## Planning Artifacts` section — the same two sources
- * `hierarchy-tracer.js` reads — so the threaded ids match what an unthreaded
- * `story-init.js` run would have resolved itself. Story #4253.
- *
- * @param {{ linkedIssues?: { prd?: number|null, techSpec?: number|null }|null, body?: string }|null|undefined} epic
- * @returns {{ prdId: number|null, techSpecId: number|null }}
- */
-function resolveEpicLinkages(epic) {
-  const linked = epic?.linkedIssues ?? parseLinkedIssues(epic?.body ?? '');
-  return {
-    prdId: linked?.prd ?? null,
-    techSpecId: linked?.techSpec ?? null,
+    docsDigestPath,
   };
 }
 

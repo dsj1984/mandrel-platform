@@ -19,9 +19,11 @@ ADR 20260512-coupling-stance in [`../docs/decisions.md`](../../docs/decisions.md
 From zero to shipped:
 
 1. **Plan the work.** Run `/plan` in your agentic IDE. The framework
-   generates a PRD, a Tech Spec, and an Acceptance Spec, decomposes the
-   work into the flat Story backlog under the Epic, and
-   transitions the Epic to `agent::ready`.
+   authors a Tech Spec and an Acceptance Table and folds both into the
+   Epic body as managed sections (the Epic is the single planning
+   document — the PRD and context-ticket artifact classes were
+   retired), decomposes the work into the flat Story backlog under the
+   Epic, and transitions the Epic to `agent::ready`.
 
    The entry point you use selects where the run begins:
    - With **no arguments** (or `--idea "<seed>"`), the workflow enters at
@@ -50,19 +52,22 @@ From zero to shipped:
    4. **Phase 4 — open the Epic Issue** *(ideation entry only)* — opens
       the GitHub Issue with **only** the `type::epic` label; the captured
       id flows into the rest of the pipeline.
-   5. **Phase 5 — re-plan detection** — checks whether the Epic already
-      carries planning artifacts and, if so, prompts before overwriting
-      the PRD / Tech Spec / Acceptance Spec in place and recreating the
-      child Story tickets.
+   5. **Phase 5 — re-plan detection** — checks whether the Epic body
+      already carries the folded Tech Spec sections (keyed on the
+      `## Delivery Slicing` managed section — Story #4324) and, if so,
+      prompts before overwriting the Tech Spec / Acceptance Table
+      sections in place and recreating the child Story tickets. Legacy
+      context tickets on historical Epics are ignored (never fetched).
    6. **Phase 6 — Epic clarity gate** — scores the Epic body against the
       five canonical sections. A `clear` verdict requires ≥ 4 of 5
       sections present **and** the Acceptance Criteria section present (AC
       is required, not optional). A `clear` verdict proceeds silently;
       `needs-refinement` drops into a one-shot refinement loop with a HITL
       diff before persisting the sharpened body.
-   7. **Phase 7 — PRD, Tech Spec & Acceptance Spec** — the
-      `epic-plan-spec-author` skill authors all three planning artifacts
-      as linked context tickets, flips the Epic to `agent::review-spec`,
+   7. **Phase 7 — Tech Spec & Acceptance Spec** — the
+      `epic-plan-spec-author` skill authors both planning artifacts;
+      the persist half folds them into the Epic body's managed
+      sections, flips the Epic to `agent::review-spec`,
       and routes high-risk Epics to a HITL review stop (low-risk Epics
       auto-proceed).
    8. **Phase 8 — work-breakdown decomposition** — the
@@ -240,7 +245,7 @@ graph LR
 
     subgraph Phase2 ["Phase 2: Planning"]
         direction TB
-        C["🤖 PRD + Tech Spec authoring"]:::agentic
+        C["🤖 Tech Spec authoring"]:::agentic
         D["🤖 Ticket Decomposer"]:::agentic
         C --> D
         D -.-> D_Art["📄 GitHub Issue Hierarchy"]:::artifact
@@ -346,7 +351,7 @@ mode:
    the canonical Epic-from-idea template; the operator confirms before
    the GitHub Issue is opened.
 5. **Open the Epic.** The Issue is opened with **only** the `type::epic`
-   label — no `state::*` label is applied at creation. PRD authoring in
+   label — no `state::*` label is applied at creation. Spec authoring in
    Phase 1b advances it to `agent::review-spec`.
 
 #### Scope triage
@@ -354,7 +359,7 @@ mode:
 `/plan` Phase 1.5 runs the
 [`core/scope-triage`](../skills/core/scope-triage/SKILL.md) rubric over the
 sharpened one-pager so a story-sized scope is not pushed through the full Epic
-ceremony (PRD + Tech Spec + Acceptance Spec + Story backlog +
+ceremony (Tech Spec + Acceptance Spec + Story backlog +
 `epic/<id>` integration branch) only to land as a degenerate one-Story
 output. The rubric anchors its sizing judgment **by reference** to
 the existing sizing SSOT (`DELIVERABLE_GRANULARITY_GUIDANCE` /
@@ -376,7 +381,7 @@ The same rubric also guards the **existing-Epic entry** (1b) as the
 hand-opened directly as a `type::epic` issue (the Phase 6 Epic Clarity Gate
 scores section *presence*, not scope *size*, so a clear-but-thin Epic would
 otherwise sail through). The advisory fires **only** when Phase 5 found no
-linked PRD / Tech Spec **and** the Epic has no open Story children, so
+folded Tech Spec sections **and** the Epic has no open Story children, so
 it never re-triages an Epic that is being re-planned. An `epic` verdict
 proceeds silently; a `story` / `borderline` verdict STOPs with the same
 three-way choice (convert to a standalone Story / proceed as Epic anyway /
@@ -420,7 +425,7 @@ Epic id.
 
 The framework reads the Epic and autonomously builds the entire work breakdown.
 
-> **Epic Clarity Gate (`/plan` `planning.clarity-gate` state).** Before PRD / Tech Spec /
+> **Epic Clarity Gate (`/plan` `planning.clarity-gate` state).** Before Tech Spec /
 > Acceptance Spec authoring kicks off, `/plan` scores the Epic body
 > against the five canonical sections from
 > [`templates/epic-from-idea.md`](../templates/epic-from-idea.md) (Context,
@@ -441,27 +446,32 @@ The framework reads the Epic and autonomously builds the entire work breakdown.
 
 1. **Epic Planner** (`epic-plan-spec.js`):
    - Synthesizes the Epic body with project documentation.
-   - Generates a **PRD** (`context::prd`), **Tech Spec**
-     (`context::tech-spec`), and **Acceptance Spec**
-     (`context::acceptance-spec`) as linked GitHub Issues.
+   - Folds the authored **Tech Spec** (opening with `## Delivery
+     Slicing`) and the **Acceptance Table** (the AC-ID table) into
+     marker-delimited managed sections of the Epic body. The Epic body
+     carries its `## User Stories` section inline — the PRD artifact
+     class was retired (Story #4314), and the `context::tech-spec` /
+     `context::acceptance-spec` ticket classes were retired the same way
+     (Story #4324): a `/plan` Epic run creates exactly **one** GitHub
+     issue.
 
-> [!TIP] **PRD authoring — acceptance criteria phrasing.** Write acceptance
+> [!TIP] **Acceptance criteria phrasing.** Write the Epic's acceptance
 > criteria in Gherkin-compatible `Given / When / Then` form so the QA
 > acceptance suite can lift them directly into executable `.feature` files. See
 > [`rules/gherkin-standards.md`](../rules/gherkin-standards.md) for the canonical
 > clause grammar, tag taxonomy, and forbidden patterns.
 
-### Acceptance Spec — the third planning context ticket
+### Acceptance Table — the second folded planning section
 
-Every Epic carries **three** planning context tickets, not two:
+Every planned Epic body carries **two** managed planning sections
+(Story #4324 — no separate context tickets):
 
-| Label                       | Artifact         | Authored by                                         | Drives                                                   |
-| --------------------------- | ---------------- | --------------------------------------------------- | -------------------------------------------------------- |
-| `context::prd`              | PRD              | `epic-plan-spec-author` skill (PRD persona)         | What we're shipping and why.                             |
-| `context::tech-spec`        | Tech Spec        | `epic-plan-spec-author` skill (Architect persona)   | How we're shipping it.                                   |
-| `context::acceptance-spec`  | Acceptance Spec  | `epic-plan-spec-author` skill (Acceptance Engineer) | The AC ID table that gates close-time reconciliation.    |
+| Section                | Artifact         | Authored by                                         | Drives                                                |
+| ---------------------- | ---------------- | --------------------------------------------------- | ----------------------------------------------------- |
+| `## Delivery Slicing`… | Tech Spec        | `epic-plan-spec-author` skill (Architect persona)   | How we're shipping it.                                |
+| `## Acceptance Table`  | Acceptance Table | `epic-plan-spec-author` skill (Acceptance Engineer) | The AC ID table that gates close-time reconciliation. |
 
-The Acceptance Spec body is a single Markdown table —
+The Acceptance Table section is a single Markdown table —
 `| AC ID | Outcome | Feature File | Scenario | Disposition |` — with
 stable `AC-<n>` IDs assigned in document order. IDs are reused across
 re-plans when an Outcome is materially unchanged so scenario tags
@@ -472,16 +482,20 @@ BDD runner + pending-tag (e.g. `playwright-bdd supports @skip`) for the
 features-first Story to consume.
 
 The spec is persisted by
-`epic-plan-spec.js --epic [Epic_ID] --prd ... --techspec ... --acceptance-spec ...`
-— the persist half writes all three artifacts in one atomic step and
-fails loudly if any is missing or empty.
+`epic-plan-spec.js --epic [Epic_ID] --tech-spec ... --acceptance-table ...`
+— the persist half folds both artifacts into the Epic body's managed
+sections in one atomic, section-scoped write (everything outside the
+managed regions is byte-preserved) and fails loudly if any input is
+missing or empty. At delivery time, hydration strips the
+`## Acceptance Table` section from story prompts — it is
+authoring/close-time machinery, not delivery context.
 
 #### Adaptive planning risk routing
 
 `/plan`'s `planning.spec-authoring` state derives a deterministic
 **`planningRisk`** envelope from a **planner-authored risk verdict**
-(`risk-verdict.json`, the fourth planning artifact the
-`epic-plan-spec-author` Skill writes from the PRD / Tech Spec it just
+(`risk-verdict.json`, the third planning artifact the
+`epic-plan-spec-author` Skill writes from the Epic body / Tech Spec it just
 authored). The persist half of `epic-plan-spec.js` validates the verdict
 against `risk-verdict.schema.json` — a malformed verdict fails closed —
 then derives the envelope via `deriveRiskEnvelope`
@@ -500,8 +514,8 @@ downstream decisions:
   Epics (visible behavior, public API, security, billing, data
   migration, destructive mutation, critical workflow) trigger a HITL
   stop after `planning.spec-authoring` so the operator can read the
-  PRD / Tech Spec / Acceptance Spec on GitHub before decomposition
-  starts. Low-risk Epics (docs-only, internal refactor, pure test
+  Epic body's Tech Spec / Acceptance Table sections on GitHub before
+  decomposition starts. Low-risk Epics (docs-only, internal refactor, pure test
   harness, cleanup) print the auto-proceed message from
   `reviewRouting.operatorMessage` and chain directly into the
   `planning.decompose` state. The operator can force the review
@@ -528,7 +542,8 @@ on the Epic ticket records the waiver. There are two routes to the label:
   (see § Adaptive planning risk routing) and,
   when `acceptanceDisposition === 'not-applicable'`, the persist half
   of `epic-plan-spec.js` applies `acceptance::n-a` on the Epic and skips
-  the Acceptance Spec artifact for that run. The disposition is also
+  the Acceptance Table section for that run (stripping a stale one on a
+  re-plan). The disposition is also
   recorded in the `epic-plan-state` checkpoint so the decision is
   auditable.
 
@@ -537,9 +552,11 @@ by both runtime gates:
 
 - The `/deliver` **start gate** (`delivery.snapshot` state) skips
   the acceptance-spec presence check when the label is set.
-- The finalize-time **acceptance-spec reconciler** returns
+- The finalize-time **acceptance reconciler** returns
   `status: 'waived'` without scanning `tests/features/**` and the
-  finalize step proceeds.
+  finalize step proceeds. (The waiver now waives the Epic body's
+  `## Acceptance Table` section — Story #4324 — with unchanged
+  meaning.)
 
 The waiver is binary — there is no partial opt-out. If an Epic later
 warrants spec coverage, remove the label and run `/plan`'s
@@ -550,9 +567,8 @@ warrants spec coverage, remove the label and run `/plan`'s
      (Epic → Story):
 
      ```text
-     Epic (type::epic)
-     ├── PRD (context::prd)
-     ├── Tech Spec (context::tech-spec)
+     Epic (type::epic)                ← body carries the folded Tech Spec
+     │                                  sections + ## Acceptance Table
      ├── Story (type::story)
      │   ├── acceptance[]            ← inline on Story body
      │   └── verify[]                ← inline on Story body
@@ -569,7 +585,7 @@ warrants spec coverage, remove the label and run `/plan`'s
 Story. The wave-loop fan-out in `/deliver` and the
 Story-branch → Epic-branch merge model are unchanged; the Feature and
 Task layers are gone, and thematic grouping lives as prose in the Epic
-body / Tech Spec.
+body (which also carries the folded Tech Spec sections).
 
 When decomposition completes the Epic flips to `agent::ready` and the
 dispatch manifest is posted as a structured comment on the Epic. That
@@ -585,9 +601,9 @@ contract is enforced at the planner boundary so `/deliver` can
 treat `agent::ready` as a load-bearing precondition rather than a
 hopeful signal.
 
-- **Planning artifacts linked or waived.** The Epic body lists a
-  linked `context::prd` and `context::tech-spec` ticket, and either a
-  linked `context::acceptance-spec` ticket **or** the
+- **Planning sections present or waived.** The Epic body carries the
+  folded Tech Spec sections (`## Delivery Slicing` onward), and either
+  the `## Acceptance Table` managed section **or** the
   `acceptance::n-a` waiver label. Missing-without-waiver fails the
   handoff.
 - **Decomposition persisted.** The structural reconciler has applied
@@ -641,19 +657,14 @@ side-effects rather than inline calls at phase boundaries; the
 "merge-lockout" lint rule keeps `gh pr merge` confined to the
 `AutomergeArmer` listener.
 
-> **Acceptance-spec start gate.** Before a single wave fans out,
+> **Acceptance start gate.** Before a single wave fans out,
 > `/deliver`'s `delivery.snapshot` state
 > ([`lib/orchestration/epic-runner/phases/snapshot.js`](../scripts/lib/orchestration/epic-runner/phases/snapshot.js))
 > asserts that the Epic either (a) carries the `acceptance::n-a`
-> waiver label, or (b) has a linked `context::acceptance-spec`
-> ticket. The ticket's GitHub state (open / closed) is not checked
-> — presence is sufficient, matching the PRD and Tech Spec contract.
-> The reviewer's OK during `/plan`'s `planning.spec-authoring`
-> state is the approval
-> signal, not a manual ticket-close action; the three planning
-> context tickets are closed automatically by the
-> `Finalizer` listener subscribed to `epic.close.end` once the
-> Epic PR opens. Neither
+> waiver label, or (b) carries the `## Acceptance Table` managed
+> section in its body (Story #4324). Presence is sufficient — the
+> reviewer's OK during `/plan`'s `planning.spec-authoring` state is
+> the approval signal. Neither
 > condition met → the snapshot throws a clear error naming the
 > missing precondition and `runAsCli` maps it to `process.exit(1)`.
 > This refuses to launch Epics that skipped acceptance-spec
@@ -748,7 +759,9 @@ standalone Stories), the Context Hydrator assembles a self-contained prompt:
 
 1. `agent-protocol.md` (universal rules).
 2. Persona and skill directives (from Task labels).
-3. Hierarchy context (Story → Epic → PRD → Tech Spec).
+3. Hierarchy context (Story → Epic — the Epic body carries the folded
+   Tech Spec sections; the `## Acceptance Table` section is stripped
+   from delivery prompts).
 4. **Story branch context.** Automatic checkouts to the Story branch. Under
    worktree isolation, each Story runs in its own `.worktrees/story-<id>/` so
    branch swaps, staging, and reflog activity are isolated per-story. See
@@ -902,15 +915,19 @@ watch / auto-merge / cleanup tail that drives the PR to merge:
    listener chain owns every close-time side effect end to end
    (Story #2894 — bus-owned finalize). The chain runs three
    responsibilities in order:
-   1. **Acceptance-spec reconciliation.** Invokes
+   1. **Acceptance reconciliation.** Invokes
       `acceptance-spec-reconciler.js` to diff the AC IDs declared in
-      the linked `context::acceptance-spec` body against `@ac-*` /
-      `@pending` tags in `tests/features/**`. A non-OK reconciliation
-      throws (per `.agents/rules/orchestration-error-handling.md`),
-      aborting finalize **before** the planning artifacts are closed —
-      so the PRD / Tech Spec / Acceptance Spec stay open until the AC
-      coverage gap is fixed. Skipped (`status: 'waived'`) when the Epic
-      carries `acceptance::n-a`.
+      the Epic body's `## Acceptance Table` managed section
+      (Story #4324) against `@epic-<id>-ac-*` / `@pending` tags in
+      `tests/features/**`. A non-OK reconciliation throws (per
+      `.agents/rules/orchestration-error-handling.md`), aborting
+      finalize **before** the PR opens — the Epic blocks until the AC
+      coverage gap is fixed. On a clean run the reconciler records
+      each row's verification outcome (`satisfied | pending |
+      missing`) into the table's Disposition column — a
+      section-scoped write that touches only the managed region.
+      Skipped (`status: 'waived'`) when the Epic carries
+      `acceptance::n-a`.
    2. **PR open (bus-owned, Story #2894).** On
       `acceptance.reconcile.ok`, the `Finalizer` listener invokes
       `openOrLocatePr({ epicId, headBranch: 'epic/<id>', baseBranch:
@@ -925,19 +942,15 @@ watch / auto-merge / cleanup tail that drives the PR to merge:
       (enforced by the merge-lockout rule in
       `.agents/scripts/check-lifecycle-lint.js`); the
       `delivery.finalize` state never shells the merge command.
-   3. **Planning-artifact close + hand-off (bus-owned, Story #2894).**
-      The `Finalizer` chains `closePlanningTickets({ epicId,
-      provider })` to close the three planning context tickets
-      (`context::prd`, `context::tech-spec`,
-      `context::acceptance-spec`) so the Epic's `Closes #<id>`
-      auto-close path is not blocked by open sub-issues, then
+   3. **Hand-off (bus-owned, Story #2894).** The `Finalizer` runs
       `postHandoffComment({ epicId, prNumber, prUrl, provider })` to
       upsert the canonical `epic-handoff` structured comment naming
-      the PR. Both helpers are idempotent — re-running finalize
-      after a crash counts already-closed tickets under
-      `alreadyClosed` and edits the existing handoff comment in
-      place rather than appending a duplicate. The Epic stays at
-      `agent::executing` until the PR merges.
+      the PR. (Story #4324 retired the `closePlanningTickets` sweep
+      with the context-ticket classes — there are no planning tickets
+      to close.) The helper is idempotent — re-running finalize after
+      a crash edits the existing handoff comment in place rather than
+      appending a duplicate. The Epic stays at `agent::executing`
+      until the PR merges.
 6. **Watch-and-iterate (Phase 8).** `/deliver` watches the open PR's
    required checks until they turn green. Transient failures trigger an
    automated re-run loop; durable failures surface for human remediation
@@ -982,7 +995,7 @@ required checks fail.
    `code-review` comment, and the retro before merging by hand, or
    (b) checks fail and need remediation on the Epic branch. There is
    no separate close command — the close-out side effects (PR open,
-   planning-ticket close, handoff comment) are owned by `/deliver`'s
+   handoff comment) are owned by `/deliver`'s
    `delivery.finalize` state (the lifecycle Finalizer listener), whose
    replay is idempotent.
 
@@ -1068,7 +1081,7 @@ action.
    integration target.
 2. **Completion.** Each Story flips to `agent::done` at its own closure
    (`story-close.js`); the wave loop tracks Epic-level progress as
-   Stories complete. There is no upward auto-cascade — Epics, PRDs, and
+   Stories complete. There is no upward auto-cascade — Epics and
    Tech Specs are never flipped by Story closure; the Epic only flips to
    `agent::done` when the operator merges the PR to `main`.
 
@@ -1159,8 +1172,10 @@ non-QA consumer) but enforced at run time: the resolver fails **loudly** with
 "this project has not bound the QA harness" when no `qa` block is present —
 there is no silent fallback. The contract's four required keys are
 `qa.featureRoot` (the `.feature` discovery root), `qa.fixturesManifest`
-(persona → seed-data binding), `qa.signInSeam` (the dev-only sign-in seam,
-either `{ urlTemplate }` or `{ skill }`), and `qa.personas` (the persona set,
+(persona → seed-data binding), `qa.environments` (the environment-keyed map —
+each entry `{ baseUrl, signInSeam, allowWrites? }`, selected per invocation by
+`resolveQaEnvironment`; the per-environment `signInSeam` is either
+`{ urlTemplate }` or `{ skill }`), and `qa.personas` (the persona set,
 authored as a name-only array under a url-template seam or as a per-persona
 credential/skill map under a skill seam); the two optional keys
 `qa.consoleAllowlist` and `qa.designTokens` default to `[]` and `null`.
@@ -1205,7 +1220,7 @@ on so re-runs short-circuit when state has not changed.
 | Close-validation          | `/deliver` `delivery.close-validation` state    | lint + test + maintainability + CRAP + coverage ratchets via `evidence-gate.js`           | blocking  | `evidence-gate` cache entry keyed by `git rev-parse HEAD`                 |
 | Pre-push                  | Local `.husky/pre-push` hook on every push           | Diff-scoped quality preview + coverage/CRAP ratchet                                       | blocking  | Working-tree SHA + staged-diff hash (per push)                            |
 | Acceptance reconciliation | `/deliver` `delivery.finalize` state            | `acceptance-spec-reconciler.js` diffs AC IDs against `@ac-*` / `@pending` feature tags    | blocking  | `acceptance-reconcile` structured comment on Epic, keyed by spec-body SHA |
-| Spec freshness            | `/plan` `planning.spec-authoring` state         | Re-derives PRD / Tech Spec / Acceptance Spec staleness against Epic body checksum         | advisory  | `epic-plan-state` checkpoint entry per spec artifact body SHA             |
+| Spec freshness            | `/plan` `planning.spec-authoring` state         | Re-derives Tech Spec / Acceptance Spec staleness against Epic body checksum               | advisory  | `epic-plan-state` checkpoint entry per spec artifact body SHA             |
 
 ### Review & feedback loop
 
@@ -1411,9 +1426,9 @@ For Stories already in flight, use one of the three options above.
 | Command                                          | Purpose                                                                                                                                                                      |
 | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `npx mandrel init`                               | Cold-start command — install `mandrel` (if absent), `mandrel sync`, bootstrap.js (provisions repo + Projects V2 board, labels, branch protection), then onboarding tail (stack detection, docs scaffolding, doctor gate, `/plan` handoff). |
-| `/plan`                                     | Ideation entry — sharpen idea, search duplicates, open Epic, then PRD + Tech Spec + decomposition.                                                                            |
+| `/plan`                                     | Ideation entry — sharpen idea, search duplicates, open Epic, then Tech Spec + decomposition.                                                                                 |
 | `/plan --idea "<seed>"`                     | Same ideation entry with pre-supplied seed.                                                                                                                                   |
-| `/plan <epicId>`                            | Existing-Epic mode — PRD + Tech Spec + decomposition for an Epic Issue already opened.                                                                                       |
+| `/plan <epicId>`                            | Existing-Epic mode — Tech Spec + decomposition for an Epic Issue already opened.                                                                                             |
 | `/deliver <epicId>`                                      | Drive an Epic end-to-end. Wave loop → close-validation → code-review → retro → opens PR to `main` with auto-merge armed.                                                       |
 | `/deliver <storyId> [<storyId>...]`                     | Deliver one or more standalone Stories (no `Epic: #N` reference). Builds a dependency-aware wave plan and fans out one worker per Story per wave.                              |
 | `/plan`                                                 | Plan a one-off Story outside an Epic backlog.                                                                                                                                  |

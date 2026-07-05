@@ -44,7 +44,7 @@
     "provenance": true
   },
   "dependencies": {
-    "mandrel": "^1.81.0"
+    "mandrel": "^1.83.0"
   },
   "scripts": {
     "typecheck": "node --input-type=module --eval 'process.exit(0)'",

@@ -2,7 +2,7 @@
  * spec-freshness.js — Tech Spec post-author cross-validation against the
  * current codebase.
  *
- * `/plan` Phase 7 authors PRD + Tech Spec from documentation alone.
+ * `/plan` Phase 7 authors the Tech Spec from documentation alone.
  * When `project.docsContextFiles` (architecture.md, etc.) drift from
  * the real source tree, the Architect persona happily cites modules and
  * paths that no longer exist. The mismatch only surfaces at delivery time,
@@ -12,7 +12,7 @@
  * probes each against `baseBranchRef` (via `git cat-file -e`), and returns a
  * `{ stale, fresh, ambiguous }` envelope. The caller (epic-plan-spec.js)
  * uses the result to write a JSON report and post an advisory structured
- * comment on the Tech Spec issue. The check is intentionally non-blocking —
+ * comment on the Epic. The check is intentionally non-blocking —
  * planning continues even when stale references are present, because the
  * operator may legitimately be planning to create the path the Tech Spec
  * cites.
@@ -274,7 +274,7 @@ export function validateSpecFreshness(specBody, opts = {}) {
  * exact rendering contract.
  *
  * @param {{ stale: Array, ambiguous: Array, fresh: Array }} report
- * @param {{ baseBranchRef: string, techSpecId?: number, epicId?: number }} ctx
+ * @param {{ baseBranchRef: string, epicId?: number }} ctx
  * @returns {string}
  */
 export function renderSpecFreshnessComment(report, ctx) {

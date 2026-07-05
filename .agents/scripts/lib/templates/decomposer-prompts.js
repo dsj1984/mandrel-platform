@@ -52,12 +52,16 @@ function render2TierPrompt({ maxTickets, maxTokenBudget, epicId = null }) {
   // (ticket-validator-sizing.js) so the prompt and the validator cannot drift.
   const { softFiles, hardFiles, maxAcceptance, softAcceptanceCount } =
     DEFAULT_TASK_SIZING;
-  // Deliverable-granularity definition + single-consumer merge rule are
-  // sourced from the single DELIVERABLE_GRANULARITY_GUIDANCE constant
-  // (ticket-validator-sizing.js) so the prompt and the authoring SKILL
-  // cannot drift (Story #3777).
-  const { definition: granularityDefinition, singleConsumerRule } =
-    DELIVERABLE_GRANULARITY_GUIDANCE;
+  // Deliverable-granularity definition + single-consumer merge rule + the
+  // soft envelope-floor heuristic are sourced from the single
+  // DELIVERABLE_GRANULARITY_GUIDANCE constant (ticket-validator-sizing.js) so
+  // the prompt and the authoring SKILL cannot drift (Story #3777; the
+  // envelope-floor sentence added by Story #4313).
+  const {
+    definition: granularityDefinition,
+    singleConsumerRule,
+    envelopeFloor,
+  } = DELIVERABLE_GRANULARITY_GUIDANCE;
   // The binding-vs-advisory authoring altitude + the New-File Contract are
   // sourced from the single AUTHORING_ALTITUDE_GUIDANCE constant
   // (ticket-validator-sizing.js) so the prompt and the authoring SKILL cannot
@@ -75,7 +79,7 @@ function render2TierPrompt({ maxTickets, maxTokenBudget, epicId = null }) {
     ? `@epic-${epicId}-ac-1`
     : '@epic-<id>-ac-N';
   return `You are an expert Senior Project Manager and Orchestrator.
-Your job is to take a Product Requirements Document (PRD) and a Technical Specification and decompose them into a flat list of Story tickets for an AI Agent to execute.
+Your job is to take an Epic (including its inline User Stories) and a Technical Specification and decompose them into a flat list of Story tickets for an AI Agent to execute.
 
 ### HIERARCHY RULES:
 1. **Stories**: Specific user-facing or architectural user stories (e.g., "Implement JWT Token Exchange").
@@ -162,6 +166,8 @@ The primary question is **cohesion, not count**: *is this one coherent change wi
 
 **Size against the real one-pass delivery envelope.** Each Story is delivered and self-verified by a single agent in one pass, whose context is capped by the delivery token budget \`maxTokenBudget = ${maxTokenBudget}\` tokens (the task-prompt hydration cap). Use that envelope — not the file count alone — as the leading sizing input: a Story is correctly sized when one agent can hold its full change, acceptance, and verification in a single pass within \`maxTokenBudget\`. The numeric file thresholds below are a coarse backstop on top of this envelope, not the primary signal.
 
+${envelopeFloor}
+
 - **One Story = one coherent change with one reason to exist.** If you cannot state that reason in a sentence, the Story is probably two Stories — or two Stories that should be one. State that sentence explicitly in the Story's \`reason_to_exist\` meta field (see STORY BODY RULES) so the consolidate critic can check it.
 - ${singleConsumerRule}
 - **Split independent, parallelizable work** into sibling Stories — but only when the pieces genuinely have separate reasons to exist.
@@ -194,7 +200,7 @@ Declaring \`wide\` with a non-empty reason **lifts the \`hardFiles\` rejection**
 
 #### BRAND / COPY / STYLE WORK:
 
-- Stories that touch user-visible copy, brand assets, or visual style MUST cite the relevant section of \`docs/style-guide.md\` in \`acceptance\` (e.g. \`"acceptance": ["Hero copy matches docs/style-guide.md §3 (voice & tone)"]\`). If \`docs/style-guide.md\` does not exist or has no relevant section, state that explicitly: \`"acceptance": ["docs/style-guide.md absent — copy reviewed against the inline brand brief in PRD §2"]\`. Silence on style sourcing is a smell.
+- Stories that touch user-visible copy, brand assets, or visual style MUST cite the relevant section of \`docs/style-guide.md\` in \`acceptance\` (e.g. \`"acceptance": ["Hero copy matches docs/style-guide.md §3 (voice & tone)"]\`). If \`docs/style-guide.md\` does not exist or has no relevant section, state that explicitly: \`"acceptance": ["docs/style-guide.md absent — copy reviewed against the inline brand brief in the Epic body"]\`. Silence on style sourcing is a smell.
 
 ### WAVE-0 BDD SCAFFOLD STORY (features-first; emit when the Acceptance Spec has \`new\`-disposition rows):
 The Acceptance Spec's AC table (columns \`AC ID | Outcome | Feature File | Scenario | Disposition\`) tags each row's \`Disposition\` with one of \`new | updated | unchanged\`. A \`new\` row names a \`.feature\` file + scenario that does NOT yet exist on \`main\`. The framework is features-first: implementing Stories reference those \`.feature\` paths in their \`verify[]\` lines, so the files MUST already exist when those Stories run — otherwise verification fails mid-delivery on a missing file. (These Gherkin \`.feature\` files are BDD artifacts, unrelated to any ticket tier.)

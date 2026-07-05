@@ -86,6 +86,31 @@ function resolveAcceptance(story) {
   return Array.isArray(body?.acceptance) ? body.acceptance : [];
 }
 
+/**
+ * Resolve the `depends_on` edge list for a Story. `depends_on` may live at the
+ * top level (the validator normalizes it there — see `ticket-validator.js`) or
+ * inside the structured body (the shape `story-body.js` parses out). Prefer the
+ * top-level array, falling back to the resolved body's `depends_on`. Returns
+ * only non-empty string slugs — mirroring the `story-body.js` normalization so
+ * a blank / non-string edge never counts as a real dependency.
+ *
+ * The cross-Story validator already rejects any `depends_on` slug that does not
+ * match a sibling in the same decomposition, so every edge that survives to the
+ * sizing layer is guaranteed to point at a sibling. The merge-candidate
+ * heuristic therefore only needs to know whether the list is non-empty.
+ *
+ * @param {object} story
+ * @returns {string[]}
+ */
+function resolveDependsOn(story) {
+  const raw = Array.isArray(story?.depends_on)
+    ? story.depends_on
+    : (resolveStoryBody(story)?.depends_on ?? []);
+  return Array.isArray(raw)
+    ? raw.filter((d) => typeof d === 'string' && d.trim().length > 0)
+    : [];
+}
+
 export const DEFAULT_TASK_SIZING = Object.freeze({
   // Typical-Story warning thresholds (soft — emit advisory findings).
   // Story #4162 raised `softFiles` 8 → 15: a capability-sized Story routinely
@@ -97,6 +122,15 @@ export const DEFAULT_TASK_SIZING = Object.freeze({
   // Hard ceilings (rejection unless lifted).
   hardFiles: 30,
   maxAcceptance: 14,
+  // Under-size (merge-candidate) thresholds (Story #4312). A Story with a
+  // footprint at or below BOTH ceilings that also carries at least one
+  // `depends_on` edge to a sibling looks like a dependent fragment rather than
+  // a capability slice — the machine-checkable form of the single-consumer
+  // merge rule. Emitted as a `soft` advisory only; never a rejection. A tiny
+  // ORPHAN Story (no `depends_on`) stays silent — small orthogonal slices are
+  // legitimate.
+  mergeCandidateMaxFiles: 3,
+  mergeCandidateMaxAcceptance: 4,
 });
 
 /**
@@ -117,6 +151,16 @@ export const DEFAULT_TASK_SIZING = Object.freeze({
  * as a single PR — not a single module or file. Module-level slices fold into
  * the capability they belong to, and a Story whose only consumer is one
  * sibling Story is merged into that sibling (single-consumer merge rule).
+ *
+ * The `envelopeFloor` sentence is the **soft** complement to the sizing
+ * section's envelope framing (Story #4313): the delivery envelope
+ * (`maxTokenBudget`) bounds the TOP of a Story, but under-utilizing it is
+ * itself a merge signal. It is deliberately prose-only — an illustrative
+ * fraction, not a threshold constant, and no validator finding backs it (the
+ * mechanical backstop is the `merge-candidate` finding). It names the
+ * per-Story delivery-session cost (hydration, branch, PR, review, CI) so the
+ * "models one-shot bigger things now" planning assumption is stated, not
+ * implicit.
  */
 export const DELIVERABLE_GRANULARITY_GUIDANCE = Object.freeze({
   // The one-sentence definition of Story granularity.
@@ -125,6 +169,9 @@ export const DELIVERABLE_GRANULARITY_GUIDANCE = Object.freeze({
   // The single-consumer merge rule.
   singleConsumerRule:
     '**Single-consumer merge rule.** A Story whose only consumer is one sibling Story should be **merged into that sibling** rather than emitted separately — a single-consumer downstream slice is not its own unit of work.',
+  // The envelope-floor heuristic (soft; no validator finding — Story #4313).
+  envelopeFloor:
+    '**Envelope floor — under-utilizing the envelope is a merge signal.** A Story that would plausibly consume well under a third of the delivery envelope (`maxTokenBudget`) and is neither parallel-deliverable nor orthogonal to its siblings should be **merged into its consumer**. The fraction is illustrative, not a threshold — the point is that modern frontier models one-shot capability-sized changes, so a chain of small dependent Stories needlessly pays a full delivery session (hydration, branch, PR, review, CI) per link. Merge such links up unless a parallelism or orthogonality reason justifies the separate slice.',
 });
 
 /**
@@ -292,6 +339,66 @@ function computeMissingReasonToExistFinding(story) {
 }
 
 /**
+ * Soft, advisory `merge-candidate` finding (Story #4312). Surfaces a Story that
+ * looks like a dependent fragment rather than a capability slice — the
+ * machine-checkable form of the single-consumer merge rule
+ * (`DELIVERABLE_GRANULARITY_GUIDANCE.singleConsumerRule`). Never a rejection:
+ * `severity: 'soft'`, so it rides the advisory `findings[]` channel and never
+ * enters the hard `errors[]` array.
+ *
+ * The rendered message names the depended-on sibling slug(s) and recommends
+ * merging into the consumer, mirroring the tone of the `wide-undeclared` nudge.
+ */
+function makeMergeCandidate(slug, fileCount, acceptanceCount, dependsOn) {
+  const siblings = dependsOn.map((d) => `"${d}"`).join(', ');
+  return {
+    kind: 'merge-candidate',
+    severity: 'soft',
+    ticketSlug: slug,
+    fileCount,
+    acceptanceCount,
+    dependsOn,
+    message: `Story "${slug}" is a thin dependent slice (${fileCount} declared file(s), ${acceptanceCount} acceptance item(s)) that depends on sibling(s) ${siblings}. A Story whose only role is to feed one sibling is not its own unit of work — consider merging it into the consumer (single-consumer merge rule) rather than shipping it as a separate slice.`,
+  };
+}
+
+/**
+ * Emit a soft `merge-candidate` finding when a Story meets the under-size
+ * heuristic (Story #4312): footprint ≤ `mergeCandidateMaxFiles` declared
+ * `changes[]` files AND ≤ `mergeCandidateMaxAcceptance` acceptance items AND at
+ * least one `depends_on` edge to a sibling. All three conditions MUST hold — a
+ * tiny ORPHAN Story (no `depends_on`) stays silent because small orthogonal
+ * slices are legitimate. Glob entries mark the footprint as unknown-width, so a
+ * glob-carrying Story is never a merge candidate.
+ *
+ * @param {object} story
+ * @param {{ fileCount: number, hasGlobs: boolean }} changesAnalysis
+ * @param {number} acceptanceCount
+ * @param {object} sizing
+ * @returns {object[]}
+ */
+function computeMergeCandidateFinding(
+  story,
+  changesAnalysis,
+  acceptanceCount,
+  sizing,
+) {
+  if (changesAnalysis.hasGlobs) return [];
+  const dependsOn = resolveDependsOn(story);
+  if (dependsOn.length === 0) return [];
+  if (changesAnalysis.fileCount > sizing.mergeCandidateMaxFiles) return [];
+  if (acceptanceCount > sizing.mergeCandidateMaxAcceptance) return [];
+  return [
+    makeMergeCandidate(
+      story.slug,
+      changesAnalysis.fileCount,
+      acceptanceCount,
+      dependsOn,
+    ),
+  ];
+}
+
+/**
  * Returns true when a `changes[]` entry is a glob pattern. Handles both the
  * canonical PathEntry object form `{ path, assumption }` and legacy strings.
  */
@@ -394,6 +501,7 @@ function computeStorySizingFindings(story, sizing) {
   const acceptance = resolveAcceptance(story);
   const changes = Array.isArray(body?.changes) ? body.changes : [];
   const declaredWide = isDeclaredWide(body?.wide ?? null);
+  const changesAnalysis = analyseChanges(changes);
 
   // Soft, advisory: flag acceptance criteria that reference a configuration
   // constant without inlining a concrete value (Story #3855). Independent of
@@ -406,6 +514,19 @@ function computeStorySizingFindings(story, sizing) {
   // runtime backstop — this deterministic finding is the cheap backstop.
   // Independent of the numeric sizing layers below.
   out.push(...computeMissingReasonToExistFinding(story));
+
+  // Soft, advisory: flag a thin dependent slice (Story #4312) — the symmetric
+  // under-size backstop to the over-size ceilings. A tiny footprint with a
+  // `depends_on` edge to a sibling is a merge candidate under the
+  // single-consumer merge rule. Independent of the numeric sizing layers below.
+  out.push(
+    ...computeMergeCandidateFinding(
+      story,
+      changesAnalysis,
+      acceptance.length,
+      sizing,
+    ),
+  );
 
   // Acceptance ceiling + soft warn.
   if (acceptance.length > sizing.maxAcceptance) {
@@ -428,7 +549,7 @@ function computeStorySizingFindings(story, sizing) {
     );
   }
 
-  const { fileCount, hasGlobs } = analyseChanges(changes);
+  const { fileCount, hasGlobs } = changesAnalysis;
 
   // Glob entries mark the Story as unknown-width: a glob cannot be bounded by
   // the numeric ceiling, so skip it. A non-wide Story carrying globs gets an
