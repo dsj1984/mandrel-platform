@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.22.1...mandrel-platform-v0.23.0) (2026-07-05)
+
+
+### Added
+
+* **ci:** add require-deploy-ran gate so a CI-gated-off deploy fails visibly (refs [#268](https://github.com/dsj1984/mandrel-platform/issues/268)) ([#269](https://github.com/dsj1984/mandrel-platform/issues/269)) ([101cfc4](https://github.com/dsj1984/mandrel-platform/commit/101cfc4c14a880c93302f15b7f84503b32fec563))
+
 ## [0.22.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.22.0...mandrel-platform-v0.22.1) (2026-07-03)
 
 
