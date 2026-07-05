@@ -169,7 +169,10 @@ jobs:
           url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${asset}"
           tmp="$(mktemp -d)"
           echo "Downloading pinned actionlint: ${url}"
-          curl -fsSL "$url" -o "${tmp}/${asset}"
+          # L8: retry a release-asset blip rather than fail ci-required on a
+          # transient registry outage. The SHA-256 check below still gates
+          # trust; retries only widen the availability window.
+          curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$url" -o "${tmp}/${asset}"
           actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
           if [ "$actual" != "$ACTIONLINT_SHA256" ]; then
             echo "::error::actionlint checksum mismatch for ${asset}: expected ${ACTIONLINT_SHA256}, got ${actual}"
@@ -268,6 +271,23 @@ jobs:
 
           if [ -n "${failed}" ]; then
             echo "❌ Failed jobs: ${failed}" >&2
+            exit 1
+          fi
+
+          # A required aggregate must never be satisfied VACUOUSLY: if EVERY
+          # tier skipped (all enable toggles off), nothing actually ran, so a
+          # green here would be a load-bearing pass from nothing. Fail instead,
+          # forcing an all-toggles-off caller to register something real.
+          # Derived from toJSON(needs) — no hardcoded tier-name list.
+          all_skipped="$(jq -r '
+            [ to_entries[] | .value.result ] as $r
+            | ($r | length) as $n
+            | if $n > 0 and ([ $r[] | select(. == "skipped") ] | length) == $n
+              then "yes" else "no" end
+          ' <<<"${NEEDS_JSON}")"
+
+          if [ "${all_skipped}" = "yes" ]; then
+            echo "❌ Every required tier was skipped — the aggregate cannot pass vacuously. Enable at least one tier." >&2
             exit 1
           fi
 

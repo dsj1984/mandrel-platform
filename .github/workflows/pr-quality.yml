@@ -498,10 +498,14 @@ permissions:
   contents: read
   actions: write
 
-# Cancel superseded runs on the same ref so stale PR pushes don't queue up.
-concurrency:
-  group: pr-quality-${{ github.ref }}
-  cancel-in-progress: true
+# NOTE: concurrency is declared at JOB level (below), not here. A workflow
+# consumed only via `workflow_call` never has its workflow-level `concurrency:`
+# evaluated — its jobs run inside the CALLER's run, so a workflow-level block
+# here is dead code that serializes nothing (the same pitfall uptime-apply.yml
+# and codeql.yml document). Each tier job carries its own
+# `pr-quality-<job>-${{ github.ref }}` group with `cancel-in-progress: true`,
+# so a superseded PR push cancels the prior run's same-tier job WITHOUT
+# serializing the parallel tiers within a single run.
 
 jobs:
   # ── Tier 1: Lint + format-check ───────────────────────────────────────────
@@ -510,6 +514,12 @@ jobs:
     if: ${{ inputs.enable-lint }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
+    # Per-job (see the note above `jobs:`): a unique per-tier group keyed on
+    # the caller's ref cancels a superseded run's lint job without serializing
+    # the sibling tiers of the same run.
+    concurrency:
+      group: pr-quality-lint-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       # Egress audit baseline (Story #112). Audit mode reports — never blocks —
       # outbound network traffic. Gated to GitHub-hosted ubuntu-latest; a no-op
@@ -519,7 +529,13 @@ jobs:
       # whole-step aliases only; merge keys (`<<:`) are unsupported by Actions.
       - &harden-runner
         name: Harden runner (egress audit)
-        if: ${{ inputs.enable-harden-runner && inputs.runner == 'ubuntu-latest' }}
+        # L6: match any GitHub-hosted ubuntu image (ubuntu-latest,
+        # ubuntu-24.04, ubuntu-22.04, …), not just the exact 'ubuntu-latest'
+        # string — a capable pinned-version runner would otherwise silently
+        # lose the egress-audit baseline. `startsWith` is false for a
+        # JSON-array self-hosted `runner` string, keeping the step a no-op
+        # there (harden-runner ships its agent in the self-hosted image).
+        if: ${{ inputs.enable-harden-runner && startsWith(inputs.runner, 'ubuntu-') }}
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
@@ -534,6 +550,13 @@ jobs:
       - &checkout
         name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # No later step does authenticated git network ops, so do not leave
+          # GITHUB_TOKEN persisted in .git/config while third-party code
+          # (pnpm lifecycle scripts, PyPI Semgrep, Playwright) runs under a
+          # token carrying `actions: write` — a compromised package could read
+          # it from .git/config (M5). The side-checkouts already set this.
+          persist-credentials: false
 
       - &setup-toolchain
         name: Setup toolchain
@@ -576,6 +599,12 @@ jobs:
             script="node_modules/mandrel-platform/scripts/check-wrangler-baseline.mjs"
           elif [ -f "scripts/check-wrangler-baseline.mjs" ]; then
             script="scripts/check-wrangler-baseline.mjs"
+          elif [ "${FAIL_ON_VIOLATION}" = "true" ]; then
+            # L5: in opted-in BLOCKING mode a missing check script means the
+            # gate the consumer explicitly enabled never ran — that must fail,
+            # not silently pass. (Advisory mode keeps the warn-and-pass path.)
+            echo "::error::check-wrangler-baseline.mjs not found in node_modules/mandrel-platform/scripts or ./scripts, but wrangler-baseline-fail-on-violation=true — the blocking baseline gate cannot run. Add mandrel-platform as a devDependency to provide the script."
+            exit 1
           else
             echo "::warning::check-wrangler-baseline.mjs not found in node_modules/mandrel-platform/scripts or ./scripts — skipping (add mandrel-platform as a devDependency to enable this check)."
             exit 0
@@ -633,6 +662,9 @@ jobs:
     if: ${{ inputs.enable-typecheck }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
+    concurrency:
+      group: pr-quality-typecheck-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - *harden-runner
 
@@ -658,6 +690,12 @@ jobs:
     if: ${{ inputs.enable-unit }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
+    # Keyed on the shard too so parallel shards of the SAME run keep distinct
+    # groups (a shared group would serialize them); across runs a superseded
+    # push still cancels the prior run's matching shard.
+    concurrency:
+      group: pr-quality-unit-${{ matrix.shard }}-${{ github.ref }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
@@ -743,6 +781,9 @@ jobs:
     if: ${{ inputs.enable-contract }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
+    concurrency:
+      group: pr-quality-contract-${{ matrix.shard }}-${{ github.ref }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
@@ -780,6 +821,9 @@ jobs:
     if: ${{ inputs.enable-e2e }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
+    concurrency:
+      group: pr-quality-e2e-${{ matrix.shard }}-${{ github.ref }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
@@ -872,6 +916,9 @@ jobs:
     if: ${{ inputs.enable-migration-guard }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
+    concurrency:
+      group: pr-quality-migration-guard-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
       # Job-level permissions REPLACE the workflow-level block, so the
@@ -885,6 +932,10 @@ jobs:
         with:
           # Full history so the merge-base diff resolves the PR's changed set.
           fetch-depth: 0
+          # This job runs the destructive-migration gate script; no step does
+          # authenticated git network ops, so do not persist GITHUB_TOKEN in
+          # .git/config while it runs (M5).
+          persist-credentials: false
 
       # Fetch the tested gate script at the exact SHA the caller's
       # `uses: …/pr-quality.yml@<ref>` pin resolved to — the same
@@ -906,13 +957,13 @@ jobs:
           persist-credentials: false
 
       # Resolve the PR's changed files and run the guard. On pull_request
-      # events we diff base..head (the commits the PR introduces); on other
-      # events the guard has no PR context and is a no-op pass. The script
-      # filters the changed set to migration files (`migration-guard-globs`
-      # plus an always-on `*.sql` tail), strips SQL/JS comments before
-      # matching, treats a DELETED migration file as destructive by itself,
-      # honours the override label, and writes the job-summary block — the
-      # exit code is the gate.
+      # events we diff the MERGE BASE of base..head (the commits the PR
+      # actually introduces) against head; on other events the guard has no PR
+      # context and is a no-op pass. The script filters the changed set to
+      # migration files (`migration-guard-globs` plus an always-on `*.sql`
+      # tail), strips SQL/JS comments before matching, treats a DELETED
+      # migration file as destructive by itself, honours the override label,
+      # and writes the job-summary block — the exit code is the gate.
       - name: Scan for destructive migrations
         shell: bash
         env:
@@ -920,11 +971,14 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GLOBS: ${{ inputs.migration-guard-globs }}
           OVERRIDE_LABEL: ${{ inputs.migration-guard-label }}
-          # Exact-element match of the override label against the PR's label
-          # names — `contains()` on an ARRAY operand compares whole elements,
-          # so there is no substring-collision false positive here (that risk
-          # only exists for `contains()` on a string operand).
-          LABEL_PRESENT: ${{ contains(github.event.pull_request.labels.*.name, inputs.migration-guard-label) }}
+          # L4: the override label is re-fetched LIVE via `gh api` at run time
+          # (below) rather than read from the triggering event payload, so
+          # adding OR removing the label re-evaluates the gate correctly on a
+          # re-run even when the caller does not subscribe to labeled/unlabeled
+          # events. `gh api` needs a token and the PR coordinates.
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
@@ -932,13 +986,43 @@ jobs:
             exit 0
           fi
 
+          # M8: diff from the MERGE BASE of base..head, not the base tip. A
+          # two-dot `git diff "${BASE_SHA}" "${HEAD_SHA}"` compares endpoints,
+          # so once main advances past the fork point it reports migrations
+          # merged by OTHERS as this PR's changes (and shows a migration absent
+          # from head as a `D` destructive block) — a false positive that
+          # trains reviewers to reflexively apply the override label. The merge
+          # base is the true fork point; `fetch-depth: 0` on the checkout above
+          # already makes it resolvable.
+          merge_base="$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")"
+          echo "Migration guard diff base (merge-base of ${BASE_SHA}..${HEAD_SHA}): ${merge_base}"
+
+          # L4: re-fetch the PR's labels live so a label add/remove since the
+          # triggering event is honoured. Exact-element match against the
+          # configured override label (jq compares whole strings, so there is
+          # no substring-collision false positive). `gh api` failures degrade
+          # to "label absent" (the safe default: a real destructive migration
+          # still blocks) with a loud warning, never a silent pass-through.
+          label_present="false"
+          if [ -n "${PR_NUMBER:-}" ]; then
+            if labels_json="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '[.[].name]' 2>/dev/null)"; then
+              if printf '%s' "${labels_json}" \
+                | jq -e --arg l "${OVERRIDE_LABEL}" 'index($l) != null' >/dev/null 2>&1; then
+                label_present="true"
+              fi
+              echo "Live PR labels re-fetched via gh api; override label '${OVERRIDE_LABEL}' present: ${label_present}"
+            else
+              echo "::warning::Could not re-fetch PR labels via gh api (repos/${REPO}/issues/${PR_NUMBER}/labels) — treating the override label as ABSENT so a destructive migration still blocks."
+            fi
+          fi
+
           # `--diff-filter` keeps Added/Copied/Modified/Renamed/Deleted; a
           # DELETED migration is itself a destructive signal, so we keep D.
           args=(--changed-files - --migration-glob "${GLOBS}" --override-label "${OVERRIDE_LABEL}")
-          if [ "${LABEL_PRESENT}" = "true" ]; then
+          if [ "${label_present}" = "true" ]; then
             args+=(--label-present)
           fi
-          git diff --name-only --diff-filter=ACMRD "${BASE_SHA}" "${HEAD_SHA}" \
+          git diff --name-only --diff-filter=ACMRD "${merge_base}" "${HEAD_SHA}" \
             | node _mandrel-platform-scripts/scripts/check-destructive-migration.mjs "${args[@]}"
 
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
@@ -983,6 +1067,9 @@ jobs:
     if: ${{ inputs.enable-security }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
+    concurrency:
+      group: pr-quality-security-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
       # Job-level permissions REPLACE the workflow-level block, so the
@@ -997,6 +1084,10 @@ jobs:
           # Full history so the gitleaks PR-diff scan can resolve the merge
           # base; a shallow clone would miss commits introduced by the PR.
           fetch-depth: 0
+          # This job runs third-party code (PyPI Semgrep, the pinned gitleaks
+          # binary); no step does authenticated git network ops, so do not
+          # persist GITHUB_TOKEN in .git/config while it runs (M5).
+          persist-credentials: false
 
       # Resolve the gitleaks commit range so the scan is scoped to what the
       # event INTRODUCED — pre-existing findings never block. On pull_request
@@ -1060,6 +1151,31 @@ jobs:
           mode: ${{ steps.range.outputs.mode == 'range' && 'git' || 'dir' }}
           log-opts: ${{ steps.range.outputs.range }}
           verbose: 'true'
+
+      # M7: fetch THIS reusable workflow's hash-pinned Semgrep lockfile at the
+      # exact resolved SHA the caller pinned (`job_workflow_sha`), so the SAST
+      # step installs Semgrep + its full transitive closure via
+      # `pip install --require-hashes` rather than a top-pin-only PyPI resolve
+      # whose ~40 transitives float at run time. The lockfile lives in THIS
+      # repo's `scripts/`, not the consumer's checkout, so — like the vendored
+      # ruleset — it comes from a dedicated side-checkout. Gated on
+      # `enable-sast` (needed regardless of `semgrep-config`, unlike the
+      # vendored-ruleset checkout below which is vendored-only).
+      - name: Checkout Semgrep lockfile (mandrel-platform@resolved-sha)
+        if: ${{ inputs.enable-sast }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field that
+          # actionlint's pinned context type model does not list, so it is
+          # read through the `fromJSON(toJSON(github))` escape hatch (typed
+          # `any`) — same pattern as the vendored-ruleset checkout below.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts/semgrep-requirements.txt
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-semgrep
+          persist-credentials: false
 
       # Check out THIS reusable workflow's own repo (mandrel-platform) at the
       # exact SHA the caller's `uses: …/pr-quality.yml@<ref>` pin resolved to
@@ -1154,6 +1270,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          # M7: hash-pinned lockfile, side-checked-out at the resolved
+          # job_workflow_sha above. On a Linux runner (the default ubuntu-latest
+          # and every linux self-hosted runner) Semgrep + its FULL transitive
+          # closure install via `pip install --require-hashes -r`, so a
+          # hijacked transitive can no longer alter or disable this fleet-wide
+          # gate. The lockfile pins linux x86_64 / cp312 wheels (see its
+          # header); a self-hosted DARWIN runner cannot satisfy those hashes, so
+          # it falls back to the top-pinned install below (the linux-only
+          # lockfile is deliberate per this change's scope — mac hashes are not
+          # generated).
+          LOCKFILE="${GITHUB_WORKSPACE}/_mandrel-platform-semgrep/scripts/semgrep-requirements.txt"
+
           # Resolve the 'vendored' sentinel (Story #132) to the path of the
           # side-checked-out platform ruleset from the step above; any other
           # value (a registry ref like 'p/security-audit' or a caller-owned
@@ -1167,43 +1295,38 @@ jobs:
             fi
           fi
 
-          # Pinned Semgrep release from PyPI. `semgrep scan --error` exits
-          # non-zero on any finding; `--config` selects the ruleset (default:
-          # this reusable workflow's own vendored `.semgrep/rules.json`, a
-          # deterministic snapshot — NOT the live registry alias
-          # 'p/default'). Bump the ruleset deliberately via
-          # `scripts/update-semgrep-rules.mjs` (see
+          # Pinned Semgrep. `semgrep scan --error` exits non-zero on any
+          # finding; `--config` selects the ruleset (default: this reusable
+          # workflow's own vendored `.semgrep/rules.json`, a deterministic
+          # snapshot — NOT the live registry alias 'p/default'). Bump the
+          # ruleset deliberately via `scripts/update-semgrep-rules.mjs` (see
           # docs/reusable-workflows.md).
           #
           # `setuptools` provides `pkg_resources`, which semgrep's transitive
           # opentelemetry dependency imports but does not declare — absent by
-          # default on Python ≥3.12. We install it alongside the pinned
-          # semgrep so the run works on a 3.12+ system interpreter too.
+          # default on Python ≥3.12. It is IN the hash-pinned lockfile (Linux
+          # path) and installed alongside the top-pin (darwin fallback), so the
+          # run works on a 3.12+ interpreter either way.
           #
-          # Install strategy (system-python, no hosted tool cache):
-          #   • Prefer `pipx` when present — it isolates the install in its own
-          #     venv and exposes `semgrep` on PATH, without polluting the
-          #     system site-packages. We `--system-site-packages` so the venv
-          #     can see a system `setuptools`, then `pipx inject` a pinned one
-          #     as a belt-and-suspenders guarantee for `pkg_resources`.
-          #   • Otherwise fall back to an EPHEMERAL `python3 -m venv` (Story
-          #     #92). We deliberately do NOT use `pip install --user`: `--user`
-          #     installs into the runner's SHARED, MUTABLE user site-packages
-          #     (`~/Library/Python/X.Y/lib/python/site-packages` on macOS). On
-          #     a self-hosted host whose user-site already holds a compiled
-          #     native extension built for a DIFFERENT arch (e.g. a prior
-          #     native-arm64 Python left an arm64 `rpds.cpython-39-darwin.so`),
-          #     a later x86_64/Rosetta run REUSES that stale `.so` instead of
-          #     rebuilding it, and Semgrep dies at IMPORT before it scans:
-          #       `mach-o file, but is an incompatible architecture
-          #        (have 'arm64', need 'x86_64')`.
-          #     A venv disables user-site by default (PEP 370) and rebuilds
-          #     native deps for the venv interpreter's own arch, so the install
-          #     is hermetic and arch-correct on a vanilla, possibly-dirty
-          #     self-hosted runner — no per-runner `rpds` purge needed
-          #     (athportal #2021 / PR #2023). The venv lives under a `mktemp -d`
-          #     dir, so it is per-run and never reads/writes the shared user
-          #     site. No `pipx` dependency.
+          # Install strategy — an EPHEMERAL `python3 -m venv` on every path
+          # (Story #92). We deliberately do NOT use `pip install --user`:
+          # `--user` installs into the runner's SHARED, MUTABLE user
+          # site-packages (`~/Library/Python/X.Y/lib/python/site-packages` on
+          # macOS). On a self-hosted host whose user-site already holds a
+          # compiled native extension built for a DIFFERENT arch (e.g. a prior
+          # native-arm64 Python left an arm64 `rpds.cpython-39-darwin.so`), a
+          # later x86_64/Rosetta run REUSES that stale `.so` instead of
+          # rebuilding it, and Semgrep dies at IMPORT before it scans:
+          #   `mach-o file, but is an incompatible architecture
+          #    (have 'arm64', need 'x86_64')`.
+          # A venv disables user-site by default (PEP 370) and rebuilds native
+          # deps for the venv interpreter's own arch, so the install is
+          # hermetic and arch-correct on a vanilla, possibly-dirty self-hosted
+          # runner — no per-runner `rpds` purge needed (athportal #2021 / PR
+          # #2023). The venv lives under a `mktemp -d` dir, so it is per-run and
+          # never reads/writes the shared user site. `pipx` is no longer used:
+          # it cannot consume a `--require-hashes` requirements file, and the
+          # M7 hash-pinning is the reason the whole tree now flows through pip.
           SEMGREP_PIN='semgrep==1.97.0'
 
           # Build the `--exclude` argument list. The vendored framework tree
@@ -1258,41 +1381,42 @@ jobs:
               --quiet
           }
 
-          if command -v pipx >/dev/null 2>&1; then
-            echo "Installing ${SEMGREP_PIN} via pipx (system python3)."
-            # `--force` keeps the step idempotent across reused self-hosted
-            # runners (a prior `pipx install semgrep` would otherwise abort
-            # with "already installed").
-            pipx install --force --pip-args='--disable-pip-version-check' \
-              --system-site-packages "${SEMGREP_PIN}"
-            pipx inject semgrep setuptools >/dev/null 2>&1 || true
-            # pipx exposes apps under ~/.local/bin, which may not be on PATH on
-            # a fresh runner. `pipx ensurepath` is interactive-shell-oriented;
-            # prepend the bin dir directly so `semgrep` resolves this step.
-            PATH="${HOME}/.local/bin:${PATH}"
-            export PATH
-            run_semgrep
-          else
-            echo "pipx not found; installing ${SEMGREP_PIN} into an ephemeral python3 venv (hermetic, arch-correct)."
-            # Ephemeral, per-run venv under a fresh mktemp dir. venvs disable
-            # user-site by default (PEP 370), so a stale / foreign-arch native
-            # extension in the runner's shared user site-packages (the Story #92
-            # rpds arm64-vs-x86_64 failure) is NOT read — pip rebuilds native
-            # deps for THIS interpreter's arch into the isolated venv. No
-            # reliance on the shared `--user` site.
-            venv_dir="$(mktemp -d)/semgrep-venv"
-            python3 -m venv "${venv_dir}"
-            # Use the venv's own python/pip directly (no `activate` needed; the
-            # venv interpreter resolves its own isolated site-packages). Pin
-            # `setuptools` alongside semgrep for the `pkg_resources` guarantee.
+          # Ephemeral, per-run venv under a fresh mktemp dir. venvs disable
+          # user-site by default (PEP 370), so a stale / foreign-arch native
+          # extension in the runner's shared user site-packages (the Story #92
+          # rpds arm64-vs-x86_64 failure) is NOT read — pip rebuilds native
+          # deps for THIS interpreter's arch into the isolated venv. No
+          # reliance on the shared `--user` site.
+          venv_dir="$(mktemp -d)/semgrep-venv"
+          python3 -m venv "${venv_dir}"
+          # `--retries 3` (L8): a PyPI/registry blip must not fail the whole
+          # fleet's ci-required and force a manual re-run. `--require-hashes`
+          # fails closed on any hash mismatch, so retries only widen the
+          # availability window, never the trust boundary.
+          if [ "$(uname -s)" = "Linux" ] && [ -f "${LOCKFILE}" ]; then
+            echo "Installing hash-pinned Semgrep from ${LOCKFILE} (Linux, --require-hashes)."
+            # `--require-hashes -r` installs semgrep + its ENTIRE transitive
+            # closure (setuptools included) only if every artifact matches a
+            # pinned sha256 in the lockfile — no floating transitive can slip
+            # in. `--only-binary :all:` keeps pip on the pinned wheels rather
+            # than building an sdist whose artifact hash would differ.
             "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
-              setuptools "${SEMGREP_PIN}"
-            # Put the venv's bin dir first so the `semgrep` resolved by
-            # `run_semgrep` is the hermetic one, not any shared/user-site copy.
-            PATH="${venv_dir}/bin:${PATH}"
-            export PATH
-            run_semgrep
+              --retries 3 --require-hashes --only-binary :all: -r "${LOCKFILE}"
+          else
+            # Fallback for non-Linux (self-hosted darwin) runners: the linux
+            # lockfile's wheels cannot satisfy this platform, so install the
+            # top-pin directly with setuptools. This path is NOT hash-pinned by
+            # design — the M7 lockfile is scoped to the linux CI target; mac
+            # hashes are deliberately not generated.
+            echo "Non-Linux runner (or no lockfile): installing ${SEMGREP_PIN} (+ setuptools) without hash-pinning."
+            "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
+              --retries 3 setuptools "${SEMGREP_PIN}"
           fi
+          # Put the venv's bin dir first so the `semgrep` resolved by
+          # `run_semgrep` is the hermetic one, not any shared/user-site copy.
+          PATH="${venv_dir}/bin:${PATH}"
+          export PATH
+          run_semgrep
           echo "✅ Semgrep found no blocking findings."
 
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
@@ -1336,6 +1460,9 @@ jobs:
     if: ${{ inputs.enable-osv-scan }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
+    concurrency:
+      group: pr-quality-osv-scan-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
       # Job-level permissions REPLACE the workflow-level block, so the
@@ -1397,7 +1524,10 @@ jobs:
           url="https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/${asset}"
           tmp="$(mktemp -d)"
           echo "Downloading pinned OSV-scanner: ${url}"
-          curl -fsSL "$url" -o "${tmp}/osv-scanner"
+          # L8: retry a release-asset blip rather than fail ci-required
+          # fleet-wide. Fail-closed is preserved — the SHA-256 check below
+          # still gates trust; retries only widen the availability window.
+          curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$url" -o "${tmp}/osv-scanner"
 
           # Verify the pinned SHA-256 before trusting the binary.
           actual="$(shasum -a 256 "${tmp}/osv-scanner" | awk '{print $1}')"
@@ -1420,6 +1550,34 @@ jobs:
           scan_rc="${scan_rc:-0}"
           echo "OSV-scanner raw exit code: ${scan_rc}"
 
+          # Fail-closed on ANY unexpected exit code, regardless of whether a
+          # report was written (M6). The only exit codes we trust are:
+          #   • 0        — clean scan, no findings.
+          #   • 1        — findings present; OSV-scanner writes a JSON report,
+          #                which the severity-band gate below owns.
+          #   • 127/128  — no recognized lockfile/manifest to scan (no-op pass).
+          # A crash that flushes a PARTIAL report before dying (e.g. exit 2/3)
+          # would otherwise reach the severity gate, which scores only the rows
+          # it happens to see — so unscanned manifests would pass silently.
+          # Guarding on the exit code here (not on report emptiness) closes
+          # that hole: a non-empty partial report from a crashed scan fails
+          # closed instead of being treated as a complete result.
+          case " 0 1 127 128 " in
+            *" ${scan_rc} "*) : ;;  # documented/expected code — continue
+            *)
+              echo "::error::OSV-scanner exited ${scan_rc} — not a documented code (0=clean, 1=findings, 127/128=no target). Failing closed: the advisory scan did not complete, so any report on disk is partial and cannot be trusted."
+              {
+                echo "### ❌ OSV advisory scan — scanner error"
+                echo ""
+                echo "OSV-scanner exited with code \`${scan_rc}\`, which is not a documented"
+                echo "exit code (0 clean / 1 findings / 127-128 no target). Any report written"
+                echo "before it exited is partial, so the advisory tier fails closed rather"
+                echo "than scoring an incomplete result."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
           # Documented no-target exit codes: OSV-scanner exits 127/128 when it
           # finds no recognized lockfile/manifest to scan. Those are the ONLY
           # non-zero codes we treat as a clean no-op pass. Any other non-zero
@@ -1429,6 +1587,9 @@ jobs:
           # never actually ran. Findings themselves also surface as a non-zero
           # code, but those always come with a JSON report, so they fall
           # through to the severity-band gate below (which owns pass/fail).
+          # The exit-code guard above already fails closed on any code outside
+          # {0,1,127,128} (partial-report crashes included, M6); this empty-
+          # report branch retains the belt-and-suspenders no-target handling.
           NO_TARGET_CODES="127 128"
           if [ ! -s "${report}" ]; then
             is_no_target=0
@@ -1758,6 +1919,23 @@ jobs:
 
           if [ -n "${failed}" ]; then
             echo "❌ Failed jobs: ${failed}" >&2
+            exit 1
+          fi
+
+          # A required aggregate must never be satisfied VACUOUSLY: if EVERY
+          # tier skipped (all enable toggles off), nothing actually ran, so a
+          # green here would be a load-bearing pass from nothing. Fail instead,
+          # forcing an all-toggles-off caller to register something real.
+          # Derived from toJSON(needs) — no hardcoded tier-name list.
+          all_skipped="$(jq -r '
+            [ to_entries[] | .value.result ] as $r
+            | ($r | length) as $n
+            | if $n > 0 and ([ $r[] | select(. == "skipped") ] | length) == $n
+              then "yes" else "no" end
+          ' <<<"${NEEDS_JSON}")"
+
+          if [ "${all_skipped}" = "yes" ]; then
+            echo "❌ Every required tier was skipped — the aggregate cannot pass vacuously. Enable at least one tier." >&2
             exit 1
           fi
 
