@@ -5,6 +5,12 @@ node_modules/
 # Workspace scratch dir (CLAUDE.md §6) — transient outputs, excluded from Git.
 temp/
 
+# Per-Story git worktrees created by story-init.js during /deliver and reaped
+# by story-close.js — transient delivery-time state, never committed. Leaving
+# it untracked-but-not-ignored trips story-close's branch-restore guard
+# ("working tree is dirty") after a Story close.
+.worktrees/
+
 # Claude Code command projection is generated from .agents/workflows/ — do not commit.
 .claude/commands/
 
