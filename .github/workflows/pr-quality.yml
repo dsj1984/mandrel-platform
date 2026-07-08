@@ -924,6 +924,14 @@ jobs:
       # Job-level permissions REPLACE the workflow-level block, so the
       # fail-fast cancel grant (Story #223) must be re-declared here.
       actions: write
+      # Story #292: the override-label re-fetch below reads
+      # repos/{repo}/issues/{n}/labels via `gh api`. GITHUB_TOKEN can read a
+      # PUBLIC repo's issues regardless of granted scopes, which is why this
+      # job worked without this line on this (public) repo — but on a
+      # PRIVATE consumer repo the same call 403s without an explicit read
+      # grant, so the guard silently and permanently treated the override
+      # label as absent. `pull-requests: read` covers the PR-labels read.
+      pull-requests: read
     steps:
       - *harden-runner
 
@@ -979,6 +987,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Story #292: fallback source when the live re-fetch fails — the
+          # labels attached to the PR at the triggering event. Possibly
+          # stale (a label added/removed since the event won't show), but a
+          # slightly-stale override read beats an override that never works.
+          EVENT_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
         run: |
           set -euo pipefail
           if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
@@ -997,24 +1010,51 @@ jobs:
           merge_base="$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")"
           echo "Migration guard diff base (merge-base of ${BASE_SHA}..${HEAD_SHA}): ${merge_base}"
 
-          # L4: re-fetch the PR's labels live so a label add/remove since the
-          # triggering event is honoured. Exact-element match against the
-          # configured override label (jq compares whole strings, so there is
-          # no substring-collision false positive). `gh api` failures degrade
-          # to "label absent" (the safe default: a real destructive migration
-          # still blocks) with a loud warning, never a silent pass-through.
+          # L4 / Story #292: re-fetch the PR's labels live so a label
+          # add/remove since the triggering event is honoured. Exact-element
+          # match against the configured override label (jq compares whole
+          # strings, so there is no substring-collision false positive).
+          #
+          # Resolution order:
+          #   1. Live `gh api` re-fetch (primary — catches a label change
+          #      since the triggering event, e.g. a re-run with no new push).
+          #   2. Event-payload labels (fallback — possibly stale, but keeps
+          #      the override usable when the live re-fetch 403s/network-
+          #      fails, e.g. a PR-scoped token on a private consumer repo).
+          #   3. Absent (fail closed — a real destructive migration still
+          #      blocks).
+          # The stderr from a failed `gh api` call is captured and surfaced
+          # (not swallowed to /dev/null) so a permission/network problem is
+          # diagnosable in the job log instead of reading identically to
+          # "label genuinely absent".
           label_present="false"
+          label_source="none"
           if [ -n "${PR_NUMBER:-}" ]; then
-            if labels_json="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '[.[].name]' 2>/dev/null)"; then
+            gh_api_err="$(mktemp)"
+            if labels_json="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '[.[].name]' 2>"${gh_api_err}")"; then
+              label_source="live"
               if printf '%s' "${labels_json}" \
                 | jq -e --arg l "${OVERRIDE_LABEL}" 'index($l) != null' >/dev/null 2>&1; then
                 label_present="true"
               fi
               echo "Live PR labels re-fetched via gh api; override label '${OVERRIDE_LABEL}' present: ${label_present}"
             else
-              echo "::warning::Could not re-fetch PR labels via gh api (repos/${REPO}/issues/${PR_NUMBER}/labels) — treating the override label as ABSENT so a destructive migration still blocks."
+              echo "::warning::Could not re-fetch PR labels via gh api (repos/${REPO}/issues/${PR_NUMBER}/labels): $(cat "${gh_api_err}") — falling back to the triggering event's label payload."
+              if labels_json="$(printf '%s' "${EVENT_LABELS_JSON}" | jq -e '[.[].name]' 2>"${gh_api_err}")"; then
+                label_source="event-payload"
+                if printf '%s' "${labels_json}" \
+                  | jq -e --arg l "${OVERRIDE_LABEL}" 'index($l) != null' >/dev/null 2>&1; then
+                  label_present="true"
+                fi
+                echo "::warning::Using event-payload labels (possibly stale) — override label '${OVERRIDE_LABEL}' present: ${label_present}"
+              else
+                echo "::warning::Event-payload label fallback also unavailable ($(cat "${gh_api_err}")) — treating the override label as ABSENT so a destructive migration still blocks."
+              fi
             fi
+            rm -f "${gh_api_err}"
           fi
+
+          echo "Override label resolution: source=${label_source} present=${label_present}"
 
           # `--diff-filter` keeps Added/Copied/Modified/Renamed/Deleted; a
           # DELETED migration is itself a destructive signal, so we keep D.
