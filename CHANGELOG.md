@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.26.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.26.1...mandrel-platform-v0.26.2) (2026-07-08)
+
+
+### Fixed
+
+* **release:** correlate the dispatched smoke run by snapshot-diff (refs [#299](https://github.com/dsj1984/mandrel-platform/issues/299)) ([#300](https://github.com/dsj1984/mandrel-platform/issues/300)) ([b46921a](https://github.com/dsj1984/mandrel-platform/commit/b46921a56c6a4bcc52c09a191f427b4e642193d3))
+* **release:** fail await-smoke fast when the cross-repo smoke run dies at startup (refs [#296](https://github.com/dsj1984/mandrel-platform/issues/296)) ([#297](https://github.com/dsj1984/mandrel-platform/issues/297)) ([4b0f2dd](https://github.com/dsj1984/mandrel-platform/commit/4b0f2dd29847700566a4ccb4f69f00bc9a96a056))
+
 ## [0.26.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.26.0...mandrel-platform-v0.26.1) (2026-07-08)
 
 
