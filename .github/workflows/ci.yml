@@ -235,6 +235,14 @@ jobs:
       # the called workflow's declared permissions never exceed the caller's
       # grant.
       actions: write
+      # Story #292: pr-quality.yml's migration-guard job declares
+      # `pull-requests: read` (unused here — enable-migration-guard is not
+      # passed, so it defaults to false and the job's `if:` skips it).
+      # GitHub validates a reusable workflow's declared job permissions
+      # against the caller's grant at dispatch time regardless of `if:`
+      # gating, so omitting this scope here makes the ENTIRE self-call fail
+      # with startup_failure before any job runs — not just the unused job.
+      pull-requests: read
 
   # ── Aggregator: single required branch-protection context ─────────────────
   #
