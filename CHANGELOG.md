@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.26.0...mandrel-platform-v0.26.1) (2026-07-08)
+
+
+### Fixed
+
+* destructive-migration guard: override-label re-fetch fails closed on private consumer repos (missing job permission, regression from [#282](https://github.com/dsj1984/mandrel-platform/issues/282)) ([#292](https://github.com/dsj1984/mandrel-platform/issues/292)) ([#293](https://github.com/dsj1984/mandrel-platform/issues/293)) ([9c213e7](https://github.com/dsj1984/mandrel-platform/commit/9c213e74a467ebbf1704f59b231d4b1e4e3957aa))
+
 ## [0.26.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.25.0...mandrel-platform-v0.26.0) (2026-07-05)
 
 
