@@ -65,6 +65,62 @@ jobs:
             -f sha="${SHA}"
           echo "Triggered smoke (workflow_dispatch) for ${SHA}"
 
+      # Story #296: link the dispatched smoke RUN to the pending status so
+      # release-please's await-smoke gate can fail fast when that run dies at
+      # startup. A `startup_failure` smoke never runs its `gate` job, so it
+      # never posts a terminal `smoke/cross-repo` status of its own — the gate
+      # would otherwise poll the full ~15-min budget before timing out. We
+      # re-post the SAME `pending` status carrying the smoke run's URL in
+      # `target_url`; await-smoke resolves that run and blocks the instant it
+      # sees the run terminally concluded non-green.
+      #
+      # Best-effort by contract: `workflow_dispatch` does not return the run id,
+      # so we correlate the newest workflow_dispatch run of smoke.yml just
+      # created (per-SHA `concurrency` above serializes this job, so a same-push
+      # re-run cannot interleave). A miss (run not yet registered, API blip,
+      # absent token) logs a warning and leaves the plain `pending` status in
+      # place — await-smoke then degrades to its existing timeout. This step
+      # MUST NOT fail the job (the smoke was already triggered above), so it
+      # runs WITHOUT `set -e` and always exits 0.
+      - name: Link dispatched smoke run to the pending status (best-effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SMOKE_TOKEN: ${{ secrets.SMOKE_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          smoke_repo="dsj1984/mandrel-platform-smoke"
+          run_url=""
+          # Poll briefly for the just-dispatched run to register (newest
+          # workflow_dispatch run of smoke.yml, createdAt-desc default sort).
+          for _ in 1 2 3 4 5 6; do
+            run_url="$(GH_TOKEN="${SMOKE_TOKEN}" gh run list \
+              --repo "${smoke_repo}" \
+              --workflow smoke.yml \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json url \
+              --jq '.[0].url // ""' 2>/dev/null || echo '')"
+            [ -n "${run_url}" ] && break
+            sleep 5
+          done
+          if [ -z "${run_url}" ]; then
+            echo "::warning::Could not resolve the dispatched smoke run URL — smoke/cross-repo stays plain 'pending'; await-smoke falls back to its timeout."
+            exit 0
+          fi
+          if gh api -X POST "repos/${REPO}/statuses/${SHA}" \
+            -f state=pending \
+            -f context=smoke/cross-repo \
+            -f description="cross-repo smoke dispatched (run linked)" \
+            -f target_url="${run_url}" >/dev/null 2>&1; then
+            echo "smoke/cross-repo pending status now links smoke run: ${run_url}"
+          else
+            echo "::warning::Failed to stamp the smoke run URL onto the pending status — non-fatal; await-smoke falls back to its timeout."
+          fi
+          exit 0
+
       # Fail-closed stays fail-closed, but loudly: without this, a failed
       # dispatch (expired SMOKE_DISPATCH_TOKEN, renamed smoke repo, …) strands
       # the `smoke/cross-repo` status at `pending` forever — release-please's
