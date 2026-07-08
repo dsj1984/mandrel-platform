@@ -59,11 +59,88 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          smoke_repo="dsj1984/mandrel-platform-smoke"
+          # Story #299: snapshot the EXISTING workflow_dispatch run ids BEFORE
+          # dispatching, so the link step below can identify the NEW run by
+          # snapshot-diff. `gh workflow run` (the workflow_dispatch API) returns
+          # no run id, and the just-created run is not immediately queryable
+          # (API replication lag) — so "newest run" grabs a stale, pre-existing
+          # one (observed on #297's merge, which linked a 22-min-old run). The
+          # comma-bounded id set is threaded to the link step via GITHUB_ENV.
+          before="$(gh run list --repo "${smoke_repo}" --workflow smoke.yml \
+            --event workflow_dispatch --limit 30 --json databaseId 2>/dev/null \
+            | jq -r '[.[].databaseId | tostring] | join(",")' 2>/dev/null || echo '')"
+          echo "SMOKE_RUNS_BEFORE=${before}" >> "$GITHUB_ENV"
           gh workflow run smoke.yml \
-            --repo dsj1984/mandrel-platform-smoke \
+            --repo "${smoke_repo}" \
             --ref main \
             -f sha="${SHA}"
           echo "Triggered smoke (workflow_dispatch) for ${SHA}"
+
+      # Story #296/#299: link the dispatched smoke RUN to the pending status so
+      # release-please's await-smoke gate can fail fast when that run dies at
+      # startup. A `startup_failure` smoke never runs its `gate` job, so it
+      # never posts a terminal `smoke/cross-repo` status of its own — the gate
+      # would otherwise poll the full ~15-min budget before timing out. We
+      # re-post the SAME `pending` status carrying the smoke run's URL in
+      # `target_url`; await-smoke resolves that run and blocks the instant it
+      # sees the run terminally concluded non-green.
+      #
+      # Correlation is SNAPSHOT-DIFF, not recency (Story #299): the newest run
+      # right after `gh workflow run` is a STALE pre-existing one, because the
+      # just-created run is not immediately queryable. We instead pick the run
+      # whose id is NOT in the pre-dispatch `SMOKE_RUNS_BEFORE` snapshot, polling
+      # until it appears through that registration lag.
+      #
+      # Best-effort by contract: a miss (empty snapshot → newest overall; no new
+      # run within budget; API blip; absent token) logs a warning and leaves the
+      # plain `pending` status in place — await-smoke then degrades to its
+      # existing timeout. This step MUST NOT fail the job (the smoke was already
+      # triggered above), so it runs WITHOUT `set -e` and always exits 0.
+      - name: Link dispatched smoke run to the pending status (best-effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SMOKE_TOKEN: ${{ secrets.SMOKE_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ env.SMOKE_RUNS_BEFORE }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          smoke_repo="dsj1984/mandrel-platform-smoke"
+          run_url=""
+          # Poll for the NEW run: the newest whose id is not in the pre-dispatch
+          # snapshot. `$id` is bound BEFORE the `$before | contains(...)` pipe —
+          # inside that pipe `.` is the snapshot string, so `.databaseId` there
+          # would throw "Cannot index string". An empty snapshot (",,") matches
+          # nothing, so every run reads as "new" → newest overall (fallback).
+          for _ in $(seq 1 12); do
+            run_url="$(GH_TOKEN="${SMOKE_TOKEN}" gh run list \
+              --repo "${smoke_repo}" \
+              --workflow smoke.yml \
+              --event workflow_dispatch \
+              --limit 30 \
+              --json databaseId,url 2>/dev/null \
+              | jq -r --arg before ",${BEFORE}," \
+                  '[ .[] | (.databaseId|tostring) as $id | select( ($before | contains("," + $id + ",")) | not ) ] | (.[0].url // "")' \
+              2>/dev/null || echo '')"
+            [ -n "${run_url}" ] && break
+            sleep 5
+          done
+          if [ -z "${run_url}" ]; then
+            echo "::warning::Could not resolve the dispatched smoke run URL — smoke/cross-repo stays plain 'pending'; await-smoke falls back to its timeout."
+            exit 0
+          fi
+          if gh api -X POST "repos/${REPO}/statuses/${SHA}" \
+            -f state=pending \
+            -f context=smoke/cross-repo \
+            -f description="cross-repo smoke dispatched (run linked)" \
+            -f target_url="${run_url}" >/dev/null 2>&1; then
+            echo "smoke/cross-repo pending status now links smoke run: ${run_url}"
+          else
+            echo "::warning::Failed to stamp the smoke run URL onto the pending status — non-fatal; await-smoke falls back to its timeout."
+          fi
+          exit 0
 
       # Fail-closed stays fail-closed, but loudly: without this, a failed
       # dispatch (expired SMOKE_DISPATCH_TOKEN, renamed smoke repo, …) strands

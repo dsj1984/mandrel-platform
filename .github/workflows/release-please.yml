@@ -89,6 +89,12 @@ jobs:
       - name: Poll smoke/cross-repo status on the release commit
         env:
           GH_TOKEN: ${{ github.token }}
+          # Story #296: reads the PRIVATE smoke repo's run to fail fast on a
+          # dead run (see the fast-fail block below). `github.token` cannot
+          # read another private repo's Actions runs; SMOKE_DISPATCH_TOKEN
+          # (the same PAT smoke-dispatch.yml uses) has Actions access there.
+          # Absent/empty → the fast-fail block degrades to the poll + timeout.
+          SMOKE_TOKEN: ${{ secrets.SMOKE_DISPATCH_TOKEN }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           # 44 sleeps * 20s ≈ 14.7 min of polling, comfortably under the
@@ -122,14 +128,17 @@ jobs:
             # timed out. Pipe `--slurp`'s raw JSON to a standalone `jq -r`
             # instead — the only supported way to slurp AND transform.
             #
-            # `|| echo none` (M10): under `set -euo pipefail` a transient `gh api`
+            # `|| echo '[]'` (M10): under `set -euo pipefail` a transient `gh api`
             # (or jq) non-zero (5xx, secondary rate limit) would otherwise abort
             # the whole poll on a single blip the 15-min budget exists to ride
-            # out. Swallow it to "none" so the blip reads as one "no status yet"
-            # attempt, bounded by MAX_ATTEMPTS, instead of killing the job.
-            state="$(gh api --paginate --slurp "repos/${REPO}/commits/${SHA}/status" 2>/dev/null \
+            # out. Swallow it to an empty array so the blip reads as one "no
+            # status yet" attempt, bounded by MAX_ATTEMPTS, not a killed job.
+            # Fetched ONCE per attempt into `status_json`; `state` and (Story
+            # #296) `target_url` are both derived from it with standalone `jq`.
+            status_json="$(gh api --paginate --slurp "repos/${REPO}/commits/${SHA}/status" 2>/dev/null || echo '[]')"
+            state="$(printf '%s' "${status_json}" \
               | jq -r '[.[].statuses[]] | map(select(.context=="smoke/cross-repo")) | (first.state // "none")' \
-              || echo none)"
+              2>/dev/null || echo none)"
             # A blank result (e.g. an empty combined-status body) also means
             # "no status yet"; normalize so the case-match below is well-defined.
             state="${state:-none}"
@@ -138,6 +147,34 @@ jobs:
               success) echo "✅ cross-repo smoke green — release may publish."; exit 0 ;;
               failure|error) echo "::error::cross-repo smoke ${state} for ${SHA} — blocking release."; exit 1 ;;
             esac
+
+            # Story #296: fail fast on a dead smoke RUN (purely additive — the
+            # success/failure short-circuits above and the timeout below are
+            # unchanged). A `startup_failure` smoke never runs its `gate` job,
+            # so it never posts a terminal status and this loop would otherwise
+            # poll to the timeout. smoke-dispatch.yml stamps the dispatched run
+            # URL into this pending status' `target_url`; resolve that run and,
+            # if it has TERMINALLY concluded non-green, block now instead of
+            # waiting out the budget. Best-effort: no url / no token / a run
+            # still in_progress all fall through to the normal poll + timeout —
+            # this never becomes a hard dependency, so the wedged-deploy case
+            # (run still `in_progress`, no conclusion) is unaffected.
+            run_url="$(printf '%s' "${status_json}" \
+              | jq -r '[.[].statuses[]] | map(select(.context=="smoke/cross-repo")) | (first.target_url // "")' \
+              2>/dev/null || echo '')"
+            if printf '%s' "${run_url}" | grep -qE '/actions/runs/[0-9]+'; then
+              run_repo="$(printf '%s' "${run_url}" | sed -E 's#^https?://[^/]+/([^/]+/[^/]+)/actions/runs/[0-9]+.*$#\1#')"
+              run_id="$(printf '%s' "${run_url}" | sed -E 's#^.*/actions/runs/([0-9]+).*$#\1#')"
+              run_tsv="$(GH_TOKEN="${SMOKE_TOKEN:-}" gh api "repos/${run_repo}/actions/runs/${run_id}" \
+                --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || echo '')"
+              run_status="$(printf '%s' "${run_tsv}" | cut -f1)"
+              run_conclusion="$(printf '%s' "${run_tsv}" | cut -f2)"
+              if [ "${run_status}" = "completed" ] && [ -n "${run_conclusion}" ] && [ "${run_conclusion}" != "success" ]; then
+                echo "::error::cross-repo smoke run ${run_repo} #${run_id} finished '${run_conclusion}' without posting a green status — blocking release. See ${run_url}"
+                exit 1
+              fi
+            fi
+
             # Don't sleep after the final attempt — fail immediately once the
             # budget is spent, instead of burning one last idle interval.
             [ "${i}" -lt "${MAX_ATTEMPTS}" ] && sleep "${INTERVAL}"
