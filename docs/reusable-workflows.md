@@ -891,6 +891,31 @@ block**; absent, a finding **fails the job** and therefore `ci-required`. This
 keeps a destructive change shippable — but only with a deliberate, on-the-record
 acknowledgement.
 
+**Override-label resolution order (Story #292).** The guard re-reads the PR's
+labels **live** at run time (rather than trusting the triggering event
+payload) so a label add/remove — including on a re-run with no new push — is
+honoured. Live reads require the `migration-guard` job's `GITHUB_TOKEN` to
+carry `pull-requests: read`; the job grants this explicitly. Resolution
+proceeds in order, and each step's outcome is logged (never silently
+swallowed):
+
+1. **Live `gh api` re-fetch** (primary) — `repos/{repo}/issues/{pr}/labels`.
+   Any failure (permission, network) surfaces the actual error via
+   `::warning::` instead of being discarded, so a fleet-specific permission
+   problem is diagnosable and distinguishable from "label genuinely absent".
+2. **Event-payload labels** (fallback) — `github.event.pull_request.labels`
+   from the triggering event, used only when step 1 fails. Possibly stale (a
+   label change since the event won't show), but keeps the override usable
+   when the live re-fetch can't run — e.g. a PR-scoped token that lacks
+   `pull-requests: read` on a private consumer repo, or a self-hosted runner
+   whose egress policy blocks `api.github.com`.
+3. **Absent** (fail closed) — when neither source is available, the label is
+   treated as absent and a real destructive migration still blocks. The gate
+   never silently passes through on a resolution failure.
+
+The job summary logs which source resolved the label (`live`,
+`event-payload`, or `none`) alongside the present/absent verdict.
+
 **Scope.** This is the **static, PR-time** half of the migration story: it
 inspects changed migration files, it does **not** introspect a live database,
 and it does **not** touch the snapshot/rollback flow in
