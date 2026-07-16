@@ -568,7 +568,7 @@ jobs:
 
       - &setup-toolchain
         name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@25cdca8f5b8dec2ae43cd9f7dfb2090657b7f18e
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
