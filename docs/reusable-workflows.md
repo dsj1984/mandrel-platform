@@ -1027,13 +1027,22 @@ step. Until a consumer opts in, its CI behaviour is unchanged.
 
 ### Secrets
 
-| Secret        | Required | Purpose                                              |
-| ------------- | -------- | ---------------------------------------------------- |
-| `TURBO_TOKEN` | No       | Turbo remote-cache read/write token.                 |
-| `TURBO_TEAM`  | No       | Turbo team slug for remote-cache scoping.            |
+| Secret                | Required | Purpose                                                          |
+| --------------------- | -------- | ---------------------------------------------------------------- |
+| `TURBO_TOKEN`         | No       | Turbo remote-cache read/write token.                             |
+| `TURBO_TEAM`          | No       | Turbo team slug for remote-cache scoping.                        |
+| `packages-read-token` | No       | Private npm-registry read token for the frozen-lockfile install. |
 
-Both are optional. The simplest caller passes `secrets: inherit`; the tiers
-run without remote caching when the secrets are absent.
+All three are optional. The simplest caller passes `secrets: inherit`; the
+tiers run without remote caching when the Turbo secrets are absent.
+
+`packages-read-token` is forwarded to every `setup-toolchain` call site and
+exported as the `PACKAGES_READ_TOKEN` environment variable for the
+`pnpm install --frozen-lockfile` step. A consumer whose committed `.npmrc`
+authenticates a private scope through that variable (e.g. a GitHub Packages
+scope such as `@acme`) then installs cleanly on every tier. Consumers with no
+private-registry dependency omit it — the variable is exported empty and
+nothing references it, so behaviour is unchanged.
 
 ### The `ci-required` aggregator
 
@@ -1718,6 +1727,14 @@ plaintext public build-time values.
 > reference them from their own seam commands, but the workflow itself only
 > maps the frozen `{CLOUDFLARE_*, TURSO_*}` set into its seam-step `env:`
 > blocks (never via `with:`).
+
+> **Install-auth secret (outside the frozen deploy set).** The optional
+> `packages-read-token` secret is not a deploy/seam secret and is never mapped
+> into a deploy `env:` block. It is forwarded to each `setup-toolchain` call
+> site so the build/snapshot jobs' `pnpm install --frozen-lockfile` can read a
+> private npm registry when a consumer's committed `.npmrc` authenticates a
+> private scope through `${PACKAGES_READ_TOKEN}`. Consumers without a
+> private-registry dependency omit it (behaviour unchanged).
 
 ### The `gh-environment` model
 

@@ -485,6 +485,14 @@ on:
       TURBO_TEAM:
         description: 'Turbo team slug for remote cache scoping.'
         required: false
+      # Private-registry read token (GitHub Packages etc.). Passed to every
+      # setup-toolchain call site so a consumer whose committed .npmrc
+      # authenticates a private scope via ${PACKAGES_READ_TOKEN} installs
+      # cleanly on the frozen-lockfile tiers. Optional — repos without a
+      # private-registry dependency omit it (default behavior unchanged).
+      packages-read-token:
+        description: 'Token for reading a private npm registry during install.'
+        required: false
 
 # Permissions: callers inherit the calling workflow's token permissions.
 # We declare the minimum needed here; callers may narrow further.
@@ -565,6 +573,7 @@ jobs:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
           trust-lockfile: ${{ inputs.trust-lockfile }}
+          packages-read-token: ${{ secrets.packages-read-token }}
 
       - name: Lint
         run: pnpm run lint

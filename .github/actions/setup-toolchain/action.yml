@@ -84,6 +84,19 @@ inputs:
       'false' — no preflight, unchanged behavior.
     required: false
     default: 'false'
+  packages-read-token:
+    description: >
+      Optional token for authenticating the install step against a private npm
+      registry (e.g. GitHub Packages). When set, it is exported as the
+      PACKAGES_READ_TOKEN environment variable for the pnpm install step, so a
+      consumer whose committed .npmrc authenticates a private scope through
+      that variable resolves it during the frozen install. Leave unset
+      (default '') for repos with no private-registry dependency: the variable
+      is exported empty and harmlessly ignored (nothing references it). It is
+      always exported (defaulting to '') so pnpm never hits an unset-variable
+      expansion error.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -104,6 +117,11 @@ runs:
       shell: bash
       env:
         TRUST_LOCKFILE: ${{ inputs.trust-lockfile }}
+        # Exported (defaulting to '') so a consumer whose committed .npmrc
+        # authenticates a private registry via ${PACKAGES_READ_TOKEN} resolves
+        # it during the frozen install. Empty for repos without a private dep —
+        # nothing references it, and pnpm never sees an unset-variable error.
+        PACKAGES_READ_TOKEN: ${{ inputs['packages-read-token'] }}
       run: |
         if [ "${TRUST_LOCKFILE}" = "true" ]; then
           pnpm install --frozen-lockfile --trust-lockfile
