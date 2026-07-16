@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.26.2...mandrel-platform-v0.27.0) (2026-07-16)
+
+
+### Added
+
+* **ci:** registry-auth passthrough for setup-toolchain / pr-quality / deploy-cloudflare ([#301](https://github.com/dsj1984/mandrel-platform/issues/301)) ([453bdfa](https://github.com/dsj1984/mandrel-platform/commit/453bdfa1194a3e9c1a043b1bfbffe0a9c3810fa5))
+
 ## [0.26.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.26.1...mandrel-platform-v0.26.2) (2026-07-08)
 
 
