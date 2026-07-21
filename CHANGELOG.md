@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.27.1...mandrel-platform-v0.28.0) (2026-07-21)
+
+
+### Added
+
+* reusable scheduled advisory-scan workflow + extracted OSV composite action ([#310](https://github.com/dsj1984/mandrel-platform/issues/310)) ([#311](https://github.com/dsj1984/mandrel-platform/issues/311)) ([6235d1e](https://github.com/dsj1984/mandrel-platform/commit/6235d1eb8562053a342915926c77bf144e6e3756))
+
 ## [0.27.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.27.0...mandrel-platform-v0.27.1) (2026-07-21)
 
 
