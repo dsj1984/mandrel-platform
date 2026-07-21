@@ -1,0 +1,69 @@
+# OSV advisory tracking-issue upsert composite action (Story #310).
+#
+# The scheduled advisory-scan.yml workflow runs the osv-scan composite in
+# non-blocking mode, then invokes this action to keep a SINGLE tracking issue
+# in sync with the current blocking finding set: open one when advisories
+# appear, update it (keyed off a findings-digest marker) only when the set
+# changes so a daily run does not spam, and close it when the set clears.
+#
+# Issue-writing lives HERE, in the scheduled path — never in pr-quality.yml.
+# A consumer's PR caller resolves that reusable workflow at compile time, so
+# adding `issues: write` (or any input/permission) there would break every
+# consumer's CI at once. The scheduled caller declares `issues: write`
+# itself; this action forwards the caller's github.token.
+#
+# GHAS-free like the rest of the OSV tier: the signal is a normal issue in
+# the run log and on the tracker, never SARIF / Code Scanning.
+name: OSV Advisory Tracking-Issue Upsert
+description: >
+  Upsert a single OSV advisory tracking issue in the target repo from an
+  osv-scan findings JSON — open on new blocking findings, update on a changed
+  finding set (digest-keyed, idempotent), close when the set clears.
+
+inputs:
+  findings-path:
+    description: >
+      Path to the findings JSON emitted by the osv-scan composite's
+      findings-out input (failOn, digest, counts, rendered summary).
+    required: true
+  repo:
+    description: >
+      owner/repo of the tracking target — where the issue is opened/updated/
+      closed. Normally the caller's own repository.
+    required: true
+  branch:
+    description: Default branch name the scan ran against (context in the issue body).
+    required: false
+    default: 'main'
+  title:
+    description: Title used when opening a new tracking issue.
+    required: false
+    default: 'OSV advisory scan — default branch findings'
+  labels:
+    description: >
+      Comma-separated labels applied to a newly-opened tracking issue and
+      used to scope the open-issue lookup. Empty for none.
+    required: false
+    default: ''
+  github-token:
+    description: >
+      Token with `issues: write` on the target repo. The caller forwards its
+      own github.token (scheduled workflows run with the caller's token).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Upsert OSV advisory tracking issue
+      shell: bash
+      env:
+        OSV_FINDINGS_PATH: ${{ inputs.findings-path }}
+        OSV_TRACK_REPO: ${{ inputs.repo }}
+        OSV_TRACK_BRANCH: ${{ inputs.branch }}
+        OSV_TRACK_TITLE: ${{ inputs.title }}
+        OSV_TRACK_LABELS: ${{ inputs.labels }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        node "${ACTION_PATH}/osv-track-issue.mjs"
