@@ -80,9 +80,23 @@ export class GitHubProvider extends ITicketingProvider {
     return this._memoizedToken;
   }
 
-  /* node:coverage ignore next */
-  async listIssues(filters = {}) {
-    return this.getEpics(filters);
+  /**
+   * The identifiers a native dependency-edge writer needs, handed over as an
+   * explicit interface (Story #4544).
+   *
+   * `providers/github/blocked-by-add.js` talks to the dependencies REST API
+   * directly, so it needs the `gh` facade plus `owner`/`repo` — none of which
+   * the `ITicketingProvider` surface exposes. Its caller lives in the
+   * orchestration layer (`plan-persist/story-ops.js`), and the alternative was
+   * for that caller to reach through `provider._gh` — a private-by-convention
+   * field — from outside this module. Naming the hand-off here keeps the
+   * coupling declared and greppable instead of incidental: the provider
+   * decides what it lends out, and the field stays private.
+   *
+   * @returns {{ gh: object, owner: string, repo: string }}
+   */
+  getDependencyWriteContext() {
+    return { gh: this._gh, owner: this.owner, repo: this.repo };
   }
 
   static isInsufficientScopes(err) {
@@ -100,7 +114,6 @@ const DELEGATIONS = [
   ['graphql', 'issues.ghGraphql'],
   ['searchIssues', 'issues.searchIssues'],
   ['listIssuesByLabel', 'issues.listIssuesByLabel'],
-  ['getEpics', 'issues.getEpics'],
   ['getEpic', 'issues.getEpic'],
   ['branchExists', 'issues.branchExists'],
   ['getSubTickets', 'issues.getSubTickets'],
@@ -108,12 +121,10 @@ const DELEGATIONS = [
   ['getTickets', 'tickets.getTickets'],
   ['getTicket', 'tickets.getTicket'],
   ['getTicketDependencies', 'tickets.getTicketDependencies'],
-  ['createTicket', 'tickets.createTicket'],
   ['createIssue', 'tickets.createIssue'],
   ['updateTicket', 'tickets.updateTicket'],
   ['_applyLabelMutations', 'tickets._applyLabelMutations'],
   ['_getNativeSubIssues', 'subIssues.getNativeSubIssues'],
-  ['_getNativeParent', 'subIssues.getNativeParent'],
   ['addSubIssue', 'subIssues.addSubIssue'],
   ['removeSubIssue', 'subIssues.removeSubIssue'],
   ['reconcileSubIssueLinks', 'subIssues.reconcileSubIssueLinks'],

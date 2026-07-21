@@ -13,7 +13,7 @@ description:
 - Phase 1 MUST restate the idea as a "How Might We" statement, ask 3–5 sharpening questions via `AskUserQuestion`, and generate 5–8 variations (not 20+ shallow ones); do not proceed until target user and success criteria are explicit.
 - Phase 2 grill loop poses **one** question at a time, each with a recommended answer + one-line rationale grounded in user input / codebase / first principles; never batch questions and never omit the recommendation.
 - Re-enumerate open branches after every grill answer; stop only when no unresolved decisions remain. Take the off-ramp directly to Phase 3 when the idea is already crisply scoped.
-- Phase 3 emits a markdown one-pager with the canonical five Epic headings exactly: `## Context`, `## Goal`, `## Non-Goals`, `## Scope`, `## Acceptance Criteria` (plus optional `## Open Questions`). No alternate heading text — the `/plan` clarity gate depends on this verbatim.
+- Phase 3 emits a markdown one-pager with the canonical five planning headings exactly: `## Context`, `## Goal`, `## Non-Goals`, `## Scope`, `## Acceptance Criteria` (plus optional `## Open Questions`). No alternate heading text — the `/plan` clarity gate depends on this verbatim.
 - Surface every key assumption inside `## Context` (or `## Scope`); assumptions do not get their own heading. Unresolved decisions MUST NOT carry into the one-pager.
 - The `## Non-Goals` list is mandatory and each entry includes a reason — focus is created by explicit exclusion.
 - Be honest, not supportive: push back on weak ideas with kindness; never function as a yes-machine.
@@ -35,12 +35,12 @@ structured divergent and convergent thinking.
 
 ## Activation
 
-Called from `/plan` Phase 1 (ideation entry, when no `<epic#>` is
-supplied or `--idea "<seed>"` is passed) and Phase 6 (Epic Clarity Gate,
-when an existing Epic body fails the section-presence rubric). In Phase 6
-the skill is seeded from the **current Epic body** — not a blank seed —
-with the rubric gap list (`missingOrPlaceholder`) as the convergence
-target.
+Called from [`/plan`](../../../workflows/plan.md) during ideation when the
+operator supplies `--seed "<text>"` (or runs ideation with no seed and
+the host collects one interactively). The skill sharpens freeform intent
+into canonical planning sections that `/plan` then folds into a Story.
+There is no separate Epic Clarity Gate path in v2 — N=1 Story authoring
+with a folded `## Spec` is the lean default.
 
 ## Usage
 
@@ -63,7 +63,7 @@ bash /mnt/skills/user/idea-refine/scripts/idea-refine.sh
 ## Output
 
 The final output is a markdown one-pager saved to `docs/ideas/[idea-name].md`
-(after user confirmation), containing the five canonical Epic sections:
+(after user confirmation), containing the five canonical planning sections:
 
 - Context (problem framing + current state)
 - Goal (desired outcome)
@@ -124,16 +124,13 @@ conversation, not a template.
      wouldn't?"
 
    Push beyond what the user initially asked for. Create products people don't
-   know they need yet.
+   know they need yet. Pick the lens that fits the idea — don't run every one
+   mechanically.
 
 **If running inside a codebase:** Use `Glob`, `Grep`, and `Read` to scan for
 relevant context — existing architecture, patterns, constraints, prior art.
 Ground your variations in what actually exists. Reference specific files and
 patterns when relevant.
-
-Read `frameworks.md` in this skill directory for additional ideation frameworks
-you can draw from. Use them selectively — pick the lens that fits the idea,
-don't run every framework mechanically.
 
 #### Phase 2: Evaluate & Converge (Grill)
 
@@ -214,7 +211,7 @@ it inside the grill loop, not after the one-pager is already written.
 Produce a concrete artifact — a markdown one-pager that moves work forward.
 The five canonical headings below match `.agents/templates/epic-from-idea.md`
 and the `/plan` clarity gate; emit them verbatim so the renderer can
-substitute the body into a new Epic without translation.
+substitute the body into a `/plan` Story seed without translation.
 
 ```markdown
 # [Idea Name]
@@ -282,9 +279,6 @@ location of their choosing). Only save if they confirm.
 Direct, thoughtful, slightly provocative. You're a sharp thinking partner, not a
 facilitator reading from a script. Channel the energy of "that's interesting,
 but what if..." -- always pushing one step further without being exhausting.
-
-Read `examples.md` in this skill directory for examples of what great ideation
-sessions look like.
 
 ## Red Flags
 

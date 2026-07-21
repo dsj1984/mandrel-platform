@@ -5,9 +5,19 @@
  * an exclusive, time-bounded claim on a ticket so two concurrent runs do not
  * both drive the same Story. Rather than invent a new state column, the lease
  * rides the ticket's existing **assignees** surface: the single assignee *is*
- * the lease owner. Liveness is decided by the owner's most-recent
- * `story.heartbeat` timestamp (the `operator` field added in this Story links
- * a heartbeat back to the claimant) compared against a configured TTL.
+ * the lease owner. Liveness is decided by the owner's last-heartbeat epoch-ms
+ * compared against a configured TTL.
+ *
+ * **There is no live heartbeat source.** The `story.heartbeat` emitter this
+ * module was designed against was structurally inert (it demanded an
+ * `epicId >= 1` that v2, which has no Epics, never supplies) and has been
+ * deleted. Every caller now reaches `acquireLease` through
+ * `lease-guard-shared.acquireLeaseFailClosed` with `anchorHeartbeatToNow`,
+ * which pins `heartbeatAt` to `now`: the lease **fails closed**, so any
+ * foreign claim reads as live and refuses. A stranded claim is cleared with
+ * `--steal`, never by TTL expiry. The TTL and the stale-reclaim branch below
+ * are therefore reachable only via an explicit caller-supplied `heartbeatAt`
+ * — the seam is kept, the automatic expiry is not real.
  *
  * The three exported operations are deliberately thin and provider-agnostic:
  *
@@ -31,19 +41,16 @@
  * Liveness seam: callers supply the owner's last-heartbeat epoch-ms via the
  * `heartbeatAt` option (a number, or `null`/`undefined` when no heartbeat has
  * ever been recorded for the current owner). Threading the timestamp in keeps
- * this module pure and trivially unit-testable — it does not read the
- * lifecycle ledger itself. A claim with no heartbeat is treated as stale
- * (reclaimable) so an abandoned assignment never wedges the ticket.
+ * this module pure and trivially unit-testable — it does not read any ledger
+ * itself. A claim with no heartbeat is treated as stale (reclaimable) by
+ * `isClaimLive`; note the live guards never take that branch, per the
+ * fail-closed anchoring described above.
  *
  * `now` is injectable (epoch ms) for deterministic tests; it defaults to
  * `Date.now()`.
  */
 
-import { readFileSync } from 'node:fs';
-
 import { resolveLeaseTtlMs } from '../config/limits.js';
-import { epicLedgerPath } from '../config/temp-paths.js';
-import { parseLedger } from './lifecycle/trace-logger.js';
 
 /**
  * The shipped, non-personal operator-identity placeholder (and its bare,
@@ -88,74 +95,20 @@ export function normalizeOperatorHandle(raw) {
 }
 
 /**
- * Read the most-recent `story.heartbeat` epoch-ms recorded for a given lease
- * owner from an Epic lifecycle ledger. Returns `null` when the ledger is
- * absent, unreadable, or carries no heartbeat for that owner — which the lease
- * primitive treats as a stale (reclaimable) claim.
- *
- * The ledger is NDJSON; each `story.heartbeat` record carries
- * `payload.operator` (Story #3480) and `payload.timestamp` (ISO-8601). A
- * malformed ledger downgrades to `null` rather than throwing so a corrupt
- * observability artifact never wedges the lease preflight.
- *
- * This is the shared liveness source the lease guards thread into
- * `acquireLease` via `heartbeatAt`; `/plan` and `/deliver` both
- * reuse it so a live foreign claim actually refuses.
- *
- * @param {object} args
- * @param {number} args.epicId
- * @param {string} args.owner            Lease owner whose heartbeat to find.
- * @param {object} [args.config]         Resolved config (for ledger path).
- * @param {string} [args.ledgerPath]     Explicit path override (tests).
- * @param {(eid: number, config?: object) => string} [args.ledgerPathResolver]
- *        Injectable resolver (tests). Defaults to `epicLedgerPath`.
- * @param {(p: string) => string} [args.readFile]  Injectable reader (tests).
- * @returns {number|null}
- */
-export function latestHeartbeatForOwner({
-  epicId,
-  owner,
-  config,
-  ledgerPath,
-  ledgerPathResolver = epicLedgerPath,
-  readFile = (p) => readFileSync(p, 'utf8'),
-}) {
-  if (typeof owner !== 'string' || owner.length === 0) return null;
-  const resolvedPath = ledgerPath ?? ledgerPathResolver(epicId, config);
-
-  let text;
-  try {
-    text = readFile(resolvedPath);
-  } catch (_err) {
-    // No ledger yet (fresh Epic) → no heartbeat → reclaimable.
-    return null;
-  }
-
-  let records;
-  try {
-    records = parseLedger(text);
-  } catch (_err) {
-    // Corrupt ledger is an observability problem, not a coordination blocker.
-    return null;
-  }
-
-  let latest = null;
-  for (const record of records) {
-    const payload = record?.payload;
-    if (!payload || payload.event !== 'story.heartbeat') continue;
-    if (payload.operator !== owner) continue;
-    const ts = Date.parse(payload.timestamp ?? '');
-    if (!Number.isFinite(ts)) continue;
-    if (latest === null || ts > latest) latest = ts;
-  }
-  return latest;
-}
-
-/**
  * Decide whether a foreign claim is still "live" given the owner's last
  * heartbeat and the configured TTL. A claim is live when a heartbeat exists
  * and is no older than `ttlMs`. A missing heartbeat (`null`/`undefined`) or a
  * heartbeat older than the TTL is stale and therefore reclaimable.
+ *
+ * The `heartbeatAt` seam is retained, but there is no longer any in-repo
+ * heartbeat *source*: the `story.heartbeat` emitter was structurally inert
+ * (it required an `epicId >= 1` that v2 never sets) and was deleted along
+ * with the ledger reader that scanned for it. Every live caller reaches this
+ * through `lease-guard-shared.acquireLeaseFailClosed` with
+ * `anchorHeartbeatToNow`, which pins `heartbeatAt` to `now` so ANY foreign
+ * claim reads live and the guard fails closed — a stranded claim is cleared
+ * with `--steal`, not by TTL expiry. The parameter stays because that
+ * anchoring is expressed through it.
  *
  * @param {object} args
  * @param {number|null|undefined} args.heartbeatAt  Owner's last heartbeat (epoch ms).
@@ -258,6 +211,16 @@ export async function describeLease(opts) {
  *                                     `reason: 'reclaimed'`.
  *   - Foreign claim + `steal:true` → reassign operator, `acquired: true`,
  *                                     `reason: 'stolen'`.
+ *   - Lost a write race            → a foreign login co-assigned between our
+ *                                     PATCH and the verify re-read; back the
+ *                                     operator out, `acquired: false`,
+ *                                     `owner: <foreign>`, `reason: 'lost-race'`.
+ *
+ * Every claiming write is verified: GitHub's assignee PATCH is not a
+ * compare-and-set, so two runs that both read the ticket unassigned will both
+ * write themselves. {@link claimAndVerify} re-reads after the write and refuses
+ * (fail-closed) when a foreign login is present, so the loser of a simultaneous
+ * claim never proceeds as though it holds the lease.
  *
  * @param {object} opts
  * @param {object} opts.provider              Ticketing provider.
@@ -272,7 +235,7 @@ export async function describeLease(opts) {
  *   acquired: boolean,
  *   owner: string,
  *   previousOwner: string|null,
- *   reason: 'unclaimed'|'already-held'|'reclaimed'|'stolen'|'held',
+ *   reason: 'unclaimed'|'already-held'|'reclaimed'|'stolen'|'held'|'lost-race',
  * }>}
  */
 export async function acquireLease(opts) {
@@ -287,13 +250,13 @@ export async function acquireLease(opts) {
 
   // Unclaimed → take it.
   if (owner === null) {
-    await provider.updateTicket(ticketId, { assignees: [operator] });
-    return {
-      acquired: true,
-      owner: operator,
+    return claimAndVerify({
+      provider,
+      ticketId,
+      operator,
       previousOwner: null,
       reason: 'unclaimed',
-    };
+    });
   }
 
   // Already ours → no write needed.
@@ -317,12 +280,70 @@ export async function acquireLease(opts) {
     };
   }
 
-  await provider.updateTicket(ticketId, { assignees: [operator] });
-  return {
-    acquired: true,
-    owner: operator,
+  return claimAndVerify({
+    provider,
+    ticketId,
+    operator,
     previousOwner: owner,
     reason: steal && live ? 'stolen' : 'reclaimed',
+  });
+}
+
+/**
+ * Write the operator to a ticket's assignees, then re-read to confirm the
+ * claim actually stuck before reporting success.
+ *
+ * The assignee write is not atomic — GitHub offers no compare-and-set on the
+ * assignees surface — so two runs that both observed the ticket unassigned (or
+ * a stale foreign claim) will both PATCH themselves in. Without a check the
+ * loser of that race returns `acquired: true` and marches into the worktree
+ * the winner is already building. The verify closes that window: it re-reads
+ * with `fresh: true` (bypassing any provider cache so it sees the other run's
+ * write, not our own), and if a foreign login is present it concedes — removes
+ * the operator from the assignee set so no phantom co-owner lingers, and
+ * returns `acquired: false` / `reason: 'lost-race'` so the fail-closed caller
+ * refuses. A clean read (assignees exactly `[operator]`) confirms the claim.
+ *
+ * It does not eliminate the race — two writes still happen — but it makes the
+ * outcome deterministic: exactly one operator survives as the sole assignee,
+ * and the other is told it lost.
+ *
+ * @param {object} args
+ * @param {object} args.provider              Ticketing provider.
+ * @param {number} args.ticketId              Ticket being claimed.
+ * @param {string} args.operator              Operator acquiring the lease.
+ * @param {string|null} args.previousOwner    Owner before this write (for the result).
+ * @param {string} args.reason                Success reason when the claim holds.
+ * @returns {Promise<{ acquired: boolean, owner: string, previousOwner: string|null, reason: string }>}
+ */
+async function claimAndVerify({
+  provider,
+  ticketId,
+  operator,
+  previousOwner,
+  reason,
+}) {
+  await provider.updateTicket(ticketId, { assignees: [operator] });
+
+  const after = await provider.getTicket(ticketId, { fresh: true });
+  const assignees = Array.isArray(after?.assignees) ? after.assignees : [];
+  const foreign = assignees.filter((login) => login !== operator);
+
+  if (foreign.length === 0) {
+    return { acquired: true, owner: operator, previousOwner, reason };
+  }
+
+  // A foreign login co-assigned after our write — we lost a simultaneous
+  // claim. Back ourselves out so the winner is the sole assignee, and report
+  // the loss so the fail-closed caller refuses rather than double-delivering.
+  await provider
+    .updateTicket(ticketId, { assignees: foreign })
+    .catch(() => undefined);
+  return {
+    acquired: false,
+    owner: foreign[0],
+    previousOwner,
+    reason: 'lost-race',
   };
 }
 

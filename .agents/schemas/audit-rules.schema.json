@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://mandrel.dev/schemas/audit-rules.schema.json",
   "title": "AuditRulesManifest",
-  "description": "Schema describing the audit-rules.json manifest read by select-audits.js and lib/audit-suite/runner.js. The manifest enumerates registered audit workflows and the triggers / substitution keys each one accepts.",
+  "description": "Schema describing the audit-rules.json manifest read by lib/audit-suite/selector.js and lib/audit-suite/runner.js. The manifest enumerates registered audit workflows and the triggers / substitution keys each one accepts, plus the sensitive-path classes that derive review depth from a change set.",
   "type": "object",
   "required": ["version", "audits"],
   "additionalProperties": false,
@@ -19,15 +19,52 @@
         "^[a-z][a-z0-9-]*$": { "$ref": "#/definitions/auditEntry" }
       },
       "additionalProperties": false
+    },
+    "sensitivePaths": {
+      "type": "object",
+      "description": "Map of sensitive-path class name to the globs that identify it. A change set touching any registered pattern derives a `high` change level, which resolves review depth to `deep` and the acceptance critic to `fresh` regardless of how narrow the diff is (deriveChangeLevel in lib/orchestration/review-depth.js). This is configuration, not code: an operator extends the classes or their globs here without editing a module, and the globs run through the same picomatch machinery as the audit-lens `filePatterns` triggers above. An absent or empty block means no path is sensitive and depth falls back to diff width alone.",
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": { "$ref": "#/definitions/sensitivePathClass" }
+      },
+      "additionalProperties": false
     }
   },
   "definitions": {
+    "sensitivePathClass": {
+      "type": "object",
+      "required": ["filePatterns"],
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "What this class covers — why a change here warrants a deeper pass."
+        },
+        "filePatterns": {
+          "type": "array",
+          "description": "Glob patterns matched against the changed files of the diff under review.",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "minItems": 1
+        }
+      }
+    },
     "auditEntry": {
       "type": "object",
-      "required": ["triggers"],
+      "required": ["triggers", "scope"],
       "additionalProperties": false,
       "properties": {
         "triggers": { "$ref": "#/definitions/triggers" },
+        "scope": {
+          "type": "string",
+          "enum": ["local", "cumulative", "global"],
+          "description": "Concern-ownership tier declaring the widest scope at which this lens's concern becomes decidable. `local` — decidable from a single Story's diff (verified at write-time + Story-scope review). `cumulative` — only decidable across the Epic's combined diff (verified at Epic close). `global` — evaluates a whole-product property regardless of the diff (verified at Epic close; exempt from change-set narrowing). All tier routing derives from this one field via resolveLensTier()."
+        },
+        "target": {
+          "type": "string",
+          "enum": ["web", "data-model", "any"],
+          "description": "Target-applicability gate: the kind of project this lens can say anything about. `web` — the lens reads a rendered web surface (pages, routes, HTML/CSS, design tokens) and is skipped entirely on a project that has none, however well its keyword or file-pattern triggers match. `data-model` — the lens reads a persistence layer (ORM models, schema migrations, seed data) and is skipped entirely on a project that has none. `any` — always applicable. ABSENT MEANS `any`: omitting the key never changes a lens's behaviour. Applicability is decided by a probe in lib/audit-suite/selector.js from observables in the consumer's own checkout — hasWebSurface() for `web` (configured navigability routeGlobs, a declared web-framework dependency, or a tracked .html/.css/.jsx/.tsx source file), hasPersistenceLayer() for `data-model` (a declared ORM dependency, a database migrations directory, or a tracked .prisma/.sql schema file) — and NOT from an .agentrc key, so a consumer with a real surface keeps these lenses with no configuration. Each probe fails OPEN: an indeterminate answer treats the project as capable, because a wasted lens run is recoverable and silently dropped coverage is not.",
+          "default": "any"
+        },
         "substitutionKeys": {
           "type": "array",
           "description": "Substitution keys this audit accepts via run-audit-suite --substitution. Empty array means no caller-supplied keys are allowed.",
@@ -38,7 +75,7 @@
     },
     "triggers": {
       "type": "object",
-      "description": "Selection criteria for whether this audit runs against a given ticket / changeset. At least one of `gates` or `alwaysRun: true` must be set for select-audits.js to ever pick the audit.",
+      "description": "Selection criteria for whether this audit runs against a given ticket / changeset. `gates` must be set for select-audits.js to ever pick the audit; keyword / file-pattern matches then narrow selection within a matched gate.",
       "additionalProperties": false,
       "properties": {
         "gates": {
@@ -46,10 +83,6 @@
           "items": { "type": "string", "pattern": "^gate[0-9]+$" },
           "uniqueItems": true,
           "description": "Quality-gate identifiers (gate1..gateN) that include this audit."
-        },
-        "alwaysRun": {
-          "type": "boolean",
-          "description": "If true, the audit is always selected regardless of keyword / file-pattern matches."
         },
         "keywords": {
           "type": "array",
@@ -62,6 +95,10 @@
           "items": { "type": "string", "minLength": 1 },
           "uniqueItems": true,
           "description": "Glob patterns matched against changed files in the diff."
+        },
+        "sourceWithoutSiblingTest": {
+          "type": "boolean",
+          "description": "Coverage-gap routing trigger (Story #4628). When true, the lens is selected whenever the change set touches a production source file whose sibling test (matched by stem, e.g. foo.js ↔ foo.test.js) is NOT also in the change set — the classic 'shipped source without a test' signal. Implemented by changeSetLacksSiblingTest() in lib/audit-suite/selector.js. Used by audit-quality in place of the backwards test-file filePatterns trigger, which fired the coverage-gap detector on test-only diffs."
         }
       }
     }

@@ -8,14 +8,16 @@
  * drives both:
  *
  *   - `/agents-bootstrap-github` — registers GitHub required-status checks.
- *   - `/git-merge-pr` → `git-pr-quality-gate.js` — runs each check locally
- *     before merge.
  */
 
 /**
- * Default required-check suite. The framework runs lint + format:check +
- * test by default; consumers override via
- * `github.branchProtection.requiredChecks` in `.agentrc.json`.
+ * Default required-check suite. Mirrors the live CI required-check set
+ * (`lint` + `test` + `baselines`); consumers override via
+ * `github.branchProtection.requiredChecks` in `.agentrc.json`. Kept in sync
+ * with the CI job names in
+ * `.github/workflows/ci.yml` — the retired `format:check` folded into `lint`
+ * (Story #1829) and `lifecycle-doc-drift` collapsed into `lint`/`docs:check`
+ * (Epic #1943), so neither belongs in the default set.
  */
 export const DEFAULT_REQUIRED_CHECKS = Object.freeze([
   Object.freeze({
@@ -23,12 +25,12 @@ export const DEFAULT_REQUIRED_CHECKS = Object.freeze([
     cmd: Object.freeze(['npm', 'run', 'lint']),
   }),
   Object.freeze({
-    name: 'format:check',
-    cmd: Object.freeze(['npm', 'run', 'format:check']),
-  }),
-  Object.freeze({
     name: 'test',
     cmd: Object.freeze(['npm', 'test']),
+  }),
+  Object.freeze({
+    name: 'baselines',
+    cmd: Object.freeze(['node', '.agents/scripts/check-baselines.js']),
   }),
 ]);
 
@@ -53,11 +55,13 @@ export const NOTIFICATIONS_DEFAULTS = Object.freeze({
     'operator-message',
   ]),
   webhookEvents: Object.freeze([
-    'epic-started',
-    'epic-progress',
-    'epic-blocked',
-    'epic-unblocked',
-    'epic-complete',
+    'state-transition',
+    'story-merged',
+    'story-closing',
+    'operator-message',
+    'merge.unlanded',
+    'merge.flip-failed',
+    'loop.tick',
   ]),
 });
 

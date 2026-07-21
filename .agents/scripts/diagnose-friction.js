@@ -81,12 +81,6 @@ const FRICTION_RULES = [
     remediation:
       ' - Syntax/parsing error. Check recently modified files for missing brackets, quotes, or invalid structures.',
   },
-  {
-    markers: ['Astro', 'astro'],
-    category: 'Missing Skill',
-    remediation:
-      ' - Framework error: Refer to `.agents/skills/stack/frontend/astro/SKILL.md` for Astro rules.',
-  },
 ];
 
 const FRICTION_DEFAULT = {
@@ -131,7 +125,7 @@ function buildFrictionSignal({
   return {
     kind: 'friction',
     eventId: crypto.randomUUID(),
-    timestamp: new Date().toISOString(),
+    ts: new Date().toISOString(),
     epicId: epicId ?? null,
     storyId: storyId ?? null,
     // 2-tier hierarchy (Epic #3163): no Task tier, so friction signals
@@ -139,11 +133,11 @@ function buildFrictionSignal({
     // and always null.
     taskId: null,
     category,
-    source: {
+    emitter: {
       tool: 'diagnose-friction.js',
       command: commandStr,
     },
-    details: errorPreview,
+    details: { errorPreview },
   };
 }
 
@@ -209,7 +203,7 @@ export async function main(args = process.argv.slice(2)) {
 
     // Story #2874 — accept story-only context (no parent Epic). When
     // only the story is resolved, write to the standalone signals
-    // stream at `<tempRoot>/standalone/story-<sid>/signals.ndjson`
+    // stream at `<tempRoot>/standalone/stories/story-<sid>/signals.ndjson`
     // by passing `epicId: null` through to the writer. The only case
     // we still skip is fully-no-context (story unresolved).
     if (resolvedStoryId != null) {

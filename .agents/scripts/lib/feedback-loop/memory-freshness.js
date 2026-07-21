@@ -6,14 +6,33 @@
  * `~/.claude/projects/<repo>/memory/`), parses the YAML frontmatter, extracts
  * candidate references (file paths, GitHub labels, GitHub issue numbers),
  * verifies each, and rewrites the frontmatter with `stale: true`,
- * `staleReason: "..."`, `staleDetectedAt: "<iso>"` when any reference is dead.
+ * `staleReason: "..."`, `staleDetectedAt: "<iso>"` when a reference is
+ * **confirmed** dead.
  *
- * The walker is idempotent: entries already marked `stale: true` are skipped
- * untouched, so a subsequent run does not re-flag or thrash the frontmatter.
+ * Three-valued probes (Story #4414 / Epic #4406). Every reference resolves to
+ * one of three states — `exists`, `missing`, or `unknown` — so only a
+ * *confirmed-missing* (or confirmed-closed) reference marks an entry stale.
+ * A transient `gh` failure (rate-limit, auth, network) resolves to `unknown`
+ * and mutates nothing: it can neither newly-stale a fresh entry nor un-stale a
+ * previously-stale one. This closes the poison-on-outage bug where any `gh`
+ * exit 1 was read as "reference deleted".
+ *
+ * Reversible stale path (Story #4414). A previously-staled entry whose
+ * references are **all** re-confirmed `exists` on a later scan is un-staled:
+ * the `stale` / `staleReason` / `staleDetectedAt` keys are stripped via the
+ * same atomic rewrite path used to stamp them. An entry that is still dead, or
+ * whose recovery cannot be confirmed (any `unknown` probe), is left
+ * byte-identical — so a stuck entry is never thrashed and recovery is only
+ * ever asserted from positive evidence.
+ *
+ * The walker is idempotent: a still-stale entry and a still-fresh entry are
+ * both left untouched, so a subsequent scan over an unchanged memory dir
+ * produces byte-identical frontmatter.
  *
  * Best-effort guarantees:
  * - The memory directory missing yields `{ scanned: 0, staleEntries: [],
- *   errors: [{ phase: 'discover', reason: '...' }] }` and no throw.
+ *   unstaledEntries: [], errors: [{ phase: 'discover', reason: '...' }] }` and
+ *   no throw.
  * - Per-file parse / probe failures are captured in `errors[]` and the file
  *   is skipped — the walker keeps going.
  * - The function NEVER throws.
@@ -34,6 +53,60 @@ import * as defaultFs from 'node:fs/promises';
 import * as path from 'node:path';
 
 const FRONTMATTER_FENCE = '---';
+
+/**
+ * Default per-probe watchdog bound for the `gh` spawns. Matches
+ * `graduator-core`'s `DEFAULT_RUN_CHILD_TIMEOUT_MS` (30000 ms) — the other
+ * feedback-loop spawn site Epic #4406 bounded so a hung `gh` cannot block a
+ * finalize/scan forever. Caller-overridable via `scanMemoryFreshness`'s
+ * `probeTimeoutMs`.
+ */
+const DEFAULT_PROBE_TIMEOUT_MS = 30000;
+
+/**
+ * Arm a caller-overridable watchdog over a probe's spawned child and return a
+ * `settle(value)` function the probe's own event handlers call to resolve.
+ * The first `settle` wins (subsequent calls are ignored) and always clears the
+ * timer, so it never outlives its purpose.
+ *
+ * On timeout the child is SIGKILL'd and the probe settles to the supplied
+ * `onTimeout` value — for these three-valued probes always `{ status:
+ * 'unknown' }`, so a hung `gh` never confirms a `missing` reference.
+ *
+ * The timer is intentionally **not** `.unref()`'d. An unref'd watchdog cannot
+ * keep an otherwise-idle event loop alive to fire, so on a stub child (or a
+ * real child whose stdio handles close early) it would silently never fire and
+ * the awaiting promise would hang forever — the exact defect Epic #4406 fixed
+ * in `graduator-core.runChild`. `settle()` always `clearTimeout()`s it.
+ *
+ * @param {object} opts
+ * @param {{ kill?: Function }} opts.child
+ * @param {number} opts.timeoutMs — watchdog bound; `0`/`Infinity` disables it
+ * @param {Function} opts.resolve — the enclosing Promise's resolve
+ * @param {*} opts.onTimeout — value to settle with on overrun
+ * @returns {(value: *) => void}
+ */
+function armProbeWatchdog({ child, timeoutMs, resolve, onTimeout }) {
+  let settled = false;
+  let timer = null;
+  const settle = (value) => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    resolve(value);
+  };
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timer = setTimeout(() => {
+      try {
+        child.kill?.('SIGKILL');
+      } catch {
+        // Killing an already-dead / stub child is a no-op we ignore.
+      }
+      settle(onTimeout);
+    }, timeoutMs);
+  }
+  return settle;
+}
 
 const FILE_PATH_REGEX =
   /(?<![\w/])((?:\.{1,2}\/|\/)?[\w.\-/]+\.[A-Za-z0-9]{1,8})\b/g;
@@ -179,17 +252,53 @@ export function extractReferences(body) {
 }
 
 /**
- * Probe `gh` for an issue's open/closed state. Resolves to one of:
- *   - `{ exists: true, state: 'open' | 'closed' }`
- *   - `{ exists: false }` — gh missing or probe failed (best-effort skip)
- *   - `{ exists: true, state: 'unknown' }` — couldn't parse JSON
+ * Classify a non-zero `gh` exit into a confirmed-missing signal versus an
+ * inconclusive/transient one. Only a positively-recognized "not found" (HTTP
+ * 404 / "could not resolve to a …") counts as `missing`; everything else —
+ * rate-limit, auth failure, network error, or any stderr we cannot positively
+ * read as a 404 — is `unknown` so a transient outage never poisons an entry.
+ *
+ * @param {string} stderr
+ * @returns {'missing' | 'unknown'}
+ */
+function classifyGhFailure(stderr) {
+  const s = String(stderr ?? '');
+  // Transient / non-authoritative failures never confirm a missing reference.
+  if (
+    /rate.?limit|\b429\b|\b403\b|\b401\b|authentic|unauthor|bad credentials|gh auth|login|token|network|timeout|timed out|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|could not resolve host|dial tcp|connection refused|no such host|TLS|handshake/i.test(
+      s,
+    )
+  ) {
+    return 'unknown';
+  }
+  // A genuine not-found is the only confirmed-missing signal.
+  if (/not found|\b404\b|could not resolve to (?:an?|the)|no such/i.test(s)) {
+    return 'missing';
+  }
+  // Anything else is inconclusive — never poison on an unrecognized failure.
+  return 'unknown';
+}
+
+/**
+ * Probe `gh` for an issue's existence and open/closed state. Resolves to one
+ * of the three-valued shapes:
+ *   - `{ status: 'exists', state: 'open' | 'closed' }`
+ *   - `{ status: 'missing' }` — confirmed 404 (issue does not exist)
+ *   - `{ status: 'unknown' }` — gh missing, spawn/child error, unparseable
+ *     JSON, a transient (rate-limit/auth/network) failure, or a spawn that
+ *     overran `timeoutMs` (the child is SIGKILL'd; never `missing`)
  *
  * Never throws.
  */
-function probeIssue({ number, ghPath, spawnImpl }) {
+function probeIssue({
+  number,
+  ghPath,
+  spawnImpl,
+  timeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+}) {
   return new Promise((resolve) => {
     if (!ghPath) {
-      resolve({ exists: false });
+      resolve({ status: 'unknown' });
       return;
     }
     let child;
@@ -200,46 +309,66 @@ function probeIssue({ number, ghPath, spawnImpl }) {
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
     } catch {
-      resolve({ exists: false });
+      resolve({ status: 'unknown' });
       return;
     }
+    const settle = armProbeWatchdog({
+      child,
+      timeoutMs,
+      resolve,
+      onTimeout: { status: 'unknown' },
+    });
     let stdout = '';
+    let stderr = '';
     child.stdout?.on('data', (c) => {
       stdout += c.toString();
     });
-    child.stderr?.on('data', () => {});
-    child.on('error', () => resolve({ exists: false }));
+    child.stderr?.on('data', (c) => {
+      stderr += c.toString();
+    });
+    child.on('error', () => settle({ status: 'unknown' }));
     child.on('close', (code) => {
       if (code !== 0) {
-        resolve({ exists: false });
+        // Distinguish a confirmed 404 from a transient outage.
+        settle({ status: classifyGhFailure(stderr) });
         return;
       }
       try {
         const parsed = JSON.parse(stdout || '{}');
-        const state =
-          typeof parsed.state === 'string'
-            ? parsed.state.toLowerCase()
-            : 'unknown';
-        resolve({ exists: true, state });
+        if (typeof parsed.state !== 'string') {
+          settle({ status: 'unknown' });
+          return;
+        }
+        settle({ status: 'exists', state: parsed.state.toLowerCase() });
       } catch {
-        resolve({ exists: true, state: 'unknown' });
+        settle({ status: 'unknown' });
       }
     });
   });
 }
 
 /**
- * Probe `gh` for a label's existence. Resolves to:
- *   - `{ exists: true }`
- *   - `{ exists: false }` (label not found OR gh missing — best-effort skip)
+ * Probe `gh` for a label's existence. Resolves to one of:
+ *   - `{ status: 'exists' }`
+ *   - `{ status: 'missing' }` — confirmed 404 (label does not exist)
+ *   - `{ status: 'unknown' }` — gh/owner/repo missing, spawn/child error, a
+ *     transient (rate-limit/auth/network) failure, or a spawn that overran
+ *     `timeoutMs` (the child is SIGKILL'd; never `missing`)
  *
  * Never throws.
  */
-function probeLabel({ name, owner, repo, ghPath, spawnImpl }) {
+function probeLabel({
+  name,
+  owner,
+  repo,
+  ghPath,
+  spawnImpl,
+  timeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
+}) {
   return new Promise((resolve) => {
     if (!ghPath || !owner || !repo) {
-      // No way to verify; treat as best-effort skip (existing).
-      resolve({ exists: true, probed: false });
+      // No way to verify; cannot confirm existence or absence.
+      resolve({ status: 'unknown' });
       return;
     }
     let child;
@@ -250,37 +379,49 @@ function probeLabel({ name, owner, repo, ghPath, spawnImpl }) {
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
     } catch {
-      resolve({ exists: true, probed: false });
+      resolve({ status: 'unknown' });
       return;
     }
+    const settle = armProbeWatchdog({
+      child,
+      timeoutMs,
+      resolve,
+      onTimeout: { status: 'unknown' },
+    });
     let stderr = '';
     child.stdout?.on('data', () => {});
     child.stderr?.on('data', (c) => {
       stderr += c.toString();
     });
-    child.on('error', () => resolve({ exists: true, probed: false }));
+    child.on('error', () => settle({ status: 'unknown' }));
     child.on('close', (code) => {
       if (code === 0) {
-        resolve({ exists: true, probed: true });
+        settle({ status: 'exists' });
         return;
       }
-      if (/not found/i.test(stderr) || code === 1) {
-        resolve({ exists: false, probed: true });
-        return;
-      }
-      // Any other failure → best-effort skip.
-      resolve({ exists: true, probed: false });
+      // Only a confirmed 404 marks the label missing; a transient failure
+      // (rate-limit/auth/network) stays unknown and mutates nothing.
+      settle({ status: classifyGhFailure(stderr) });
     });
   });
 }
 
 /**
- * Verify the candidate references inside a single memory entry. Returns the
- * first dead-reference reason discovered, or `null` if everything checks out.
+ * Verify every candidate reference inside a single memory entry and collapse
+ * the outcome into a three-valued freshness verdict:
+ *   - `{ status: 'dead', reason }`  — at least one reference is confirmed
+ *     missing (or a referenced issue is confirmed closed).
+ *   - `{ status: 'alive' }`         — every reference is confirmed to exist.
+ *   - `{ status: 'unknown' }`       — no confirmed-dead reference, but at least
+ *     one probe was inconclusive, so recovery cannot be asserted.
  *
- * @returns {Promise<string|null>}
+ * A confirmed-dead reference dominates (marks the entry stale even if other
+ * probes are unknown); `alive` requires *every* reference positively confirmed
+ * so an un-stale is only ever driven by positive evidence.
+ *
+ * @returns {Promise<{ status: 'dead' | 'alive' | 'unknown', reason?: string }>}
  */
-async function findFirstDeadReason({
+async function verifyReferences({
   references,
   fsImpl,
   ghPath,
@@ -288,7 +429,11 @@ async function findFirstDeadReason({
   owner,
   repo,
   projectRoot,
+  probeTimeoutMs,
 }) {
+  let sawUnknown = false;
+
+  // Files resolve deterministically off the filesystem — never `unknown`.
   for (const filePath of references.filePaths) {
     const resolved = path.isAbsolute(filePath)
       ? filePath
@@ -296,32 +441,81 @@ async function findFirstDeadReason({
     try {
       await fsImpl.access(resolved);
     } catch {
-      return `file reference no longer exists: ${filePath}`;
+      return {
+        status: 'dead',
+        reason: `file reference no longer exists: ${filePath}`,
+      };
     }
   }
 
-  if (ghPath) {
-    for (const number of references.issues) {
-      const probe = await probeIssue({ number, ghPath, spawnImpl });
-      if (probe.exists && probe.state === 'closed') {
-        return `issue #${number} is closed`;
-      }
+  for (const number of references.issues) {
+    const probe = await probeIssue({
+      number,
+      ghPath,
+      spawnImpl,
+      timeoutMs: probeTimeoutMs,
+    });
+    if (probe.status === 'missing') {
+      return { status: 'dead', reason: `issue #${number} no longer exists` };
     }
-    for (const labelName of references.labels) {
-      const probe = await probeLabel({
-        name: labelName,
-        owner,
-        repo,
-        ghPath,
-        spawnImpl,
-      });
-      if (probe.probed && !probe.exists) {
-        return `label "${labelName}" no longer exists`;
-      }
+    if (probe.status === 'exists' && probe.state === 'closed') {
+      return { status: 'dead', reason: `issue #${number} is closed` };
+    }
+    if (probe.status === 'unknown') {
+      sawUnknown = true;
     }
   }
 
-  return null;
+  for (const labelName of references.labels) {
+    const probe = await probeLabel({
+      name: labelName,
+      owner,
+      repo,
+      ghPath,
+      spawnImpl,
+      timeoutMs: probeTimeoutMs,
+    });
+    if (probe.status === 'missing') {
+      return {
+        status: 'dead',
+        reason: `label "${labelName}" no longer exists`,
+      };
+    }
+    if (probe.status === 'unknown') {
+      sawUnknown = true;
+    }
+  }
+
+  return sawUnknown ? { status: 'unknown' } : { status: 'alive' };
+}
+
+const STALE_KEYS = ['stale', 'staleReason', 'staleDetectedAt'];
+
+/**
+ * Return a copy of a parsed entry with the stale-marker keys stripped from
+ * both the frontmatter map and the key order, preserving every other key and
+ * the body verbatim.
+ *
+ * @param {{ frontmatter: Record<string,string>, body: string, keyOrder: string[] }} parsed
+ * @returns {{ frontmatter: Record<string,string>, body: string, keyOrder: string[] }}
+ */
+function stripStaleKeys(parsed) {
+  const frontmatter = { ...parsed.frontmatter };
+  for (const key of STALE_KEYS) delete frontmatter[key];
+  const keyOrder = parsed.keyOrder.filter((key) => !STALE_KEYS.includes(key));
+  return { ...parsed, frontmatter, keyOrder };
+}
+
+/**
+ * Whether a parsed entry currently carries the stale marker.
+ *
+ * @param {{ frontmatter: Record<string,string> }} parsed
+ * @returns {boolean}
+ */
+function isStale(parsed) {
+  return (
+    parsed.frontmatter.stale === 'true' || parsed.frontmatter.stale === true
+  );
 }
 
 /**
@@ -337,9 +531,13 @@ async function findFirstDeadReason({
  * @param {string} [opts.owner] — GitHub owner used for label probes
  * @param {string} [opts.repo]  — GitHub repo used for label probes
  * @param {string} [opts.now]   — ISO timestamp injector (test seam)
+ * @param {number} [opts.probeTimeoutMs] — per-`gh`-spawn watchdog bound (ms);
+ *   defaults to {@link DEFAULT_PROBE_TIMEOUT_MS}. A spawn that overruns is
+ *   SIGKILL'd and resolves `unknown`, so a hung `gh` never marks an entry stale.
  * @returns {Promise<{
  *   scanned: number,
  *   staleEntries: Array<{ file: string, reason: string }>,
+ *   unstaledEntries: Array<{ file: string }>,
  *   errors: Array<{ phase: string, file?: string, reason: string }>,
  * }>}
  */
@@ -353,8 +551,14 @@ export async function scanMemoryFreshness({
   owner,
   repo,
   now,
+  probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
 } = {}) {
-  const result = { scanned: 0, staleEntries: [], errors: [] };
+  const result = {
+    scanned: 0,
+    staleEntries: [],
+    unstaledEntries: [],
+    errors: [],
+  };
 
   if (typeof memoryDir !== 'string' || memoryDir.length === 0) {
     result.errors.push({
@@ -405,14 +609,6 @@ export async function scanMemoryFreshness({
       continue;
     }
 
-    // Idempotent: already-stale entries are left untouched.
-    if (
-      parsed.frontmatter.stale === 'true' ||
-      parsed.frontmatter.stale === true
-    ) {
-      continue;
-    }
-
     let references;
     try {
       references = extractReferences(parsed.body);
@@ -425,9 +621,9 @@ export async function scanMemoryFreshness({
       continue;
     }
 
-    let reason;
+    let verdict;
     try {
-      reason = await findFirstDeadReason({
+      verdict = await verifyReferences({
         references,
         fsImpl,
         ghPath,
@@ -435,6 +631,7 @@ export async function scanMemoryFreshness({
         owner,
         repo,
         projectRoot,
+        probeTimeoutMs,
       });
     } catch (err) {
       result.errors.push({
@@ -445,14 +642,44 @@ export async function scanMemoryFreshness({
       continue;
     }
 
-    if (!reason) continue;
+    const alreadyStale = isStale(parsed);
+
+    // Reversible stale path (Story #4414): a previously-stale entry whose
+    // references are now ALL confirmed alive is un-staled. `unknown` (a
+    // transient probe) leaves the marker in place — recovery is only ever
+    // asserted from positive evidence — and `dead` keeps it stale. Both the
+    // still-dead and still-unknown cases fall through to a no-op, so a scan
+    // over an unchanged memory dir is byte-identical (idempotent).
+    if (alreadyStale) {
+      if (verdict.status !== 'alive') continue;
+
+      const rendered = renderFrontmatter(stripStaleKeys(parsed));
+      const tmpPath = `${filePath}.unstale.tmp`;
+      try {
+        await fsImpl.writeFile(tmpPath, rendered, 'utf8');
+        await fsImpl.rename(tmpPath, filePath);
+      } catch (err) {
+        result.errors.push({
+          phase: 'write',
+          file: name,
+          reason: `atomic un-stale write failed: ${err.message}`,
+        });
+        continue;
+      }
+      result.unstaledEntries.push({ file: name });
+      continue;
+    }
+
+    // A fresh entry is marked stale ONLY on a confirmed-dead reference; an
+    // `unknown` verdict (transient gh outage) mutates nothing.
+    if (verdict.status !== 'dead') continue;
 
     const stamped = {
       ...parsed,
       frontmatter: {
         ...parsed.frontmatter,
         stale: 'true',
-        staleReason: reason,
+        staleReason: verdict.reason,
         staleDetectedAt: now ?? new Date().toISOString(),
       },
     };
@@ -471,7 +698,7 @@ export async function scanMemoryFreshness({
       continue;
     }
 
-    result.staleEntries.push({ file: name, reason });
+    result.staleEntries.push({ file: name, reason: verdict.reason });
   }
 
   return result;

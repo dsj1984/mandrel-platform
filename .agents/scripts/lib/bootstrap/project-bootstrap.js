@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isCommandExcluded } from '../command-header.js';
 import { detectPackageManager as detectPm } from '../detect-package-manager.js';
 import { LEDGER_RELATIVE_PATH } from './install-ledger.js';
 import { ensureIssueForms } from './issue-forms-template.js';
@@ -23,6 +24,12 @@ import { PHASE_GROUPS, previewMutationManifest } from './manifest.js';
 import { applyQualityBootstrap } from './quality-bootstrap.js';
 
 export const SYNC_COMMAND = 'node .agents/scripts/sync-claude-commands.js';
+
+// Epic #4478 (M7-B). The role-scoped agent projection runs in every place the
+// command projection does — `sync:agents` script, `prepare`, and the bootstrap
+// `sync` phase (`runSyncCommands`) — so `.claude/agents/*.md` materializes for
+// hosts that read it, exactly as `.claude/commands/*.md` does.
+export const SYNC_AGENTS_COMMAND = 'node .agents/scripts/sync-claude-agents.js';
 
 export const BOOTSTRAP_COMMAND = 'node .agents/scripts/bootstrap.js';
 
@@ -202,6 +209,7 @@ export function ensurePackageJson(ctx) {
   const outcomes = {
     created: false,
     scriptsSyncCommands: 'already-present',
+    scriptsSyncAgents: 'already-present',
     scriptsPrepare: 'already-present',
     scriptsBootstrap: 'already-present',
   };
@@ -220,13 +228,29 @@ export function ensurePackageJson(ctx) {
     pkg.scripts['sync:commands'] = SYNC_COMMAND;
     outcomes.scriptsSyncCommands = 'added';
   }
+  if (!pkg.scripts['sync:agents']) {
+    pkg.scripts['sync:agents'] = SYNC_AGENTS_COMMAND;
+    outcomes.scriptsSyncAgents = 'added';
+  }
   const prepare = pkg.scripts.prepare;
   if (!prepare) {
-    pkg.scripts.prepare = SYNC_COMMAND;
+    pkg.scripts.prepare = `${SYNC_COMMAND} && ${SYNC_AGENTS_COMMAND}`;
     outcomes.scriptsPrepare = 'added';
-  } else if (!prepare.includes('sync-claude-commands.js')) {
-    pkg.scripts.prepare = `${prepare} && ${SYNC_COMMAND}`;
-    outcomes.scriptsPrepare = 'appended';
+  } else {
+    // Append each projection independently so an existing prepare that already
+    // carries the command sync still gains the agent sync on the next bootstrap
+    // (and both are idempotent — a prepare carrying both is left untouched).
+    let next = prepare;
+    if (!next.includes('sync-claude-commands.js')) {
+      next = `${next} && ${SYNC_COMMAND}`;
+    }
+    if (!next.includes('sync-claude-agents.js')) {
+      next = `${next} && ${SYNC_AGENTS_COMMAND}`;
+    }
+    if (next !== prepare) {
+      pkg.scripts.prepare = next;
+      outcomes.scriptsPrepare = 'appended';
+    }
   }
   // Expose a discoverable `npm run bootstrap` alias for the framework
   // setup command. An operator-defined `bootstrap` script always wins —
@@ -238,6 +262,7 @@ export function ensurePackageJson(ctx) {
   const mutated =
     outcomes.created ||
     outcomes.scriptsSyncCommands === 'added' ||
+    outcomes.scriptsSyncAgents === 'added' ||
     outcomes.scriptsPrepare !== 'already-present' ||
     outcomes.scriptsBootstrap === 'added';
   if (mutated) writeJson(pkgPath, pkg, fsImpl);
@@ -361,52 +386,17 @@ export async function validateAgentrc(ctx) {
   return { ok: !!ok, errors: ok ? [] : (validate.errors ?? []) };
 }
 
-/**
- * Step 3 — Merge the `UserPromptSubmit` sync hook into `.claude/settings.json`.
- * Returns `{ action }`.
- *
- * The sync hook keeps the generated flat `/<name>` command tree
- * (`.claude/commands/`) current. The flat projection needs no plugin
- * enablement keys — it loads in every Claude Code environment, including those
- * where the plugin system (`/plugin`) is unavailable (the #3576 plugin cutover
- * was reverted for exactly that reason).
- *
- * @param {object} ctx
- * @param {typeof fs} [ctx.fsImpl]
- */
-export function ensureClaudeSettings(ctx) {
-  const { fsImpl = fs } = ctx;
-  const target = path.join(ctx.projectRoot, '.claude', 'settings.json');
-  const hook = { type: 'command', command: SYNC_COMMAND };
-  if (!fsImpl.existsSync(target)) {
-    fsImpl.mkdirSync(path.dirname(target), { recursive: true });
-    const fresh = {
-      hooks: {
-        UserPromptSubmit: [{ hooks: [hook] }],
-      },
-    };
-    writeJson(target, fresh, fsImpl);
-    return { action: 'created', path: target };
-  }
-  const settings = readJsonIfExists(target, fsImpl);
-  settings.hooks = settings.hooks ?? {};
-  settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit ?? [];
-  const hookAlready = settings.hooks.UserPromptSubmit.some((group) =>
-    (group?.hooks ?? []).some(
-      (h) =>
-        typeof h?.command === 'string' &&
-        h.command.includes('sync-claude-commands.js'),
-    ),
-  );
-  let mutated = false;
-  if (!hookAlready) {
-    settings.hooks.UserPromptSubmit.push({ hooks: [hook] });
-    mutated = true;
-  }
-  if (!mutated) return { action: 'already-present', path: target };
-  writeJson(target, settings, fsImpl);
-  return { action: 'merged', path: target };
-}
+// Story #4527/#4530: the UserPromptSubmit sync-hook wiring
+// (ensureClaudeSettings, formerly Step 3) was removed. It spawned
+// `mandrel sync-commands` on every prompt to keep `.claude/commands/` in
+// sync with `.agents/workflows/` — a rewrite racing the harness's own read
+// of that same directory while expanding a slash command, and a directory
+// that cannot change mid-session in the first place, so the hook reported
+// `0 file(s) synced` on effectively every invocation. The real sync points
+// already cover every case: `prepare` on install, `mandrel sync` /
+// `mandrel update` on upgrade, and doctor's `commands-in-sync` check for
+// hand-edits. `lib/cli/uninstall.js#revertClaudeSettings` still removes the
+// hook from a consumer who already has it installed from a prior version.
 
 /**
  * Step 4 + Step 8 — Ensure `.gitignore` carries every {@link GITIGNORE_BLOCKS}
@@ -442,7 +432,7 @@ export function ensureGitignore(ctx) {
 
 /**
  * Materialize the generated GitHub Issue Forms
- * (`.github/ISSUE_TEMPLATE/story.yml` + `epic.yml`) into the consumer
+ * (`.github/ISSUE_TEMPLATE/story.yml`) into the consumer
  * project (Story #4227). Derived from the Story-body SSOT so a human-filed
  * ticket round-trips through `story-body.parse()`. Idempotent and additive,
  * mirroring `ensureGitignore`: byte-identical forms are `unchanged`,
@@ -482,25 +472,39 @@ function ensureIssueFormsPhase(ctx) {
  */
 export function runSyncCommands(ctx) {
   const { spawnImpl = defaultSpawnSync } = ctx;
-  const script = path.join(
+  const scriptsDir = path.join(
     ctx.agentRoot ?? path.join(ctx.projectRoot, '.agents'),
     'scripts',
-    'sync-claude-commands.js',
   );
-  const result = spawnImpl(process.execPath, [script], {
-    cwd: ctx.projectRoot,
-    encoding: 'utf8',
-  });
-  if (result.status !== 0) {
-    throw new Error(
-      `[Bootstrap] sync-claude-commands.js failed (exit ${result.status}): ${(
-        result.stderr ?? ''
-      )
-        .trim()
-        .slice(0, 400)}`,
+  // Both projections run here (Epic #4478, M7-B): the command tree AND the
+  // role-scoped agent tree, so `mandrel sync` / the postinstall path
+  // materializes `.claude/agents/*.md` alongside `.claude/commands/*.md`.
+  const projections = [
+    { label: 'sync-claude-commands.js', script: 'sync-claude-commands.js' },
+    { label: 'sync-claude-agents.js', script: 'sync-claude-agents.js' },
+  ];
+  const stdouts = [];
+  for (const { label, script } of projections) {
+    const result = spawnImpl(
+      process.execPath,
+      [path.join(scriptsDir, script)],
+      {
+        cwd: ctx.projectRoot,
+        encoding: 'utf8',
+      },
     );
+    if (result.status !== 0) {
+      throw new Error(
+        `[Bootstrap] ${label} failed (exit ${result.status}): ${(
+          result.stderr ?? ''
+        )
+          .trim()
+          .slice(0, 400)}`,
+      );
+    }
+    stdouts.push((result.stdout ?? '').trim());
   }
-  return { ok: true, stdout: (result.stdout ?? '').trim() };
+  return { ok: true, stdout: stdouts.filter(Boolean).join('\n') };
 }
 
 /**
@@ -508,6 +512,15 @@ export function runSyncCommands(ctx) {
  * flat command tree `.claude/commands/*.md`. Step 5's sync already enforces
  * this; this is a belt-and-braces verification that the command projection
  * covers every top-level workflow.
+ *
+ * A workflow whose frontmatter carries `command: false` is deliberately NOT
+ * projected to a command — `sync-claude-commands.js` skips it via the same
+ * `isCommandExcluded` predicate used here. Such a workflow must therefore be
+ * excluded from the expected-command set, or this check would demand a
+ * command the sync is contracted never to emit (e.g. the `audit-lighthouse` /
+ * `audit-security` lenses, which are run by the audit suite, not as slash
+ * commands). Keeping the two surfaces on one predicate is what stops them
+ * drifting.
  *
  * @param {object} ctx
  * @param {typeof fs} [ctx.fsImpl]
@@ -527,7 +540,14 @@ export function checkParity(ctx) {
           .map((e) => e.name.replace(/\.md$/, ''))
           .sort()
       : [];
-  const workflows = new Set(list(workflowsDir));
+  // Expected commands = projectable workflows only. A `command: false`
+  // workflow is contracted out of the command tree, so it is not "missing" a
+  // command — it declined one.
+  const projectable = (name) =>
+    !isCommandExcluded(
+      fsImpl.readFileSync(path.join(workflowsDir, `${name}.md`), 'utf8'),
+    );
+  const workflows = new Set(list(workflowsDir).filter(projectable));
   const commands = new Set(list(commandsDir));
   const missingCommand = [...workflows].filter((n) => !commands.has(n));
   const orphanCommand = [...commands].filter((n) => !workflows.has(n));
@@ -705,11 +725,6 @@ export const BOOTSTRAP_PHASES = Object.freeze([
     run: async (ctx) => validateAgentrc(ctx),
     isFatal: true,
     formatError: fatalValidation,
-  },
-  {
-    name: 'claudeSettings',
-    phaseGroup: PHASE_GROUPS.IDE_WIRING,
-    run: (ctx) => ensureClaudeSettings(ctx),
   },
   {
     name: 'systemPromptWiring',

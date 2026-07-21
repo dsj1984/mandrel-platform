@@ -1,27 +1,25 @@
 /**
- * `temp/epic-<id>/` path-resolution helper (Epic #1030 Story #1039).
+ * `temp/run-<id>/` path-resolution helper (Epic #1030 Story #1039).
  *
  * Single source of truth for every artifact path that lives under
  * `project.paths.tempRoot`. Every script that previously hand-rolled
- * a flat `temp/<artifact>-epic-<id>.<ext>` path migrates to call one of
+ * a flat `temp/<artifact>-run-<id>.<ext>` path migrates to call one of
  * these helpers. The Tech Spec (#1032) names this module as the cutover
  * grep target — `temp/.*-epic-` should be empty across `.agents/scripts`
  * once the migration Stories land.
  *
  * Layout:
- *   temp/epic-<eid>/
+ *   temp/run-<eid>/
  *     ├─ techspec.md
  *     ├─ manifest.md          (dispatch manifest)
  *     ├─ retro.md             (mirror of GitHub retro at Epic close)
- *     ├─ perf-report.md       (analyzer output, Epic-level)
  *     ├─ lifecycle.ndjson     (lifecycle bus ledger)
- *     ├─ checkpoints/...      (epic-runner state store)
- *     ├─ <name>               (epicArtifactPath escape hatch)
+ *     ├─ checkpoints/...      (pre-v2 epic-runner state store; retained layout)
+ *     ├─ <name>               (runArtifactPath escape hatch)
  *     └─ stories/
  *        └─ story-<sid>/
  *           ├─ manifest.md       (story dispatch manifest)
  *           ├─ signals.ndjson    (append-only signals writer)
- *           ├─ perf-summary.md
  *           └─ <name>            (storyArtifactPath escape hatch)
  *
  * Standalone Stories (no parent Epic) follow the same shape under
@@ -42,11 +40,12 @@
  * resolve a *relative* `tempRoot` against the **main checkout root** (the
  * parent of `git rev-parse --git-common-dir`) rather than `process.cwd()`.
  * Without this, a story child that `cd`s into `.worktrees/story-<id>/` before
- * calling `story-phase.js` would append `story.heartbeat` records to
- * `<worktree>/temp/epic-N/lifecycle.ndjson`, while the `/deliver` host
+ * emitting a lifecycle record would append it to
+ * `<worktree>/temp/run-N/lifecycle.ndjson`, while the `/deliver` host
  * (running from the main checkout) reads the main-checkout copy — so the
- * idle-watchdog never sees heartbeats and the Epic-lease guard silently
- * reclaims live foreign claims (the audit-#3513 bug class). Anchoring the
+ * host never sees the child's records (the audit-#3513 bug class; its
+ * original `story.heartbeat` instance is gone with that emitter, but the
+ * divergence applies to every ledger writer). Anchoring the
  * ledger to the git common dir makes the worktree child writer and the
  * main-checkout host reader converge on a single file regardless of cwd. An
  * absolute `tempRoot` is honoured verbatim; only relative roots are anchored.
@@ -155,11 +154,9 @@ export function tempRootFrom(config) {
     : 'temp';
 }
 
-const epicId = (id) => {
+const runId = (id) => {
   if (!Number.isInteger(id) || id <= 0) {
-    throw new Error(
-      `[temp-paths] epicId must be a positive integer; got ${id}`,
-    );
+    throw new Error(`[temp-paths] runId must be a positive integer; got ${id}`);
   }
   return id;
 };
@@ -206,18 +203,18 @@ const artifactName = (name) => {
 };
 
 /**
- * `temp/epic-<eid>/` — every Epic-scoped artifact lives under here.
+ * `temp/run-<id>/` — every run-scoped artifact lives under here.
  *
- * @param {number} eid
+ * @param {number} rid
  * @param {object} [config]
  * @returns {string}
  */
-export function epicTempDir(eid, config) {
-  return path.join(anchorTempRoot(tempRootFrom(config)), `epic-${epicId(eid)}`);
+export function runTempDir(rid, config) {
+  return path.join(anchorTempRoot(tempRootFrom(config)), `run-${runId(rid)}`);
 }
 
 /**
- * `temp/epic-<eid>/stories/story-<sid>/` — every Story-scoped artifact
+ * `temp/run-<eid>/stories/story-<sid>/` — every Story-scoped artifact
  * lives under here.
  *
  * Story #2874: accepts `eid === null` for standalone Stories (no
@@ -241,12 +238,12 @@ export function storyTempDir(eid, sid, config) {
   const parent =
     checkedEid === null
       ? path.join(anchorTempRoot(tempRootFrom(config)), 'standalone')
-      : epicTempDir(checkedEid, config);
+      : runTempDir(checkedEid, config);
   return path.join(parent, 'stories', `story-${storyId(sid)}`);
 }
 
 /**
- * `temp/epic-<eid>/stories/story-<sid>/signals.ndjson` — append-only
+ * `temp/run-<eid>/stories/story-<sid>/signals.ndjson` — append-only
  * signal stream consumed by the analyzer (Epic #1030 AC1).
  *
  * @param {number} eid
@@ -259,6 +256,30 @@ export function signalsFile(eid, sid, config) {
 }
 
 /**
+ * `temp/run-<eid>/stories/story-<sid>/lifecycle.ndjson` — the story-scope
+ * ledger destination for lifecycle events emitted directly by a Story
+ * (rather than routed through the Epic-scoped bus ledger). Story #4426
+ * (Epic #4425) introduces the first consumer: a standalone
+ * `single-story-close` run (no parent Epic) emitting `merge.unlanded`
+ * needs an on-disk home even though there is no `run-<id>/` directory to
+ * anchor the event to.
+ *
+ * Mirrors `runLedgerPath` exactly, one level down: `eid === null` routes
+ * through `storyTempDir`'s standalone branch to
+ * `<tempRoot>/standalone/stories/story-<sid>/lifecycle.ndjson`; a real
+ * `eid` routes to `<tempRoot>/run-<eid>/stories/story-<sid>/lifecycle.ndjson`,
+ * so an Epic-attached Story's story-scope ledger sits alongside its
+ * `signals.ndjson` sibling.
+ *
+ * @param {number|null} eid
+ * @param {number} sid
+ * @param {object} [config]
+ * @returns {string}
+ */
+export const storyLedgerPath = (eid, sid, config) =>
+  storyArtifactPath(eid, sid, 'lifecycle.ndjson', config);
+
+/**
  * Escape hatch for an Epic-level artifact whose name isn't part of the
  * canonical layout (one of the per-Epic perf surfaces, retro mirror, etc.).
  * Use the named helpers below for the canonical files; reserve this one
@@ -269,14 +290,13 @@ export function signalsFile(eid, sid, config) {
  * @param {object} [config]
  * @returns {string}
  */
-export function epicArtifactPath(eid, name, config) {
-  return path.join(epicTempDir(eid, config), artifactName(name));
+export function runArtifactPath(eid, name, config) {
+  return path.join(runTempDir(eid, config), artifactName(name));
 }
 
 /**
  * Escape hatch for a Story-level artifact whose name isn't part of the
- * canonical layout (signals.ndjson + perf-summary.md + manifest.md ship
- * named helpers).
+ * canonical layout (signals.ndjson + manifest.md ship named helpers).
  *
  * @param {number} eid
  * @param {number} sid
@@ -284,39 +304,12 @@ export function epicArtifactPath(eid, name, config) {
  * @param {object} [config]
  * @returns {string}
  */
-export function storyArtifactPath(eid, sid, name, config) {
+function storyArtifactPath(eid, sid, name, config) {
   return path.join(storyTempDir(eid, sid, config), artifactName(name));
 }
 
-// --- Canonical Epic-level filenames (Tech Spec #1032 §tempRoot) ---
-
-export const epicTechSpecPath = (eid, config) =>
-  epicArtifactPath(eid, 'techspec.md', config);
-export const epicManifestPath = (eid, config) =>
-  epicArtifactPath(eid, 'manifest.md', config);
-export const epicRetroMirrorPath = (eid, config) =>
-  epicArtifactPath(eid, 'retro.md', config);
-export const epicPerfReportPath = (eid, config) =>
-  epicArtifactPath(eid, 'perf-report.md', config);
-
 /**
- * `temp/epic-<eid>/epic-perf-report.json` — canonical JSON snapshot of
- * the `epic-perf-report` payload persisted at /deliver close
- * (Epic #3019 / Story #3029 / Task #3040). When present alongside the
- * `epic-perf-report` structured comment, the report is discoverable
- * from the file system without round-tripping the ticketing provider,
- * and the `epic-handoff` structured close comment links it by relative
- * path.
- *
- * @param {number} eid
- * @param {object} [config]
- * @returns {string}
- */
-export const epicPerfReportJsonPath = (eid, config) =>
-  epicArtifactPath(eid, 'epic-perf-report.json', config);
-
-/**
- * `temp/epic-<eid>/lifecycle.ndjson` — append-only lifecycle bus ledger
+ * `temp/run-<eid>/lifecycle.ndjson` — append-only lifecycle bus ledger
  * (Story #2510). The LedgerWriter persists every emitted/completed/failed
  * record here; the TraceLogger renders the companion markdown from it.
  *
@@ -328,12 +321,10 @@ export const epicPerfReportJsonPath = (eid, config) =>
  * @param {object} [config]
  * @returns {string}
  */
-export const epicLedgerPath = (eid, config) =>
-  epicArtifactPath(eid, 'lifecycle.ndjson', config);
+export const runLedgerPath = (eid, config) =>
+  runArtifactPath(eid, 'lifecycle.ndjson', config);
 
 // --- Canonical Story-level filenames ---
 
 export const storyManifestPath = (eid, sid, config) =>
   storyArtifactPath(eid, sid, 'manifest.md', config);
-export const storyPerfSummaryPath = (eid, sid, config) =>
-  storyArtifactPath(eid, sid, 'perf-summary.md', config);

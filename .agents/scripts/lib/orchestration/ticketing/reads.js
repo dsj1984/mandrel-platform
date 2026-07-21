@@ -12,7 +12,8 @@
  */
 
 import { AGENT_LABELS } from '../../label-constants.js';
-import { WAVE_MARKER_RE } from '../wave-marker.js';
+
+const WAVE_MARKER_RE = /^wave-([0-9]{1,3})-(start|end)$/;
 
 /**
  * Canonical agent-state label triad used by every state mutator. Kept on
@@ -23,7 +24,7 @@ export const STATE_LABELS = {
   READY: AGENT_LABELS.READY,
   EXECUTING: AGENT_LABELS.EXECUTING,
   // Story #2144 — intermediate state held by a Story between successful
-  // close-preflight and a confirmed merge into `epic/<id>`. Included in
+  // close-preflight and a confirmed Story PR merge into `main`. Included in
   // the state enum so `transitionTicketState` can apply the label via
   // the canonical one-state-at-a-time path (which removes every other
   // `agent::*` label in the same call) and so the read-side `ALL_STATES`
@@ -59,53 +60,44 @@ export const STRUCTURED_COMMENT_TYPES = Object.freeze([
   'friction',
   'notification',
   // Extended set (Story #449 — retro follow-ons)
-  'code-review',
+  // Story #4411 (Epic #4405) — the former `code-review` structured comment
+  // is unified with the former `audit-results` comment into the single
+  // `verification-results` findings contract. `runCodeReview` (the sole code
+  // producer) upserts `verification-results`; the feedback-loop graduators and
+  // the auto-merge integration gate read it. Both the `code-review` and (as of
+  // Story #4412's slim-Epic-close cutover) the `audit-results` markers are
+  // retired here — the Phase 4 standalone lens walk folded into the Phase 5
+  // code-review pass, whose single `verification-results` comment now carries
+  // the Epic-close lens findings. Hard cutover, no dual-shape reader per
+  // `git-conventions.md`.
+  'verification-results',
   'retro',
   'retro-partial',
+  // v2 Story closeout — actionable follow-ups from friction signals
+  'follow-ups',
+  // v2 plan-run epilogue artifacts (posted on the primary Story)
+  'plan-run-audit-roster',
+  'plan-run-sibling-coherence',
   'epic-run-state',
   'epic-run-progress',
   'epic-plan-state',
   'parked-follow-ons',
-  'dispatch-manifest',
-  // Story #566 — per-phase wall-clock summary posted by story-close
-  // and consumed by the epic-runner progress reporter to surface median /
-  // p95 phase timings across completed stories.
+  // Story #566 — per-phase wall-clock summary posted by single-story-close.js.
   'phase-timings',
   // Story #831 — story-init upserts a `story-init` comment that
   // surfaces `dependenciesInstalled` (and the underlying installStatus) so
   // downstream workflow steps don't have to infer install state from
   // node_modules presence.
   'story-init',
-  // Story #908 — /deliver upserts a `story-run-progress` snapshot
-  // on each Story per Task transition. The /deliver aggregator and
-  // the epic-runner progress reporter both read this comment to derive
-  // Story-level state without re-fetching ticket labels.
-  'story-run-progress',
-  // Story #1123 — analyze-execution.js upserts perf summaries at close
-  // time. Story-mode posts `story-perf-summary` on each Story; Epic-mode
-  // posts `epic-perf-report` on the Epic. Both replace the legacy
-  // per-Task `friction` fan-out and the standalone `phase-timings`
-  // surface (Epic #1030).
-  'story-perf-summary',
-  'epic-perf-report',
-  // Story #2128 — Phase 6 Epic Clarity Gate. `epic-plan-clarity.js` upserts
-  // a `clarity-gate-update` comment on the Epic when the operator approves
-  // a sharpened body rewrite, recording the persistence event for audit.
+  // Story #2128 — Phase 6 Epic Clarity Gate (CLI retired). Historical
+  // `clarity-gate-update` comments may still exist on older tickets.
   'clarity-gate-update',
-  // Story #2635 — Phase 7 Tech Spec freshness check. `epic-plan-spec.js`
+  // Story #2635 — Tech Spec freshness check. `plan-persist.js`
   // upserts a `spec-freshness` comment on the Epic listing any
   // path-shaped references that don't exist at the base branch, so the
   // operator can correct drift before Phase 8 decomposes from a stale
   // spec. Advisory: the run continues regardless of the report contents.
   'spec-freshness',
-  // Story #2681 — `/deliver` Phase 4 epic-audit helper upserts an
-  // `audit-results` comment on the Epic listing the per-lens findings
-  // returned by the change-set audit pass. The marker was prescribed by
-  // `helpers/epic-audit.md` Step 4 long before it was added to this
-  // registry; without the entry the helper's `post-structured-comment.js`
-  // invocation always failed with "Invalid structured-comment type". One
-  // entry per Epic; re-runs replace prior content.
-  'audit-results',
   // Story #2813 — the per-Task progress writer (since retired under
   // #3157) upserted a `model-attribution` comment on a Task ticket at
   // the moment it transitioned to `agent::executing`, recording which
@@ -124,42 +116,60 @@ export const STRUCTURED_COMMENT_TYPES = Object.freeze([
   // ticket. Re-invocations upsert the same marker rather than appending
   // duplicates.
   'epic-handoff',
-  // Story #2899 (Epic #2880, F13) — `epic-deliver-preflight.js` upserts a
-  // `delivery-preflight` comment on the Epic at the start of
-  // /deliver Phase 1, surfacing estimated story count, install cost,
+  // Story #2899 (Epic #2880, F13) — the deleted `epic-deliver-preflight.js`
+  // upserted a `delivery-preflight` comment on the Epic at the start of
+  // pre-v2 Epic `/deliver` Phase 1, surfacing estimated story count, install cost,
   // wave count, GitHub API request volume, Claude quota burn, and any
   // threshold breaches against `delivery.preflight.max*`. One entry per
   // Epic; re-runs replace prior content.
   'delivery-preflight',
-  // Story #3062 (Epic #3051) — `wave-tick.js` upserts a
+  // Story #3062 (Epic #3051) — the deleted `wave-tick.js` upserted a
   // `recurring-failure-class` comment on the Epic when the cross-Story
   // detector finds two or more Stories that hit the same `failedGate` in
   // `close-validate.end`. One entry per Epic; re-ticks with the same
   // findings upsert in place (`upsertStructuredComment` diffs by body).
   'recurring-failure-class',
-  // Story #3061 (Epic #3051) — the /deliver §2e Idle Watchdog
-  // subsection instructs the parent host LLM to upsert a `wave-stall`
-  // comment on the Epic whenever an in-flight Story has been silent for
-  // longer than the configured cadence. `wave-tick.js --check-idle`
-  // emits the matching envelope; registering the kind here is what makes
+  // Story #3061 (Epic #3051) — the pre-v2 `/deliver` idle-watchdog prose
+  // instructed the parent host LLM to upsert a `wave-stall` comment on the
+  // Epic whenever an in-flight Story had been silent for longer than the
+  // configured cadence. The deleted `wave-tick.js --check-idle` CLI emitted
+  // the matching envelope; registering the kind here keeps historical
   // the documented remediation actually executable
   // (assertValidStructuredCommentType would otherwise throw).
   'wave-stall',
-  // Story #3873 (Epic #3865) — `epic-plan-spec.js` upserts a `risk-verdict`
-  // comment on the Epic at persist time, recording the planner-authored,
-  // schema-validated risk verdict and the planningRisk envelope derived
-  // from it (`deriveRiskEnvelope`). One entry per Epic; re-plans upsert in
-  // place. Schema: `.agents/schemas/risk-verdict.schema.json`.
-  'risk-verdict',
-  // Story #4019 — `epic-plan-lease-guard.js` upserts a `plan-lease`
-  // comment on the Epic at lease-acquire time, recording the claiming
-  // operator and the claim timestamp. `/plan` emits no
-  // `story.heartbeat`, so this claim-time is the liveness signal that
-  // makes the documented `--steal` contract decidable: a foreign claim
-  // older than the lease TTL is reclaimed automatically; a fresh one
-  // refuses with the claim age. One entry per Epic; re-acquires upsert
+  // Story #4019 — the plan-tier lease guard upserts a `plan-lease`
+  // comment at lease-acquire time, recording the claiming operator and the
+  // claim timestamp. Nothing emits a per-run liveness beat, so this
+  // claim-time is the only age signal a reader has when reasoning about the
+  // documented `--steal` contract. The guard itself fails closed regardless
+  // (it anchors liveness to `now`), so a stranded claim is cleared with
+  // `--steal`, not by TTL expiry. One entry per ticket; re-acquires upsert
   // in place.
   'plan-lease',
+  // Story #4415 (Epic #4406) — the feedback-loop graduators
+  // (`audit-results-graduator.js` / `retro-proposals-graduator.js`) upsert a
+  // `cross-repo-deferred` comment on the Epic listing findings that route
+  // to a different repository and were therefore not filed here. Replaces
+  // the prior log-line-only trace so the deferral survives the finalize
+  // run as a durable, operator-visible record. Discriminated by a
+  // `graduator="audit-results|code-review"` attr so the two graduators
+  // upsert independent comments; re-runs upsert in place.
+  'cross-repo-deferred',
+  // Epic #4474 (PR3) / v2 Stage 3 — `plan-persist.js` upserts a single
+  // `plan-summary` comment on the primary Story at terminal persist
+  // success, carrying risk / routing receipts and the depends_on order
+  // table. One entry per plan; a re-persist upserts in place.
+  'plan-summary',
+  // v2 Stage 3 — flat Story persist checkpoint on every created Story
+  // (replaces epic-plan-state for new plans). plan-summary stays primary-only.
+  'story-plan-state',
+  // Story #4535 — `plan-persist.js` upserts a `superseded-by` comment on
+  // each `/plan --tickets` source issue at persist time, naming the single
+  // Story that claims it (plus any per-supersede note the plan authored),
+  // immediately before closing the issue as `not_planned`. Keying off this
+  // marker rather than a bare `postComment` is what makes a re-run
+  // non-double-commenting. One entry per source issue.
+  'superseded-by',
 ]);
 
 export const WAVE_TYPE_PATTERN = WAVE_MARKER_RE;
@@ -245,8 +255,8 @@ export function structuredCommentMarker(type, attrs = null) {
  * recent `findStructuredComment` / `upsertStructuredComment` call.
  * Story #1795 — every Epic run owns its process for the duration of
  * the run, so a single seed-then-reuse window saves one
- * `getTicketComments` per repeat upsert on the hot path (wave-level
- * `story-run-progress`, `wave-N-end`, etc).
+ * `getTicketComments` per repeat upsert on the hot path (`story-init`,
+ * `verification-results`, etc).
  *
  * Lifecycle:
  *   - First call to `findStructuredComment(provider, t, type, attrs)`
@@ -332,8 +342,8 @@ export function structuredCommentCacheKey(ticketId, type, attrs) {
  * array returned by the most recent `provider.getTicketComments(ticketId)`
  * call. Story #2465 — `findStructuredComment` is invoked back-to-back for
  * different `type` discriminators against the same ticket (e.g.
- * `story-run-progress` + `epic-run-progress` + a `friction` probe during
- * an Epic-close wave). Without this cache each lookup pays a full
+ * `story-init` + `verification-results` + a `friction` probe during a
+ * single close). Without this cache each lookup pays a full
  * pagination round-trip even when the prior call already fetched the
  * same comments. The structured-comment-id cache short-circuits *repeat*
  * lookups for the same `(type, attrs)` tuple but does not help across

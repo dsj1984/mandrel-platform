@@ -1,7 +1,7 @@
 /**
  * phases/auto-merge.js — enable GitHub native auto-merge on the PR.
  *
- * Mirrors the epic-deliver finalize call shape: squash strategy, delete
+ * Mirrors the v2 `single-story-close.js` finalize call shape: squash strategy, delete
  * the branch on merge. Non-fatal — returns `{ enabled: false, reason }`
  * on any failure so the caller can fall back to the operator-merges-button
  * path.
@@ -27,6 +27,30 @@
 
 import { gh as defaultGh } from '../../../gh-exec.js';
 import { resolveAutoMergeArmCwd } from '../../auto-merge-cwd.js';
+
+/**
+ * Arm reasons that mean **the operator deliberately owns the merge** — the PR
+ * was never armed because it was asked not to be, not because arming failed.
+ *
+ * The distinction is load-bearing: an un-armed-by-request PR has nothing for
+ * close to land, so `resolveWaitForMerge` (`./options.js`) resolves
+ * `waitForMerge` to `false` for these reasons and the Story rests at
+ * `agent::closing` for the human. Every *other* falsy arm outcome
+ * (`pr-number-unparseable`, an `enableAutoMerge` failure) is a genuine fault
+ * and still routes through the merge-unlanded block path.
+ */
+const OPERATOR_MERGE_ARM_REASONS = Object.freeze([
+  'disabled-by-flag',
+  'disabled-by-policy-strict',
+]);
+
+/**
+ * @param {string|null|undefined} reason
+ * @returns {boolean}
+ */
+export function isOperatorMergeReason(reason) {
+  return OPERATOR_MERGE_ARM_REASONS.includes(reason);
+}
 
 /**
  * Enable GitHub native auto-merge on the PR. Non-fatal.
@@ -139,6 +163,7 @@ function makeDefaultGhAutoMergeRunner(gh) {
  *   prNumber: number|null,
  *   prUrl: string,
  *   noAutoMerge: boolean,
+ *   autoMergePolicy?: 'trust-ci'|'strict',
  *   gh?: ReturnType<typeof import('../../../gh-exec.js').createGh>,
  *   progress: (tag: string, msg: string) => void,
  * }} args
@@ -149,12 +174,30 @@ export async function runAutoMergePhase({
   prNumber,
   prUrl,
   noAutoMerge,
+  autoMergePolicy = 'trust-ci',
   gh,
   progress,
 }) {
   if (noAutoMerge) {
     progress('PR', '⏭  Auto-merge disabled (--no-auto-merge).');
     return { autoMergeEnabled: false, autoMergeReason: 'disabled-by-flag' };
+  }
+  // `delivery.ci.autoMerge: "strict"` opts standalone Stories out of
+  // auto-merge (parallel to the Epic path's strict predicate): the PR opens
+  // and waits for an operator merge instead of arming native auto-merge.
+  // The default `"trust-ci"` keeps arming on green required CI — GitHub's
+  // native `--auto` is the required-check gate, so no client-side predicate
+  // is needed here (unlike the Epic path, which gates on local
+  // audit/review/retro signals a standalone Story does not produce).
+  if (autoMergePolicy === 'strict') {
+    progress(
+      'PR',
+      '⏭  Auto-merge skipped (delivery.ci.autoMerge="strict") — operator merges.',
+    );
+    return {
+      autoMergeEnabled: false,
+      autoMergeReason: 'disabled-by-policy-strict',
+    };
   }
   if (prNumber == null) {
     progress(

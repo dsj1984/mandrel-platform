@@ -20,7 +20,6 @@
  */
 
 import { Logger } from '../../Logger.js';
-import { TYPE_LABELS } from '../../label-constants.js';
 import { ALL_STATES, STATE_LABELS } from './reads.js';
 import {
   postStructuredComment,
@@ -33,7 +32,7 @@ import {
  * 5xx, transport timeouts) inside the cascade transition. Three attempts with
  * exponential backoff (250ms / 500ms / 1000ms) mirrors the budget used by
  * `gitFetchWithRetry` (see `lib/git-utils.js`) and the HTTP-client retry path
- * referenced by `epic-plan-decompose.js`. Backoff is overridable via
+ * referenced by the plan persist surface. Backoff is overridable via
  * {@link __setCascadeRetryDelays} so tests don't pay real wall-clock time.
  */
 const CASCADE_RETRY_BACKOFF_MS = [250, 500, 1000];
@@ -290,30 +289,6 @@ async function processCascadeParentLocked(
     );
     if (!allDone) return { cascadedTo, failed };
 
-    // EXCLUSION: Epics do not auto-close via cascade. Epics close via
-    // formal /deliver (its own machinery handles branch merges,
-    // PR-driven `Closes #N` auto-close, and a recovery transition in
-    // `epic-deliver-finalize.js`).
-    //
-    // Legacy planning tickets (pre-#4324 `context::*` artifacts on
-    // historical Epics) DO close via cascade (Story #1951): leaving
-    // them open as native sub-issues of the Epic blocks GitHub from
-    // honoring the Epic's `Closes #N` footer. New Epics carry their
-    // planning content on the Epic body itself, so this branch is
-    // purely a legacy-hygiene path.
-    //
-    // Reuse the parentSnapshot from the idempotency check above — it is
-    // a fresh read (cache was invalidated before the getTicket call) and
-    // the parent's type label is invariant within a single cascade lock
-    // hold, so a second getTicket is wasteful and redundant.
-    const isEpic = parentSnapshot.labels.includes(TYPE_LABELS.EPIC);
-    if (isEpic) {
-      logger.warn(
-        `[Ticketing] Cascade reached Epic #${parentId}. Skipping auto-close (Epics close via the operator's PR merge).`,
-      );
-      return { cascadedTo, failed };
-    }
-
     // Retry the parent transition on transient `gh` failures (rate limit,
     // 5xx, transport timeouts). Permanent failures fall through to the
     // outer catch on the first attempt so the operator sees the real
@@ -382,7 +357,7 @@ async function processCascadeParentLocked(
  *   unset so the module-level {@link Logger} is used.
  * @returns {Promise<{ cascadedTo: number[], failed: Array<{ parentId: number, error: string }> }>}
  */
-export async function cascadeCompletion(provider, ticketId, opts = {}) {
+async function cascadeCompletion(provider, ticketId, opts = {}) {
   const ticket = await provider.getTicket(ticketId);
 
   // Determine if this ticket is agent::done
@@ -390,43 +365,14 @@ export async function cascadeCompletion(provider, ticketId, opts = {}) {
     return { cascadedTo: [], failed: [] };
   }
 
+  // Story #4545 — one strategy, not three. The `parent: #N` body footer and
+  // the native sub-issue link were both written by `createTicket`, the
+  // Epic-hierarchy write surface deleted in the same Story; with no writer,
+  // the body regex could only ever miss and the native lookup could only
+  // ever spend an API call to learn the same. The operator-settable `blocks`
+  // annotation is the one parent edge that can still exist.
   const { blocks: parentIds } = await provider.getTicketDependencies(ticketId);
-
-  // Fallback: parse `parent: #NNN` from the body when `blocks` syntax isn't used (C-5).
-  let parsedParents = parentIds;
-  if (!parsedParents || parsedParents.length === 0) {
-    const parentMatch = ticket.body
-      ? [...ticket.body.matchAll(/parent:\s*#(\d+)/gi)]
-      : [];
-    parsedParents = parentMatch.map((m) => Number.parseInt(m[1], 10));
-  }
-
-  // Story #2982 — third fallback: GitHub's native Sub-Issues API. The
-  // resume reconciler can strip the `parent: #N` orchestrator footer
-  // from a Story body (see Issue 2 in #2982); without the body marker
-  // the cascade silently returned `{ cascadedTo: [], failed: [] }` and
-  // left intermediate parent tickets stranded OPEN. The native link is
-  // independent of body text, so consult it when the first two
-  // strategies came back empty.
-  if (
-    parsedParents.length === 0 &&
-    typeof provider._getNativeParent === 'function' &&
-    ticket.nodeId
-  ) {
-    try {
-      const nativeParent = await provider._getNativeParent(
-        ticket.nodeId,
-        ticketId,
-      );
-      if (typeof nativeParent === 'number') {
-        parsedParents = [nativeParent];
-      }
-    } catch (err) {
-      Logger.warn(
-        `[cascadeCompletion] native parent lookup failed for #${ticketId}: ${err.message}`,
-      );
-    }
-  }
+  const parsedParents = Array.isArray(parentIds) ? parentIds : [];
 
   if (parsedParents.length === 0) {
     return { cascadedTo: [], failed: [] };
@@ -562,22 +508,18 @@ export async function cascadeParentState(provider, ticketId, opts = {}) {
 }
 
 /**
- * Resolve the parent issue ids for a ticket: native `blocks:` dependency
- * annotations first, then `parent: #NNN` body references as a fallback.
- * Mirrors the resolution path used by {@link cascadeCompletion}.
+ * Resolve the parent issue ids for a ticket from its `blocks:` dependency
+ * annotations. Mirrors the resolution path used by {@link cascadeCompletion}
+ * — see there for why the `parent: #NNN` body fallback is gone (Story #4545).
  *
  * @param {import('../../ITicketingProvider.js').ITicketingProvider} provider
- * @param {object} ticket
+ * @param {object} _ticket
  * @param {number} ticketId
  * @returns {Promise<number[]>}
  */
-async function resolveParentIds(provider, ticket, ticketId) {
+async function resolveParentIds(provider, _ticket, ticketId) {
   const { blocks: parentIds } = await provider.getTicketDependencies(ticketId);
-  if (Array.isArray(parentIds) && parentIds.length > 0) return parentIds;
-  const parentMatch = ticket?.body
-    ? [...ticket.body.matchAll(/parent:\s*#(\d+)/gi)]
-    : [];
-  return parentMatch.map((m) => Number.parseInt(m[1], 10));
+  return Array.isArray(parentIds) ? parentIds : [];
 }
 
 /**

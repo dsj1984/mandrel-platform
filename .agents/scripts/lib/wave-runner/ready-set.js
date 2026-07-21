@@ -2,8 +2,8 @@
  * lib/wave-runner/ready-set.js — the path-agnostic ready-set scheduling
  * core.
  *
- * This module is the scheduling kernel both the Epic and standalone
- * delivery paths dispatch through. It replaces wave-*batch* selection
+ * This module is the scheduling kernel the v2 `/deliver` multi-Story path
+ * dispatches through (`stories-wave-tick.js`). It replaces wave-*batch* selection
  * (group N must fully drain before group N+1 opens) with *continuous*,
  * dependency-driven selection: a Story becomes dispatchable the instant
  * **its own** dependencies are satisfied, regardless of whether unrelated
@@ -15,14 +15,14 @@
  * reads GitHub, the lifecycle ledger, nor a checkpoint, and it dispatches
  * nothing. Callers supply the live Story records (already fetched), the
  * resolved `inFlight` count, and the `globalCap`, and receive back the set
- * of Stories that are safe to dispatch on this beat. Later Stories wire the
- * Epic / standalone adapters on top of this core; this Story ships the core
- * alone and does not modify `tick.js` or `stories-wave-tick.js`.
+ * of Stories that are safe to dispatch on this beat. The
+ * `stories-wave-tick.js` adapter wires this core; this module does not
+ * modify that CLI surface.
  *
  * Three exports:
  *   - `classifyStory(story)` — live-label classifier mapping a Story
  *     record's labels + issue state to one of `done | blocked | executing |
- *     ready`. Mirrors the done-predicate `tick.js` already uses
+ *     ready`. Mirrors the done-predicate this module uses
  *     (`agent::done` OR closed issue) so a Story closed manually through
  *     the GitHub UI is recognised as done.
  *   - `storiesOverlap(a, b)` — the file-overlap co-dispatch guard: true
@@ -157,14 +157,36 @@ export function storyFootprint(story) {
 }
 
 /**
- * File-overlap co-dispatch guard. Returns `true` when two Stories' declared
- * file footprints intersect on at least one path — meaning they would race
- * the same file if dispatched onto parallel `story-<id>` branches in the
- * same beat. Two Stories that overlap MUST NOT both appear in one dispatch
- * set; one is withheld until the other clears.
+ * Does a declared path contain a glob metacharacter? Mirrors the detection
+ * in `story-body.js#extractChangePaths`, whose `isGlob` flag documents an
+ * "unknown-width footprint" policy that was never implemented downstream.
  *
- * An empty footprint on either side means "no known overlap" → `false`. A
- * Story that declares no files is therefore never withheld by this guard.
+ * @param {string} path
+ * @returns {boolean}
+ */
+function isGlobPath(path) {
+  return path.includes('*') || path.includes('?') || path.includes('{');
+}
+
+/**
+ * File-overlap co-dispatch guard. Returns `true` when two Stories' declared
+ * file footprints intersect — meaning they would race the same file if
+ * dispatched onto parallel `story-<id>` branches in the same beat. Two
+ * Stories that overlap MUST NOT both appear in one dispatch set; one is
+ * withheld until the other clears.
+ *
+ * Two deliberate asymmetries:
+ *
+ *   - **An empty footprint means "no known overlap"** → `false`. A Story that
+ *     declares no files is never withheld. This is permissive by necessity:
+ *     an undeclared footprint carries no information, and withholding on
+ *     absence would serialize every run.
+ *   - **A glob footprint overlaps EVERYTHING** → `true` (Story #4539/#4540).
+ *     Comparison is exact-string, so a Story declaring
+ *     `.agents/scripts/lib/**` would not match another declaring
+ *     `.agents/scripts/lib/story-adjacency.js` — the guard would silently
+ *     pass two Stories that genuinely race. Unknown width is not the same as
+ *     no width: fail safe by serializing.
  *
  * @param {StoryRecord} a
  * @param {StoryRecord} b
@@ -176,7 +198,11 @@ export function storiesOverlap(a, b) {
   const fb = storyFootprint(b);
   if (fb.size === 0) return false;
   for (const path of fa) {
+    if (isGlobPath(path)) return true;
     if (fb.has(path)) return true;
+  }
+  for (const path of fb) {
+    if (isGlobPath(path)) return true;
   }
   return false;
 }

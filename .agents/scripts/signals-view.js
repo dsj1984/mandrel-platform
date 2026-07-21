@@ -5,7 +5,7 @@
  * Task #1463).
  *
  * Reads signals via `lib/signals/read`, materialises a span-tree via
- * `lib/signals/buildSpanTree`, and prints a readable Epic → Story → Task →
+ * `lib/signals/buildSpanTree`, and prints a readable run → Story →
  * events tree to stdout. The output is **plain text via
  * `process.stdout.write`** — no Ink, no blessed, no terminal-control
  * escape sequences — so it works on Windows + bash hosts (see
@@ -16,10 +16,10 @@
  * stdout uses `process.stdout.write`, not the console).
  *
  * Usage:
- *   node .agents/scripts/signals-view.js <epic-id> [--story <id>]
+ *   node .agents/scripts/signals-view.js <run-id> [--story <id>]
  *
  * Args:
- *   <epic-id>            Positive integer Epic ID. Required.
+ *   <run-id>             Positive integer run ID. Required.
  *   --story <id>         Optional positive integer Story ID. When set,
  *                        narrows the printed tree to a single Story
  *                        subtree.
@@ -27,7 +27,7 @@
  * Exit codes:
  *   0  — happy path, OR missing signals file (friendly message printed,
  *        no stack trace).
- *   1  — bad arguments (non-integer epic, missing positional, etc.).
+ *   1  — bad arguments (non-integer run, missing positional, etc.).
  *
  * Tempfile contract:
  *   The viewer resolves the on-disk signals path via the configured
@@ -57,7 +57,7 @@ function println(line) {
 }
 
 const USAGE =
-  'Usage: node .agents/scripts/signals-view.js <epic-id> [--story <id>] [--temp-root <path>]';
+  'Usage: node .agents/scripts/signals-view.js <run-id> [--story <id>] [--temp-root <path>]';
 
 /**
  * Parse a token as a strict positive integer (no leading +, no float, no
@@ -86,7 +86,7 @@ const HELP_FLAGS = new Set(['--help', '-h']);
  * print a friendly message and exit 1 without a stack trace.
  *
  * Delegates the flag walking to `parseStandardCliArgs` and post-validates
- * the diagnose-specific invariants (single positional epic-id, strictly
+ * the signals-view-specific invariants (single positional run-id, strictly
  * positive integers for both ids).
  *
  * @param {string[]} argv
@@ -94,7 +94,7 @@ const HELP_FLAGS = new Set(['--help', '-h']);
  */
 export function parseArgs(argv) {
   if (!Array.isArray(argv) || argv.length === 0) {
-    return err(`missing <epic-id>. ${USAGE}`);
+    return err(`missing <run-id>. ${USAGE}`);
   }
   if (argv.some((t) => HELP_FLAGS.has(t))) return err(USAGE);
 
@@ -118,7 +118,7 @@ export function parseArgs(argv) {
   // Exactly one positional, which must be a strictly positive integer
   // (no leading `+`, no float, no trailing junk).
   if (positionals.length === 0) {
-    return err(`missing <epic-id>. ${USAGE}`);
+    return err(`missing <run-id>. ${USAGE}`);
   }
   if (positionals.length > 1) {
     return err(`unexpected token ${JSON.stringify(positionals[1])}. ${USAGE}`);
@@ -126,7 +126,7 @@ export function parseArgs(argv) {
   const epic = parseStrictPositiveInt(positionals[0]);
   if (epic == null) {
     return err(
-      `<epic-id> must be a positive integer; got ${JSON.stringify(positionals[0])}. ${USAGE}`,
+      `<run-id> must be a positive integer; got ${JSON.stringify(positionals[0])}. ${USAGE}`,
     );
   }
 
@@ -161,7 +161,7 @@ function formatDuration(ms) {
 }
 
 function describeEvent(evt) {
-  const ts = evt?.ts ?? evt?.timestamp ?? '(no ts)';
+  const ts = evt?.ts ?? '(no ts)';
   const kind = evt?.kind ?? '(no kind)';
   const phase = evt?.phase ? ` phase=${evt.phase}` : '';
   const category = evt?.category ? ` category=${evt.category}` : '';
@@ -174,13 +174,13 @@ function describeEvent(evt) {
  * `process.stdout.write`). Logger is intentionally not used: the
  * viewer's contract is "dumb terminal compatible, parseable output".
  *
- * @param {{ epic: number | null, stories: Array<object> }} tree
+ * @param {{ run: number | null, stories: Array<object> }} tree
  * @param {{ storyFilter?: number | null }} [opts]
  * @returns {void}
  */
 export function renderTree(tree, opts = {}) {
   const filter = opts.storyFilter ?? null;
-  println(`Epic #${tree.epic ?? '?'}`);
+  println(`Run #${tree.run ?? '?'}`);
   const stories =
     filter == null ? tree.stories : tree.stories.filter((s) => s.id === filter);
 
@@ -226,12 +226,16 @@ export async function main(argv, deps = {}) {
     println(parsed.error);
     return 1;
   }
-  const { epic, story, tempRoot } = parsed;
+  const { epic: runId, story, tempRoot } = parsed;
   const read = deps.read ?? signals.read;
   const buildSpanTree = deps.buildSpanTree ?? signals.buildSpanTree;
   const config = buildConfig(tempRoot);
 
-  const iter = read(story != null ? { epic, story, config } : { epic, config });
+  // The reader resolves the run directory through temp-paths
+  // (`temp/run-<id>/`) keyed by the `run` id.
+  const iter = read(
+    story != null ? { run: runId, story, config } : { run: runId, config },
+  );
 
   // Eagerly collect to detect the missing-file case before we start
   // printing — when the iterator yields nothing we want a friendly
@@ -241,7 +245,7 @@ export async function main(argv, deps = {}) {
     tree = await buildSpanTree(iter);
   } catch (err) {
     println(
-      `signals: failed to read signals for Epic #${epic}: ${
+      `signals: failed to read signals for run #${runId}: ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
@@ -250,7 +254,7 @@ export async function main(argv, deps = {}) {
 
   if (tree.stories.length === 0) {
     const scope = story != null ? ` (Story #${story})` : '';
-    println(`No signals found for Epic #${epic}${scope}.`);
+    println(`No signals found for run #${runId}${scope}.`);
     return 0;
   }
 
@@ -258,15 +262,15 @@ export async function main(argv, deps = {}) {
   // `story` is omitted. If the requested Story filter doesn't match any
   // observed Story id, treat that as the missing-file case too.
   if (story != null && !tree.stories.some((s) => s.id === story)) {
-    println(`No signals found for Epic #${epic} (Story #${story}).`);
+    println(`No signals found for run #${runId} (Story #${story}).`);
     return 0;
   }
 
-  // Pin the Epic id on the tree to the requested one — `buildSpanTree`
-  // pins it from the first observed event, which is normally the same,
-  // but if every event lacks an `epic` field the tree's `epic` would be
-  // `null` while we still know what was requested.
-  if (tree.epic == null) tree = { ...tree, epic };
+  // Pin the run id on the tree to the requested one — `buildSpanTree`
+  // stores it in the `run` field from the first observed event, which is
+  // normally the same, but if every event lacks that field the tree's
+  // `run` would be `null` while we still know what was requested.
+  if (tree.run == null) tree = { ...tree, run: runId };
 
   renderTree(tree, { storyFilter: story });
   return 0;

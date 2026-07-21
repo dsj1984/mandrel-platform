@@ -109,25 +109,57 @@ const PROJECT_SCHEMA = {
 
 /**
  * Curated webhook event vocabulary. The webhook channel is gated by an
- * explicit allowlist of event names — the webhook narrative is "epic %
- * progress + blockers", not the firehose of per-story transitions that the
- * GitHub-comment channel still receives.
+ * explicit allowlist of event names — the vocabulary mirrors the events the
+ * v2 runtime actually emits through `notify()` (Story transitions, merge
+ * outcomes, loop lifecycle beats).
+ *
+ * `story.heartbeat` was retired here (A22): the vocabulary's contract is
+ * "events the runtime actually emits", and nothing could emit this one. Its
+ * emitter (`emit-story-heartbeat.js`) demanded an `epicId >= 1` while the
+ * sole call path (`single-story-init.js` → `setActiveStoryEnv`) passed
+ * `epicId: null`, so `CC_EPIC_ID` was never set and the hook that would have
+ * fired the beat always short-circuited. Emitter, hook, and schema are all
+ * deleted; keeping the name allowlistable would let an operator subscribe to
+ * a channel that can never deliver. Removing it from the enum makes a
+ * resurrection fail loudly at config-validation time rather than silently
+ * never firing.
  */
 export const WEBHOOK_EVENT_NAMES = Object.freeze([
-  'epic-started',
-  'epic-progress',
-  'epic-blocked',
-  'epic-unblocked',
-  'epic-complete',
+  'state-transition',
+  'story-merged',
+  'story-closing',
+  'operator-message',
+  'merge.unlanded',
+  'merge.flip-failed',
+  'loop.tick',
 ]);
 
 /**
  * Curated GitHub-comment event vocabulary. The comment channel is gated by
  * an explicit allowlist of event names — same model as `webhookEvents`.
+ *
+ * **Deliberately narrower than {@link WEBHOOK_EVENT_NAMES}**, and the axis
+ * is ticket scope, not importance. A comment is written *onto a Story
+ * issue*, so only events that are about one Story, and whose message reads
+ * as narrative an operator wants durably on the ticket, belong here. The
+ * webhook-only remainder — `merge.unlanded`, `merge.flip-failed`,
+ * `loop.tick` — are run-scoped or firehose beats;
+ * mirroring them onto the ticket would bury the narrative under machine
+ * chatter, and `notify()` drops a comment for any dispatch without a
+ * resolvable ticket id regardless.
+ *
+ * `story-closing` IS in scope by that rule (Story-scoped, `level: 'story'`,
+ * human-readable — the same shape as `story-merged`) and its earlier
+ * absence was an oversight: the event was emittable to webhooks but could
+ * not be allowlisted for comments at all. It is in the vocabulary but NOT
+ * in the shipped default (`config/github.js` `NOTIFICATIONS_DEFAULTS`) —
+ * opting in is an operator choice, not a behaviour change forced on every
+ * consumer.
  */
 export const COMMENT_EVENT_NAMES = Object.freeze([
   'state-transition',
   'story-merged',
+  'story-closing',
   'operator-message',
 ]);
 
@@ -208,19 +240,14 @@ const GITHUB_SCHEMA = {
 // planning.* — inputs to /plan
 // ---------------------------------------------------------------------------
 
-/**
- * `planning.context` — bounded planning-context budget for `--emit-context`
- * payloads. When the full payload would exceed `maxBytes`, planners switch
- * to a summary representation.
- */
-const PLANNING_CONTEXT_SCHEMA = {
-  type: 'object',
-  properties: {
-    maxBytes: { type: 'integer', minimum: 1024 },
-    summaryMode: { type: 'string', enum: ['auto', 'always', 'never'] },
-  },
-  additionalProperties: false,
-};
+// Story #4541: `planning.context.{maxBytes, summaryMode}` was retired. The
+// `applyBudget` pass it fed lost its last caller in the v2 cutover, and it
+// bounded a field the envelope builders discarded before shipping the raw seed
+// anyway — so the key resolved but capped nothing. The live bound on
+// planner-context size is the fixed `PLAN_CONTEXT_ENVELOPE_BYTE_CEILING` in
+// `lib/orchestration/plan-context.js`. Setting `planning.context` is now
+// rejected as an additional property, so a resurrected key fails loudly rather
+// than silently doing nothing.
 
 /**
  * Story #2634 — `planning.codebaseSnapshot` controls the structural
@@ -246,65 +273,79 @@ const CODEBASE_SNAPSHOT_SCHEMA = {
   additionalProperties: false,
 };
 
-/**
- * `planning.taskSizing` — Story-sizing thresholds consumed by
- * `ticket-validator-sizing.js`. Operator overrides shallow-merge with
- * `DEFAULT_TASK_SIZING` defaults (softFiles 15, hardFiles 30,
- * maxAcceptance 14, softAcceptanceCount 10 — the uniform relaxed profile
- * from Story #3874). Story #3760 collapsed the per-profile matrix and the
- * parallel `testSurface` axis into a flat set of knobs; the `sizingProfile`
- * enum was replaced by an optional body-level `wide` declaration that lifts
- * the `hardFiles` rejection.
- */
-const TASK_SIZING_SCHEMA = {
-  type: 'object',
-  properties: {
-    softFiles: { type: 'integer', minimum: 1 },
-    hardFiles: { type: 'integer', minimum: 1 },
-    maxAcceptance: { type: 'integer', minimum: 1 },
-    softAcceptanceCount: { type: 'integer', minimum: 1 },
-    // Under-size (merge-candidate) thresholds (Story #4312). A Story whose
-    // footprint is at or below BOTH ceilings and that carries a `depends_on`
-    // edge to a sibling trips the advisory `merge-candidate` soft finding.
-    mergeCandidateMaxFiles: { type: 'integer', minimum: 1 },
-    mergeCandidateMaxAcceptance: { type: 'integer', minimum: 1 },
-  },
-  additionalProperties: false,
-};
-
 const PLANNING_SCHEMA = {
   type: 'object',
   properties: {
     riskHeuristics: LIST_OR_EXTENDER_OF_STRINGS,
-    context: PLANNING_CONTEXT_SCHEMA,
     codebaseSnapshot: CODEBASE_SNAPSHOT_SCHEMA,
-    taskSizing: TASK_SIZING_SCHEMA,
     // Cross-Story conflict-finding severity gates. Off by default so
     // existing repos keep advisory-only behaviour; flipping either to
     // `true` upgrades the matching finding class to `'hard'`, which routes
     // it through the validator's `errors[]` channel and trips the bounded
     // decompose loop's re-prompt gate.
-    failOnSharedEditors: { type: 'boolean' },
-    requireExplicitCrossStoryDeps: { type: 'boolean' },
+    // `planning.modelCapacity` was collapsed to the framework constant
+    // `DEFAULT_MODEL_CAPACITY` in ticket-validator-sizing.js (authored-
+    // tokens-only mass); setting it in a config is rejected as an
+    // additional property.
+    failOnSharedEditors: {
+      type: 'boolean',
+      description:
+        'When true, upgrade shared-editor conflict findings to hard errors (default false — advisory soft findings only).',
+    },
+    requireExplicitCrossStoryDeps: {
+      type: 'boolean',
+      description:
+        'When true, upgrade implicit cross-Story dependency findings to hard errors (default false — advisory soft findings only).',
+    },
     // Cross-cutting registry conflict knobs consumed by
     // `ticket-validator-conflicts.js` (wired through
     // `epic-plan-decompose/phases/planning-artifacts.js`).
     // `crossCuttingRegistries` names the registry paths whose concurrent
     // edits are flagged; `failOnRegistryConflicts` upgrades that finding to
     // `'hard'`. `failOnLargeFanOut` / `largeFanOutThreshold` gate the
-    // single-Story fan-out finding.
-    crossCuttingRegistries: LIST_OR_EXTENDER_OF_STRINGS,
-    failOnRegistryConflicts: { type: 'boolean' },
-    failOnLargeFanOut: { type: 'boolean' },
-    largeFanOutThreshold: { type: 'integer', minimum: 0 },
-    // Navigability-reachability config consumed by the epic-plan-healthcheck
-    // --paranoid reachability check (Epic #4131, F7). Opt-in: absent or empty
-    // routeGlobs degrades to a silent no-op.
+    // delete blast-radius finding (call sites of a module a Story marks
+    // `assumption: "deletes"`).
+    crossCuttingRegistries: {
+      ...LIST_OR_EXTENDER_OF_STRINGS,
+      description:
+        'Registry path patterns whose concurrent edits across Stories are flagged as conflicts. Defaults to the framework listener/handler index patterns when omitted.',
+    },
+    failOnRegistryConflicts: {
+      type: 'boolean',
+      description:
+        'When true, upgrade cross-cutting registry conflict findings to hard errors (default false).',
+    },
+    failOnLargeFanOut: {
+      type: 'boolean',
+      description:
+        'When true, upgrade fan-out-warning findings (delete blast radius) to hard errors (default false — soft advisory).',
+    },
+    largeFanOutThreshold: {
+      type: 'integer',
+      minimum: 0,
+      description:
+        'Call-site count above which a Story that deletes a module emits a fan-out-warning. Counts base-branch references to the deleted path basename. Soft by default; does not size or reject Stories. Default 10.',
+    },
+    // Navigability-reachability config consumed by the plan-persist draft
+    // reachability gate (Epic #4131 F7; demoted into persist by #4474 PR6).
+    // Opt-in: absent or empty routeGlobs degrades to a silent no-op.
     navigation: {
       type: 'object',
+      description:
+        'Opt-in navigability reachability gate. Absent or empty routeGlobs is a silent no-op.',
       properties: {
-        routeGlobs: { type: 'array', items: { type: 'string' } },
-        navRegistry: { type: 'array', items: { type: 'string' } },
+        routeGlobs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Glob patterns (e.g. pages/**, app/**/route.ts) marking paths that add a user-facing route.',
+        },
+        navRegistry: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Tokens identifying the nav-registry SSOT a route-adding Story is expected to reference.',
+        },
       },
       additionalProperties: false,
     },

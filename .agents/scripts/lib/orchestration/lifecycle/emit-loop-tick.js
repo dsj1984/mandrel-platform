@@ -9,14 +9,12 @@
  * appends an inspectable `emitted` line a reconciler can read for
  * forward-progress evidence.
  *
- * Distinct from `story.heartbeat` (emit-story-heartbeat.js): the
- * heartbeat carries Story-phase info for a single in-flight Story and is
- * always Epic-scoped (its ledger path is `epicLedgerPath(epicId)`). A
- * host loop is not bound to a Story tier, so `loop.tick` carries a
+ * A host loop is not bound to a Story tier, so `loop.tick` carries a
  * free-form `loopName`, a monotonic `round` counter, the loop's
- * configured `cadence` label, and a per-round `status` instead. Keeping
- * the two events separate means a loop tick never masquerades as Story
- * progress (and vice versa).
+ * configured `cadence` label, and a per-round `status`. It is now the only
+ * forward-progress beat: the Story-scoped `story.heartbeat` it was once
+ * contrasted against was Epic-scoped by construction, could never fire under
+ * v2 (which has no Epics), and was deleted (A22).
  *
  * Bus path (Story acceptance: "Emitting a loop.tick event THROUGH the
  * lifecycle bus appends a record to the per-run ledger"): this helper
@@ -39,15 +37,15 @@
  * Ledger path resolution: a caller supplies EITHER an explicit
  * `ledgerPath` (the host-loop case — the loop owns where its ledger
  * lives) OR an `epicId`, in which case the canonical
- * `epicLedgerPath(epicId)` is used so an Epic-scoped loop's ticks land
- * in the same `temp/epic-<id>/lifecycle.ndjson` the rest of the run
+ * `runLedgerPath(epicId)` is used so an Epic-scoped loop's ticks land
+ * in the same `temp/run-<id>/lifecycle.ndjson` the rest of the run
  * reads. Exactly one of the two MUST be supplied.
  */
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { epicLedgerPath } from '../../config/temp-paths.js';
+import { runLedgerPath } from '../../config/temp-paths.js';
 import { createBus } from './bus.js';
 import { createLedgerWriter } from './ledger-writer.js';
 
@@ -65,8 +63,8 @@ const SCHEMA_DIR = path.resolve(
 const VALID_STATUSES = new Set(['running', 'done', 'blocked']);
 
 /**
- * Parse `temp/epic-<id>/lifecycle.ndjson` (or any
- * `<dir>/epic-<id>/lifecycle.ndjson`) back into `{ tempRoot, epicId }`
+ * Parse `temp/run-<id>/lifecycle.ndjson` (or any
+ * `<dir>/run-<id>/lifecycle.ndjson`) back into `{ tempRoot, epicId }`
  * so a LedgerWriter — which is constructed from `{ epicId, tempRoot }`
  * rather than a raw path — can be bound to the supplied ledger path.
  *
@@ -79,13 +77,13 @@ const VALID_STATUSES = new Set(['running', 'done', 'blocked']);
  * @returns {{ tempRoot: string, epicId: number }}
  */
 function decomposeLedgerPath(ledgerPath) {
-  const epicDir = path.dirname(ledgerPath);
-  const tempRoot = path.dirname(epicDir);
-  const epicDirName = path.basename(epicDir);
-  const m = /^epic-(\d+)$/.exec(epicDirName);
+  const runDir = path.dirname(ledgerPath);
+  const tempRoot = path.dirname(runDir);
+  const runDirName = path.basename(runDir);
+  const m = /^run-(\d+)$/.exec(runDirName);
   if (!m) {
     throw new Error(
-      `emitLoopTick: ledgerPath does not match <tempRoot>/epic-<id>/lifecycle.ndjson layout (got ${ledgerPath})`,
+      `emitLoopTick: ledgerPath does not match <tempRoot>/run-<id>/lifecycle.ndjson layout (got ${ledgerPath})`,
     );
   }
   const epicId = Number.parseInt(m[1], 10);
@@ -104,7 +102,7 @@ function decomposeLedgerPath(ledgerPath) {
  *                                   One of running|done|blocked.
  * @param {string} [opts.timestamp]  ISO-8601 wall clock. Defaults to now().
  * @param {number} [opts.epicId]     When supplied (and no `ledgerPath`),
- *                                   the canonical `epicLedgerPath(epicId)`
+ *                                   the canonical `runLedgerPath(epicId)`
  *                                   is used for the ledger.
  * @param {object} [opts.config]     Optional resolved config for tempRoot
  *                                   (only consulted on the `epicId` path).
@@ -158,7 +156,7 @@ export async function emitLoopTick(opts) {
     if (!Number.isInteger(epicId) || epicId < 1) {
       throw new Error('emitLoopTick: epicId must be a positive integer');
     }
-    ledgerPath = epicLedgerPath(epicId, config);
+    ledgerPath = runLedgerPath(epicId, config);
   }
 
   const payload = {

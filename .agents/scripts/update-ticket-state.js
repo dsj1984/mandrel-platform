@@ -1,23 +1,14 @@
 /**
- * .agents/scripts/update-ticket-state.js — CLI Re-export Shim
- *
- * Thin backward-compatibility shim. The core logic has been moved to
- * `lib/orchestration/ticketing.js` as part of the SDK refactor.
- *
- * This file preserves backward compatibility for CLI usage and existing
- * testing patterns.
- *
- * Successor to the retired mandrel MCP tools. See ADR 20260424-702a in docs/decisions.md for the migration table.
+ * .agents/scripts/update-ticket-state.js — CLI entrypoint for ticket
+ * label transitions. Core logic lives in `lib/orchestration/ticketing.js`;
+ * this file is the operator-facing command surface (not a compatibility
+ * layer).
  */
 
 import { parseArgs } from 'node:util';
 import { resolveConfig } from './lib/config-resolver.js';
 import { Logger } from './lib/Logger.js';
-import {
-  cascadeCompletion,
-  STATE_LABELS,
-  transitionTicketState,
-} from './lib/orchestration/ticketing.js';
+import { transitionTicketState } from './lib/orchestration/ticketing.js';
 import { createProvider } from './lib/provider-factory.js';
 
 // ── CLI Main Block ────────────────────────────────────────────────────────
@@ -29,7 +20,6 @@ if (
   const { values } = parseArgs({
     args: process.argv.slice(2),
     options: {
-      task: { type: 'string' },
       ticket: { type: 'string' },
       state: { type: 'string' },
       'remove-label': { type: 'string' },
@@ -37,17 +27,14 @@ if (
     strict: false,
   });
 
-  // `--ticket` is the v5.9.0 alias for `--task` (labels can apply to any
-  // ticket type, not just Tasks). Both continue to work.
-  const idSource = values.ticket ?? values.task;
-  const ticketId = Number.parseInt(idSource, 10);
+  const ticketId = Number.parseInt(values.ticket, 10);
   const state = values.state;
   const removeLabel = values['remove-label'];
 
   if (Number.isNaN(ticketId) || (!state && !removeLabel)) {
     throw new Error(
       'Usage: node update-ticket-state.js ' +
-        '(--ticket|--task) <id> ' +
+        '--ticket <id> ' +
         '[--state <state> | --remove-label <label>]',
     );
   }
@@ -72,21 +59,14 @@ if (
     Logger.info(
       `[State-Sync] Transitioning ticket #${ticketId} to ${state}...`,
     );
+    // Story #4545 — no second cascade here. `transitionTicketState` already
+    // fires the upward cascade on every transition (bulk.js registers
+    // `cascadeParentState` as transition.js's cascade runner, and the DONE
+    // branch delegates to `cascadeCompletion`), so the explicit call this
+    // used to make re-walked the same parents and re-spent the same API
+    // calls a second time on every done transition — under a Story-only
+    // model where no orchestration parent exists to find.
     await transitionTicketState(provider, ticketId, state);
-
-    if (state === STATE_LABELS.DONE) {
-      Logger.info(`[State-Sync] Cascading completion from #${ticketId}...`);
-      const cascade = await cascadeCompletion(provider, ticketId);
-      // Hoisted out of the `for...of` initializer because typhonjs-escomplex
-      // mis-parses optional chaining there (it would zero out this file's
-      // maintainability score).
-      const cascadeFailures = cascade?.failed ?? [];
-      for (const { parentId, error } of cascadeFailures) {
-        Logger.warn(
-          `[State-Sync] ⚠️  Cascade partial-failure on parent #${parentId}: ${error}`,
-        );
-      }
-    }
 
     // Optional secondary label removal alongside the state transition
     // (e.g. clear `status::blocked` when transitioning back to ready).

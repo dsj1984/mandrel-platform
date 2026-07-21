@@ -2,40 +2,39 @@
 /* node:coverage ignore file */
 
 /**
- * single-story-init.js — Initialize a standalone Story (no parent Epic).
+ * single-story-init.js — Initialize a Story for v2 `/deliver`.
  *
- * Counterpart to `story-init.js` for the `/single-story-deliver` workflow.
- * The framework's main `story-init.js` requires an `Epic: #N` reference in
- * the Story body to trace hierarchy, seed the Story branch from
- * `epic/<id>`, and gate execution on the epic's dispatch manifest. None of
- * that applies to a standalone Story — a top-level work unit that branches
- * directly from `main` and opens its PR straight to `main`.
+ * Seeds `story-<id>` from `project.baseBranch` (default `main`), materialises
+ * the per-Story worktree when isolation is enabled, upserts a `story-init`
+ * structured comment, and flips the Story to `agent::executing`. There is no
+ * Epic parent, epic branch, or dispatch-manifest gate.
  *
  * What this script does:
  *   1. Validate the Story (type::story, not closed).
- *   2. Fetch origin.
- *   3. Create the Story branch from `project.baseBranch` (default
+ *   2. Acquire the assignee lease, then refuse a Story already labelled
+ *      `agent::executing` this run does not hold (unless `--steal`).
+ *   3. Flip the Story to `agent::executing` — BEFORE provisioning, so the
+ *      claim is label-visible to concurrent operators' probes during the
+ *      multi-minute install window (Story #4620). A provisioning failure after
+ *      this reverts the label and releases the lease.
+ *   4. Fetch origin.
+ *   5. Create the Story branch from `project.baseBranch` (default
  *      `main`) — local-only, no remote push at this stage.
- *   4. Materialise a worktree at `.worktrees/story-<id>/` when worktree
+ *   6. Materialise a worktree at `.worktrees/story-<id>/` when worktree
  *      isolation is enabled; otherwise check out the branch in-place.
- *   5. Upsert a `story-init` structured comment carrying
+ *   7. Upsert a `story-init` structured comment carrying
  *      `standalone: true`.
- *   6. Flip the Story to `agent::executing`.
  *
- * What this script does NOT do (and why):
- *   - Skips `validateBlockers` against the body's `Blocked by:` markers —
- *     pre-flight is still the operator's responsibility, but the Epic-scope
- *     blocker chain doesn't fit.
- *   - Skips child-Task transitions — a standalone Story is treated as
- *     atomic (one branch, one commit-set, one PR).
+ * What this script does NOT do:
+ *   - Child-Task transitions — a Story is atomic (one branch, one
+ *     commit-set, one PR to `main`).
  *
  * Usage: `node single-story-init.js --story <STORY_ID> [--dry-run]`
  * Exit codes: 0 ok, 1 error.
  *
- * @see .agents/workflows/helpers/single-story-deliver.md
+ * @see .agents/workflows/helpers/deliver-story.md
  */
 
-import { spawnSync as defaultSpawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { parseSprintArgs } from './lib/cli-args.js';
@@ -60,18 +59,30 @@ import {
   executeFastForward,
   planFastForward,
 } from './lib/orchestration/git-cleanup/phases/fast-forward.js';
-import { acquireStoryLease } from './lib/orchestration/single-story-lease-guard.js';
+import { verifyRemote } from './lib/orchestration/remote-verifier.js';
+import {
+  acquireStoryLease,
+  releaseStoryLease,
+} from './lib/orchestration/single-story-lease-guard.js';
+import { handleRemoteVerificationFailure } from './lib/orchestration/story-init-remote.js';
 import {
   STATE_LABELS,
   transitionTicketState,
   upsertStructuredComment,
 } from './lib/orchestration/ticketing.js';
 import { createProvider } from './lib/provider-factory.js';
+import { buildProtectionCtx } from './lib/single-story-sweep/protection-ctx.js';
 // `sweepMergedStoryBranches` is imported dynamically below — its transitive
 // graph reaches `picomatch` (via `git-cleanup.js`). Loading it statically
 // would crash module resolution before `assertDepsInstalled()` can emit a
 // friendly "run npm install" message.
 import { WorktreeManager } from './lib/worktree-manager.js';
+
+export { handleRemoteVerificationFailure } from './lib/orchestration/story-init-remote.js';
+// `makeGhRunner` moved to the shared `single-story-sweep/protection-ctx.js`
+// module (Story #4373) so the three boot callers build an identical
+// protection ctx. Re-exported here to preserve its existing import path.
+export { makeGhRunner } from './lib/single-story-sweep/protection-ctx.js';
 
 /**
  * Fail fast with a clear, actionable message when project deps are missing.
@@ -98,50 +109,6 @@ function assertDepsInstalled(projectRoot) {
 const progress = Logger.createProgress('single-story-init', { stderr: true });
 
 /**
- * Build the synchronous `gh` runner the single-story sweep uses for its
- * candidate-protection checks. Exported for testing.
- *
- * Story #2990: the sweep protection-ctx ghRunner stays on raw
- * `spawnSync('gh', …)` (not the `lib/gh-exec.js` async facade) because
- * `executeCleanup` invokes the protection checks inside a synchronous
- * candidate-filter loop. The runner contract is the legacy
- * `(args, opts) => stdout string` shape; converting it to async would
- * ripple into the single-story-sweep planner, which is intentionally out
- * of scope for the callers-only provider migration.
- *
- * Story #4073: the `spawnImpl` seam injects the `spawnSync` boundary so the
- * runner's success/error handling can be unit-tested without a live `gh`
- * binary. It defaults to `child_process.spawnSync` (mirroring the
- * `spawnImpl` seam in `lib/gh-exec.js` and the `runner` seam in
- * `lib/bootstrap/gh-preflight.js`), so the production CLI path is unchanged.
- * The synchronous `spawnSync` shape is preserved deliberately — the
- * candidate-filter loop in `executeCleanup` is synchronous, so converting
- * this to the async `lib/gh-exec.js` facade would ripple into the
- * single-story-sweep planner.
- *
- * @param {string} cwd Repo root used as the default spawn cwd.
- * @param {typeof defaultSpawnSync} [spawnImpl] Injectable spawn boundary —
- *   defaults to `child_process.spawnSync`. Tests pass a fake to assert the
- *   error/exit-code handling without spawning a real child process.
- * @returns {(args: string[], opts?: { cwd?: string }) => string}
- */
-export function makeGhRunner(cwd, spawnImpl = defaultSpawnSync) {
-  return (args, opts) => {
-    const result = spawnImpl('gh', args, {
-      cwd: opts?.cwd ?? cwd,
-      encoding: 'utf-8',
-      shell: false,
-    });
-    if (result.status !== 0) {
-      throw new Error(
-        `gh ${args.join(' ')} exit ${result.status}: ${result.stderr ?? ''}`,
-      );
-    }
-    return result.stdout ?? '';
-  };
-}
-
-/**
  * Validate that the fetched ticket is a standalone Story this script can
  * deliver. Throws with the canonical operator-facing message otherwise.
  * Exported for testing.
@@ -152,11 +119,140 @@ export function makeGhRunner(cwd, spawnImpl = defaultSpawnSync) {
 export function assertDeliverableStory(story, storyId) {
   if (!story.labels.includes(TYPE_LABELS.STORY)) {
     throw new Error(
-      `Issue #${storyId} is not a Story (labels: ${story.labels.join(', ')}). Use /deliver or /deliver for Epic-attached work.`,
+      `Issue #${storyId} is not a Story (labels: ${story.labels.join(', ')}). ` +
+        'v2 /deliver accepts type::story tickets only.',
     );
   }
   if (story.state === 'closed') {
     throw new Error(`Story #${storyId} is already closed.`);
+  }
+  const body = typeof story.body === 'string' ? story.body : '';
+  if (/\b(?:Epic|Parent):\s*#\d+/i.test(body)) {
+    throw new Error(
+      `Story #${storyId} still declares an Epic/Parent footer. ` +
+        'v2 delivery is Story-only — re-plan as a standalone Story before /deliver.',
+    );
+  }
+}
+
+/**
+ * Defense-in-depth refusal for a Story already labelled `agent::executing`
+ * that this run does not already hold.
+ *
+ * The assignee lease is the primary cross-run guard, but the label and the
+ * assignee can drift apart: a prior run that crashed *after* the early
+ * `agent::executing` flip but *before* (or without) taking/holding the lease
+ * leaves the Story labelled executing with no live foreign lease to trip the
+ * lease preflight. Left unchecked, a fresh run would seed the branch and
+ * worktree straight over that drift. Refuse unless the caller already holds the
+ * lease (`reason === 'already-held'`, i.e. a legitimate idempotent re-init) or
+ * passed `--steal`.
+ *
+ * Runs *after* the lease acquire (so it can read the acquire's reason) but
+ * *before* any git mutation. On refusal it releases the lease this run just
+ * took so the ticket is left exactly as found — a clean state for the operator
+ * to inspect before re-running with `--steal`.
+ *
+ * @param {object} args
+ * @param {{ labels?: string[] }} args.story        Fetched Story ticket.
+ * @param {{ reason: string, previousOwner: string|null }} args.lease  Acquire result.
+ * @param {boolean} args.stealRequested
+ * @param {number} args.storyId
+ * @param {object} args.provider
+ * @param {object} args.config
+ */
+export async function assertNotForeignExecuting({
+  story,
+  lease,
+  stealRequested,
+  storyId,
+  provider,
+  config,
+}) {
+  const labelled =
+    Array.isArray(story?.labels) &&
+    story.labels.includes(STATE_LABELS.EXECUTING);
+  if (!labelled || stealRequested || lease.reason === 'already-held') return;
+
+  // Back out the lease we just took so the refusal leaves the ticket unchanged.
+  try {
+    await releaseStoryLease({ provider, storyId, config });
+  } catch (err) {
+    Logger.error(
+      `[single-story-init] ⚠️ Failed to release lease during executing-refusal: ${err?.message ?? err}`,
+    );
+  }
+  throw new Error(
+    `Story #${storyId} is already labelled agent::executing` +
+      (lease.previousOwner
+        ? ` (assignee @${lease.previousOwner})`
+        : ' with no assignee') +
+      '. Another /deliver run may already own it. Confirm that run is dead, ' +
+      'then re-run with --steal to take it.',
+  );
+}
+
+/**
+ * Publish this run's claim as the `agent::executing` label **before** the
+ * multi-minute worktree install, so a concurrent operator's probe sees the
+ * claim during the install window instead of reading `agent::ready` and
+ * dispatching the Story a second time.
+ *
+ * Best-effort: the assignee lease is the real guard, so a failed flip logs and
+ * proceeds rather than aborting init. Routes through `transitionTicketState`
+ * so the Projects v2 Status column follows the label (Story #2548).
+ *
+ * @param {object} provider
+ * @param {number} storyId
+ * @param {object} story  Prefetched snapshot (round-trip elimination).
+ * @returns {Promise<void>}
+ */
+async function flipStoryToExecuting(provider, storyId, story) {
+  try {
+    await transitionTicketState(provider, storyId, STATE_LABELS.EXECUTING, {
+      ticketSnapshot: story,
+      cascade: false,
+    });
+    progress('LABELS', `🏷️  Story #${storyId} → agent::executing`);
+  } catch (err) {
+    Logger.error(
+      `[single-story-init] ⚠️ Failed to flip Story labels: ${err?.message ?? err}`,
+    );
+  }
+}
+
+/**
+ * Undo this run's claim when provisioning fails after the early
+ * `agent::executing` flip: revert the label to `agent::ready` and release the
+ * lease, both best-effort. Without this a crashed init would strand the Story
+ * as phantom-executing — claimed and labelled in-flight but with no live run —
+ * which every other operator's probe would then withhold indefinitely.
+ *
+ * @param {object} provider
+ * @param {number} storyId
+ * @param {object} config
+ * @returns {Promise<void>}
+ */
+async function rollbackClaimOnInitFailure(provider, storyId, config) {
+  try {
+    await transitionTicketState(provider, storyId, STATE_LABELS.READY, {
+      cascade: false,
+    });
+    progress(
+      'ROLLBACK',
+      `↩️  Reverted Story #${storyId} → agent::ready after init failure`,
+    );
+  } catch (err) {
+    Logger.error(
+      `[single-story-init] ⚠️ Failed to revert label after init failure: ${err?.message ?? err}`,
+    );
+  }
+  try {
+    await releaseStoryLease({ provider, storyId, config });
+  } catch (err) {
+    Logger.error(
+      `[single-story-init] ⚠️ Failed to release lease after init failure: ${err?.message ?? err}`,
+    );
   }
 }
 
@@ -222,12 +318,7 @@ export async function reapMergedStoryBranches({
         info: (m) => progress('CLEANUP', m),
         warn: (m) => progress('CLEANUP', `⚠️ ${m}`),
       },
-      protectionCtx: {
-        repoRoot: cwd,
-        gitSpawn,
-        ghRunner: makeGhRunner(cwd),
-        getTicket: (id) => provider.getTicket(id),
-      },
+      protectionCtx: buildProtectionCtx({ cwd, provider }),
       lockPath,
       lockTimeoutMs,
     });
@@ -261,12 +352,10 @@ export async function reapMergedStoryBranches({
 /**
  * Fetch remote refs, reap merged story branches, and fast-forward the local
  * base branch so new story branches seed from origin's tip. Exported for
- * testing (owns the fast-forward cascade; mirrors `fetchMainRefs` +
- * `ensureEpicBranch` in `branch-initializer.js`).
+ * testing (owns the fast-forward cascade).
  *
- * Routes the `origin` fetch through `cachedGitFetch` so concurrent standalone
- * Story waves share the same per-process coalescing window that Epic-attached
- * stories get via `branch-initializer.js#fetchMainRefs`. Pass `fetchFn` to
+ * Routes the `origin` fetch through `cachedGitFetch` so concurrent Story
+ * waves share a per-process fetch-coalescing window. Pass `fetchFn` to
  * inject a stub in tests without touching real git.
  *
  * @param {object} opts
@@ -451,12 +540,10 @@ export async function provisionWorktree({
   }
 
   try {
-    // Story #2874 — standalone Stories have no parent Epic; pass
-    // `epicId: null` so the helper omits CC_EPIC_ID from env + file
-    // instead of throwing on a 0 sentinel. The trace hook keys its
-    // standalone-trace branch on CC_EPIC_ID being absent.
+    // v2 Stories are standalone — no parent Epic. The helper omits
+    // CC_EPIC_ID from env + file; the trace hook keys its standalone-trace
+    // branch on CC_EPIC_ID being absent.
     setActiveStoryEnv({
-      epicId: null,
       storyId,
       workCwd,
       logger: {
@@ -490,6 +577,12 @@ export async function runSingleStoryInit({
   injectedAcquireLease,
   steal = false,
   leaseNow,
+  injectedVerifyRemote,
+  // Story #4620: swap the git-touching provisioning steps so the
+  // early-flip-then-rollback ordering is unit-testable without a real worktree.
+  injectedMaterialize = materializeBaseBranch,
+  injectedSeedBranch = seedStoryBranch,
+  injectedProvisionWorktree = provisionWorktree,
 } = {}) {
   const parsed =
     storyIdParam !== undefined
@@ -520,9 +613,7 @@ export async function runSingleStoryInit({
   const provider = injectedProvider || createProvider(config);
 
   const baseBranch = config.project?.baseBranch ?? 'main';
-  // The first arg is unused (legacy epicId slot); pass 0 to satisfy the
-  // numeric-validation guard.
-  const storyBranch = getStoryBranch(0, storyId);
+  const storyBranch = getStoryBranch(storyId);
 
   const runtime = resolveRuntime({ config });
   progress(
@@ -531,8 +622,28 @@ export async function runSingleStoryInit({
   );
   progress('INIT', `Initializing standalone Story #${storyId}...`);
 
+  // Issue #4483 — deterministic remote evidence at the v2 `/deliver` entry
+  // seam (`single-story-init.js`). The
+  // probe is read-only, so it runs under --dry-run too. The CLI records
+  // the fact; the workflow owns the `agent::blocked` transition on
+  // `remoteVerified: false` — inline delivery to local `main` is never a
+  // sanctioned fallback.
+  const remote = (injectedVerifyRemote ?? verifyRemote)({ cwd });
+  progress(
+    'REMOTE',
+    remote.remoteVerified
+      ? `✅ remoteVerified=true — ${remote.detail}`
+      : `⛔ remoteVerified=false — ${remote.detail}`,
+  );
+
   const story = await provider.getTicket(storyId);
   assertDeliverableStory(story, storyId);
+  await handleRemoteVerificationFailure({
+    provider,
+    storyId,
+    remote,
+    dryRun,
+  });
 
   progress(
     'CONTEXT',
@@ -546,6 +657,10 @@ export async function runSingleStoryInit({
   // assignee is treated as a live claim and aborts init (naming the current
   // owner) unless --steal forcibly transfers it. Unclaimed / self-held claims
   // proceed. Skipped under --dry-run (no assignee mutation).
+  let workCwd = cwd;
+  let worktreeCreated = false;
+  let installStatus = { status: 'skipped', reason: 'dry-run' };
+
   if (!dryRun) {
     const acquire = injectedAcquireLease ?? acquireStoryLease;
     const lease = await acquire({
@@ -559,31 +674,51 @@ export async function runSingleStoryInit({
       'LEASE',
       `🔒 Story #${storyId} lease ${lease.reason} (owner=@${lease.owner}).`,
     );
-  }
 
-  let workCwd = cwd;
-  let worktreeCreated = false;
-  let installStatus = { status: 'skipped', reason: 'dry-run' };
-
-  if (!dryRun) {
-    await materializeBaseBranch({
-      cwd,
-      baseBranch,
-      storyBranch,
-      config,
-      provider,
-      injectedSweep,
-      progress,
-    });
-    seedStoryBranch({ cwd, storyBranch, baseBranch, progress });
-    ({ workCwd, worktreeCreated, installStatus } = await provisionWorktree({
-      runtime,
-      cwd,
+    // Defense in depth: refuse a Story already labelled agent::executing that
+    // this run does not hold (label/assignee drift the lease alone misses).
+    // Runs before any git mutation; releases the just-taken lease on refusal.
+    await assertNotForeignExecuting({
+      story,
+      lease,
+      stealRequested,
       storyId,
-      storyBranch,
+      provider,
       config,
-      progress,
-    }));
+    });
+
+    // Publish the claim as agent::executing BEFORE the multi-minute worktree
+    // install (not after), so a concurrent operator's probe sees it during the
+    // install window instead of reading agent::ready and double-dispatching.
+    await flipStoryToExecuting(provider, storyId, story);
+
+    // Any failure from here on leaves a claimed, executing-labelled Story with
+    // no live run behind it — revert the label and release the lease so the
+    // Story is not stranded as phantom-executing.
+    try {
+      await injectedMaterialize({
+        cwd,
+        baseBranch,
+        storyBranch,
+        config,
+        provider,
+        injectedSweep,
+        progress,
+      });
+      injectedSeedBranch({ cwd, storyBranch, baseBranch, progress });
+      ({ workCwd, worktreeCreated, installStatus } =
+        await injectedProvisionWorktree({
+          runtime,
+          cwd,
+          storyId,
+          storyBranch,
+          config,
+          progress,
+        }));
+    } catch (err) {
+      await rollbackClaimOnInitFailure(provider, storyId, config);
+      throw err;
+    }
   }
 
   const dependenciesInstalled =
@@ -607,10 +742,14 @@ export async function runSingleStoryInit({
     dependenciesInstalled,
     installFailed: installStatus.status === 'failed',
     dryRun,
+    // Issue #4483 — verified remote evidence for the orchestrating agent.
+    remoteVerified: remote.remoteVerified,
+    remoteProbe: { remoteUrl: remote.remoteUrl, detail: remote.detail },
   };
 
-  // Upsert the `story-init` structured comment + flip Story to executing.
-  // Both are no-ops under --dry-run.
+  // Upsert the `story-init` structured comment (no-op under --dry-run). The
+  // `agent::executing` flip already happened above, before provisioning, so the
+  // claim is label-visible during the install window (see `flipStoryToExecuting`).
   if (!dryRun) {
     try {
       await upsertStructuredComment(
@@ -626,27 +765,6 @@ export async function runSingleStoryInit({
     } catch (err) {
       Logger.error(
         `[single-story-init] ⚠️ Failed to upsert story-init structured comment: ${err?.message ?? err}`,
-      );
-    }
-
-    try {
-      // Route through the canonical state mutator so the Projects v2
-      // Status column mirrors the label flip (Story #2548 wires column-
-      // sync inside `transitionTicketState`). A direct
-      // `provider.updateTicket({ labels })` would skip the board update
-      // and leave the Story on its prior status column for the entire
-      // run. `cascade: false` is correct — a standalone Story has no
-      // parent chain — and threading the prefetched `story` as
-      // `ticketSnapshot` preserves the round-trip elimination from
-      // Story #1795.
-      await transitionTicketState(provider, storyId, STATE_LABELS.EXECUTING, {
-        ticketSnapshot: story,
-        cascade: false,
-      });
-      progress('LABELS', `🏷️  Story #${storyId} → agent::executing`);
-    } catch (err) {
-      Logger.error(
-        `[single-story-init] ⚠️ Failed to flip Story labels: ${err?.message ?? err}`,
       );
     }
   }
@@ -676,6 +794,8 @@ export function renderSingleStoryInitComment(result) {
     worktreeCreated: result.worktreeCreated,
     dependenciesInstalled: result.dependenciesInstalled,
     installStatus: result.installStatus,
+    remoteVerified: result.remoteVerified,
+    remoteProbe: result.remoteProbe,
   };
   return [
     '## Story init (standalone)',
@@ -685,6 +805,7 @@ export function renderSingleStoryInitComment(result) {
     `- **baseBranch:** \`${result.baseBranch}\``,
     `- **workCwd:** \`${result.workCwd}\``,
     `- **worktreeEnabled:** \`${result.worktreeEnabled}\``,
+    `- **remoteVerified:** \`${result.remoteVerified}\``,
     `- **dependenciesInstalled:** \`${result.dependenciesInstalled}\``,
     '',
     '```json',

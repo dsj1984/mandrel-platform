@@ -8,34 +8,51 @@ set. You MUST strictly adhere to the following rules:
 
 ## 1. System Guardrails & Initialization
 
-### A. Persona Routing & Execution
+### A. Role Framing (no persona packs)
 
-When the runtime injects a persona for the current task (via the hydrator from
-`task.persona`), retrieve and strictly adopt the rules in
-`.agents/personas/[role].md`. If a user explicitly instructs "Act as
-[Role/Persona]" in chat, honor that as well.
+v2 has **no** `.agents/personas/` packs and **no** `persona::*` GitHub labels.
+Behavioral constraints come from this file, always-on / on-demand rules, and
+skills. Role-scoped spawn contexts (when used) live under `.agents/agents/`
+via `delivery.routing.roleScopedAgents`. QA auth identities (`qa.personas`)
+are a separate fixture concept — not agent behavior packs.
 
-- **Fallback:** If the specific persona file is missing, default to
-  `.agents/personas/engineer.md`.
+If a user says "act as [role]" in chat, apply the matching skill / workflow
+guidance (e.g. QA skills for verification work, security skill for threat
+modeling) rather than looking for a persona file.
 
 ### B. Skill Activation
 
 The skill library uses a **two-tier architecture**:
 
 - **`core/`** — Universal, process-driven skills that apply across any project
-  (e.g., `core/debugging-and-error-recovery`, `core/test-driven-development`,
+  (e.g., `core/debugging-and-error-recovery`, `core/code-review-and-quality`,
   `core/security-and-hardening`). Always check for a relevant core skill first.
-- **`stack/`** — Tech-stack-specific skills for concrete libraries, services,
-  and tools (e.g., `stack/backend/cloudflare-hono-architect`,
-  `stack/frontend/tailwind-v4`, `stack/qa/playwright`). Apply these when the
-  project uses that specific technology.
+  The **test-first** discipline (TDD cycle, Prove-It Pattern, good-test style,
+  property-based technique) lives in
+  [`rules/testing-standards.md`](rules/testing-standards.md), not a skill.
+- **`stack/`** — Tech-stack-specific skills for concrete tools (e.g.,
+  `stack/qa/playwright`, `stack/qa/vitest`, `stack/qa/gherkin-authoring`).
+  Apply these when the project uses that specific technology. For third-party
+  library and framework knowledge not covered here, use the live-docs lookup
+  mandated in § 1.C rather than a frozen in-repo cache.
 
 When a task involves a specific domain or technology, you MUST read the
 corresponding `.agents/skills/[tier]/[category]/[skill-name]/SKILL.md` file and
-apply its constraints. Review the skill's `examples/` directory or
-`examples.md` sibling **when present and relevant** to the task — most skills
-do not ship one, so do not probe blindly. When uncertain which skill to apply,
-read `core/using-agent-skills` for guidance on skill selection and sequencing.
+apply its constraints. A `SKILL.md` leads with its **Policy Capsule** — the
+contract, and the whole cost of activating the skill — followed by pointers
+into an on-demand `reference.md` sibling holding the long-form material
+(patterns, worked examples, checklists). This is the same split the always-on
+rules use (§ 1.F): read the capsule on activation, and open a `reference.md`
+section only when the task actually engages it. Review the skill's `examples/`
+directory or `examples.md` sibling **when present and relevant** to the task —
+most skills do not ship one, so do not probe blindly. When uncertain which skill applies,
+match the task against the one-line `description` in each skill's frontmatter
+(catalogued in `.agents/skills/skills.index.json`). Skills compose: a complete
+feature typically flows `idea-refinement` → the `/plan` workflow →
+implementation test-first (`rules/testing-standards.md`) →
+`code-review-and-quality` — not every task needs every skill. The always-on
+operating posture (surface assumptions, manage confusion, push back on flawed
+approaches, verify don't assume) is governed by § 3–4 and § 1.I of this file.
 
 ### C. Proactive Documentation
 
@@ -96,12 +113,17 @@ does not re-pay their bytes on every turn.
 - **Always-on core** (loaded alongside this file):
   - [`rules/security-baseline.md`](rules/security-baseline.md) — inviolable
     security MUSTs; applies to every piece of code generated.
-  - [`rules/git-conventions.md`](rules/git-conventions.md) — every commit,
-    branch, and PR touches it.
+  - [`rules/git-conventions.md`](rules/git-conventions.md) — the always-on git
+    core (branch shapes, commit-subject format, `refs #`, push/hygiene MUSTs);
+    every commit, branch, and PR touches it.
 
 - **On-demand** — read the file **before** doing the matching work; each opens
   with a one-line "this rule applies when…" scope header, so skimming its first
   paragraph confirms whether it governs the task at hand:
+  - [`rules/git-conventions-reference.md`](rules/git-conventions-reference.md)
+    — the git-history mechanics the core summarizes: hard-cutover policy, the
+    push-hook false-negative signature, shared-checkout contention, the
+    docs-freshness gate, and `meta::*` routing labels.
   - [`rules/shell-conventions.md`](rules/shell-conventions.md) — before
     chaining shell commands or writing cross-platform command strings.
   - [`rules/testing-standards.md`](rules/testing-standards.md) — before
@@ -110,6 +132,10 @@ does not re-pay their bytes on every turn.
   - [`rules/orchestration-error-handling.md`](rules/orchestration-error-handling.md)
     — before writing or modifying orchestration scripts under
     `.agents/scripts/**`.
+  - [`rules/ci-remediation.md`](rules/ci-remediation.md) — before remediating
+    a red (or repeatedly slow) CI check during delivery (the root-cause-only
+    triage decision tree, the never-rerun / never-quarantine prohibitions,
+    and the escalation criteria).
   - [`rules/api-conventions.md`](rules/api-conventions.md),
     [`rules/gherkin-standards.md`](rules/gherkin-standards.md),
     [`rules/changelog-style.md`](rules/changelog-style.md),
@@ -134,21 +160,21 @@ technology context is intentionally kept out of `.agentrc.json`.
 
 ### H. Observability & Friction Telemetry
 
-You MUST log telemetry about any operational difficulty or automation
-opportunity you encounter. Post friction details directly to the relevant
-GitHub Story (or Epic) ticket:
+You MUST log telemetry about operational difficulty or automation
+opportunities you hit. Friction is a **local NDJSON signal**:
+`diagnose-friction.js` appends one `kind: friction` record to the per-run/
+per-Story `signals.ndjson` stream on local disk — not posted to the ticket at
+capture time; the retro phase surfaces the aggregate as routed proposals.
 
 - **Command**:
   `node .agents/scripts/diagnose-friction.js --story [STORY_ID] --cmd [FAILED_COMMAND]`
-  (add `--epic [EPIC_ID]` when the Story sits under an Epic)
-- **When to fire**: After consecutive tool validation errors, unrecoverable
-  command failures, or ambiguity requiring explicit self-correction. Also
-  after repetitive sequences of commands or boilerplate-heavy steps that
-  could be simplified by a workflow or skill.
-- **No-ticket fallback**: If you hit friction outside an Epic/Story
-  loop, write a JSON record to `temp/friction-<timestamp>.json` with the
-  same fields, and mention the file in your final summary so a human can
-  route it later. Do not silently drop the signal.
+- **When to fire**: after repeated tool-validation errors, an unrecoverable
+  command failure, ambiguity needing self-correction, or repetitive
+  boilerplate steps a workflow/skill could simplify.
+
+The schema validation, the standalone stream path, and the
+never-silently-dropped guarantee are reference detail — see
+[`docs/execution-reference.md` § Friction telemetry](docs/execution-reference.md#friction-telemetry).
 
 #### Log Level Control
 
@@ -181,19 +207,11 @@ recurred, and what assumption you would test next, then either Re-Plan or
 hand back to the operator. Do not paper over the loop with another
 just-in-case retry.
 
-This protocol is not soft-prompt-only — it has a runtime substrate. While
-executing as a Story delivery sub-agent (via `helpers/epic-deliver-story`
-or `helpers/single-story-deliver`), you MUST emit a `story.heartbeat`
-lifecycle event on every Task transition (or whenever you stall on a
-long-running step) so the parent `/deliver` idle watchdog (§ 2e of
-`.agents/workflows/helpers/deliver-epic.md`, re-ticked every 30 minutes via
-`wave-tick.js --check-idle 30`) can distinguish a child still making
-progress from a dead one. If you genuinely cannot proceed, transition to
-`agent::blocked` and exit non-zero — never fall silent. A child with no
-recent `story.heartbeat`, no commit on its `story-<id>` branch, and no
-`agent::blocked` label is exactly the failure mode the idle watchdog is
-built to catch, and the watchdog will re-dispatch (or escalate) the Story
-without your participation.
+While executing as a Story delivery sub-agent (via `helpers/deliver-story`),
+if you genuinely cannot proceed you MUST transition to `agent::blocked` and
+exit non-zero — **never fall silent**. A stalled child that reports nothing
+is indistinguishable from a dead one, and the parent `/deliver` run can only
+escalate what you surface.
 
 ### J. HITL Blocker Escalation (Safe Execution)
 
@@ -223,8 +241,7 @@ resolve by this **total ordering** (higher wins):
    (§ 1.E).
 2. **This file** — `.agents/instructions.md`.
 3. **Global rules** — `.agents/rules/*.md` (§ 1.F).
-4. **The active persona** — `.agents/personas/[role].md` (§ 1.A).
-5. **Skills** — `.agents/skills/**/SKILL.md` (§ 1.B).
+4. **Skills** — `.agents/skills/**/SKILL.md` (§ 1.B).
 
 Two carve-outs refine the ordering:
 
@@ -232,23 +249,25 @@ Two carve-outs refine the ordering:
   tier overlap, the narrower, more-specific statement governs the broader one
   (e.g. a stack-specific skill refines a general core skill; a per-rule
   statement refines a cross-rule one).
-- **`rules/security-baseline.md` is inviolable.** No persona, skill, or local
-  override may relax a security MUST. A security constraint that conflicts
-  with any lower-tier guidance — or with a local override — always wins,
-  regardless of its tier position above.
+- **`rules/security-baseline.md` is inviolable.** No skill or local override
+  may relax a security MUST. A security constraint that conflicts with any
+  lower-tier guidance — or with a local override — always wins, regardless of
+  its tier position above.
 
 ---
 
 ## 2. FinOps & Token Budgeting (Economic Guardrails)
 
-Mandrel does **not** enforce live LLM spend from response metadata. It caps
-**hydrated prompt size** (`delivery.maxTokenBudget`, section-aware elision) and
-runs optional **pre-dispatch estimates** (`delivery.preflight.*`); your host
-runtime owns session quota and hard stops. The config keys, the ≈4-char/token
-estimate, and the elision behaviour are reference detail — see
+Mandrel does **not** enforce live LLM spend from response metadata, and it has
+no operator-tunable context budget. What it does bound are fixed framework
+ceilings — the `/plan` context envelope and plan-time Story sizing — and they
+**fail closed** with a message naming what to trim, rather than silently
+handing the model a truncated context. Your host runtime owns session quota and
+hard stops. The constants, the ≈4-char/token estimate, and the trim options are
+reference detail — see
 [`docs/execution-reference.md` § FinOps & token budgeting](docs/execution-reference.md#finops--token-budgeting-economic-guardrails).
-Consult it when a task prompt was elided or `/deliver` refused a fan-out on
-budget grounds.
+Consult it when `/plan` refused an over-ceiling envelope or an over-budget
+Story count.
 
 ---
 
@@ -256,52 +275,51 @@ budget grounds.
 
 1. **Context First:** Before proposing any solution, understand the
    repository's tech stack, historical context, and structure.
-   - **Mandatory Reading (planning & interactive tasks)**: For planning
-     (`/plan`) and interactive tasks, before starting ANY work you MUST read
-     every file listed in `project.docsContextFiles` in `.agentrc.json`.
-     This list is the project's authoritative reference set (architecture,
-     data dictionary, decisions log, patterns, etc.) and replaces any
-     hardcoded filename list. Resolve each entry against
-     `project.paths.docsRoot` (default `docs/`) and skip silently
-     when an entry's file is absent. The decisions log (`decisions.md`) may
-     be either a single-file dated-entry log or an **index** into a
-     `decisions/` ADR directory — both are first-class layouts (see
+   - **Digest-first Reading (Story #4433)** — stated once here; it governs
+     every call site. **Never ingest the whole `project.docsContextFiles` set
+     up front.** Read the **docs digest** — a compact outline (path, byte
+     size, heading outline with line numbers, and the first paragraph under
+     each `##`) built from those files — decide which docs bear on the task at
+     hand, then **pull the full file on demand**, jumping to the section at
+     the line number the digest names. This is a hard cutover: no
+     read-every-file branch is retained on any path.
+
+     The call sites differ only in how the digest reaches you — the
+     discipline above is identical for all of them:
+     - `/plan` and interactive tasks — a file at `temp/run-<id>/docs-digest.md`
+       (`plan-context.js`, via the shared generator in
+       `.agents/scripts/lib/orchestration/docs-digest.js`).
+     - `/deliver` Story sub-agents (`helpers/deliver-story`) — the
+       `docsDigestPath` the caller threads.
+     - Standalone-Story planning (`story-plan.js --emit-context`) — inline as
+       `corpusContext.docsDigest` (no per-run directory to anchor a
+       file), alongside `corpusContext.relevantSections`.
+
+     When no digest exists for the task at hand — an ad hoc task outside
+     `/deliver`, `project.docsContextFiles` unset, or a null `docsDigestPath` —
+     there is **no mandatory docs read**: read a full doc only when the task's
+     own context points you at one.
+
+     The decisions log (`decisions.md`) may be either a single-file
+     dated-entry log or an **index** into a `decisions/` ADR directory — both
+     are first-class layouts (see
      [`skills/core/documentation-and-adrs`](skills/core/documentation-and-adrs/SKILL.md)).
-     When it is an index, only the index is the mandatory-read; the
-     per-ADR bodies under `decisions/` are link-followed on demand
-     (index-only by default), not auto-loaded into every task's context.
-   - **Digest-first Reading (`/deliver` story sub-agents)**: A `/deliver`
-     Story delivery sub-agent (dispatched via `helpers/epic-deliver-story` or
-     `helpers/single-story-deliver`) does **not** re-read the full
-     `project.docsContextFiles` set per Story. Instead it reads the **per-Epic
-     docs digest** — a single compact outline (path, byte size, heading
-     outline with line numbers, and the first paragraph under each `##`) that
-     `epic-deliver-prepare.js` writes to
-     `temp/epic-<epicId>/docs-digest.md` and the parent threads into the
-     child prompt as `docsDigestPath`. Use the digest to decide which docs are
-     relevant to the Story at hand, then **pull the full file on demand**
-     (reading the section at the line number the digest names) when a section
-     bears on the change. When `docsDigestPath` is null (the project has no
-     `project.docsContextFiles` configured) there is no digest to read and no
-     per-Story docs mandate — read a full doc only if the Story's own context
-     points you at one. This is the hard cutover from the former
-     read-every-file-per-Story rule: delivery children no longer ingest the
-     whole docs set up front.
+     Treat an index like any other digested doc: link-follow the per-ADR
+     bodies on demand rather than auto-loading them.
    - **Conditional Reads**: When the task touches UI copy, layout, or
      routing and the corresponding file is present in the project, also
      read `docs/style-guide.md` and `docs/web-routes.md`. Skip both when
      absent or unrelated to the task — they are not part of the universal
      mandatory set.
-   - **Epic Context**: Additionally, read the current Epic's body — the
-     single planning document (ideation sections plus the folded Tech
-     Spec sections; Story #4324 retired the separate context tickets) —
-     and the task-specific instructions.
+   - **Story Context**: Additionally, read the current Story's body — the
+     inline `## Spec` plus its `acceptance[]` / `verify[]` entries — and
+     the task-specific instructions.
    - **Optimization**: For large projects, prioritize targeted retrieval
      (semantic code search or focused text search) to isolate specific
      schemas or decisions before reading broad files.
 2. **Plan First:** For non-trivial tasks (3+ steps or architectural
-   decisions), enter **Plan Mode**. Update the Epic body's Tech Spec
-   sections (via `/plan`) or create a new Technical Specification document
+   decisions), enter **Plan Mode**. Update the Story's `## Spec`
+   (via `/plan`) or create a new Technical Specification document
    in the `docs/` root (if not already handled by a ticket) before
    touching code.
 3. **Artifacts over Chat:** Create log files for test results, build
@@ -330,6 +348,13 @@ budget grounds.
   spawns (search, doc regeneration, lint, log triage) and keep
   **implementation and design** work on the default capability; name no
   specific model — let the host and operator own the concrete mapping.
+  **Depth compounds the cost.** Sub-agents now carry the `Agent` tool and
+  can nest further (verified depth 2, announced max depth 5; see
+  [#2870](https://github.com/dsj1984/mandrel/issues/2870)), so this
+  spend-per-spawn caution is not one-level — **every** nesting level
+  re-pays the full always-loaded context. Weigh the whole subtree's cost,
+  not just the immediate spawn, before opening a deeper orchestration
+  level, and stay within the supported depth envelope.
 - **Anti-Laziness:** NEVER use placeholder comments like
   `// ... existing code ...`, `/* rest of file */`, or
   `// implementation here`. You MUST output the ENTIRE file or the ENTIRE
@@ -345,24 +370,23 @@ budget grounds.
 
 ---
 
-## 5. Git & Epic Protocol (Strict Standards)
+## 5. Git & Story Protocol (Strict Standards)
 
 To maintain a clean and readable repository history, you MUST follow these
-strict conventions for all epic-related Git operations. See
+strict conventions for all Story-related Git operations. See
 [`.agents/rules/git-conventions.md`](rules/git-conventions.md) for the full
 canonical reference.
 
 ### A. Branch Naming (Canonical)
 
-Epic execution uses two branch shapes. The runtime creates and maintains
-them automatically; agents commit on the execution branch only.
+v2 delivery uses one branch shape. The runtime creates and maintains it
+via `single-story-init.js`; agents commit on that branch only.
 
-| Purpose          | Format                       | Owner                  | Notes                                                                                         |
-| ---------------- | ---------------------------- | ---------------------- | --------------------------------------------------------------------------------------------- |
-| Story execution  | `story-<storyId>`            | `story-init.js` | Per-Story worktree at `.worktrees/story-<storyId>/`. All Story implementation commits land here. |
-| Epic integration | `epic/<epicId>`              | `/deliver` slash command | Story branches merge into this branch with `--no-ff`. Pushed per wave.                       |
+| Purpose         | Format            | Owner                   | Notes                                                                 |
+| --------------- | ----------------- | ----------------------- | --------------------------------------------------------------------- |
+| Story execution | `story-<storyId>` | `single-story-init.js`  | Per-Story worktree at `.worktrees/story-<storyId>/`. PR target is `main` (squash + required checks). There is no `epic/<id>` integration branch and no `--no-ff` wave merge. |
 
-- **Verification**: After `story-init.js` returns, confirm
+- **Verification**: After `single-story-init.js` returns, confirm
   `git branch --show-current` reports `story-<storyId>` before making any
   commits. If it does not, **STOP** and re-init.
 
@@ -378,31 +402,32 @@ prompted.
 
 ### C. History Hygiene
 
-Prioritize a clean `epic/[EPIC_ID]` branch. Story branches are merged into
-the Epic branch automatically by `helpers/epic-deliver-story` (via
-`story-close.js`); the Epic branch reaches `main` via the pull request that
-`/deliver` opens at the end of its run — the operator merges through
-the GitHub UI. There is no in-script merge to `main`.
+Every Story reaches `main` via its own PR (`story-<id>` → squash + required
+checks). `helpers/deliver-story` / `single-story-close.js` open that PR;
+there is no Epic integration branch and no in-script push to `main`.
 
-### D. Ticket hierarchy (2-tier)
+### D. Ticket hierarchy (Story-only)
 
-Mandrel uses a **2-tier ticket hierarchy** (Epic → Story).
-Acceptance criteria and verification steps live inline on the Story
-body (`acceptance[]` / `verify[]`); there is no Feature tier and no
-`type::task` ticket layer. Thematic grouping lives as prose in the
-Epic body (which also carries the folded Tech Spec sections).
+v2 collapses the ticket model to **Story**. Acceptance criteria and
+verification steps live inline on the Story body (`acceptance[]` /
+`verify[]`); the folded Tech Spec lives inline in `## Spec` (over-budget
+Specs fail closed — split or tighten; never write under `docs/`). Optional
+`depends_on` edges order rare multi-Story runs — and, because `/deliver`
+resolves them from live state, they order Stories **across plan runs and
+over time**, not just within one batch.
 
-- The decomposer emits only `type::epic` and `type::story` issues;
-  Stories attach directly to the Epic.
-- Each Story-implementation phase is executed by
-  `helpers/epic-deliver-story` (Epic-attached) or
-  `helpers/single-story-deliver` (standalone). There is no per-Task
-  sub-loop; the agent authors commit subjects directly per
-  [`rules/git-conventions.md`](rules/git-conventions.md) and references
-  the parent Story via `(refs #<storyId>)`.
-- Story branches, the Epic-branch integration target, the wave-loop
-  fan-out, and the `epic/<id>` → `main` PR merge model are the same
-  as Section 5.A.
+- `/plan` emits one or more `type::story` issues (default N=1). There is no
+  batch label: `/deliver` takes ids and discovers the graph.
+- Each Story is executed by `helpers/deliver-story` (invoked from
+  [`/deliver`](workflows/deliver.md)). There is no per-Task sub-loop; the
+  agent authors commit subjects directly per
+  [`rules/git-conventions.md`](rules/git-conventions.md) and references the
+  Story via `(refs #<storyId>)`.
+- Branch model matches Section 5.A (`story-<id>` → PR → `main`).
+- There is no `type::epic` / `type::task` label and no Epic issue form. An
+  Epic is at most an optional untyped human umbrella issue outside
+  orchestration; `/deliver` refuses tickets that still carry an
+  `Epic: #N` footer.
 
 ---
 
@@ -420,12 +445,12 @@ To keep the repository clean and avoid polluting the Git history:
 
 ## 7. Complexity-Aware Execution
 
-The dispatcher automatically calculates the execution plan for an Epic. A
-Story is a **capability slice a frontier model delivers and self-verifies in
-one pass** — a broad footprint is normal when the change is cohesive. The
-numeric sizing backstop lives in one place: `DEFAULT_TASK_SIZING` in
-`.agents/scripts/lib/orchestration/ticket-validator-sizing.js` (operator
-override via `planning.taskSizing`). Do not re-slice a capability-sized
+`/plan` sizes each Story as a **capability slice a frontier model delivers
+and self-verifies in one pass** — a broad footprint is normal when the
+change is cohesive. The session-capacity backstop lives in one place:
+`DEFAULT_MODEL_CAPACITY` in
+`.agents/scripts/lib/orchestration/ticket-validator-sizing.js` (framework
+constant — not operator-tunable). Do not re-slice a capability-sized
 Story into per-module fragments just because it touches many files.
 
 ### A. When You See `⚠️ COMPLEXITY WARNING`

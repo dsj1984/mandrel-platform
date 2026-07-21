@@ -3,7 +3,7 @@ description:
   Convert findings produced by the audit-* workflows into actionable
   GitHub Stories. Reads temp/audits/audit-*-results.md, groups findings
   cross-audit, deduplicates against existing Issues by fingerprint, and
-  either chains into /plan --idea or opens standalone Stories.
+  either chains into /plan --seed-file or opens standalone Stories.
 ---
 
 # /audit-to-stories [audit-file-or-glob]
@@ -22,8 +22,8 @@ Dimension / Category, Current State, Recommendation, Agent Prompt).
 `/audit-to-stories` closes the loop: it parses those reports, groups
 related findings (including across audit dimensions), classifies each
 group as eligible-to-create or already-tracked, and — at the operator's
-choice — either chains into `/plan --idea` for a single planned
-Epic or opens standalone Stories directly.
+choice — either chains into `/plan --seed-file` for a planned Story
+(or N>1 under the split policy) or opens standalone Stories directly.
 
 The audit producers themselves are **not modified** by this workflow.
 They remain read-only emitters of audit reports.
@@ -117,38 +117,38 @@ Ask:
 
 > How would you like these `<M>` Stories created?
 >
-> - **Single Epic via `/plan`** **[Recommended]** — opens one Epic,
->   then chains into `/plan --idea` so the standard spec-and-WBS
->   authoring handles decomposition. Grouped Stories become the
->   seed for Phase 7 decomposition.
+> - **Single plan via `/plan`** **[Recommended]** — chains into
+>   `/plan --seed-file <emitted.md>` so the standard Story authoring
+>   handles the seed. Prefer one Story; split only under the
+>   default-single policy.
 > - **Individual standalone Stories** — opens one GitHub Issue per
->   group directly, no Epic wrapper.
+>   group directly (no plan ceremony).
 
 **STOP** until the operator picks.
 
-## Phase 5a — Single-Epic path
+## Phase 5a — Single-plan path
 
-Build the `/plan` idea seed from the filtered plan envelope:
+Build the `/plan` seed from the filtered plan envelope:
 
 ```bash
-node .agents/scripts/audit-to-stories.js --emit-epic-seed \
+node .agents/scripts/audit-to-stories.js --emit-plan-seed \
   --plan temp/audits/audit-to-stories-plan.json \
-  --out "temp/audits/audit-epic-seed-$(date +%Y%m%dT%H%M%S).md"
+  --out "temp/audits/audit-plan-seed-$(date +%Y%m%dT%H%M%S).md"
 ```
 
 The seed renders the canonical one-pager sections — Problem Statement,
 Recommended Direction, Key Assumptions (with links to every source
-report), MVP Scope (the M proposed Stories), Key Files (so `/plan`
-Phase 7 decompose has concrete anchors), Not Doing.
+report), MVP Scope (the M proposed Stories), Key Files (so `/plan`'s
+authoring step has concrete anchors), Not Doing.
 
 Chain into the existing planning entrypoint:
 
 ```text
-/plan --idea "<path-to-seed>"
+/plan --seed-file <path-to-seed>
 ```
 
-`/plan` then runs ideation → duplicate-search → render Epic body
-→ open Epic → Phase 7 / 8 decompose, as documented in its workflow.
+(`/plan --seed "$(cat <path>)"` also works for small seeds). `/plan`
+then runs its author → persist path, as documented in its workflow.
 Each Story it spawns from the seed carries `context::audit:
 <reportLink>` and `audit-fingerprint: <sha>` in its body so future
 Phase 6 idempotency works on the next run.
@@ -210,9 +210,36 @@ workflow owns **no** parallel dedup or footer-parsing code: the
 fingerprint, footer round-trip, and routing all live in that one shared
 module.
 
+Dedup runs in **two stages** when a provider resolves (Story #4626): a
+meaning-first **semantic candidate** pass (`searchCandidates`, wired to
+[`lib/findings/semantic-issue-search.js`](../scripts/lib/findings/semantic-issue-search.js))
+runs FIRST and widens the net across open + closed issues; the exact
+**fingerprint / semantic-key** confirmation runs SECOND. A finding whose title
+was reworded but whose *location* is unchanged still confirms against the Issue
+that already tracks that location, because the audit filers stamp a
+location-based `audit-semantic-keys` footer alongside the `audit-fingerprints`
+footer. Close-time filings from the
+[`audit-results-graduator`](../scripts/lib/feedback-loop/audit-results-graduator.js)
+carry the same canonical `audit-fingerprints` footer, so a sweep recognizes a
+graduator-filed issue and never re-files it.
+
 When no provider is available (e.g. air-gapped dev environment), pass
 `--no-provider` to the `--scan` step — every group is classified
 `create` and the operator is informed that dedupe was skipped.
+
+### Cross-run ledger
+
+The `--scan` classifications only see *live* issues. To decay findings across
+runs — recognizing re-detections, suppressing deliberately-rejected findings,
+and flagging genuine regressions — the sweep folds each scan onto a committed
+**ledger** (`baselines/audit-ledger.json`, the arch-cycles-baseline envelope
+shape). Each entry is keyed by the finding's fingerprint plus a location-based
+`semanticKey` and carries a lifecycle `status`
+(`new | filed | fixed | accepted-risk | regressed`). A finding whose tracking
+Issue was closed as `not_planned` becomes `accepted-risk` and is **suppressed**
+on every later scan; a `fixed` finding that re-appears becomes `regressed`. The
+ledger is written by the unattended `--auto` sweep and by any `--scan --ledger`
+run; the plain `--scan` path leaves it untouched.
 
 ## Phase 7 — Summary & cleanup
 
@@ -220,13 +247,13 @@ Persist `temp/audits/audit-to-stories-$(date +%Y%m%dT%H%M%S).md`
 summarising the run:
 
 - Per-group breakdown: which findings merged, fingerprints, dependency
-  edges, created/skipped Issue link (or new Epic link).
+  edges, created/skipped Issue link (or plan-run / Story links).
 - The severity threshold and grouping mode the operator chose.
 - Final tally: `"<M> groups planned · <K> created · <J> skipped (open)
   · <L> skipped (re-occurring)"`.
 
-When the Single-Epic path ran, link the Epic the chained `/plan`
-opened. When the Standalone-Stories path ran, list every Issue URL.
+When the single-plan path ran, link the Story (or plan-run) the chained
+`/plan` opened. When the Standalone-Stories path ran, list every Issue URL.
 
 ## Constraints
 
@@ -248,10 +275,33 @@ opened. When the Standalone-Stories path ran, list every Issue URL.
   creation; fall back to `gh issue create` when the MCP tool is
   unavailable.
 
+## Scheduling a nightly sweep
+
+To run an unattended maintenance sweep, `/schedule` a nightly (or weekly)
+job that (1) runs the relevant `audit-*` lens workflows full-scope — no
+`--paths`, no change-set filter, so the whole target-set union is audited —
+writing their `temp/audits/audit-*-results.md` reports, then (2) invokes the
+CLI's **`--auto` mode** over those results:
+
+```bash
+node .agents/scripts/audit-to-stories.js --auto [--dry-run] \
+  [--glob "temp/audits/audit-*-results.md"] [--severity <floor>]
+```
+
+`--auto` runs with **no interactive gates**: it resolves the severity floor
+from `delivery.auditToStories.severityFloor` (default `high`, overridable with
+`--severity`), applies the two-stage dedup, reconciles the cross-run ledger,
+and prints a run-summary JSON (create / skip-open / skip-reoccurring /
+suppressed-by-ledger tallies, plus the re-detected open Issue numbers an
+operator may want a "re-detected" comment on). `--dry-run` performs zero GitHub
+writes and skips the ledger write, emitting only the summary. The host
+scheduler owns the cadence; this workflow owns the routing. (This paragraph
+folds in the `loops/nightly-audit.md` starter unit retired in issue 4482.)
+
 ## See also
 
-- [`/plan`](helpers/plan-epic.md) — the planning pipeline `/audit-to-stories`
-  chains into for the Single-Epic grouping mode.
+- [`/plan`](plan.md) — the planning pipeline `/audit-to-stories`
+  chains into for Story creation.
 - [`lib/findings/route-finding.js`](../scripts/lib/findings/route-finding.js) —
   the shared fingerprint/dedup/route helper this workflow and `qa-explore`
   both consume. There is no second dedup implementation.
