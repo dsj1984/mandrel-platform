@@ -1557,7 +1557,7 @@ jobs:
       # reusable workflow references a first-party composite by absolute
       # owner/repo/path@<sha> form only — never a relative ./ path.
       - name: OSV advisory scan (pinned binary)
-        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@f2d4f68015496bde6f60a53b8cae00d73087f7a3
+        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@aa84e24d3bbe1b8b0e3516f10f21a8c6d624cc4e
         with:
           osv-scanner-version: ${{ inputs.osv-scanner-version }}
           fail-on-severity: ${{ inputs.osv-fail-on-severity }}
