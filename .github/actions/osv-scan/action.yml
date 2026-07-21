@@ -1,0 +1,268 @@
+# Shared OSV advisory-scan composite action (Story #310).
+#
+# Single source of truth for the pinned-OSV-scanner installer + scan + the
+# severity-band gate. Before this action, that logic lived inline in
+# pr-quality.yml's Tier 7 job — a ~360-line block whose Node half was a
+# heredoc, so the banding, the Story #145 allow-list schema, and the
+# `revisitBy` re-gating had no unit coverage at all, and the machinery was
+# reachable ONLY from a pull_request/push event. Extracting it is what lets
+# advisory-scan.yml run the same scan on a schedule against the default
+# branch (issue #309) without a consumer hand-rolling the binary download.
+#
+# This composite owns the ONE version + per-platform checksum map (see
+# OSV_DEFAULT_VERSION / the checksum case below — the single place to bump on
+# an OSV-scanner release) and the cross-platform asset selector (darwin/linux
+# × amd64/arm64, bash-3.2-compatible for macOS self-hosted runners).
+#
+# Pinning the BINARY (not an action) keeps the gate SHA-action-ratchet-exempt
+# and GHAS-free: findings surface via the run log and job summary, never
+# SARIF / Code Scanning, so the tier stays load-bearing on a PRIVATE repo
+# with no GitHub Advanced Security — the same constraint that made
+# gitleaks/Semgrep the chosen gates over CodeQL.
+#
+# Usage (blocking PR gate — pr-quality Tier 7):
+#   - name: OSV advisory scan (pinned binary)
+#     uses: dsj1984/mandrel-platform/.github/actions/osv-scan@<sha>
+#     with:
+#       osv-scanner-version: ${{ inputs.osv-scanner-version }}
+#       fail-on-severity: ${{ inputs.osv-fail-on-severity }}
+#       allowlist-path: ${{ inputs.osv-allowlist-path }}
+#
+# Usage (non-blocking scheduled signal — advisory-scan):
+#   - name: OSV advisory scan (scheduled, non-blocking)
+#     id: osv
+#     uses: dsj1984/mandrel-platform/.github/actions/osv-scan@<sha>
+#     with:
+#       non-blocking: 'true'
+#       findings-out: ${{ runner.temp }}/osv-findings.json
+#
+# Cross-repo portability contract (scripts/check-workflow-portability.mjs):
+# no `${{ }}` expressions in input descriptions/defaults; reusable workflows
+# reference this action by absolute `owner/repo/path@<sha>` form only.
+name: OSV Advisory Scan
+description: >
+  Download a pinned, SHA-256-verified OSV-scanner binary (cross-platform
+  asset selector, darwin/linux amd64/arm64), scan the lockfile/manifest tree,
+  and gate on the CVSS severity band with an optional per-finding allow-list.
+  The pinned version and its per-platform checksum map live in this action —
+  the single place to bump on an OSV-scanner release.
+
+inputs:
+  osv-scanner-version:
+    description: >
+      Pinned OSV-scanner release version (without the leading 'v'). Must have
+      a matching entry in this action's per-platform SHA-256 checksum map —
+      bump both together. Default 2.4.0.
+    required: false
+    default: '2.4.0'
+  fail-on-severity:
+    description: >
+      Lowest CVSS severity band that BLOCKS: one of none, low, medium, high,
+      critical. Findings below the band are reported as warnings without
+      blocking. Default 'high'.
+    required: false
+    default: 'high'
+  allowlist-path:
+    description: >
+      Path (relative to the repo root) to an optional OSV allow-list JSON
+      file. Each entry requires id, reason, and revisitBy; optionally
+      package/ecosystem to scope the match. Entries past revisitBy re-gate as
+      blocking. A missing file is a no-op (gating identical to having no
+      allow-list). Default '.osv-allowlist.json'.
+    required: false
+    default: '.osv-allowlist.json'
+  non-blocking:
+    description: >
+      When 'true', a blocking finding set is REPORTED (summary, outputs,
+      findings-out) but never fails this step — the scheduled advisory
+      posture, where the tracking issue is the signal rather than a red job.
+      Download / checksum / scanner-error failures ALWAYS fail the step
+      regardless: a supply-chain integrity failure, or a gate that could not
+      evaluate, is never a soft signal. Default 'false'.
+    required: false
+    default: 'false'
+  findings-out:
+    description: >
+      Optional path to write a machine-readable findings JSON (failOn,
+      digest, counts, rendered summary) for a downstream step such as the
+      tracking-issue upsert. Empty (default) writes no file.
+    required: false
+    default: ''
+
+outputs:
+  blocking-count:
+    description: Number of findings at or above the fail-on-severity band (after allow-list resolution).
+    value: ${{ steps.gate.outputs.blocking-count }}
+  warning-count:
+    description: Number of findings below the fail-on-severity band.
+    value: ${{ steps.gate.outputs.warning-count }}
+  suppressed-count:
+    description: Number of would-block findings suppressed by an unexpired allow-list entry.
+    value: ${{ steps.gate.outputs.suppressed-count }}
+  expired-count:
+    description: Number of allow-list suppressions past revisitBy, re-gated as blocking.
+    value: ${{ steps.gate.outputs.expired-count }}
+  findings-digest:
+    description: Stable digest of the blocking finding set — unchanged across runs when the advisory set is unchanged.
+    value: ${{ steps.gate.outputs.findings-digest }}
+  scanned:
+    description: >
+      'true' when OSV-scanner produced a report, 'false' when there was no
+      recognized lockfile/manifest to scan (no-op pass).
+    value: ${{ steps.gate.outputs.scanned }}
+
+runs:
+  using: composite
+  steps:
+    # Download + verify the PINNED OSV-scanner binary, run the scan, and hand
+    # the report to the gate script. The asset selector maps uname OS/arch →
+    # the release asset (OSV-scanner ships bare per-platform executables, no
+    # archive), then verifies it against a pinned SHA-256 before execution.
+    # Uses a `case` statement instead of `declare -A` and `shasum -a 256`
+    # instead of `sha256sum` to remain compatible with bash 3.2 / macOS
+    # self-hosted runners.
+    - name: OSV advisory scan (pinned binary)
+      id: gate
+      shell: bash
+      env:
+        OSV_VERSION: ${{ inputs.osv-scanner-version }}
+        OSV_FAIL_ON: ${{ inputs.fail-on-severity }}
+        OSV_ALLOWLIST_PATH: ${{ inputs.allowlist-path }}
+        OSV_NON_BLOCKING: ${{ inputs.non-blocking }}
+        OSV_FINDINGS_OUT: ${{ inputs.findings-out }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        os="$(uname -s)"
+        arch="$(uname -m)"
+        case "$os" in
+          Darwin) osv_os="darwin" ;;
+          Linux)  osv_os="linux" ;;
+          *) echo "::error::Unsupported OS for OSV-scanner asset selector: $os"; exit 1 ;;
+        esac
+        case "$arch" in
+          arm64|aarch64) osv_arch="arm64" ;;
+          x86_64|amd64)  osv_arch="amd64" ;;
+          *) echo "::error::Unsupported arch for OSV-scanner asset selector: $arch"; exit 1 ;;
+        esac
+
+        # ── Single bump point ────────────────────────────────────────────
+        # Pinned SHA-256 checksums for the OSV-scanner release binaries.
+        # On a version bump, update the osv-scanner-version default above and
+        # ALL FOUR slug checksums together. This map is the only place in the
+        # repo that carries OSV-scanner checksum literals — consumers inherit
+        # the bump via this action.
+        slug="${OSV_VERSION}_${osv_os}_${osv_arch}"
+        case "$slug" in
+          "2.4.0_darwin_amd64") expected="088119325156321c34c456ac3703d6013538fd71cbac82b891ab34db491e4d66" ;;
+          "2.4.0_darwin_arm64") expected="9ca3185ad63e9ab54f7cb90f46a7362be02d80e37f0123d095a54355ea202f5d" ;;
+          "2.4.0_linux_amd64")  expected="15314940c10d26af9c6649f150b8a47c1262e8fc7e17b1d1029b0e479e8ed8a0" ;;
+          "2.4.0_linux_arm64")  expected="44e580752910f0ff36ec99aff59af20f65df1e859aa31e5605a8f0d055b496e9" ;;
+          *) expected="" ;;
+        esac
+        if [ -z "$expected" ]; then
+          echo "::error::No pinned checksum for OSV-scanner $slug — update the SHA256 map for this version/platform."
+          exit 1
+        fi
+
+        asset="osv-scanner_${osv_os}_${osv_arch}"
+        url="https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/${asset}"
+        tmp="$(mktemp -d)"
+        echo "Downloading pinned OSV-scanner: ${url}"
+        # Retry a release-asset blip rather than fail fleet-wide. Fail-closed
+        # is preserved — the SHA-256 check below still gates trust; retries
+        # only widen the availability window.
+        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$url" -o "${tmp}/osv-scanner"
+
+        actual="$(shasum -a 256 "${tmp}/osv-scanner" | awk '{print $1}')"
+        if [ "$actual" != "$expected" ]; then
+          echo "::error::OSV-scanner checksum mismatch for ${asset}: expected ${expected}, got ${actual}"
+          exit 1
+        fi
+        echo "✅ OSV-scanner ${asset} checksum verified."
+        chmod +x "${tmp}/osv-scanner"
+        "${tmp}/osv-scanner" --version
+
+        # Scan the lockfile/manifest tree recursively. OSV-scanner exits
+        # non-zero on ANY finding (and 127/128 on no scannable target); we
+        # capture exit code + JSON and decide the gate ourselves from the
+        # severity band, so swallowing the code here is intentional — the
+        # gate script owns pass/fail, not OSV-scanner's coarse exit code.
+        report="${tmp}/osv-report.json"
+        echo "Running: osv-scanner scan source -r . --format json"
+        "${tmp}/osv-scanner" scan source -r . --format json --output-file "${report}" || scan_rc=$?
+        scan_rc="${scan_rc:-0}"
+        echo "OSV-scanner raw exit code: ${scan_rc}"
+
+        # Fail-closed on ANY unexpected exit code, regardless of whether a
+        # report was written. The only exit codes we trust are:
+        #   • 0        — clean scan, no findings.
+        #   • 1        — findings present; a JSON report the gate script owns.
+        #   • 127/128  — no recognized lockfile/manifest to scan (no-op pass).
+        # A crash that flushes a PARTIAL report before dying (e.g. exit 2/3)
+        # would otherwise reach the severity gate, which scores only the rows
+        # it happens to see — so unscanned manifests would pass silently.
+        # Guarding on the exit code (not on report emptiness) closes that hole.
+        case " 0 1 127 128 " in
+          *" ${scan_rc} "*) : ;;  # documented/expected code — continue
+          *)
+            echo "::error::OSV-scanner exited ${scan_rc} — not a documented code (0=clean, 1=findings, 127/128=no target). Failing closed: the advisory scan did not complete, so any report on disk is partial and cannot be trusted."
+            {
+              echo "### ❌ OSV advisory scan — scanner error"
+              echo ""
+              echo "OSV-scanner exited with code \`${scan_rc}\`, which is not a documented"
+              echo "exit code (0 clean / 1 findings / 127-128 no target). Any report written"
+              echo "before it exited is partial, so the advisory tier fails closed rather"
+              echo "than scoring an incomplete result."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+            ;;
+        esac
+
+        # Documented no-target exit codes: OSV-scanner exits 127/128 when it
+        # finds no recognized lockfile/manifest. Those are the ONLY non-zero
+        # codes treated as a clean no-op pass. The exit-code guard above
+        # already fails closed on anything outside {0,1,127,128}; this
+        # empty-report branch retains the belt-and-suspenders handling.
+        NO_TARGET_CODES="127 128"
+        if [ ! -s "${report}" ]; then
+          is_no_target=0
+          for code in ${NO_TARGET_CODES}; do
+            if [ "${scan_rc}" = "${code}" ]; then is_no_target=1; break; fi
+          done
+          if [ "${scan_rc}" != "0" ] && [ "${is_no_target}" = "0" ]; then
+            echo "::error::OSV-scanner exited ${scan_rc} with no JSON report — this is not a documented no-target code (${NO_TARGET_CODES}). Failing closed: the advisory scan did not complete."
+            {
+              echo "### ❌ OSV advisory scan — scanner error"
+              echo ""
+              echo "OSV-scanner exited with code \`${scan_rc}\` and produced no report."
+              echo "This is not a documented no-target exit code (\`${NO_TARGET_CODES}\`),"
+              echo "so the advisory tier fails closed rather than passing silently."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "No OSV JSON report produced (no scannable lockfile/manifest) — advisory scan is a no-op pass."
+          {
+            echo "### OSV advisory scan — no scannable target"
+            echo ""
+            echo "OSV-scanner found no recognized lockfile/manifest to scan; nothing to advise on."
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "blocking-count=0"
+            echo "warning-count=0"
+            echo "suppressed-count=0"
+            echo "expired-count=0"
+            echo "findings-digest=empty-0"
+            echo "scanned=false"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "scanned=true" >> "$GITHUB_OUTPUT"
+
+        # Severity-band gate with optional per-finding suppression
+        # (Story #145). Lives in a sibling module so it is unit-testable
+        # (scripts/osv-report-gate.test.mjs); it ships inside this action's
+        # directory, so a consumer still needs NO extra file in its checkout.
+        OSV_REPORT="${report}" node "${ACTION_PATH}/osv-report-gate.mjs"

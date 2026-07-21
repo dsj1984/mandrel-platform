@@ -1,0 +1,42 @@
+# mandrel-platform's own scheduled advisory scan (Story #310, issue #309).
+#
+# Dogfoods the reusable advisory-scan.yml against this repo's default branch
+# BEFORE the consumer (Beestera/swarm-os#654) adopts it — so the whole path
+# (scan → non-blocking gate → tracking-issue upsert/close) is exercised on a
+# live repo, not shipped untested.
+#
+# GitHub-hosted (ubuntu-latest) deliberately, like runner-fleet-health.yml: a
+# scheduled advisory monitor must keep running when the self-hosted Mac is
+# down. Daily cadence — advisories publish continuously, but a red feature-PR
+# check is only avoided if the proactive scan runs at least daily.
+name: Advisory Scan
+
+on:
+  schedule:
+    # Daily at 07:17 UTC — an off-the-hour minute to dodge the top-of-hour
+    # scheduling congestion GitHub warns about for cron workflows.
+    - cron: '17 7 * * *'
+  # On-demand from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: advisory-scan-schedule-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  advisory-scan:
+    uses: ./.github/workflows/advisory-scan.yml
+    permissions:
+      contents: read
+      issues: write
+    with:
+      runner: ubuntu-latest
+      osv-fail-on-severity: high
+      tracking-issue-labels: 'audit::dependencies,meta::framework-gap'
+    # No `secrets: inherit` — least privilege (the SAST secrets-inherit rule).
+    # advisory-scan.yml's only secret (packages-read-token) is optional, and
+    # this repo's install needs none, so the scheduled caller forwards nothing.
