@@ -40,6 +40,28 @@ function coerceBooleanFlag(value) {
   return Boolean(value);
 }
 
+/** Like coerceBooleanFlag, but preserves `undefined` (flag absent). */
+function optionalBooleanFlag(value) {
+  if (value === undefined) return undefined;
+  return coerceBooleanFlag(value);
+}
+
+/**
+ * Parse a positive-integer flag, preserving `undefined` when the flag is
+ * absent so a caller can distinguish "not supplied" (fall back to config)
+ * from an explicit value. A non-numeric or non-positive value is treated as
+ * absent rather than coerced to 0 — a `--max-wait-seconds=abc` typo must not
+ * silently become a zero-second wait.
+ *
+ * @param {unknown} value
+ * @returns {number|undefined}
+ */
+function parsePositiveInt(value) {
+  if (value === undefined || value === null) return undefined;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 /**
  * Standardized CLI argument parser for sprint scripts.
  * Supports options like --epic, --story, --dry-run, --skip-dashboard.
@@ -57,7 +79,12 @@ export function parseSprintArgs(args = process.argv) {
       'skip-validation': { type: 'boolean', default: false },
       'skip-sync': { type: 'boolean', default: false },
       'no-auto-merge': { type: 'boolean', default: false },
-      'no-full-scope-crap': { type: 'boolean', default: false },
+      // No default — absent means "use delivery.routing.closeAndLand".
+      'wait-merge': { type: 'boolean' },
+      'no-wait-merge': { type: 'boolean', default: false },
+      // Story #4543 — per-run override of `delivery.mergeWatch.maxWaitSeconds`
+      // (the merge wait's per-invocation bound). Absent means "use the config".
+      'max-wait-seconds': { type: 'string' },
       executor: { type: 'string' },
       cwd: { type: 'string' },
       'recut-of': { type: 'string' },
@@ -78,7 +105,16 @@ export function parseSprintArgs(args = process.argv) {
     skipValidation: coerceBooleanFlag(values['skip-validation']),
     skipSync: coerceBooleanFlag(values['skip-sync']),
     noAutoMerge: coerceBooleanFlag(values['no-auto-merge']),
-    noFullScopeCrap: coerceBooleanFlag(values['no-full-scope-crap']),
+    // Close-and-land: `--wait-merge` forces land-in-close; `--no-wait-merge`
+    // opts out. When neither flag is present (`undefined`),
+    // `parseCloseOptions` applies `delivery.routing.closeAndLand` (default
+    // true) so attended and headless delivers share the same happy path.
+    waitForMerge: optionalBooleanFlag(values['wait-merge']),
+    noWaitForMerge: coerceBooleanFlag(values['no-wait-merge']),
+    // Story #4543 — raise the merge wait's per-invocation bound for a
+    // headless caller with no host tool-invocation ceiling, so it lands in
+    // one block instead of returning `pending` at the default 300s.
+    maxWaitSeconds: parsePositiveInt(values['max-wait-seconds']),
     executor: values.executor ?? null,
     // Resolve worktree cwd from flag or env. Empty string/whitespace → null.
     cwd:
@@ -87,7 +123,9 @@ export function parseSprintArgs(args = process.argv) {
       null,
     recutOf: parseTicketId(values['recut-of']),
     // Story #4253: pre-resolved Epic linkage threaded by the /deliver
-    // fan-out so `story-init.js` can skip the per-Story `getEpic` round-trip.
+    // fan-out so `single-story-init.js` can skip redundant Epic lookups when
+    // the parent already threaded Epic context (pre-v2; field retained for
+    // CLI compatibility).
     resume: values.resume ?? false,
     restart: values.restart ?? false,
     noEvidence: values['no-evidence'] ?? false,

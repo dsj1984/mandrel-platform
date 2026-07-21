@@ -8,13 +8,16 @@
  *
  * The gateway is constructed with a `{ gh, owner, repo, hooks }` object so
  * cross-gateway concerns can be threaded in without bloating the constructor
- * signature. Today the only hooks the ticket surface reaches for are
- * `addSubIssue` (from the future SubIssueGateway, used by `createTicket` to
- * link a freshly-created child as a native sub-issue) and `addItemToProject`
- * (from the projects-v2 shim, used by `createTicket` to add the new issue
- * to the configured Project V2).
+ * signature. The `addItemToProject` hook (from the projects-v2 shim) adds a
+ * newly-created issue to the configured Project V2.
  *
- * Public surface: `GitHubProvider.createTicket / createIssue / getTicket /
+ * Story #4545 deleted `createTicket` and its `composeStoryBody` helper — the
+ * Epic-hierarchy write surface. It composed the exact `Epic: #N` footer that
+ * `pr-base-guard.js` hard-refuses at delivery, so the framework retained the
+ * ability to generate work it would then reject; it had no production caller
+ * (`/plan` persists through the bare `createIssue` below).
+ *
+ * Public surface: `GitHubProvider.createIssue / getTicket /
  * getTickets / updateTicket / getTicketDependencies / primeTicketCache /
  * invalidateTicket` all delegate to the same-named methods on this class.
  *
@@ -23,7 +26,6 @@
 
 import { parseBlockedBy, parseBlocks } from '../../lib/dependency-parser.js';
 import { Logger } from '../../lib/Logger.js';
-import { TYPE_LABELS } from '../../lib/label-constants.js';
 import { addIssueToBoard } from './board-add.js';
 import { createInlineTicketCache } from './cache.js';
 import { withTransientRetry } from './errors.js';
@@ -42,54 +44,6 @@ import {
  */
 const SEARCH_PAGE_CAP = 10;
 
-/**
- * Compose the final markdown body for a created ticket. Under the 2-tier
- * hierarchy (Epic → Story), `body` is always a string supplied
- * by the caller (the decomposer, the spec planner, or the reconciler-apply
- * engine). This helper appends the canonical orchestrator footer
- * (`parent: #<n>` / `Epic: #<m>` / `blocked by #<x>`) byte-stable with the
- * format consumers (manifest, close-gate, dispatcher) parse.
- *
- * Story #3186 — inlined here when the Task-tier body-renderer helpers
- * were retired. The structured-body (object) path is gone: Stories carry
- * inline `acceptance[]` / `verify[]`
- * arrays on the Story body authored by the decomposer; there is no
- * server-side rendering of a four-section payload at create time.
- *
- * @param {{
- *   body: string,
- *   parentId: number,
- *   epicId?: number,
- *   dependencies?: number[],
- * }} opts
- * @returns {string}
- *
- * Story #3958 — this is the single owner of the `blocked by #N` footer.
- * Callers (the reconciler-apply create path, the spec planner) pass
- * resolved dependency issue numbers via `dependencies` and supply a body
- * WITHOUT any pre-appended footer. A caller that also appends a
- * `blocked by` block to `body` would double every dependency line.
- */
-export function composeStoryBody({
-  body,
-  parentId,
-  epicId,
-  dependencies = [],
-}) {
-  const head = typeof body === 'string' ? body : '';
-  const lines = ['---', `parent: #${parentId}`];
-  if (epicId !== undefined && epicId !== null) {
-    lines.push(`Epic: #${epicId}`);
-  }
-  if (dependencies.length > 0) {
-    lines.push('');
-    for (const dep of dependencies) {
-      lines.push(`blocked by #${dep}`);
-    }
-  }
-  return `${head}\n\n${lines.join('\n')}`;
-}
-
 export class TicketGateway {
   /**
    * @param {{
@@ -97,7 +51,6 @@ export class TicketGateway {
    *   owner: string,
    *   repo: string,
    *   hooks?: {
-   *     addSubIssue?: (parentNumber: number, childNodeId: string) => Promise<unknown>,
    *     addItemToProject?: (nodeId: string) => Promise<unknown>,
    *     getProjectNumber?: () => number|null,
    *   },
@@ -297,90 +250,27 @@ export class TicketGateway {
   // ---------------------------------------------------------------------------
 
   /**
-   * Create a new issue. Renders the body via the inline `composeStoryBody`
-   * helper so the `parent: #N` / `Epic: #M` / `blocked by #X` footer is
-   * consistent across creators.
-   *
-   * After the POST, opportunistically link the child as a native sub-issue
-   * (via the `addSubIssue` hook — retried internally on the sub-issue
-   * gateway) and add it to the configured Project V2 (best-effort —
-   * failures warn but do not fail the create).
-   *
-   * @field-manifest POST /repos/{owner}/{repo}/issues: number, id, node_id,
-   *                 html_url
-   */
-  /* node:coverage ignore next */
-  async createTicket(parentId, ticketData) {
-    const epicId = ticketData.epicId || parentId;
-    const renderedBody = composeStoryBody({
-      body: ticketData.body ?? '',
-      parentId,
-      epicId,
-      dependencies: ticketData.dependencies ?? [],
-    });
-
-    // Mirror the Epic create path (issues.js:160 → `labels: TYPE_LABELS.EPIC`):
-    // inject TYPE_LABELS.STORY so a spec that omits the labels array cannot
-    // produce an unlabeled, undispatchable Story. Dedupe to avoid duplicates
-    // when the caller already carries the label. (Story #4324 retired the
-    // `context::*` ticket classes, so every ticket created through this
-    // factory is a Story.)
-    const callerLabels = ticketData.labels ?? [];
-    const labels = callerLabels.includes(TYPE_LABELS.STORY)
-      ? callerLabels
-      : [TYPE_LABELS.STORY, ...callerLabels];
-    const result = await this._gh.api({
-      method: 'POST',
-      endpoint: `/repos/${this.owner}/${this.repo}/issues`,
-      body: {
-        title: ticketData.title,
-        body: renderedBody,
-        labels,
-      },
-    });
-    const issue = parseApiJson(result);
-    this._listCache.clear();
-
-    let subIssueLinked = false;
-    let subIssueError = null;
-    try {
-      if (typeof this._hooks.addSubIssue === 'function') {
-        await this._hooks.addSubIssue(parentId, issue.node_id);
-        subIssueLinked = true;
-      }
-    } catch (err) {
-      subIssueError = err;
-    }
-
-    await addIssueToBoard({
-      nodeId: issue.node_id,
-      issueNumber: issue.number,
-      getProjectNumber: this._hooks.getProjectNumber,
-      addItemToProject: this._hooks.addItemToProject,
-    });
-
-    return {
-      id: issue.number,
-      internalId: issue.id,
-      nodeId: issue.node_id,
-      url: issue.html_url,
-      subIssueLinked,
-      subIssueError,
-    };
-  }
-
-  /**
-   * Create a **bare** issue — no `parent: #N` footer composition and no
-   * sub-issue link. Serves the standalone create paths that bypass
-   * `createTicket`'s Story-shaped body rendering: the `/plan`
-   * persist step and the `/plan` Phase 4 Epic open
-   * (`openEpicFromOnePager`'s `createIssue` port).
+   * Create a **bare** issue — no footer composition and no sub-issue link.
+   * Since Story #4545 this is the *only* create path: `/plan` persist and the
+   * `/plan` Phase 4 Epic open (`openEpicFromOnePager`'s `createIssue` port)
+   * both route through it.
    *
    * After the POST, the new issue is added to the configured Project V2
    * board via the shared `addIssueToBoard` helper (Story #3822) —
    * idempotent, non-fatal, and a no-op when no project number resolves —
    * so board membership never depends on GitHub's "Auto-add to project"
    * built-in workflow.
+   *
+   * The POST is wrapped in `withTransientRetry` (Story #4541) so it absorbs
+   * the same 502/429/ECONNRESET blips the read surfaces already do. It used
+   * to post bare, which made a single transient failure at story *k* of *N*
+   * abort `/plan` persist with `1..k-1` already live on the tracker.
+   *
+   * Retry alone is not sufficient for that failure mode — a POST whose
+   * response is lost would double-create on the retry — so the caller
+   * (`plan-persist`'s `createStoryIssues`) carries the idempotency half via
+   * a plan fingerprint it looks up before creating. Retry narrows the
+   * window; the fingerprint closes it.
    *
    * @field-manifest POST /repos/{owner}/{repo}/issues: number, id, node_id,
    *                 html_url
@@ -396,11 +286,15 @@ export class TicketGateway {
    * }>}
    */
   async createIssue({ title, body, labels = [] }) {
-    const result = await this._gh.api({
-      method: 'POST',
-      endpoint: `/repos/${this.owner}/${this.repo}/issues`,
-      body: { title, body, labels },
-    });
+    const result = await withTransientRetry(
+      () =>
+        this._gh.api({
+          method: 'POST',
+          endpoint: `/repos/${this.owner}/${this.repo}/issues`,
+          body: { title, body, labels },
+        }),
+      { label: `createIssue "${title}"`, onRetry: defaultRetryWarn },
+    );
     const issue = parseApiJson(result);
     this._listCache.clear();
 

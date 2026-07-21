@@ -18,62 +18,17 @@ existing external APIs or business logic.
 
 ## Execution strategy (dual-path)
 
-This lens runs along one of two execution paths. Both emit the **identical**
-report contract (Step 3); downstream consumers (`/deliver` Phase 4
-epic-audit, `audit-to-stories`) are agnostic to which path produced it.
+This lens runs along one of two execution paths (orchestrated dynamic-workflow
+or sequential single-pass). Both emit the **identical** Step 3 report contract;
+downstream consumers (`audit-to-stories`) are agnostic to which path produced
+it. See [`helpers/audit-dual-path.md`](helpers/audit-dual-path.md) for strategy
+selection, the forcing flags, and the read-only guarantee — read `audit-<lens>`
+there as this lens's name.
 
-- **Orchestrated (dynamic-workflow) path.** When Claude Code's
-  [dynamic workflows](https://code.claude.com/docs/en/workflows) are
-  available, the saved project workflow
-  `.claude/workflows/audit-architecture.workflow.js` fans the dimensions below
-  out as parallel read-only subagents, runs an **adversarial cross-check**
-  stage (an independent agent reviews each dimension's findings and drops
-  false positives before they enter the report), then synthesises the Step 3
-  report. The orchestrator derives its per-dimension prompts from *this*
-  markdown at run time — the lens stays the single source of truth; the
-  script does not fork a second copy of the spec.
-- **Sequential (single-pass) path.** When dynamic workflows are unavailable,
-  follow Steps 1–3 below turn-by-turn exactly as before. This is the default
-  fallback and changes nothing about the existing behaviour.
+## Scope (Story / plan-run mode)
 
-**Strategy selection** is computed by
-[`lib/dynamic-workflow/capability.js`](../scripts/lib/dynamic-workflow/capability.js)
-(`selectAuditStrategy`). The orchestrated path is chosen only when the runtime
-is Claude Code, `disableWorkflows` is not set (settings.json **or**
-`CLAUDE_CODE_DISABLE_WORKFLOWS`), and the Claude Code version meets the
-research-preview floor (`>= 2.1.154`). Any other runtime, a disabled setting,
-or an older version degrades gracefully to the sequential path.
-
-> **Capability degradation, not a contract shim.** This dual path is **not**
-> covered by the No-Shim / hard-cutover rule in
-> [`git-conventions.md`](../rules/git-conventions.md). That rule forbids
-> running two shapes of the *same contract* side by side. Here there is **one**
-> report contract; only the *execution strategy* is selected from a runtime
-> capability — the same pattern the protocol already endorses for live-docs
-> fallback in [`instructions.md` §1.C/§1.D](../instructions.md). The full
-> capability-degradation rationale lives in the
-> [`capability.js`](../scripts/lib/dynamic-workflow/capability.js) module
-> docstring; the orchestrated-run evidence and per-lens cost/precision gate
-> verdicts live in [`docs/roadmap.md`](../../docs/roadmap.md) (Part 3 —
-> Dynamic-Workflow Orchestration).
-
-**Forcing a path (for testing).** Set `MANDREL_AUDIT_STRATEGY=sequential` to
-verify the fallback path with the feature notionally disabled, or
-`MANDREL_AUDIT_STRATEGY=orchestrated` to pin the dynamic path. To exercise the
-real disable signals instead, set `CLAUDE_CODE_DISABLE_WORKFLOWS=1` (env) or
-`disableWorkflows: true` in `.claude/settings.json` and re-run the lens — both
-degrade to the sequential path.
-
-> **Read-only on both paths.** The lens is read-only (see Constraint). The
-> orchestrated subagents run in `acceptEdits` and inherit the session tool
-> allowlist, but the workflow script grants the analysis agents only
-> read/search tools (`Read`, `Grep`, `Glob`) — no write/edit/shell-mutation
-> tools. The single write in an orchestrated run is the final report artifact.
-
-## Scope (Epic mode)
-
-When this lens is invoked from `/deliver` Phase 4 (epic-audit), the
-following block is populated with the Epic's change-set file list.
+When this lens is invoked from `/deliver` close lenses (or a plan-run audit), the
+following block is populated with the Story (or plan-run) change-set file list.
 Otherwise — for any manual `/audit-<dimension>` invocation — the block
 renders the literal substitution token and you MUST treat it as **no
 scope filter — run the lens codebase-wide** exactly as you would have
@@ -90,6 +45,56 @@ before this section existed.
   (i.e. no substitution was supplied), ignore this section entirely and
   proceed with the full codebase-wide scan defined in the remaining
   steps.
+
+## Step 0: Tool-first detection (mandatory — run before any LLM dimension)
+
+Ground every structural finding in a measured instrument this repo already
+ships rather than free-associating over the source. Run the shipped checkers
+**first** and treat their output as the spine of the report; the LLM
+dimensions in Step 2 only *interpret, rank, and phrase* what the tools
+surface. Skipping this step and reasoning about boundaries from prose alone is
+the failure mode this lens exists to prevent.
+
+1. **Cycle detection.** Run the shipped circular-dependency checker:
+
+   ```bash
+   node .agents/scripts/check-arch-cycles.js
+   ```
+
+   Each reported cycle is a grounded finding under the **Automated
+   Architecture Guardrails** dimension. When the shipped checker is
+   unavailable in the consumer project, fall back to
+   `npx madge --circular <srcDir>` or
+   `npx depcruise --validate <config> <srcDir>` (dependency-cruiser).
+
+2. **Dead-export detection.** Run the shipped dead-export checker:
+
+   ```bash
+   node .agents/scripts/check-dead-exports.js
+   ```
+
+   Each unreferenced export is a grounded candidate. **Cede it** to
+   audit-clean-code's Dead Code dimension rather than re-deriving it here (see
+   the deferral in Step 2). When the shipped checker is unavailable, fall back
+   to `npx knip --production` — and heed the `!`-suffix entry-pattern caveat
+   that [`audit-clean-code`](audit-clean-code.md) documents, since
+   `knip --production` is a silent no-op without it.
+
+3. **Hotspot ranking.** Rank the modules the checkers implicate by
+   **fan-in / fan-out** (how many modules import a file versus how many it
+   imports) and by **churn** (e.g.
+   `git log --format= --name-only -n 200 | sort | uniq -c | sort -rn`). A file
+   that is both heavily depended upon and frequently churned is the
+   highest-priority structural hotspot; lead the Triage Summary with it.
+
+4. **LLM triage on top.** Only after the tools have run do you apply the Step 2
+   dimensions to interpret, rank, and phrase the findings. A structural claim
+   that no tool grounds and no Step 2 dimension covers does not belong in this
+   report — route it to the ceded clean-code dimensions instead.
+
+When a shipped checker exits non-zero or is genuinely absent, record that as an
+**Automated Architecture Guardrails** finding (the guardrail is missing or
+broken) rather than skipping the step silently.
 
 ## Step 1: Context Gathering (Read-Only Scan)
 
@@ -137,23 +142,19 @@ Structural Change can be Medium. As a loose default, Quick Wins typically land
 High (cheap to fix, real payoff) and Structural Changes Medium/High, but grade
 Impact on the risk itself rather than deriving it mechanically from Category.
 
-Evaluate the gathered context against the following clean code dimensions:
+> **Ceded to audit-clean-code.** The five clean-code-overlapping dimensions
+> this lens historically enumerated — Over-Engineering & Abstractions,
+> Cognitive Load & Nesting, Dead Code & Redundancy, Naming &
+> Self-Documentation, and Coupling & Cohesion — are now owned by
+> [`audit-clean-code`](audit-clean-code.md). Do **not** duplicate them here: a
+> smell in one of those five belongs in the clean-code report, and the
+> dead-export candidates from Step 0 flow into audit-clean-code's Dead Code
+> dimension. This lens keeps only the two structural dimensions no other lens
+> owns — the testable-surface boundary and the automated-guardrail maturity.
 
-1. **Over-Engineering & Abstractions:** Identify "dry-run" complexity, premature
-   optimizations, or interfaces/classes that add boilerplate without clear value
-   (e.g., interfaces with only one implementation).
-2. **Cognitive Load & Nesting:** Pinpoint deeply nested logic (arrow code),
-   massive functions violating the Single Responsibility Principle (SRP), or
-   excessive cyclomatic complexity.
-3. **Dead Code & Redundancy:** Locate unused exports, redundant utility
-   functions that duplicate standard library features, or obsolete commented-out
-   code blocks.
-4. **Naming & Self-Documentation:** Find poorly named variables/functions,
-   inconsistent naming conventions, or areas that rely heavily on comments to
-   explain *what* the code does rather than *why*.
-5. **Coupling & Cohesion:** Spot tight coupling between modules that should be
-   independent or god-objects handling too many concerns.
-6. **Testable Surface (Humble-Object Boundary):** Flag modules that interleave
+Evaluate the gathered context against the following architecture dimensions:
+
+1. **Testable Surface (Humble-Object Boundary):** Flag modules that interleave
    hard-to-test I/O — filesystem (`fs`), process spawning (`child_process`,
    `exec`, `spawn`), network calls, database access, or GUI/terminal
    rendering — directly with business logic. The humble-object /
@@ -190,7 +191,7 @@ Evaluate the gathered context against the following clean code dimensions:
    thin `runAsCli` shell — not the logic — owns the `process.exit` side effect,
    keeping the wrapped logic exercisable under a stubbed `process.exit`. Cite
    that precedent where it applies rather than restating it.
-7. **Automated Architecture Guardrails:** Assess whether the project encodes
+2. **Automated Architecture Guardrails:** Assess whether the project encodes
    its architectural boundaries as **deterministic, automated checks** rather
    than relying on convention or reviewer memory. When relevant to the
    consumer project's shape, evaluate enforcement for:
@@ -218,7 +219,7 @@ Evaluate the gathered context against the following clean code dimensions:
    gates, baseline kinds, close-validation steps, dependencies, or
    harness subsystems under this dimension.
 
-   **Scope-mode behavior.** When this lens is invoked in Epic mode (the
+   **Scope-mode behavior.** When this lens is invoked in Story scope (the
    `{{changedFiles}}` block above is populated with a file list), the
    maturity assessment for this dimension is a repo-wide property that
    cannot be represented by a small changeset. In that case, render the
@@ -246,6 +247,9 @@ Generate and save a highly structured Markdown audit report to
 `{{auditOutputDir}}/audit-architecture-results.md`, using the exact template
 below.
 
+> Grade every finding's severity on the shared
+> [`Critical | High | Medium | Low` scale](helpers/audit-severity-scale.md).
+
 ```markdown
 # Architecture & Clean Code Review
 
@@ -269,7 +273,7 @@ architectural pain points and areas for simplification.]
 ## Architecture Guardrail Coverage
 
 [Codebase-wide mode: complete this section using the maturity rubric in
-Step 2. Epic-mode / scoped run: set `Current Maturity` to
+Step 2. Story-scoped run: set `Current Maturity` to
 `Not Assessed — scoped run` and leave the remaining fields empty or
 marked `n/a`.]
 
@@ -298,16 +302,19 @@ marked `n/a`.]
 
 ## Detailed Findings
 
-[For every gap identified, use the following strict structure:]
+[For every gap identified, use the following strict structure. Lead each title
+with the primary file the finding lives in:]
 
-### [Short Title of the Issue]
+### `path/to/primary-file.ext` — [Short title of the issue]
 
-- **Impact:** [High | Medium | Low]
+- **Impact:** [Critical | High | Medium | Low]
 - **Category:** [Quick Win | Structural Change]
 - **Dimension:** [e.g., Cognitive Load & Nesting | Testable Surface (Humble-Object Boundary) | Automated Architecture Guardrails]
+- **Location:** `path/to/primary-file.ext:line`
 - **Current State:** [The specific file/function and why it is problematic]
 - **Recommendation & Rationale:** [The specific refactor strategy and how it
   improves readability or maintainability]
+- **Acceptance signal:** [the command or observable that proves this finding is remediated — e.g. a maintainability-index re-check, `npm test`, or a re-run of this lens]
 - **Agent Prompt:**
   `[A copy-pasteable, highly specific prompt to execute this refactor independently. Must explicitly state NOT to change external APIs.]`
 ```
@@ -319,3 +326,13 @@ marked `n/a`.]
 Do NOT execute any code modifications, edit files, create branches, or implement
 changes. This is strictly a read-only analysis. Ensure all recommendations
 preserve existing functionality and external APIs. Output the report and stop.
+
+## Self-cross-check (mandatory — filter false positives before you finalize)
+
+Before you write the report artifact from the previous step, run the shared
+adversarial self-cross-check over your Detailed Findings — see
+[`helpers/audit-self-check.md`](helpers/audit-self-check.md). It defines the
+per-finding evidence bar, the exclusion list, and the final re-open-and-drop
+pass whose `kept <k> / dropped <d>` counts you record in the Executive
+Summary, so the sequential single-pass path filters unverified findings just as
+the orchestrated path's adversarial reviewer does.

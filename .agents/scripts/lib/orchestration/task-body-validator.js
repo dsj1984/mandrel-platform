@@ -24,16 +24,23 @@
  * name at least one path-shaped token so vague verbs ("clean up",
  * "refactor") can't slip through.
  *
- * `body.changes` items may be either:
- *   1. A string bullet (legacy shape, e.g. `"src/foo.ts: extract handler"`).
- *   2. An object `{ path: string, assumption: enum }` (Story #2636 shape).
+ * `acceptance` / `verify` are the **top-level machine contract** (Story
+ * #4541). The decomposer prompt tells authors to write those lists once at
+ * the ticket's top level and omit the matching body sections; persist syncs
+ * them into the body at assemble time. Validation runs *before* that sync,
+ * so this validator resolves each contract field from the parsed body and
+ * falls back to the ticket's top-level array when the body section is
+ * absent. Without that fallback the validator rejected the very shape its
+ * own prompt prescribes.
+ *
+ * `body.changes` items must be object-form `{ path: string, assumption: enum }`
+ * entries (Story #2636 shape). Plain string bullets are rejected at parse
+ * time and by this validator.
  *
  * Object-form items must declare an `assumption` ∈ `creates |
  * refactors-existing | exists | deletes`. The optional `body.references`
  * array uses the same object shape and is the home for paths the Story
  * reads but does not modify (test fixtures, sibling modules, etc.).
- * String-form `changes` items remain legal so legacy plans keep parsing,
- * but they emit a deprecation signal via `validateStoryFileAssumptions`.
  *
  * `body.verify` entries must either name a testing tier in parentheses
  * drawn from `VERIFY_TIER_VALUES` (e.g. `npm run test (unit)`) or be the
@@ -53,8 +60,8 @@ import { FILE_ASSUMPTION_VALUES } from './file-assumption-enum.js';
 
 /**
  * Canonical testing-tier labels that a `verify[]` entry must name (in
- * parentheses) to pass plan-time validation. Mirrors the skill contract in
- * `core/epic-plan-decompose-author/SKILL.md § verify rules`.
+ * parentheses) to pass plan-time validation. Mirrors the verify-rules contract
+ * in `.agents/scripts/lib/templates/decomposer-prompts.js`.
  *
  * Entries that do not end with `(<tier>)` and are not `manual:<reason>` are
  * rejected by `collectVerifyErrors`.
@@ -167,6 +174,39 @@ function resolveStructuredBody(ticket) {
 }
 
 /**
+ * The two contract fields that live at the ticket's top level and are
+ * synced into the body by `plan-persist` at assemble time.
+ */
+const CONTRACT_FIELDS = Object.freeze(['acceptance', 'verify']);
+
+/**
+ * Resolve the body's contract fields against the ticket's top-level arrays
+ * (Story #4541). The decomposer prompt prescribes authoring `acceptance[]`
+ * / `verify[]` **once** at top level and omitting the matching body
+ * sections; `assemblePlanStories#syncContractFieldFromTopLevel` performs
+ * the sync, but it runs *after* validation. So an absent body section is
+ * not a violation when the ticket carries the list at top level — it is the
+ * preferred shape. A body section that is present and disagrees with the
+ * top level is left alone here: the sync itself fails closed on that
+ * mismatch, and duplicating the check would report it twice.
+ *
+ * @param {object} ticket
+ * @param {object} bodyObject Parsed / structured body.
+ * @returns {object} A copy of `bodyObject` with the contract fields resolved.
+ */
+function resolveContractFieldsFromTopLevel(ticket, bodyObject) {
+  const resolved = { ...bodyObject };
+  for (const field of CONTRACT_FIELDS) {
+    const bodyValue = Array.isArray(resolved[field]) ? resolved[field] : [];
+    if (bodyValue.length > 0) continue;
+    const topLevel = Array.isArray(ticket?.[field]) ? ticket[field] : [];
+    if (topLevel.length === 0) continue;
+    resolved[field] = topLevel.map(String);
+  }
+  return resolved;
+}
+
+/**
  * Validate one Story body and return every violation it exhibits. Empty
  * array means clean. Splits the per-ticket cascade out of
  * `collectTaskBodyErrors` so the iteration stays straight-line and so
@@ -184,13 +224,14 @@ function resolveStructuredBody(ticket) {
  */
 export function validateTaskBodyShape(ticket) {
   const prefix = `Story "${ticket.title}" (${ticket.slug})`;
-  const { body, error } = resolveStructuredBody(ticket);
+  const { body: parsed, error } = resolveStructuredBody(ticket);
   if (error !== null) {
     return [error];
   }
-  if (body === null || typeof body !== 'object') {
-    return [`${prefix}: body must be an object, got ${typeof body}.`];
+  if (parsed === null || typeof parsed !== 'object') {
+    return [`${prefix}: body must be an object, got ${typeof parsed}.`];
   }
+  const body = resolveContractFieldsFromTopLevel(ticket, parsed);
   const errors = [];
   if (typeof body.goal !== 'string' || body.goal.trim() === '') {
     errors.push(`${prefix}: body.goal must be a non-empty string.`);
@@ -248,25 +289,17 @@ function collectChangesErrors(prefix, rawChanges) {
     return [`${prefix}: body.changes must list at least one bullet.`];
   }
   const errors = [];
-  // An entry "names a path" when it is either a path-shaped bullet
-  // string OR an object-form entry that passed the assumption schema.
-  const namesPath = (c) => {
-    if (typeof c === 'string') return bulletNamesPath(c);
-    return isObjectPathEntry(c);
-  };
+  const namesPath = (c) => isObjectPathEntry(c);
   if (changes.every((c) => !namesPath(c))) {
     errors.push(
-      `${prefix}: body.changes bullets name no path-shaped token. Use "<path>: <verb> <object>" — e.g. "src/components/Foo.tsx: extract handleSubmit". Object-form entries may also declare { path, assumption } directly.`,
+      `${prefix}: body.changes must declare at least one { path, assumption } object entry.`,
     );
   }
   for (const entry of changes) {
     if (typeof entry === 'string') {
-      const verb = vagueVerbWithoutTarget(entry);
-      if (verb) {
-        errors.push(
-          `${prefix}: body.changes bullet uses vague verb "${verb}" without a named target: "${entry}".`,
-        );
-      }
+      errors.push(
+        `${prefix}: body.changes entry must be a { path, assumption } object; plain string bullets are no longer accepted: "${entry}".`,
+      );
       continue;
     }
     if (isMalformedObjectPathEntry(entry)) {
@@ -310,7 +343,9 @@ function collectReferencesErrors(prefix, rawReferences) {
 function collectAcceptanceErrors(prefix, rawAcceptance) {
   const acceptance = Array.isArray(rawAcceptance) ? rawAcceptance : [];
   if (acceptance.length === 0) {
-    return [`${prefix}: body.acceptance must list at least one criterion.`];
+    return [
+      `${prefix}: acceptance must list at least one criterion — author it at the ticket's top level (preferred) or in the body's ## Acceptance section.`,
+    ];
   }
   return [];
 }
@@ -333,7 +368,7 @@ function collectVerifyErrors(prefix, rawVerify) {
   const verify = Array.isArray(rawVerify) ? rawVerify : [];
   if (verify.length === 0) {
     return [
-      `${prefix}: body.verify must list at least one entry. Use "manual:<reason>" only when truly unverifiable in isolation.`,
+      `${prefix}: verify must list at least one entry — author it at the ticket's top level (preferred) or in the body's ## Verify section. Use "manual:<reason>" only when truly unverifiable in isolation.`,
     ];
   }
   const errors = [];

@@ -14,12 +14,20 @@
 // aggregate into per-gate files under `config/gates/`.
 import { GATES_SCHEMA } from './config/gates/index.js';
 
+// Story #4531: miDropMustRefactor (here) and autoRefresh.miDropCap (below)
+// were retired. Both were schema-validated, defaulted, and resolved, but
+// never consumed by the gate they were named for — quality-preview.js's
+// computeExitCode short-circuits on miExit (derived from the ALREADY-
+// consumed delivery.quality.gates.maintainability.tolerance) before either
+// knob is ever read. maintainability.tolerance is now the single documented
+// MI-drop control. See lib/migrations/index.js for the consumer-config
+// migration that strips these keys on upgrade (additionalProperties: false
+// below means a leftover key is a hard AJV failure, not a silent no-op).
 const CODING_GUARDRAILS_SCHEMA = {
   type: 'object',
   properties: {
     cyclomaticFlag: { type: 'integer', minimum: 1 },
     cyclomaticMustFix: { type: 'integer', minimum: 1 },
-    miDropMustRefactor: { type: 'number', minimum: 0 },
     requireSiblingTest: { type: 'boolean' },
   },
   additionalProperties: false,
@@ -29,7 +37,6 @@ const AUTO_REFRESH_SCHEMA = {
   type: 'object',
   properties: {
     enabled: { type: 'boolean' },
-    miDropCap: { type: 'number', minimum: 0 },
     crapJumpCap: { type: 'number', minimum: 0 },
     scope: { type: 'string', enum: ['diff', 'full'] },
   },
@@ -96,6 +103,15 @@ export const QUALITY_SCHEMA = {
     codingGuardrails: CODING_GUARDRAILS_SCHEMA,
     autoRefresh: AUTO_REFRESH_SCHEMA,
     baselineEpsilon: BASELINE_EPSILON_SCHEMA,
+    // Story #4495. Fail-closed baseline-enforcement policy for the unified
+    // check-baselines close-validation gate. Default false: a consumer that
+    // enables baseline gates but has not committed baseline artifacts under
+    // baselines/ gets a clean skip-with-reason from buildDefaultGates rather
+    // than a deterministic first-try close failure. Set true to keep the gate
+    // registered so an absent baseline artifact fails close-validation with a
+    // preflight hint (the fail-closed posture, analogous to
+    // delivery.ci.requireChecks).
+    requireBaselines: { type: 'boolean' },
     // Navigability lens + post-wave integration gate config (Epic #4131,
     // F2/F3/F1/F4). Read by audit-suite/selector.js (route globs) and the
     // deliver-epic.md Phase 6.5 gate (journey suite). Opt-in: absent or empty
@@ -114,8 +130,13 @@ export const QUALITY_SCHEMA = {
 };
 
 /**
- * `delivery.codeReview` — sibling to `delivery.epicAudit`. Same bounded
- * retry + scope cap, applied to /deliver Phase 5 (code-review).
+ * `delivery.codeReview` — review-provider chain + bounded-retry knobs for
+ * the /deliver code-review ceremony (Story-close and plan-run close).
+ *
+ * `autoFixSeverity` (Story #4399) is the threshold that governs which
+ * findings the host-LLM focused-fix routing remediates on-branch —
+ * `medium` (default) routes 🔴/🟠/🟡 while 🟢 still graduates, `high`
+ * reproduces the pre-4399 Critical/High-only routing.
  */
 export const CODE_REVIEW_SCHEMA = {
   type: 'object',
@@ -129,15 +150,10 @@ export const CODE_REVIEW_SCHEMA = {
     // hatch reserved for adapter-specific options.
     //
     // Story #2871 added `security-review` to the inline registry plus
-    // a multi-provider `providers: []` chain shape. When `providers` is
-    // set and non-empty, it wins over the legacy single-string
-    // `provider` field. Chain entries can also reference the
-    // `ultrareview` manual-prompt provider via `manualPrompt: true`.
-    provider: {
-      type: 'string',
-      enum: ['native', 'codex', 'security-review'],
-      default: 'native',
-    },
+    // the `providers: []` chain shape. Chain entries can also reference
+    // the `ultrareview` manual-prompt provider via `manualPrompt: true`.
+    // When `providers` is unset or empty, the factory defaults to
+    // `[{ name: 'native' }]`.
     providers: {
       type: 'array',
       items: {
@@ -173,6 +189,7 @@ export const CODE_REVIEW_SCHEMA = {
     providerConfig: { type: 'object', additionalProperties: true },
     maxFixAttempts: { type: 'integer', minimum: 0 },
     maxFixScopeFiles: { type: 'integer', minimum: 1 },
+    autoFixSeverity: { type: 'string', enum: ['high', 'medium'] },
   },
   additionalProperties: false,
 };

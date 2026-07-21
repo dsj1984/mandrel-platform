@@ -4,11 +4,11 @@
  * Asserts that `git config core.bare` on the main checkout is NOT set
  * to `true`. This guards the old failure mode where an `npm test` path
  * mis-set `core.bare=true` on the main checkout, after which
- * `story-close.js`'s post-rebase `git checkout` aborted with
+ * `single-story-close.js`'s post-rebase `git checkout` aborted with
  * `fatal: this operation must be run in a work tree`. `cleanGitEnv`
  * already lands the live fix; this check is the regression guard.
  *
- * Severity is `blocker` because story-close cannot recover on its own
+ * Severity is `blocker` because single-story-close cannot recover on its own
  * — the operator must run `git config --unset core.bare` (or rely on
  * `cleanGitEnv` to do it before the rebase). The check is
  * refuse-and-print: the `fixCommand` is the literal unset, and the
@@ -24,7 +24,10 @@
 export default {
   id: 'core-bare-clean',
   severity: 'blocker',
-  scope: ['story-close', 'retro'],
+  // 'npm-test' keeps the test-wrapper preflight's refusal claim true: a
+  // poisoned shared config is caught before a suite (or N concurrent
+  // /deliver workers) inherits it, not only at close/retro time (#4580).
+  scope: ['story-close', 'retro', 'npm-test'],
   autoCorrect: 'refuse-and-print',
   detect(state) {
     const coreBare = state?.git?.coreBare;

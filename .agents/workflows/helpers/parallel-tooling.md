@@ -20,8 +20,8 @@ them in one assistant turn rather than serially. The host runtime executes
 the batch in parallel; serial calls cost N round-trips for no gain.
 
 - **Tool primitives:** `Read`, `Grep`, `Glob`, MCP `list_*` / `get_*` calls.
-- **When:** reading the Epic body (with its folded Tech Spec sections)
-  and Story body up front; grepping
+- **When:** reading the Story body (with its inline `## Spec`)
+  up front; grepping
   for multiple unrelated patterns; globbing several directory trees;
   fetching independent GitHub tickets.
 - **Anti-pattern:** sequential `Read` → wait → `Read` → wait → `Grep` chains
@@ -42,7 +42,7 @@ the full duration and blocks every other parallel opportunity.
   fetches, anything you would have prefixed with `nohup` in a terminal.
 - **Anti-pattern:** synchronous `Bash` with a 600 000 ms timeout used as a
   blocker — that pattern is reserved for scripts whose exit is the
-  signal-to-proceed (e.g., `story-init.js`'s per-tree install, which the
+  signal-to-proceed (e.g., `single-story-init.js`'s per-tree install, which the
   parent skill calls out explicitly).
 - **Don't poll with `sleep`:** `Monitor` returns on each stdout line. Loop
   on `until <condition>; do sleep 2; done` only when no event stream is
@@ -76,8 +76,15 @@ If a unit of work is both long (Rule 2) and independent (Rule 1 or 3),
 prefer the higher-numbered rule — the parallelism gain compounds the
 background-shell gain. Concretely: dispatch the `Agent` calls in one turn
 (Rule 3), and **inside** each sub-agent let it apply Rule 2 to its own
-long-running shells. The host does not need to micromanage the child's
-shell strategy.
+long-running shells — and, within the supported nesting depth budget
+(verified depth 2, announced max depth 5; see
+[#2870](https://github.com/dsj1984/mandrel/issues/2870)), let it apply
+**Rule 3** to its own independent sub-units as well, not only Rule 2
+background shells. A sub-agent is a full orchestrator at its own level:
+recursive `Agent` fan-out is available to it, so the host does not need to
+micromanage the child's shell **or** dispatch strategy. Mind the depth
+budget and the compounding cost — every nesting level re-pays the
+always-loaded context (see [`instructions.md` § 4](../../instructions.md)).
 
 ## Constraints
 

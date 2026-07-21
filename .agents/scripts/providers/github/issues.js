@@ -3,7 +3,7 @@
  *
  * Owns the remaining read-side surface that did not belong to any of the
  * earlier six gateways: the raw GraphQL shim (`graphql` / `_ghGraphql`),
- * epic enumeration (`getEpics`, `getEpic`), repository-wide label scans
+ * epic reads (`getEpic`), repository-wide label scans
  * (`listIssuesByLabel`), branch existence probes (`branchExists`), and the
  * three-strategy sub-ticket aggregator (`getSubTickets`).
  *
@@ -16,11 +16,10 @@
  */
 
 import { Logger } from '../../lib/Logger.js';
-import { TYPE_LABELS } from '../../lib/label-constants.js';
 import { concurrentMap } from '../../lib/util/concurrent-map.js';
 import { isNotFoundError } from './branch-protection.js';
 import { withTransientRetry } from './errors.js';
-import { issueToEpic, issueToEpicListItem } from './mappers.js';
+import { issueToEpic } from './mappers.js';
 import {
   defaultRetryWarn,
   paginateRest,
@@ -114,13 +113,15 @@ export class IssuesGateway {
    * are returned (no `state:` qualifier is appended) so a closed-fingerprint
    * match can surface as `regression-of-closed`.
    *
-   * Returns the trimmed `[{ number, state, body }]` projection the dedup
-   * port expects. `state` is normalised to the REST lowercase form
-   * (`open` / `closed`).
+   * Returns the trimmed `[{ number, state, body, title, html_url }]`
+   * projection. Dedup callers use `{ number, state, body }`; duplicate-
+   * search also needs `title` / `html_url`. `state` is normalised to the
+   * REST lowercase form (`open` / `closed`). Results are capped at one
+   * Search API page (`per_page=100`).
    *
    * @param {{ query: string, owner?: string, repo?: string }} params
-   * @returns {Promise<Array<{ number: number, state: string, body: string }>>}
-   * @field-manifest GET /search/issues: total_count, items[number, state, body]
+   * @returns {Promise<Array<{ number: number, state: string, body: string, title: string, html_url?: string }>>}
+   * @field-manifest GET /search/issues: total_count, items[number, state, body, title, html_url]
    */
   async searchIssues({ query, owner, repo } = {}) {
     if (typeof query !== 'string' || query.trim().length === 0) {
@@ -133,7 +134,8 @@ export class IssuesGateway {
     // issue body where the `<!-- audit-fingerprints: ... -->` footer lives.
     const qualifiers = [`repo:${scopeOwner}/${scopeRepo}`, 'type:issue'];
     const q = `${query.trim()} ${qualifiers.join(' ')}`;
-    const endpoint = `/search/issues?q=${encodeURIComponent(q)}`;
+    const params = new URLSearchParams({ q, per_page: '100' });
+    const endpoint = `/search/issues?${params}`;
     const result = await withTransientRetry(
       () => this._gh.api({ method: 'GET', endpoint }),
       { label: `searchIssues ${query}`, onRetry: defaultRetryWarn },
@@ -144,26 +146,9 @@ export class IssuesGateway {
       number: item.number,
       state: item.state ?? 'open',
       body: item.body ?? '',
+      title: item.title ?? '',
+      html_url: item.html_url ?? undefined,
     }));
-  }
-
-  /**
-   * List Epic-typed issues. Filter shape preserved from the old code.
-   *
-   * @field-manifest /repos/{owner}/{repo}/issues?labels=type::epic: number,
-   *                 title, labels, state, state_reason, pull_request
-   */
-  /* node:coverage ignore next */
-  async getEpics(filters = {}) {
-    const params = new URLSearchParams({
-      state: filters.state ?? 'all',
-      labels: TYPE_LABELS.EPIC,
-    });
-    const endpoint = `/repos/${this.owner}/${this.repo}/issues?${params}`;
-    const issues = await paginateRest(this._gh, endpoint);
-    return issues
-      .filter((issue) => !issue.pull_request)
-      .map(issueToEpicListItem);
   }
 
   /**

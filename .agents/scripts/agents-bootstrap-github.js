@@ -3,7 +3,7 @@
  * agents-bootstrap-github — Idempotent Label & Field Setup
  *
  * Creates the required label taxonomy and project board custom fields
- * for the v5 Epic-centric flow on a target GitHub repo. Idempotent —
+ * for the v5 Story-centric flow on a target GitHub repo. Idempotent —
  * skips resources that already exist.
  *
  * Usage:
@@ -237,7 +237,7 @@ async function ensureProjectFields(provider, project, log) {
  *
  * Accepts the canonical resolved config (output of `resolveConfig()` —
  * `config.github` holds the GitHub provider block). Epic #2880 removed the
- * legacy shim parameters; see `.agents/rules/git-conventions.md#contract-cutovers-—-no-shim-layer`.
+ * legacy shim parameters; see `.agents/rules/git-conventions-reference.md#contract-cutovers-—-no-shim-layer`.
  *
  * Consent-first install (Story #3526, Feature #3515, Epic #3438): every
  * mutation this function performs — labels, Projects V2, branch protection,

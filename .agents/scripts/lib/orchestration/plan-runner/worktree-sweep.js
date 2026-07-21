@@ -1,15 +1,15 @@
 /**
  * plan-runner/worktree-sweep.js
  *
- * Reap-sweep used at the start of `/epic-plan-spec` and
- * `/epic-plan-decompose` (via `drainPendingCleanupAtBoot` in
- * `epic-plan-spec.js`, which see). Iterates the `.worktrees/story-<id>/`
+ * Reap-sweep run at plan boot (via `drainPendingCleanupAtBoot` in
+ * `lib/orchestration/epic-plan-spec/phases/drain.js`, wired into
+ * `plan-persist.js`). Iterates the `.worktrees/story-<id>/`
  * entries registered with git, looks up each parent Story, and force-removes
  * any whose Story is already closed or labeled `agent::done`.
  *
  * The `--force` flag is intentional. By the time a Story is `agent::done`
  * its branch has already been merged into the Epic branch (via
- * `story-close.js`), so any residue left in the worktree — dirty
+ * `single-story-close.js`), so any residue left in the worktree — dirty
  * build artifacts, an interrupted rebase, a stray Windows lock — is noise.
  * The safety rails in `WorktreeManager.reap` exist for the _active_ close
  * path; at plan time we already know the Story is done and want the

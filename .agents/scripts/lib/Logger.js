@@ -18,7 +18,6 @@
  *   - `silent`   → only `fatal` emits.
  *   - `info`     → default. Emits `info` and above; suppresses `debug`.
  *   - `verbose`  → emits everything (including `debug`).
- *   - `debug`    → alias for `verbose` (backward compatible).
  */
 /**
  * Recognized log levels, lowest-noise first. Anything outside this set
@@ -26,9 +25,7 @@
  *
  * @type {ReadonlySet<string>}
  */
-const VALID_LEVELS = Object.freeze(
-  new Set(['silent', 'info', 'verbose', 'debug']),
-);
+const VALID_LEVELS = Object.freeze(new Set(['silent', 'info', 'verbose']));
 
 /**
  * Process-wide level override. `null` means "no explicit override — read
@@ -50,7 +47,7 @@ let levelOverride = null;
  * the level branches react in-process, without a child process per level
  * (Story #3329).
  *
- * @returns {'silent'|'info'|'verbose'|'debug'}
+ * @returns {'silent'|'info'|'verbose'}
  */
 export function resolveLevel() {
   const raw = (
@@ -63,12 +60,12 @@ export function resolveLevel() {
 
 /**
  * Pin the process-wide log level, bypassing `AGENT_LOG_LEVEL`. Pass a
- * recognized level (`silent` / `info` / `verbose` / `debug`) to force it,
+ * recognized level (`silent` / `info` / `verbose`) to force it,
  * or `null` to clear the pin and restore env-driven resolution. An
  * unrecognized non-null value throws so callers cannot silently pin a
  * level that resolves to `info`.
  *
- * @param {('silent'|'info'|'verbose'|'debug')|null} level
+ * @param {('silent'|'info'|'verbose')|null} level
  * @returns {void}
  */
 export function setLevel(level) {
@@ -78,15 +75,14 @@ export function setLevel(level) {
   }
   if (typeof level !== 'string' || !VALID_LEVELS.has(level.toLowerCase())) {
     throw new RangeError(
-      `setLevel: level must be one of silent|info|verbose|debug or null (got ${level})`,
+      `setLevel: level must be one of silent|info|verbose or null (got ${level})`,
     );
   }
   levelOverride = level.toLowerCase();
 }
 
 function debugEnabled() {
-  const level = resolveLevel();
-  return level === 'verbose' || level === 'debug';
+  return resolveLevel() === 'verbose';
 }
 
 function infoEnabled() {
@@ -106,8 +102,8 @@ let progressStdoutSink = (msg) => console.log(msg);
  * Flip every Logger output that can land on stdout (`info`, `warn`, and the
  * stdout branch of `createProgress`) to stderr for the lifetime of the
  * process. Idempotent. Use when stdout is reserved for a structured payload
- * — for example the `--emit-context` JSON envelopes emitted by
- * `epic-plan-spec.js` and `epic-plan-decompose.js`, where any interleaved
+ * — for example the JSON envelope emitted by
+ * `plan-context.js`, where any interleaved
  * `[Orchestrator] ℹ️ …` log line corrupts the captured file
  * (Story #2278).
  */
@@ -180,8 +176,8 @@ export const NOOP_LOGGER = Object.freeze({
 
 /**
  * Frozen logger that routes every level to **stderr**. Use this when a
- * caller's stdout is a structured payload (e.g. `--emit-context` JSON
- * envelopes from `epic-plan-spec.js` / `epic-plan-decompose.js`) and any
+ * caller's stdout is a structured payload (e.g. the authoring-context JSON
+ * envelope from `plan-context.js`) and any
  * progress/telemetry log must not interleave with the payload. Mirrors the
  * `{ info, warn, error, debug }` shape that the orchestration helpers
  * accept via optional `logger` arguments.

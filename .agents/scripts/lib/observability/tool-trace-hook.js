@@ -5,7 +5,7 @@
  * PostToolUse hook entries. Resolves the active Epic + Story from
  * environment variables (`CC_EPIC_ID` / `CC_STORY_ID`), pairs Pre/Post
  * tool-call events, and appends one `kind:"trace"` NDJSON line per tool
- * call to `temp/epic-<eid>/stories/story-<sid>/traces.ndjson` via the
+ * call to `temp/run-<id>/stories/story-<sid>/traces.ndjson` via the
  * `signals-writer.appendTrace` helper.
  *
  * Robustness contract (Tech Spec #1032 §observability + §security):
@@ -220,15 +220,23 @@ function hashBashInput(toolInput) {
  * (`tool_input.file_path`, `tool_input.path`, `tool_input.pattern`)
  * before recording. The raw value never appears on disk.
  *
- * @param {{ tool: string, toolInput?: object, durationMs?: number|null }} args
+ * @param {{ tool: string, toolInput?: object, durationMs?: number|null, exitCode?: number|null }} args
  * @returns {object}
  */
-function buildDetails({ tool, toolInput, durationMs }) {
+function buildDetails({ tool, toolInput, durationMs, exitCode }) {
   const details = {};
   if (typeof durationMs === 'number') {
     details.durationMs = durationMs;
   } else if (durationMs === null) {
     details.durationMs = null;
+  }
+
+  // Bash exit code — the retry detector's failure predicate
+  // (`details.exitCode !== 0`) can only fire once this is recorded. Only
+  // Bash PostToolUse events carry a meaningful exit code; other tools omit
+  // the field entirely (Epic #4406 / Story #4413).
+  if (tool === 'Bash' && typeof exitCode === 'number') {
+    details.exitCode = exitCode;
   }
 
   if (toolInput && typeof toolInput === 'object') {
@@ -274,6 +282,35 @@ function buildDetails({ tool, toolInput, durationMs }) {
 }
 
 /**
+ * Extract the Bash exit code from a PostToolUse event. The harness reports
+ * the tool result under `tool_response` (occasionally at the event root);
+ * the exit-code field name is not contractually fixed across harness
+ * versions, so we probe the known aliases and return the first numeric
+ * hit. Returns `null` when no numeric exit code is present — the caller
+ * omits `details.exitCode` entirely rather than recording a guess.
+ *
+ * Exported for testing.
+ *
+ * @param {object} event
+ * @returns {number|null}
+ */
+export function extractExitCode(event) {
+  const candidates = [
+    event?.tool_response?.exitCode,
+    event?.tool_response?.exit_code,
+    event?.tool_response?.returnCode,
+    event?.tool_response?.code,
+    event?.tool_response?.status,
+    event?.exit_code,
+    event?.exitCode,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'number' && Number.isFinite(c)) return c;
+  }
+  return null;
+}
+
+/**
  * PreToolUse handler. Stashes `{ startedAt, tool }` into the in-flight
  * Map keyed by the harness `tool_use_id`. Does not append to
  * `traces.ndjson` — the matching Post event does that once it has a
@@ -306,6 +343,7 @@ export async function handlePost(event, active) {
   const id = event?.tool_use_id ?? event?.id ?? null;
   const tool = event?.tool_name ?? event?.tool ?? 'unknown';
   const toolInput = event?.tool_input;
+  const exitCode = extractExitCode(event);
 
   let durationMs = null;
   if (id && inflight.has(id)) {
@@ -317,13 +355,13 @@ export async function handlePost(event, active) {
   const trace = {
     ts: new Date().toISOString(),
     kind: 'trace',
-    source: { tool: clamp(tool) },
+    emitter: { tool: clamp(tool) },
     epicId: active.epicId,
     storyId: active.storyId,
     taskId: null,
     phase:
       typeof process.env.CC_PHASE === 'string' ? process.env.CC_PHASE : null,
-    details: buildDetails({ tool, toolInput, durationMs }),
+    details: buildDetails({ tool, toolInput, durationMs, exitCode }),
   };
 
   await appendTrace({
@@ -343,15 +381,16 @@ export async function handlePost(event, active) {
  */
 export async function main(event) {
   try {
-    const active = resolveActiveStory();
-    if (!active) return; // No active Story => zero filesystem calls.
     if (!event || typeof event !== 'object') return;
+    const active = resolveActiveStory();
 
     const phase = event.hook_event_name;
     if (phase === 'PreToolUse') {
-      handlePre(event);
+      // Pre-pairing only matters for the trace-line duration, which only
+      // the Story-scoped trace path records.
+      if (active) handlePre(event);
     } else if (phase === 'PostToolUse') {
-      await handlePost(event, active);
+      if (active) await handlePost(event, active);
     }
     // Any other phase is silently ignored — the hook is registered for
     // Pre/Post only; receiving anything else is a configuration error

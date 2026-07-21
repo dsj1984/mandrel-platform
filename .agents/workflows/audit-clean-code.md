@@ -15,10 +15,10 @@ quality. Your objective is to identify "code smells," technical debt, and
 violations of clean code principles (SOLID, DRY, KISS) that hinder long-term
 velocity.
 
-## Scope (Epic mode)
+## Scope (Story / plan-run mode)
 
-When this lens is invoked from `/deliver` Phase 4 (epic-audit), the
-following block is populated with the Epic's change-set file list.
+When this lens is invoked from `/deliver` close lenses (or a plan-run audit), the
+following block is populated with the Story (or plan-run) change-set file list.
 Otherwise — for any manual `/audit-<dimension>` invocation — the block
 renders the literal substitution token and you MUST treat it as **no
 scope filter — run the lens codebase-wide** exactly as you would have
@@ -38,57 +38,74 @@ before this section existed.
 
 ## Execution strategy (dual-path)
 
-This lens runs along one of two execution paths. Both emit the **identical**
-report contract (Step 3); downstream consumers (`/deliver` Phase 4
-epic-audit, `audit-to-stories`) are agnostic to which path produced it.
+This lens runs along one of two execution paths (orchestrated dynamic-workflow
+or sequential single-pass). Both emit the **identical** Step 3 report contract;
+downstream consumers (`audit-to-stories`) are agnostic to which path produced
+it. See [`helpers/audit-dual-path.md`](helpers/audit-dual-path.md) for strategy
+selection, the forcing flags, and the read-only guarantee — read `audit-<lens>`
+there as this lens's name.
 
-- **Orchestrated (dynamic-workflow) path.** When Claude Code's
-  [dynamic workflows](https://code.claude.com/docs/en/workflows) are
-  available, the saved project workflow
-  `.claude/workflows/audit-clean-code.workflow.js` fans the dimensions below
-  out as parallel read-only subagents, runs an **adversarial cross-check**
-  stage (an independent agent reviews each dimension's findings and drops
-  false positives before they enter the report), then synthesises the Step 3
-  report. The orchestrator derives its per-dimension prompts from *this*
-  markdown at run time — the lens stays the single source of truth; the
-  script does not fork a second copy of the spec.
-- **Sequential (single-pass) path.** When dynamic workflows are unavailable,
-  follow Steps 1–3 below turn-by-turn exactly as before. This is the default
-  fallback and changes nothing about the existing behaviour.
+## Step 0: Tool-first detection (mandatory — measure before you judge)
 
-**Strategy selection** is computed by
-[`lib/dynamic-workflow/capability.js`](../scripts/lib/dynamic-workflow/capability.js)
-(`selectAuditStrategy`). The orchestrated path is chosen only when the runtime
-is Claude Code, `disableWorkflows` is not set (settings.json **or**
-`CLAUDE_CODE_DISABLE_WORKFLOWS`), and the Claude Code version meets the
-research-preview floor (`>= 2.1.154`). Any other runtime, a disabled setting,
-or an older version degrades gracefully to the sequential path.
+Ground the maintainability, duplication, and dead-code findings in the exact
+instruments this repo ships, then let the LLM triage in Steps 1–2 interpret and
+rank the numbers. Do **not** eyeball complexity or "spot" dead code from prose —
+run the tools first.
 
-> **Capability degradation, not a contract shim.** This dual path is **not**
-> covered by the No-Shim / hard-cutover rule in
-> [`git-conventions.md`](../rules/git-conventions.md). That rule forbids
-> running two shapes of the *same contract* side by side. Here there is **one**
-> report contract; only the *execution strategy* is selected from a runtime
-> capability — the same pattern the protocol already endorses for live-docs
-> fallback in [`instructions.md` §1.C/§1.D](../instructions.md). The full
-> capability-degradation rationale lives in the
-> [`capability.js`](../scripts/lib/dynamic-workflow/capability.js) module
-> docstring; the orchestrated-run evidence and per-lens cost/precision gate
-> verdicts live in [`docs/roadmap.md`](../../docs/roadmap.md) (Part 3 —
-> Dynamic-Workflow Orchestration).
+1. **Complexity / maintainability (scoped mode).** When a change-set is in
+   scope, run the quality preview against the base:
 
-**Forcing a path (for testing).** Set `MANDREL_AUDIT_STRATEGY=sequential` to
-verify the fallback path with the feature notionally disabled, or
-`MANDREL_AUDIT_STRATEGY=orchestrated` to pin the dynamic path. To exercise the
-real disable signals instead, set `CLAUDE_CODE_DISABLE_WORKFLOWS=1` (env) or
-`disableWorkflows: true` in `.claude/settings.json` and re-run the lens — both
-degrade to the sequential path.
+   ```bash
+   node .agents/scripts/quality-preview.js --changed-since <base>
+   ```
 
-> **Read-only on both paths.** The lens is read-only (see Constraint). The
-> orchestrated subagents run in `acceptEdits` and inherit the session tool
-> allowlist, but the workflow script grants the analysis agents only
-> read/search tools (`Read`, `Grep`, `Glob`) — no write/edit/shell-mutation
-> tools. The single write in an orchestrated run is the final report artifact.
+   It reports the per-file maintainability-index and complexity deltas the
+   `check-baselines.js` gate enforces. Treat any per-file MI drop beyond
+   `delivery.quality.gates.maintainability.tolerance` (default 0.5pt) as a
+   grounded must-fix finding, and any cyclomatic reading over the
+   `codingGuardrails` ceilings (flag > 8, must-fix > 12) as measured, not
+   guessed.
+
+2. **Committed baselines (codebase-wide mode).** Read the committed metric
+   baselines under `baselines/` — `baselines/maintainability.json`,
+   `baselines/duplication.json`, `baselines/crap.json`,
+   `baselines/dead-exports.json` — and cite the outlier rows as evidence
+   rather than re-deriving them. These are the same artifacts the delivery
+   gates read, so a finding that quotes a baseline row is reproducible.
+
+3. **Duplication.** Run the shipped duplication checker
+   (`node .agents/scripts/check-baselines.js --gate duplication`, backed by
+   jscpd) and lift its clone clusters into the DRY dimension.
+
+4. **Dead code.** Run the shipped dead-export checker
+   (`node .agents/scripts/check-dead-exports.js`); it is backed by `knip`.
+   **`knip --production` is a silent no-op unless entry points are declared
+   with `!`-suffixed patterns** — a run that reports `{"issues":[]}` without
+   `!`-suffixed entries has measured nothing, so verify the entry config before
+   trusting a clean result. Apply the **dead-code exclusion taxonomy** below so
+   the report does not drown real dead code in false positives:
+
+   - **Entry points** — CLI mains, `bin/` scripts, and files named in
+     `package.json` `main` / `exports` / `bin`: reachable by definition, never
+     dead.
+   - **Public API surface** — exports that are the package's declared
+     `exports` / barrel contract: consumed out-of-tree, so a zero in-repo
+     importer count is not death.
+   - **Dynamic imports** — symbols reached via `import()`,
+     `require(variable)`, or string-keyed dispatch tables: invisible to static
+     export-graph analysis, so exclude unless you confirm no dynamic reference.
+   - **Test-only seams** — exports consumed only by tests (the sanctioned
+     `test-seams` pattern): flag as test-only, not dead, and never as a
+     production-dead finding.
+   - **Framework/registration hooks** — decorators, lifecycle listeners, and
+     files auto-loaded by convention (globbed listener/plugin dirs): reachable
+     via the framework, not the import graph.
+
+5. **Churn-by-complexity hotspot cap.** Rank candidate hotspots by
+   **churn × complexity** (frequently-changed files that also score poorly on
+   MI/CRAP) and **cap the Detailed Findings at the top ~15 hotspots** so the
+   report stays a ranked, actionable batch rather than an exhaustive dump. Note
+   the cap in the Executive Summary when it bites.
 
 ## Step 1: Quality Scan
 
@@ -102,8 +119,9 @@ Analyze the repository with a focus on:
   cyclomatic complexity > 8 (`delivery.quality.codingGuardrails.cyclomaticFlag`)
   is **flag in review** (annotate or split); > 12
   (`codingGuardrails.cyclomaticMustFix`) is **must-fix** before the work merges.
-  A per-file MI drop > 1.5pt (`codingGuardrails.miDropMustRefactor`) requires a
-  refactor in the same Story rather than a baseline bump.
+  A per-file MI drop beyond the configured
+  `delivery.quality.gates.maintainability.tolerance` (default 0.5pt) requires
+  a refactor in the same Story rather than a baseline bump.
 - **Duplication:** Find "copy-paste" logic that should be abstracted into
   reusable utilities or hooks.
 - **Component Health:** In UI code, look for "component bloat" (files > 300
@@ -139,6 +157,9 @@ Generate and save a highly structured Markdown audit report to
 `{{auditOutputDir}}/audit-clean-code-results.md`, using the exact template
 below.
 
+> Grade every finding's severity on the shared
+> [`Critical | High | Medium | Low` scale](helpers/audit-severity-scale.md).
+
 ```markdown
 # Clean Code Audit Report
 
@@ -149,15 +170,18 @@ primary themes.]
 
 ## Detailed Findings
 
-[For every gap identified, use the following strict structure:]
+[For every gap identified, use the following strict structure. Lead each title
+with the primary file the finding lives in:]
 
-### [Short Title of the Issue]
+### `path/to/primary-file.ext` — [Short title of the issue]
 
 - **Dimension:** [e.g., SOLID Principles | DRY | KISS | Dead Code]
-- **Impact:** [High | Medium | Low]
+- **Impact:** [Critical | High | Medium | Low]
+- **Location:** `path/to/primary-file.ext:line`
 - **Current State:** [Problematic code snippet, file, or pattern description]
 - **Recommendation & Rationale:** [The specific refactor strategy and how it
   improves long-term velocity]
+- **Acceptance signal:** [the command or observable that proves this finding is remediated — e.g. a duplication re-check, `npm test`, or a re-run of this lens]
 - **Agent Prompt:**
   `[A copy-pasteable, highly specific prompt to execute this refactor independently]`
 
@@ -177,3 +201,13 @@ standards.]
 
 This workflow is **read-only**. Provide the analysis and the roadmap, but do not
 apply changes.
+
+## Self-cross-check (mandatory — filter false positives before you finalize)
+
+Before you write the report artifact from the previous step, run the shared
+adversarial self-cross-check over your Detailed Findings — see
+[`helpers/audit-self-check.md`](helpers/audit-self-check.md). It defines the
+per-finding evidence bar, the exclusion list, and the final re-open-and-drop
+pass whose `kept <k> / dropped <d>` counts you record in the Executive
+Summary, so the sequential single-pass path filters unverified findings just as
+the orchestrated path's adversarial reviewer does.

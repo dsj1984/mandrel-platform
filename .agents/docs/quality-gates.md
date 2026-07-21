@@ -4,8 +4,8 @@ This is the consumer-facing reference for the quality gates the framework
 runs against your repo: the lint baseline ratchet, the maintainability
 ratchet, the CRAP per-method gate, the **absolute quality floors**
 (90/85/90 coverage, MI ≥ 70, CRAP ≤ 20), the anti-thrashing protocol,
-and the concurrent close-safety retry that protects the Epic branch when
-multiple Stories close in quick succession.
+and the concurrent close-safety retry that protects Story-branch pushes
+when multiple Stories close in quick succession.
 
 The floor + ratchet duo is intentional: the ratchet protects against
 regressions on touched files; the floor enforces an absolute threshold
@@ -17,9 +17,8 @@ the lift the floor gate represents.
 
 The configuration knobs that drive these gates live in
 [`.agents/docs/configuration.md`](../docs/configuration.md) under
-`delivery.quality.*` and the framework-internal `DEFAULT_STORY_MERGE_RETRY` constant. This
-file is the runbook side — what the gate does, when it fires, and how to
-bootstrap or refresh it.
+`delivery.quality.*`. This file is the runbook side — what the gate does,
+when it fires, and how to bootstrap or refresh it.
 
 The **baseline envelope, per-kind shapes, component model, writer/reader
 contract, and floor-override path** are documented in the
@@ -36,16 +35,14 @@ it once and reuse the context as you read through any individual gate.
 
 ## Concurrent close safety
 
-`/deliver`'s wave loop may close multiple Stories into the same
-`epic/<epicId>` branch in quick succession. The push step inside `story-close.js` retries
-on a non-fast-forward rejection — fetch, replay the story merge on top of
-the new remote tip, push again — bounded by
-`DEFAULT_STORY_MERGE_RETRY.maxAttempts` (3) and
-`DEFAULT_STORY_MERGE_RETRY.backoffMs` (`[250, 500, 1000]`) from
-`.agents/scripts/lib/config/runners.js`.
-A real
-content conflict (both stories touched the same lines) aborts the loop
-with a clear error and leaves the local tree clean for manual resolution.
+`/deliver` may close multiple Stories from separate Story branches in quick
+succession. Each Story rebases onto the latest `main` in its own base-sync
+phase (`phases/base-sync.js`) before the push, so concurrent closes serialize
+through their own worktrees rather than racing one shared branch. The push
+step itself does not retry: a rejected push fails the close non-zero and the
+operator resolves it, and a real content conflict (both Stories touched the
+same lines) surfaces at base-sync with a clear error, leaving the local tree
+clean for manual resolution.
 
 ---
 
@@ -117,17 +114,14 @@ The same files-out-of-scope list as before, declared in `.c8rc.cjs`:
   whose meaningful logic (label taxonomy + project field defs) lives
   in `lib/label-taxonomy.js` and is unit-tested there. The CLI shell
   itself is integration-only against a live GitHub repo.
-- `.agents/scripts/hydrate-context.js` — thin wrapper around the
-  unit-tested hydration engine; end-to-end coverage requires a real
-  provider tree and Story prompt context, which lives in integration
-  tests.
-- `epic-plan-decompose.js`, `epic-plan-spec.js`,
-  `epic-plan-healthcheck.js` — `/epic-plan` slash-command CLI shells
-  with no unit-test seam; the meaningful orchestration logic lives in
-  `lib/orchestration/plan-runner/*` and is unit-tested there.
+- `plan-context.js`, `plan-persist.js` —
+  `/plan` CLI shells with no unit-test seam; the meaningful
+  orchestration logic lives in `lib/orchestration/plan-context.js`,
+  `lib/orchestration/plan-persist/*`, and the plan phase modules, and is
+  unit-tested there.
 - A larger Story #1702 carve-out of top-level CLI gates, orchestration
   CLIs, git-manipulation CLIs, and `lib/*` glue (e.g. `lint-baseline.js`,
-  `story-close.js`, `dispatcher.js`, `run-tests.js`,
+  `single-story-init.js`, `run-tests.js`,
   `lib/config-schema.js`) — see the `.c8rc.cjs` header comment for the
   per-category rationale and the authoritative entry list.
 
@@ -250,7 +244,7 @@ file. When any threshold under
 the qualitative anti-thrashing cues in
 [`.agents/instructions.md`](../instructions.md) are tripped, the
 friction logger flips the Story to `agent::blocked` and
-posts a structured `friction` comment on the Task so the operator has
+posts a structured `friction` comment on the Story so the operator has
 the trace.
 
 ---
@@ -260,16 +254,15 @@ the trace.
 After a Story's implementation commits land and **before** the Story
 proceeds to close, delivery runs a bounded acceptance self-eval loop
 (Step 1a of
-[`helpers/epic-deliver-story`](../workflows/helpers/epic-deliver-story.md)
-and `helpers/single-story-deliver`; the shared per-round mechanic lives
-in
+[`helpers/deliver-story`](../workflows/helpers/deliver-story.md); the shared
+per-round mechanic lives in
 [`helpers/acceptance-self-eval`](../workflows/helpers/acceptance-self-eval.md),
 with the gate CLI at
 [`.agents/scripts/acceptance-eval.js`](../scripts/acceptance-eval.js)).
 Each round, a fresh-context **critic pass** — independent of the
-implementing agent — scores the working diff against every inline
-`acceptance[]` item, using `verify[]` output as evidence, and yields one
-of three decisions:
+implementing agent — scores the change set its caller injected (never one
+it re-derives) against every inline `acceptance[]` item, using `verify[]`
+output as evidence, and yields one of three decisions:
 
 - **proceed** — all criteria met; the Story continues to close.
 - **redraft** — unmet criteria are redrafted and re-implemented, then
@@ -292,8 +285,8 @@ the `delivery.acceptanceEval` field reference.
 > Baseline envelope, axes, and component model: see the
 > [Baseline reference](#baseline-reference) section below.
 
-The lint baseline engine enforces zero-deterioration during Epic
-workflows. Integrations fail if new lint warnings are introduced, and the
+The lint baseline engine enforces zero-deterioration during Story
+delivery. Integrations fail if new lint warnings are introduced, and the
 baseline automatically tightens when the codebase improves.
 
 The canonical baseline file lives at `baselines/lint.json` (override via
@@ -318,7 +311,7 @@ this was removed in a pre-npm-era release; the operator is now the gate.
 A per-file maintainability scoring engine computes composite scores based
 on cyclomatic complexity, file length, and dependency counts. The
 `baselines/maintainability.json` baseline prevents score degradation
-between Epics.
+between Stories.
 
 Refresh with `npm run maintainability:update`.
 
@@ -520,7 +513,7 @@ does not pause automatically on `risk::high`.
 
 The sole runtime HITL pause point is `agent::blocked`: when an agent
 encounters an unresolvable blocker (including unsafe destructive actions
-lacking explicit authorization), it flips the ticket/Epic to
+lacking explicit authorization), it flips the ticket to
 `agent::blocked`, posts friction context, and waits for operator resume
 (`agent::executing`).
 
@@ -581,9 +574,9 @@ Cross-references:
 - [`.agents/README.md`](../README.md) — consumer onboarding.
 
 > The `mutation` gate ships **dormant** (built-but-unwired, intentionally
-> opt-in). The cost/fit analysis behind deferring its activation lives in
-> the header comment of
-> [`.agents/scripts/update-mutation-baseline.js`](../scripts/update-mutation-baseline.js).
+> opt-in). The former `update-mutation-baseline.js` refresh CLI was retired
+> with the rest of the zero-consumer script surface (#4482); the
+> `lib/mutation/` snapshot machinery remains for a future activation.
 
 ### Envelope
 
@@ -758,10 +751,10 @@ Behaviour:
 - The `components` map is optional. When omitted, the default
   `{ "*": ["**"] }` applies and only `*` rows are ever evaluated.
 - The unified `check-baselines.js` reports breaches per component, with
-  `*` always present in the output. The per-component progress signals
-  (`crap-drift.js#detectComponentRegressions`,
-  `maintainability-drift.js#detectComponentRegressions`) name the
-  breached component in their bullet so a `*` rollup is not falsely
+  `*` always present in the output. The shared baselines kernel
+  (`lib/baselines/kernel.js`, via the per-kind rollups in
+  `lib/baselines/kinds/`) groups rows by component and names the
+  breached component in its output so a `*` rollup is not falsely
   implicated when only a component-scoped floor was crossed.
 
 #### Floor axes must match rollup axes

@@ -15,8 +15,10 @@ read the same numbers from here so a "high cyclomatic complexity" finding in
 
 Run [`npm run quality:preview`](../../../package.json) before committing
 on any Story that touches production source. The preview runs
-`quality-preview.js` with `--changed-since HEAD`, which exercises the
-same maintainability and CRAP engines (`escomplex` + `c8` coverage) that
+`quality-preview.js`, which scopes the diff to `HEAD` by default (the
+alias passes no `--changed-since`; the script defaults to `HEAD`) and
+exercises the same maintainability and CRAP engines (`escomplex` +
+`c8` coverage) that
 `check-baselines.js` enforces at merge time, then merges the results
 into a single per-file delta table. A clean preview means the commit
 will not bounce off the unified baselines gate. The `.husky/pre-commit`
@@ -58,16 +60,17 @@ review-time prose rule.
 
 Per-file Maintainability Index (MI) is tracked in
 [`baselines/maintainability.json`](../../../baselines/maintainability.json).
-A commit that drops a file's MI by more than
-`delivery.quality.codingGuardrails.miDropMustRefactor` points (default
-`1.5`) requires a refactor in the same Story — not a baseline bump. The MI
-ratchet's per-file `tolerance` (default `0.5`) is a noise filter, **not**
-permission to spend the budget; the 1.5-point ceiling is the upper bound
-above which the change is treated as a regression that must be undone or
-offset, not absorbed.
+A commit that drops a file's MI by more than the configured
+`delivery.quality.gates.maintainability.tolerance` (default `0.5` points)
+requires a refactor in the same Story — not a baseline bump. `tolerance` is
+the single MI-drop control: it is not a noise filter beneath a separate
+must-refactor ceiling — any drop past it is treated as a regression that
+must be undone or offset, not absorbed. Set `tolerance` higher only when the
+project deliberately wants a looser MI-drop budget.
 
-`quality:preview --changed-since HEAD` shows the per-file MI delta in the
-working tree before the commit lands.
+`quality:preview` shows the per-file MI delta in the working tree before
+the commit lands (scoped to `HEAD` by default — the alias passes no
+`--changed-since`; the script defaults to `HEAD`).
 
 ## Rename = baseline-refresh
 

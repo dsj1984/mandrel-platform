@@ -193,16 +193,17 @@ export async function loadBodyTemplate(projectRoot) {
  *   bodyTemplate: string,
  *   duplicateCandidates: Array<object>,
  *   techStack?: string|null,
+ *   corpusContext?: { docsDigest: string|null, relevantSections: Array<object> }|null,
  *   maxResults?: number,
  * }} opts
  */
 export function buildContextEnvelope({
   seed,
   refine,
-  persona,
   bodyTemplate,
   duplicateCandidates,
   techStack = null,
+  corpusContext = null,
   maxResults = DEFAULT_DUPLICATE_MAX_RESULTS,
 }) {
   return {
@@ -210,7 +211,6 @@ export function buildContextEnvelope({
     version: 1,
     seed,
     refine,
-    persona,
     bodyTemplate,
     requiredSections: [...REQUIRED_SECTIONS],
     duplicateCandidates: {
@@ -218,9 +218,10 @@ export function buildContextEnvelope({
       candidates: duplicateCandidates,
     },
     techStack,
+    corpusContext,
     deliverContract: {
-      workflow: '.agents/workflows/helpers/single-story-deliver.md',
-      requiredLabels: ['type::story', `persona::${persona}`],
+      workflow: '.agents/workflows/helpers/deliver-story.md',
+      requiredLabels: ['type::story'],
       forbidden: ['Epic: #N references in the body'],
     },
   };

@@ -18,7 +18,11 @@
 import { syncBranchFromBase } from '../../../git/sync-from-base.js';
 import { Logger } from '../../../Logger.js';
 import { AGENT_LABELS } from '../../../label-constants.js';
-import { upsertStructuredComment } from '../../ticketing/state.js';
+import {
+  STATE_LABELS,
+  transitionTicketState,
+  upsertStructuredComment,
+} from '../../ticketing.js';
 
 /**
  * Orchestrate the pre-push base-sync step: run `syncBranchFromBase`
@@ -76,7 +80,7 @@ export async function runBaseSyncPhase({
           : syncResult.stderr
             ? `: ${syncResult.stderr.slice(0, 200)}`
             : '') +
-        `. Story transitioned to ${AGENT_LABELS.BLOCKED}; resolve in ${syncCwd} and re-run \`/single-story-deliver\`.`,
+        `. Story transitioned to ${AGENT_LABELS.BLOCKED}; resolve in ${syncCwd} and re-run \`/deliver ${storyId}\`.`,
     );
   }
   progress('SYNC', `✅ Synced from origin/${baseBranch} (${syncResult.kind}).`);
@@ -126,13 +130,11 @@ export async function handleSyncFailure({
     );
   }
 
+  // Story #4539 — the canonical mutator, not a direct label write: a bare
+  // `provider.updateTicket` skips the Projects v2 column sync (Story
+  // #2548) and strands the board on the Story's prior status.
   try {
-    await provider.updateTicket(storyId, {
-      labels: {
-        add: [AGENT_LABELS.BLOCKED],
-        remove: [AGENT_LABELS.EXECUTING, AGENT_LABELS.READY, AGENT_LABELS.DONE],
-      },
-    });
+    await transitionTicketState(provider, storyId, STATE_LABELS.BLOCKED, {});
     progress('SYNC', `🚧 Flipped Story #${storyId} → ${AGENT_LABELS.BLOCKED}.`);
   } catch (err) {
     Logger.warn?.(
@@ -164,7 +166,7 @@ export function buildSyncFailureCommentBody({
   const lines = [
     `### ${heading}`,
     '',
-    '`/single-story-deliver` close-validation passed, but the pre-push',
+    '`/deliver` close-validation passed, but the pre-push',
     `sync against \`origin/${baseBranch}\` could not complete. The Story has`,
     `been transitioned to \`agent::blocked\`. To resume:`,
     '',

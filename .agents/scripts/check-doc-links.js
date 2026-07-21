@@ -50,6 +50,9 @@ export const RETIRED_COMMANDS = new Set([
   'agents-bootstrap-github',
   'single-story-plan',
   'mandrel',
+  // #4482 — dead workflow surface retired (host-native equivalents).
+  'explain',
+  'git-merge-pr',
 ]);
 
 // Tokens that look like `/foo` in prose but are not slash commands. Tokens
@@ -254,8 +257,8 @@ function stripAnchorAndQuery(target) {
 // A slash token is `/<name>` where:
 //   - the preceding char is NOT a word char, `/`, `:`, `.`, `>`, `]`, `)`,
 //     so we don't match URL path segments or fragments embedded in paths
-//     like `temp/epic-<id>/lifecycle.ndjson` (preceded by `>`) or
-//     `temp/epic-[ID]/tickets.json` (preceded by `]`).
+//     like `temp/run-<id>/lifecycle.ndjson` (preceded by `>`) or
+//     `temp/run-[ID]/tickets.json` (preceded by `]`).
 //   - the following char is NOT a word char, `-`, or `.`, so file
 //     extensions like `/tickets.json` and identifier suffixes don't match.
 // The optional `(?::[a-z][a-z0-9-]*)?` tail captures the namespaced

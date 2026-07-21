@@ -3,7 +3,8 @@
  *
  * Consolidates the "does this branch exist locally / remotely?" and
  * "ensure this branch exists and is checked out" logic that
- * `story-init.js` and `dispatch-engine.js` had each re-implemented.
+ * `single-story-init.js` centralizes (formerly duplicated across the deleted
+ * `story-init.js` and `dispatch-engine.js` entry seams).
  *
  * All helpers take an explicit `cwd`. Callers with worktree isolation
  * enabled pass the worktree path; single-tree callers pass `PROJECT_ROOT`.
@@ -87,18 +88,16 @@ export function branchExistsViaTrackingRef(branch, cwd) {
 
 /**
  * Pure: classify how a `story-<id>` branch should be seeded from the (local,
- * remote) ref-presence matrix. This is the single source of truth shared by
- * both story-init paths (Story #3513):
- *   - `single-story-init.js#decideStoryBranchSeed` (standalone path)
- *   - `story-init/branch-initializer.js#planStoryBranchSeed` (Epic path)
+ * remote) ref-presence matrix. This is the single source of truth for
+ * `single-story-init.js#decideStoryBranchSeed` (v2 `/deliver` path).
  *
- * Both call sites previously re-implemented the same `local → no-op, remote →
- * fetch, else create` decision tree; they now delegate here so the branching
- * logic lives in exactly one place. The two callers keep their own keyword for
+ * The init path previously re-implemented the same `local → no-op, remote →
+ * fetch, else create` decision tree; it now delegates here so the branching
+ * logic lives in exactly one place. The caller keeps its own keyword for
  * the "local ref already exists" outcome (`reuse` vs `none`) — synonyms for
- * "do not re-create / do not re-seed" preserved for their existing public/test
- * contracts — so this classifier returns the neutral `'local'` keyword and
- * each caller maps it onto its own vocabulary.
+ * "do not re-create / do not re-seed" preserved for its existing public/test
+ * contract — so this classifier returns the neutral `'local'` keyword and
+ * the caller maps it onto its own vocabulary.
  *
  * @param {{ localHas: boolean, remoteHas: boolean }} presence
  * @returns {'local'|'fetch'|'create'}
@@ -116,22 +115,18 @@ export function classifyBranchSeed({ localHas, remoteHas }) {
 
 /**
  * Single-home for the story-branch seed-action *switch shell* that
- * `single-story-init.js#seedStoryBranch` (standalone path) and
- * `story-init/branch-initializer.js#ensureStoryBranchSeed` (Epic path) had
- * each re-implemented (Story #4255). Both already delegated the (local,
- * remote) decision to `classifyBranchSeed`; only the act-on-the-decision
- * shell (reuse / fetch / create) was duplicated, and that shell was the
- * drift surface for the seed-decision contract.
+ * `single-story-init.js#seedStoryBranch` owns (Story #4255). The deleted
+ * Epic `story-init/branch-initializer.js` path had duplicated the same
+ * shell before v2 cutover.
  *
  * The two callers differ in exactly two behavioural axes, both of which are
  * parameters here — no other conditional branching is introduced:
- *   - **`baseRef`** — the ref to branch from on `create` (`main` for the
- *     standalone path, the Epic branch for the Epic path).
+ *   - **`baseRef`** — the ref to branch from on `create` (`main` for v2
+ *     `/deliver`; pre-v2 Epic close used the Epic branch).
  *   - **`swallowCreateRace`** — when `true`, a `git branch` that exits
  *     non-zero with an "already exists" stderr is treated as reuse rather
- *     than a fatal error (closes the probe→create race the Epic path runs
- *     under concurrent wave dispatch). When `false`, any create failure
- *     throws (the standalone path has no concurrent creator to race).
+ *     than a fatal error (pre-v2 concurrent wave dispatch). When `false`, any create failure
+ *     throws (the v2 standalone path has no concurrent creator to race).
  *
  * The asymmetric surrounding wrappers (merged-sweep, fast-forward,
  * donor-prime, workspace-verify, phase-timer) are deliberately NOT folded
@@ -205,90 +200,6 @@ export function seedStoryBranchRef({
 }
 
 /**
- * Ensure an Epic branch exists and is published to `origin`. Handles all
- * four states of the (local, remote) matrix.
- *
- * @param {string} epicBranch
- * @param {string} baseBranch
- * @param {string} cwd
- * @param {{ progress?: (phase: string, message: string) => void }} [opts]
- */
-export async function ensureEpicBranch(epicBranch, baseBranch, cwd, opts = {}) {
-  assertBranchSafe(epicBranch, baseBranch);
-  const progress = opts.progress ?? (() => {});
-
-  // Short-circuit: if we're already on the epic branch, just sync with remote.
-  // This avoids redundant checkout calls and prevents the edge case where
-  // branchExistsLocally returns false while we're on the branch (detached HEAD,
-  // worktree race), which would route into the create path and fail on -b.
-  const onBranch = currentBranch(cwd);
-  if (onBranch === epicBranch) {
-    const remote = branchExistsRemotely(epicBranch, cwd);
-    if (remote) {
-      progress('GIT', `Already on ${epicBranch}. Syncing with remote.`);
-      await gitPullWithRetry(cwd, 'origin', epicBranch);
-    } else {
-      progress('GIT', `Already on ${epicBranch}. Publishing to remote.`);
-      gitSync(cwd, 'push', '--no-verify', '-u', 'origin', epicBranch);
-    }
-    return;
-  }
-
-  const local = branchExistsLocally(epicBranch, cwd);
-  const remote = branchExistsRemotely(epicBranch, cwd);
-
-  if (!local && !remote) {
-    progress('GIT', `Creating Epic branch: ${epicBranch} (from ${baseBranch})`);
-    gitSync(cwd, 'checkout', baseBranch);
-    await gitPullWithRetry(cwd, 'origin', baseBranch);
-    gitSync(cwd, 'checkout', '-b', epicBranch);
-    gitSync(cwd, 'push', '--no-verify', '-u', 'origin', epicBranch);
-    _assertOnBranch(cwd, epicBranch);
-    return;
-  }
-
-  if (local && !remote) {
-    progress(
-      'GIT',
-      `Epic branch exists locally only: ${epicBranch}. Publishing.`,
-    );
-    gitSync(cwd, 'checkout', epicBranch);
-    gitSync(cwd, 'push', '--no-verify', '-u', 'origin', epicBranch);
-    _assertOnBranch(cwd, epicBranch);
-    return;
-  }
-
-  if (!local && remote) {
-    progress('GIT', `Tracking remote Epic branch: ${epicBranch}`);
-    gitSync(cwd, 'checkout', '-b', epicBranch, `origin/${epicBranch}`);
-    await gitPullWithRetry(cwd, 'origin', epicBranch);
-    _assertOnBranch(cwd, epicBranch);
-    return;
-  }
-
-  progress('GIT', `Epic branch exists. Syncing: ${epicBranch}`);
-  gitSync(cwd, 'checkout', epicBranch);
-  await gitPullWithRetry(cwd, 'origin', epicBranch);
-  _assertOnBranch(cwd, epicBranch);
-}
-
-/**
- * Post-operation assertion: verify HEAD is on the expected branch.
- * Guards against TOCTOU races where a parallel agent switches branches
- * between our checkout and pull.
- */
-function _assertOnBranch(cwd, expected) {
-  const actual = currentBranch(cwd);
-  if (actual !== expected) {
-    throw new Error(
-      `[git-branch-lifecycle] Branch assertion failed after checkout. ` +
-        `Expected HEAD on '${expected}', found '${actual}'. ` +
-        `A concurrent process may have switched branches.`,
-    );
-  }
-}
-
-/**
  * Check out a Story branch, creating it from `epicBranch` if neither local
  * nor remote exists. Non-destructive: if the branch already exists, this
  * plain-`checkout`s it rather than `-B`-resetting.
@@ -340,80 +251,6 @@ export async function checkoutStoryBranch(
 
   progress('GIT', `Creating Story branch: ${storyBranch} (from ${epicBranch})`);
   gitSync(cwd, 'checkout', '-b', storyBranch, epicBranch);
-}
-
-/**
- * Ensure an Epic branch ref exists locally and is published to `origin`,
- * **without moving HEAD**. Designed for the worktree bootstrap path where
- * the main checkout must not switch branches (a parallel agent may be
- * working there, or the tree may be dirty).
- *
- * Uses `git branch` (not `checkout -b`) to create refs, and `git push` to
- * publish. Callers that need HEAD on the epic branch should use
- * `ensureEpicBranch()` instead.
- *
- * @param {string} epicBranch
- * @param {string} baseBranch
- * @param {string} cwd
- * @param {{ progress?: (phase: string, message: string) => void }} [opts]
- */
-/**
- * Pure: choose the action to take for `ensureEpicBranchRef` given whether
- * the branch exists locally and/or remotely. One of:
- *   - `'noop'` — both refs exist; nothing to do.
- *   - `'fetch'` — only remote exists; fetch into local.
- *   - `'publish-existing'` — only local exists; push it.
- *   - `'create-and-publish'` — neither exists; create from base then push.
- *
- * @param {boolean} local
- * @param {boolean} remote
- * @returns {'noop' | 'fetch' | 'publish-existing' | 'create-and-publish'}
- */
-export function planEnsureEpicBranchRefAction(local, remote) {
-  if (local) return remote ? 'noop' : 'publish-existing';
-  return remote ? 'fetch' : 'create-and-publish';
-}
-
-export function ensureEpicBranchRef(epicBranch, baseBranch, cwd, opts = {}) {
-  assertBranchSafe(epicBranch, baseBranch);
-  const progress = opts.progress ?? (() => {});
-
-  // `ensureEpicBranchRef` is always called after a `git fetch origin` (via
-  // `cachedGitFetch` / `fetchMainRefs` in `bootstrapWorktree`). The
-  // remote-tracking refs are therefore authoritative, so we check
-  // `refs/remotes/origin/<branch>` locally rather than issuing a second
-  // network `ls-remote` call.
-  const action = planEnsureEpicBranchRefAction(
-    branchExistsLocally(epicBranch, cwd),
-    branchExistsViaTrackingRef(epicBranch, cwd),
-  );
-
-  if (action === 'noop') {
-    progress('GIT', `Epic branch ref exists (local+remote): ${epicBranch}`);
-    return;
-  }
-
-  if (action === 'fetch') {
-    progress('GIT', `Fetching remote Epic branch ref: ${epicBranch}`);
-    const res = gitSpawn(cwd, 'fetch', 'origin', `${epicBranch}:${epicBranch}`);
-    if (res.status !== 0) {
-      throw new Error(
-        `ensureEpicBranchRef: failed to fetch ${epicBranch}: ${res.stderr}`,
-      );
-    }
-    return;
-  }
-
-  if (action === 'create-and-publish') {
-    progress(
-      'GIT',
-      `Creating Epic branch ref: ${epicBranch} (from ${baseBranch})`,
-    );
-    gitSync(cwd, 'branch', epicBranch, baseBranch);
-  }
-
-  progress('GIT', `Publishing Epic branch: ${epicBranch}`);
-  gitSync(cwd, 'push', '--no-verify', '-u', 'origin', epicBranch);
 }
 
 /**

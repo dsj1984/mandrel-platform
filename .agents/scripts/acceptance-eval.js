@@ -4,8 +4,8 @@
  * acceptance-eval.js — bounded per-Story acceptance self-eval gate (Story #3819).
  *
  * The Story-implementation phase runs an independent (fresh-context)
- * critic pass that scores the working diff against each inline
- * `acceptance[]` item, emitting one verdict file per round
+ * critic pass that scores the caller-injected change set against each
+ * inline `acceptance[]` item, emitting one verdict file per round
  * (`.agents/schemas/acceptance-eval-verdict.schema.json`). This CLI is the
  * deterministic substrate that turns that verdict into the loop's next
  * action:
@@ -32,15 +32,20 @@
  * — this CLI is the decision + signal boundary, mirroring how the existing
  * gates separate decision from ticket mutation.
  *
+ * One invocation shape: per-Story. The diff is one Story's; round scoping
+ * is per Story off the Story's `signals.ndjson`. (v2.0.0 removed the Epic
+ * tier along with the per-AC-cluster `--epic <id> --cluster <id>` mode that
+ * scored an Epic `## Acceptance Table` against a `main..epic/<id>` diff.)
+ *
  * CLI:
- *   --story <id>            Story ID (required).
- *   --epic <id>            Parent Epic ID (omit for standalone Stories).
+ *   --story <id>           Story ID (required).
  *   --verdict <path>       Path to the round's verdict JSON (required).
  *   --no-signal            Suppress the signal emit (tests).
  *
  * Stdout: a single JSON envelope
  *   { storyId, epicId, decision, round, cap, capReached, totalCriteria,
  *     metCount, unmetCriteria[], signalEmitted }
+ *   (`epicId` is retained as a always-null field for envelope stability.)
  *
  * @see .agents/scripts/lib/orchestration/acceptance-eval-decision.js
  * @see .agents/schemas/acceptance-eval-verdict.schema.json
@@ -125,17 +130,14 @@ function parseCliArgs(argv) {
     args: argv,
     options: {
       story: { type: 'string' },
-      epic: { type: 'string' },
       verdict: { type: 'string' },
       'no-signal': { type: 'boolean', default: false },
     },
     strict: false,
   });
   const storyId = Number.parseInt(values.story ?? '', 10);
-  const epicRaw = Number.parseInt(values.epic ?? '', 10);
   return {
     storyId: Number.isInteger(storyId) && storyId > 0 ? storyId : null,
-    epicId: Number.isInteger(epicRaw) && epicRaw > 0 ? epicRaw : null,
     verdictPath: values.verdict ?? null,
     emitSignal: values['no-signal'] !== true,
   };
@@ -149,7 +151,6 @@ function parseCliArgs(argv) {
  *
  * @param {object} args
  * @param {number} args.storyId
- * @param {number | null} args.epicId
  * @param {object} args.verdict — validated verdict object.
  * @param {object} args.config — resolved `.agentrc.json`.
  * @param {boolean} args.emitSignal
@@ -163,7 +164,7 @@ function parseCliArgs(argv) {
  * @returns {Promise<{ envelope: object, exitCode: number }>}
  */
 export async function runAcceptanceEval(
-  { storyId, epicId, verdict, config, emitSignal, round },
+  { storyId, verdict, config, emitSignal, round },
   deps = {},
 ) {
   const {
@@ -174,7 +175,7 @@ export async function runAcceptanceEval(
   const resolvedRound =
     Number.isInteger(round) && round >= 1
       ? round
-      : deriveRoundFn({ epicId: epicId ?? null, storyId, config });
+      : deriveRoundFn({ epicId: null, storyId, config });
   const outcome = decideAcceptanceEval({
     verdict,
     maxRounds,
@@ -184,12 +185,12 @@ export async function runAcceptanceEval(
   let signalEmitted = false;
   if (emitSignal) {
     const signal = {
-      ...buildAcceptanceEvalSignal({ storyId, epicId, outcome }),
+      ...buildAcceptanceEvalSignal({ storyId, epicId: null, outcome }),
       ts: new Date().toISOString(),
     };
     try {
       signalEmitted = await appendSignalFn({
-        epicId,
+        epicId: null,
         storyId,
         signal,
         config,
@@ -206,8 +207,8 @@ export async function runAcceptanceEval(
   }
 
   const envelope = {
-    storyId,
-    epicId: epicId ?? null,
+    storyId: storyId ?? null,
+    epicId: null,
     decision: outcome.decision,
     round: outcome.round,
     cap: outcome.cap,
@@ -231,11 +232,11 @@ export async function runAcceptanceEval(
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { storyId, epicId, verdictPath, emitSignal } = parseCliArgs(argv);
+  const { storyId, verdictPath, emitSignal } = parseCliArgs(argv);
 
   if (!storyId) {
     throw new Error(
-      'Usage: node acceptance-eval.js --story <id> [--epic <id>] --verdict <path> [--no-signal]',
+      'Usage: node acceptance-eval.js --story <id> --verdict <path> [--no-signal]',
     );
   }
   if (!verdictPath) {
@@ -277,7 +278,6 @@ export async function main(argv = process.argv.slice(2)) {
   const config = resolveConfig();
   const { envelope, exitCode } = await runAcceptanceEval({
     storyId,
-    epicId,
     verdict,
     config,
     emitSignal,

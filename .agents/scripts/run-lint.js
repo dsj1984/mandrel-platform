@@ -57,14 +57,24 @@ const tasks = [
     args: ['.agents/scripts/check-lifecycle-lint.js'],
   },
   {
+    // Custom Node-based lint for the workflow prose surface (Epic #4474
+    // PR5). Enforces: no workflow may instruct calling an exported
+    // library function that has no CLI entrypoint — the measured
+    // shim-writing failure mode the /plan collapse killed. See
+    // check-workflow-cli-lint.js for the paragraph-level heuristic.
+    name: 'workflow-cli-lint',
+    cmd: 'node',
+    args: ['.agents/scripts/check-workflow-cli-lint.js'],
+  },
+  {
     // Custom Node-based lint for label-vocabulary citations in
     // `.agents/docs/SDLC.md` and `.agents/workflows/**/*.md` (Story #2892,
     // Tech Spec F9 under Epic #2880). Greps inline backtick code
     // spans for axis-shaped tokens (`type/epic`, etc.) and asserts
     // only the canonical `<axis>::<value>` separator from
     // `lib/label-constants.js` appears. Closes the drift gap that
-    // let the original `type/epic` typo land at
-    // `.agents/workflows/helpers/plan-epic.md:49`.
+    // let the original `type/epic` typo land in a since-retired
+    // planning workflow helper.
     name: 'label-vocabulary',
     cmd: 'node',
     args: ['.agents/scripts/lint-label-vocabulary.js'],
@@ -77,17 +87,6 @@ const tasks = [
     name: 'arch-cycles',
     cmd: 'node',
     args: ['.agents/scripts/check-arch-cycles.js'],
-  },
-  {
-    // Loop-unit frontmatter gate (Story #4288, Epic #4284). Validates
-    // every `.agents/workflows/loops/*.md` loop unit against
-    // `.agents/schemas/loop-unit.schema.json`. An absent/empty loops
-    // directory is a clean pass; a malformed unit (e.g. a self-paced
-    // cadence missing its required `verify`) fails the lint gate with a
-    // message naming the offending file + field.
-    name: 'loop-units',
-    cmd: 'node',
-    args: ['.agents/scripts/check-loop-units.js'],
   },
 ];
 

@@ -15,9 +15,6 @@
     "projectNumber": 8
   },
   "delivery": {
-    "ci": {
-      "skipForStoryPushes": true
-    },
     "quality": {
       "gates": {
         "crap": {

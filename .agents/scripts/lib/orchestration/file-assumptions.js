@@ -15,7 +15,13 @@
  *
  * Rules (one error per mismatched path):
  *   - `creates`            + path **exists**  → error (Story would clobber).
- *   - `refactors-existing` + path **absent** → error (no target to refactor).
+ *   - `refactors-existing` (via `changes`) + path **absent** →
+ *     auto-normalized to `creates` with a logged warning (#4496 fix 5):
+ *     a refactor declaration against a base-untracked path is
+ *     deterministically a create, so rejecting it only forces a
+ *     reject→amend→re-persist cycle for a mechanical rewrite. Genuine
+ *     mismatches keep failing — a `references`-sourced `refactors-existing`
+ *     on an absent path is a missing read dependency and stays an error.
  *   - `exists`             + path **absent** → error (read dependency missing).
  *   - `deletes`            + path **absent** → error (nothing to delete).
  *
@@ -39,11 +45,10 @@
  * the shared-editor conflict gate's domain — that finding's rendering is
  * cross-referenced (see `renderMismatch`), not duplicated here.
  *
- * Legacy compatibility: stories whose `body.changes` items are still bare
- * strings carry no assumption and are skipped silently here. The
- * deprecation signal is emitted *once* per validator invocation through
- * `collectDeprecationWarnings`, so consumers running an older planner
- * see a clear migration nudge without a hard failure mid-flight.
+ * String bullets: stories whose `body.changes` items are still bare
+ * strings are hard errors — they are pushed to `errors[]` by the
+ * validator's body-shape gate before this module runs. There is no
+ * silent skip or deprecation nudge.
  */
 
 import { gitSpawn } from '../git-utils.js';
@@ -186,6 +191,18 @@ function renderMismatch({
 }
 
 /**
+ * Render an auto-normalization (#4496 fix 5) into a stable warning string.
+ * Kept pure and exported through the report so callers log a
+ * self-explanatory line rather than re-deriving the rationale.
+ *
+ * @param {{ slug: string, source: string, path: string, assumption: string }} normalization
+ * @returns {string}
+ */
+function renderNormalization({ slug, source, path, assumption }) {
+  return `"${slug}" → body.${source} declares assumption="${assumption}" for ${path} but the path is untracked at the base branch — auto-normalized to "creates" (a refactor of a base-untracked path is deterministically a create). Declare assumption="creates" in the plan to silence this warning.`;
+}
+
+/**
  * Index, across every Story, which Stories declare a `creates` (and which
  * declare a `deletes`) for each `changes`-sourced path. The maps drive the
  * wave-aware simulated-tree overlay: a path created by a transitive
@@ -251,8 +268,11 @@ function predecessorMutator(index, path, predecessors) {
  *
  *   {
  *     errors:    string[]   // one entry per mismatch, batched per Story
- *     warnings:  string[]   // legacy/no-assumption deprecation nudges
+ *     warnings:  string[]   // legacy/no-assumption deprecation nudges +
+ *                           // auto-normalization notices (#4496 fix 5)
  *     mismatches: object[]  // structured payload for downstream tooling
+ *     normalizations: object[] // `refactors-existing`→`creates`
+ *                           // auto-normalizations on base-untracked paths
  *   }
  *
  * Under the 2-tier hierarchy the Story is the implementation unit, so the
@@ -283,6 +303,7 @@ export function validateStoryFileAssumptions(opts) {
   const errors = [];
   const warnings = [];
   const mismatches = [];
+  const normalizations = [];
   const probeCache = new Map();
 
   // Wave-aware setup (Story #3960): transitive predecessor sets over the
@@ -297,21 +318,16 @@ export function validateStoryFileAssumptions(opts) {
     const entries = collectStoryAssumptionEntries(story);
 
     if (entries.length === 0) {
-      // Legacy path: this Story carries no object-form entries. Emit a
-      // single deprecation warning so the operator sees the migration
-      // nudge once per Story rather than per-bullet.
       if (hasLegacyChangeBullets(story)) {
-        warnings.push(
-          `"${slug}" → body.changes uses legacy string bullets without { path, assumption }. Migrate to object form so Phase 8 can verify file-state assumptions. See Story #2636.`,
+        errors.push(
+          `"${slug}" → body.changes uses legacy string bullets without { path, assumption }. Migrate every bullet to object form so Phase 8 can verify file-state assumptions. See Story #2636.`,
         );
       }
       continue;
     }
 
-    // Partial-migration warning: some entries are object-form, some are
-    // still strings. Surface once so the operator notices the gap.
     if (hasLegacyChangeBullets(story)) {
-      warnings.push(
+      errors.push(
         `"${slug}" → body.changes mixes object-form entries with legacy string bullets. Migrate every bullet for full freshness coverage.`,
       );
     }
@@ -350,6 +366,14 @@ export function validateStoryFileAssumptions(opts) {
         predecessorCreator,
       });
       if (mismatch !== null) {
+        // Auto-normalization (#4496 fix 5): a deterministic
+        // `refactors-existing`→`creates` rewrite is a warning, never a
+        // rejection — genuine mismatches keep flowing to `errors`.
+        if (mismatch.normalizedTo === 'creates') {
+          normalizations.push(mismatch);
+          warnings.push(renderNormalization(mismatch));
+          continue;
+        }
         mismatches.push(mismatch);
         errors.push(renderMismatch(mismatch));
         continue;
@@ -384,7 +408,7 @@ export function validateStoryFileAssumptions(opts) {
       }
     }
   }
-  return { errors, warnings, mismatches };
+  return { errors, warnings, mismatches, normalizations };
 }
 
 /**
@@ -468,12 +492,43 @@ function checkAssumption({
       }
       return null;
     case 'refactors-existing':
+      // Validate against the simulated tree: a predecessor `creates` makes
+      // an otherwise-absent base path present, so `refactors-existing`
+      // against it is no longer a false-positive mismatch (Story #3960).
+      if (!simulatedExists) {
+        // Auto-normalization (#4496 fix 5): a `changes`-sourced refactor
+        // declaration on a path untracked at the base branch (and not
+        // produced by any predecessor) is deterministically a create —
+        // downgrade to a normalization warning instead of rejecting. Two
+        // genuine mismatches stay hard errors: a `references`-sourced entry
+        // (a read dependency this Story does not author cannot be "created"
+        // here), and a base-TRACKED path a predecessor deletes (the absence
+        // is a plan-shape conflict, not an untracked-path misdeclaration).
+        if (source === 'changes' && !baseExists) {
+          return {
+            slug,
+            source,
+            path,
+            assumption,
+            expected: 'creates',
+            actual: 'absent',
+            normalizedTo: 'creates',
+          };
+        }
+        return {
+          slug,
+          source,
+          path,
+          assumption,
+          expected: 'present',
+          actual: 'absent',
+        };
+      }
+      return null;
     case 'exists':
     case 'deletes':
-      // Validate against the simulated tree: a predecessor `creates` makes
-      // an otherwise-absent base path present, so `refactors-existing` /
-      // `exists` / `deletes` against it is no longer a false-positive
-      // mismatch (Story #3960).
+      // Same simulated-tree overlay as above (Story #3960); an absent path
+      // remains a genuine mismatch for both assumptions.
       if (!simulatedExists) {
         return {
           slug,
