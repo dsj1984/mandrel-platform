@@ -31,7 +31,11 @@
 #       with:
 #         runner: ubuntu-latest
 #         osv-fail-on-severity: high
-#       secrets: inherit
+#       # Forward only what is needed (least privilege — avoid `secrets:
+#       # inherit`). packages-read-token is optional; omit the block entirely
+#       # when the consumer's install needs no private-registry token:
+#       secrets:
+#         packages-read-token: ${{ secrets.PACKAGES_READ_TOKEN }}
 #
 # GHAS-free: findings surface via the run log, the job summary, and the
 # tracking issue — never SARIF / Code Scanning — matching the PR tier's

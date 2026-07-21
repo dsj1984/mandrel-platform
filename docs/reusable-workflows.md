@@ -1837,7 +1837,11 @@ jobs:
     with:
       runner: ubuntu-latest
       osv-fail-on-severity: high
-    secrets: inherit
+    # Least privilege — forward only what is needed, not `secrets: inherit`.
+    # packages-read-token is optional; omit the block when the install needs
+    # no private-registry token.
+    secrets:
+      packages-read-token: ${{ secrets.PACKAGES_READ_TOKEN }}
 ```
 
 > **`issues: write` is required, and lives here — never in `pr-quality.yml`.**

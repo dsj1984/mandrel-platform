@@ -37,4 +37,6 @@ jobs:
       runner: ubuntu-latest
       osv-fail-on-severity: high
       tracking-issue-labels: 'audit::dependencies,meta::framework-gap'
-    secrets: inherit
+    # No `secrets: inherit` — least privilege (the SAST secrets-inherit rule).
+    # advisory-scan.yml's only secret (packages-read-token) is optional, and
+    # this repo's install needs none, so the scheduled caller forwards nothing.
