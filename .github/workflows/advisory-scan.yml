@@ -1,0 +1,160 @@
+# Reusable scheduled advisory-scan workflow (Story #310, issue #309).
+#
+# The PR-time OSV tier in pr-quality.yml only scans on pull_request/push. So a
+# high advisory newly published against a transitive dep ALREADY on `main`
+# first surfaces as a red required check on some unrelated feature PR — the
+# failing PR's own diff is irrelevant. This workflow is the proactive
+# companion: driven by a consumer `schedule:` cron, it scans the default
+# branch on a cadence and raises the advisory as its OWN tracked issue,
+# decoupled from feature delivery.
+#
+# It reuses the SAME osv-scan composite the PR tier uses (pinned binary,
+# per-platform checksum map, severity-band gate, Story #145 allow-list) — no
+# consumer hand-rolls the OSV download. The scan runs in non-blocking mode
+# (the tracking issue is the signal, not a red job), and osv-track-issue keeps
+# a single issue in sync: open on new blocking findings, update only when the
+# finding set changes, close when it clears.
+#
+# Consumer caller (a near-copy of the PR caller, plus a cron + issues: write):
+#
+#   name: Advisory Scan
+#   on:
+#     schedule:
+#       - cron: '17 7 * * *'   # daily
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#     issues: write
+#   jobs:
+#     advisory-scan:
+#       uses: dsj1984/mandrel-platform/.github/workflows/advisory-scan.yml@<sha>
+#       with:
+#         runner: ubuntu-latest
+#         osv-fail-on-severity: high
+#       secrets: inherit
+#
+# GHAS-free: findings surface via the run log, the job summary, and the
+# tracking issue — never SARIF / Code Scanning — matching the PR tier's
+# private-repo posture.
+name: Advisory Scan (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: >
+          Runs-on label. Single string (e.g. 'ubuntu-latest') or a
+          JSON-encoded label array string. Defaults to ubuntu-latest.
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+      osv-fail-on-severity:
+        description: >
+          Lowest CVSS severity band that counts as a tracked (blocking)
+          finding: none, low, medium, high, critical. Default 'high'.
+        required: false
+        type: string
+        default: 'high'
+      osv-scanner-version:
+        description: >
+          Pinned OSV-scanner release version (without the leading 'v'). Must
+          match an entry in the osv-scan composite's checksum map. Default
+          2.4.0.
+        required: false
+        type: string
+        default: '2.4.0'
+      osv-allowlist-path:
+        description: >
+          Path to an optional OSV allow-list JSON (same schema as the PR
+          tier). Suppressed findings are reported in the tracking issue, not
+          raised. A missing file is a no-op. Default '.osv-allowlist.json'.
+        required: false
+        type: string
+        default: '.osv-allowlist.json'
+      toolchain-cache:
+        description: >
+          Passed through to setup-toolchain's `cache` input. Set 'false' on
+          self-hosted runners with a warm pnpm store.
+        required: false
+        type: string
+        default: 'true'
+      pnpm-dest:
+        description: >
+          Passed through to setup-toolchain's `pnpm-dest` input. Leave empty
+          for the default; self-hosted callers should set it explicitly.
+        required: false
+        type: string
+        default: ''
+      tracking-issue-title:
+        description: Title used when opening a new advisory tracking issue.
+        required: false
+        type: string
+        default: 'OSV advisory scan — default branch findings'
+      tracking-issue-labels:
+        description: >
+          Comma-separated labels applied to the tracking issue and used to
+          scope the open-issue lookup. Empty for none.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      packages-read-token:
+        description: >
+          Optional registry read token forwarded to setup-toolchain for a
+          consumer that installs from a private registry. Absent is fine.
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisory-scan-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  advisory-scan:
+    name: advisory-scan
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # The tracking-issue upsert opens / edits / closes the advisory issue in
+      # this repo. This grant is why issue-writing lives HERE, not in
+      # pr-quality.yml (where a permission change would break every consumer's
+      # compile-time-resolved CI). The caller must also grant issues: write.
+      issues: write
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # No authenticated git network op runs after checkout — the upsert
+          # talks to the API via GH_TOKEN, not .git/config — so do not persist
+          # the token while the OSV binary and node run.
+          persist-credentials: false
+
+      - name: Setup toolchain
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1ace1d82dfd181ce0a02367294c614ac9894da9f
+        with:
+          cache: ${{ inputs.toolchain-cache }}
+          pnpm-dest: ${{ inputs.pnpm-dest }}
+          packages-read-token: ${{ secrets.packages-read-token }}
+
+      - name: OSV advisory scan (scheduled, non-blocking)
+        id: osv
+        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@f2d4f68015496bde6f60a53b8cae00d73087f7a3
+        with:
+          osv-scanner-version: ${{ inputs.osv-scanner-version }}
+          fail-on-severity: ${{ inputs.osv-fail-on-severity }}
+          allowlist-path: ${{ inputs.osv-allowlist-path }}
+          non-blocking: 'true'
+          findings-out: ${{ runner.temp }}/osv-findings.json
+
+      - name: Upsert advisory tracking issue
+        uses: dsj1984/mandrel-platform/.github/actions/osv-track-issue@f2d4f68015496bde6f60a53b8cae00d73087f7a3
+        with:
+          findings-path: ${{ runner.temp }}/osv-findings.json
+          repo: ${{ github.repository }}
+          branch: ${{ github.event.repository.default_branch }}
+          title: ${{ inputs.tracking-issue-title }}
+          labels: ${{ inputs.tracking-issue-labels }}
+          github-token: ${{ github.token }}
