@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.27.0...mandrel-platform-v0.27.1) (2026-07-21)
+
+
+### Fixed
+
+* setup-toolchain: pre-clean pnpm dest to fix ENOTEMPTY self-installer race on persistent-temp runners ([#306](https://github.com/dsj1984/mandrel-platform/issues/306)) ([#307](https://github.com/dsj1984/mandrel-platform/issues/307)) ([c1c47d0](https://github.com/dsj1984/mandrel-platform/commit/c1c47d0449f29f606410fe4bdafd851139a117d2))
+
 ## [0.27.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.26.2...mandrel-platform-v0.27.0) (2026-07-16)
 
 
