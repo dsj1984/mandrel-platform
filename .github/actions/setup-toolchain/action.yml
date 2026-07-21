@@ -101,6 +101,21 @@ inputs:
 runs:
   using: composite
   steps:
+    # Pre-clean the pnpm shim dest. On self-hosted runners runner.temp
+    # (_work/_temp) is NOT wiped between jobs, so a prior job's pnpm install
+    # survives at dest and pnpm/action-setup@v4's self-installer races its own
+    # cleanup rmdir on the non-empty content-addressable store
+    # (node_modules/.bin/store/v11/files/*) -> ENOTEMPTY, failing the step
+    # before install starts. dest is a throwaway shim dir action-setup
+    # recreates, so removing it is safe and idempotent; on hosted runners the
+    # path is already absent and `rm -rf` is a no-op. Resolve the path once here
+    # into PNPM_DEST so it can never drift from the `dest:` expression below.
+    - name: Clean stale pnpm install dir
+      shell: bash
+      run: rm -rf "${PNPM_DEST}"
+      env:
+        PNPM_DEST: ${{ inputs['pnpm-dest'] || format('{0}/pnpm', runner.temp) }}
+
     - name: Setup pnpm
       uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
       with:
