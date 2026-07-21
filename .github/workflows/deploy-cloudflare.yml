@@ -492,6 +492,15 @@ on:
           to before this secret existed — the audit only reads what the default
           token can see).
         required: false
+      packages-read-token:
+        description: >
+          Optional token for reading a private npm registry (GitHub Packages
+          etc.) during the build/snapshot jobs' install. Passed to every
+          setup-toolchain call site so a consumer whose committed .npmrc
+          authenticates a private scope via ${PACKAGES_READ_TOKEN} installs
+          cleanly on the frozen-lockfile deploy jobs. Omit for repos without a
+          private-registry dependency (default behaviour unchanged).
+        required: false
       # ----- worker-secrets passthrough (opt-in, Story #170) -----
       # The in-pipeline worker-secrets step (see the `worker-secrets` input and
       # the "Provision worker secrets in-pipeline" step in the deploy job) does
@@ -792,9 +801,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@25cdca8f5b8dec2ae43cd9f7dfb2090657b7f18e
         with:
           cache: 'true'
+          packages-read-token: ${{ secrets.packages-read-token }}
           # Single-sourced wrangler preflight (Story #231): the built-in D1
           # export / migrations-apply branches run `pnpm exec wrangler`, so
           # require it whenever EITHER built-in branch is active (a consumer
@@ -995,9 +1005,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@25cdca8f5b8dec2ae43cd9f7dfb2090657b7f18e
         with:
           cache: 'true'
+          packages-read-token: ${{ secrets.packages-read-token }}
           # Single-sourced wrangler preflight (Story #231): the built-in
           # per-worker deploy loop runs `pnpm exec wrangler deploy` (skipped
           # when deploy-command replaces it), and the opt-in worker-secrets
@@ -1225,9 +1236,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@b48be232f44cba7fb759a69808cf50fffb42895d
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@25cdca8f5b8dec2ae43cd9f7dfb2090657b7f18e
         with:
           cache: 'true'
+          packages-read-token: ${{ secrets.packages-read-token }}
           # M14: the built-in probe NO LONGER needs root wrangler. Its
           # workers.dev subdomain derivation now uses the Cloudflare REST
           # endpoint (GET /accounts/{account_id}/workers/subdomain) with the

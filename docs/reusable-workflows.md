@@ -190,6 +190,16 @@ Semantics and caveats:
   read-only default, or an explicit narrow `permissions:` block on the
   caller) must grant `actions: write` at the caller level, as in the snippet
   above.
+- **`pull-requests: read` is also required (since Story #292).** The
+  `migration-guard` job declares `pull-requests: read` for its live
+  override-label re-fetch. GitHub validates a called workflow's declared job
+  permissions against the caller's grant at **compile time, ignoring the
+  job's `if:` gate**, so this grant is required of **every** caller pinning a
+  #292-or-later version — **even one that never enables the migration guard**.
+  A caller missing it fails the whole `pr-quality.yml` call with
+  `startup_failure`. See
+  [Destructive-migration guard → Caller permission requirement](#destructive-migration-guard-enable-migration-guard)
+  for the full note.
 - **A permission gap cannot mask the real failure.** The cancel step is loud
   but non-fatal: when the cancel call fails (missing grant, API error) it
   emits a `::warning::` and exits `0`. The tier's own failure result — the
@@ -928,6 +938,10 @@ signal on changed files is sufficient for the gate.
 > jobs:
 >   pr-quality:
 >     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+>     permissions:
+>       contents: read
+>       actions: write        # fail-fast run-cancel step (#223)
+>       pull-requests: read   # migration-guard live label re-fetch (#292)
 >     with:
 >       enable-migration-guard: true
 >     secrets: inherit
@@ -937,6 +951,22 @@ signal on changed files is sufficient for the gate.
 > reviewer can apply it. Override `migration-guard-label` /
 > `migration-guard-globs` only when your repo uses a different label name or
 > migration directory layout.
+
+> **Caller permission requirement — `pull-requests: read` (Story #292).**
+> Since #292 the `migration-guard` job **declares** `pull-requests: read` for
+> its live override-label re-fetch. GitHub validates a called reusable
+> workflow's declared job permissions against the **caller's** grant at
+> **compile time — regardless of any per-job `if:` gate** — so a caller whose
+> token is restricted (an org/repo read-only default, or an explicit narrow
+> `permissions:` block) **must** grant `pull-requests: read`, exactly as it
+> already must grant `actions: write` for the fail-fast tier. This applies to
+> **every** consumer that pins a version containing #292, **even one that does
+> not set `enable-migration-guard`** (the default `false` still leaves the job
+> declared, and the compile-time check ignores the `if: false`). A caller that
+> omits the grant fails the **entire** `pr-quality.yml` call with
+> `startup_failure` (zero jobs) — not just the migration-guard job. If your
+> caller currently grants only `contents: read` + `actions: write`, add
+> `pull-requests: read` when you bump your pin across #292.
 
 > **Detection contract.** The destructive-signal set is codified and
 > unit-tested in `scripts/check-destructive-migration.mjs` /
@@ -1027,13 +1057,22 @@ step. Until a consumer opts in, its CI behaviour is unchanged.
 
 ### Secrets
 
-| Secret        | Required | Purpose                                              |
-| ------------- | -------- | ---------------------------------------------------- |
-| `TURBO_TOKEN` | No       | Turbo remote-cache read/write token.                 |
-| `TURBO_TEAM`  | No       | Turbo team slug for remote-cache scoping.            |
+| Secret                | Required | Purpose                                                          |
+| --------------------- | -------- | ---------------------------------------------------------------- |
+| `TURBO_TOKEN`         | No       | Turbo remote-cache read/write token.                             |
+| `TURBO_TEAM`          | No       | Turbo team slug for remote-cache scoping.                        |
+| `packages-read-token` | No       | Private npm-registry read token for the frozen-lockfile install. |
 
-Both are optional. The simplest caller passes `secrets: inherit`; the tiers
-run without remote caching when the secrets are absent.
+All three are optional. The simplest caller passes `secrets: inherit`; the
+tiers run without remote caching when the Turbo secrets are absent.
+
+`packages-read-token` is forwarded to every `setup-toolchain` call site and
+exported as the `PACKAGES_READ_TOKEN` environment variable for the
+`pnpm install --frozen-lockfile` step. A consumer whose committed `.npmrc`
+authenticates a private scope through that variable (e.g. a GitHub Packages
+scope such as `@acme`) then installs cleanly on every tier. Consumers with no
+private-registry dependency omit it — the variable is exported empty and
+nothing references it, so behaviour is unchanged.
 
 ### The `ci-required` aggregator
 
@@ -1718,6 +1757,14 @@ plaintext public build-time values.
 > reference them from their own seam commands, but the workflow itself only
 > maps the frozen `{CLOUDFLARE_*, TURSO_*}` set into its seam-step `env:`
 > blocks (never via `with:`).
+
+> **Install-auth secret (outside the frozen deploy set).** The optional
+> `packages-read-token` secret is not a deploy/seam secret and is never mapped
+> into a deploy `env:` block. It is forwarded to each `setup-toolchain` call
+> site so the build/snapshot jobs' `pnpm install --frozen-lockfile` can read a
+> private npm registry when a consumer's committed `.npmrc` authenticates a
+> private scope through `${PACKAGES_READ_TOKEN}`. Consumers without a
+> private-registry dependency omit it (behaviour unchanged).
 
 ### The `gh-environment` model
 
