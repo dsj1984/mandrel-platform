@@ -1785,6 +1785,111 @@ its environment-scoped secrets and any required reviewers / wait timers.
 
 ---
 
+## `advisory-scan.yml`
+
+A **reusable scheduled advisory-scan** workflow. Where the
+[OSV advisory tier](#osv-advisory-tier-enable-osv-scan) in `pr-quality.yml`
+scans on **pull-request / push** events, this workflow scans the consumer's
+**default branch on a cadence** (driven by the consumer's own `schedule:`
+cron) and raises findings as a **single tracked issue**, decoupled from
+feature delivery.
+
+**Why it exists.** A high advisory newly published against a transitive
+dependency **already on `main`** would otherwise first surface as a **red
+required check on an unrelated feature PR** — the failing PR's own diff is
+irrelevant, and the advisory landed after the dep did. Nothing scanned `main`
+proactively. This workflow is that proactive companion; it does **not** replace
+the PR-time gate (keep `enable-osv-scan: true` on `pr-quality.yml`).
+
+**Reuses the PR tier's machinery.** The scan step is the **same** first-party
+[`osv-scan` composite action](../.github/actions/osv-scan/action.yml) the PR
+tier calls — the pinned, checksum-verified OSV-scanner binary, the per-platform
+SHA-256 map, the CVSS severity-band gate, and the Story #145 allow-list
+(`{ id, reason, revisitBy, package?, ecosystem? }`, including `revisitBy`
+re-gating). No consumer hand-rolls the OSV download. It runs the composite in
+**non-blocking** mode: the tracking issue is the signal, so the scheduled run
+never fails on findings (a supply-chain integrity failure — a bad checksum or a
+scanner crash — still hard-fails, because a scan that did not complete is never
+a soft signal).
+
+**Private-repo-capable, no GHAS.** Like every OSV surface, findings live in the
+run log, the job summary, and the tracking issue — **no SARIF / Code Scanning
+upload** — so the workflow is load-bearing on a **private repo with no GitHub
+Advanced Security**.
+
+### Minimal caller
+
+A scheduled caller is a near-copy of the PR caller, plus a `schedule:` trigger
+and an `issues: write` grant:
+
+```yaml
+name: Advisory Scan
+on:
+  schedule:
+    - cron: '17 7 * * *' # daily, off-the-hour
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  advisory-scan:
+    uses: dsj1984/mandrel-platform/.github/workflows/advisory-scan.yml@<sha> # <tag>
+    with:
+      runner: ubuntu-latest
+      osv-fail-on-severity: high
+    secrets: inherit
+```
+
+> **`issues: write` is required, and lives here — never in `pr-quality.yml`.**
+> The tracking-issue upsert opens / edits / closes the advisory issue. That
+> permission is deliberately confined to this scheduled path: a consumer's PR
+> caller resolves `pr-quality.yml` **at compile time**, so adding a permission
+> or input to the PR workflow would break **every** consumer's CI at once. The
+> scheduled caller grants `issues: write` on its own job.
+
+> **In-repo reference example (dogfood).** This repo runs the scan on its own
+> default branch via
+> [`.github/workflows/advisory-scan-schedule.yml`](../.github/workflows/advisory-scan-schedule.yml)
+> — a live copy of this minimal caller, differing only in its same-repo
+> **relative** `uses:` ref (legitimate in a caller; consumers use the
+> SHA-pinned cross-repo ref above).
+
+### Inputs
+
+| Input                   | Type   | Default                                          | When to override                                                                    |
+| ----------------------- | ------ | ------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `runner`                | string | `'ubuntu-latest'`                                | Runs-on label (single string or JSON label-array string). `ubuntu-latest` keeps the monitor running when a self-hosted fleet is down. |
+| `osv-fail-on-severity`  | string | `'high'`                                         | Lowest CVSS band counted as a tracked finding (`none`…`critical`).                  |
+| `osv-scanner-version`   | string | `'2.4.0'`                                        | Pinned OSV-scanner version — must match the `osv-scan` composite's checksum map.     |
+| `osv-allowlist-path`    | string | `'.osv-allowlist.json'`                          | Path to the optional allow-list (same schema as the PR tier). Suppressed findings are reported in the issue, never raised. |
+| `toolchain-cache`       | string | `'true'`                                         | Passed to `setup-toolchain`'s `cache`. `'false'` on self-hosted runners with a warm store. |
+| `pnpm-dest`             | string | `''`                                             | Passed to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set it explicitly. |
+| `tracking-issue-title`  | string | `'OSV advisory scan — default branch findings'`  | Title used when opening a new tracking issue.                                        |
+| `tracking-issue-labels` | string | `''`                                             | Comma-separated labels applied to the tracking issue and used to scope the lookup.  |
+
+Secret `packages-read-token` is optional (forwarded to `setup-toolchain` for a
+private-registry consumer; absent is fine).
+
+### Tracking-issue upsert semantics
+
+A single issue is kept in sync with the current **blocking** finding set,
+discovered by an HTML-comment marker in its body and change-detected by an
+embedded findings **digest** — so a daily run over an unchanged set writes
+nothing:
+
+| Situation                                          | Action                                              |
+| -------------------------------------------------- | --------------------------------------------------- |
+| Blocking findings, no open tracking issue          | **Open** one issue.                                 |
+| Blocking findings, open issue, **same** digest     | **Noop** — the issue already reflects the set.      |
+| Blocking findings, open issue, **changed** digest  | **Update** the issue body.                          |
+| Blocking set now **empty**, open issue             | **Comment + close** the issue (`completed`).        |
+| Blocking set empty, no issue                        | **Noop**.                                           |
+
+Allow-list-suppressed and below-gate findings are rendered in the issue body as
+context — they never open or reopen an issue.
+
+---
+
 ## `secret-scan-push.yml`
 
 A full-history secret-scan **signal** on push to the default branch. The
