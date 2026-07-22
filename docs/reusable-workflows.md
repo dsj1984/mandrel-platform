@@ -223,18 +223,37 @@ binary directly and **block the job on a finding via a non-zero exit code** —
 no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
 **private repo with no GitHub Advanced Security (GHAS)**.
 
-- **Secret scan** — a pinned `gitleaks` binary over the PR diff (blocking). On
-  `pull_request` events the scan is scoped to the commits the PR introduces
-  (merge-base..head); on push / other events it falls back to a full-tree
-  scan. The installer is the shared first-party `gitleaks-scan` composite
-  action (`.github/actions/gitleaks-scan`), which owns the pinned version +
-  per-platform SHA-256 checksum map and selects the binary asset per platform
-  (darwin/linux × arm64/x64), verifying it before execution. Bumping the
-  gitleaks release is a single edit inside that composite — there is no
+- **Secret scan** — a pinned `gitleaks` binary over the event diff (blocking).
+  The scan range comes from a single event-agnostic base/head derivation
+  (`scripts/resolve-diff-range.sh`): `pull_request` → `base.sha..head.sha`;
+  `merge_group` → `merge_group.base_sha..head_sha`; `push` →
+  `event.before..sha`. Only when no ranged base is resolvable does it fall back
+  to a full-tree scan. The installer is the shared first-party `gitleaks-scan`
+  composite action (`.github/actions/gitleaks-scan`), which owns the pinned
+  version + per-platform SHA-256 checksum map and selects the binary asset per
+  platform (darwin/linux × arm64/x64), verifying it before execution. Bumping
+  the gitleaks release is a single edit inside that composite — there is no
   per-workflow version input or checksum copy.
-- **SAST** — pinned Semgrep. On `pull_request` events it is scoped to the PR
-  diff via a baseline commit, so only findings **introduced** by the PR block;
-  on push / schedule it scans the full tree.
+- **SAST** — pinned Semgrep, scoped via `--baseline-commit` to the same shared
+  derivation, so only findings **introduced** by the event block: the
+  merge-base of `base..head` on `pull_request`, `merge_group.base_sha` on
+  `merge_group`, `event.before` on `push`. When no baseline is resolvable it
+  scans the full tree.
+
+> **Merge-queue (`merge_group`) safety.** This workflow is `on: workflow_call`
+> and runs under whatever event the caller fires, so a consumer that adopts a
+> GitHub **merge queue** invokes it under a `merge_group` event where
+> `github.event.pull_request.*` is empty. The diff-scoped security tiers derive
+> their range from `github.event.merge_group.base_sha..head_sha` instead, so
+> gitleaks and Semgrep stay scoped to the queued commits — a **pre-existing**
+> finding outside that range never bounces the queue batch, and an absent
+> `pull_request` context never causes a `startup_failure`. The
+> [destructive-migration guard](#destructive-migration-guard-enable-migration-guard)
+> is a **deliberate no-op** under `merge_group`: the guard plus its
+> `migration:destructive-ok` override label already gated the originating PR
+> before it entered the queue. No caller change is needed — declaring
+> `on: merge_group` in your caller and adding the reusable workflow's
+> `ci-required` context to the queue's required checks is sufficient.
 
 Toggle matrix:
 

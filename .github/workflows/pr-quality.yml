@@ -975,8 +975,14 @@ jobs:
 
       # Resolve the PR's changed files and run the guard. On pull_request
       # events we diff the MERGE BASE of base..head (the commits the PR
-      # actually introduces) against head; on other events the guard has no PR
-      # context and is a no-op pass. The script filters the changed set to
+      # actually introduces) against head; on any other event — including a
+      # `merge_group` (merge-queue) event — the guard has no PR context and is a
+      # DELIBERATE no-op pass (Story #314). Unlike the diff-scoped security
+      # tiers, the migration guard is NOT re-scoped onto `merge_group.*`: the
+      # guard plus its `migration:destructive-ok` override label already gated
+      # the originating PR before it could enter the queue, so re-resolving that
+      # PR from a queue entry would add machinery for no additional safety (out
+      # of scope here). The script filters the changed set to
       # migration files (`migration-guard-globs` plus an always-on `*.sql`
       # tail), strips SQL/JS comments before matching, treats a DELETED
       # migration file as destructive by itself, honours the override label,
@@ -1004,7 +1010,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
-            echo "No pull_request context — destructive-migration guard is a no-op."
+            echo "No pull_request context (e.g. a merge_group / push event) — destructive-migration guard is a deliberate no-op; the guard plus its override label already gated the PR before it could enter the merge queue."
             exit 0
           fi
 
@@ -1097,8 +1103,12 @@ jobs:
   #                   (blocking, no SARIF upload). On pull_request events it is
   #                   scoped to the PR diff via `--baseline-commit <merge-base>`
   #                   (M8: the true fork point, not the base-branch tip, so
-  #                   base drift never surfaces phantom findings), so only INTRODUCED
-  #                   by the PR block; on push / schedule it scans the full tree.
+  #                   base drift never surfaces phantom findings), so only commits
+  #                   INTRODUCED by the PR block; on merge_group (merge queue) it
+  #                   is scoped to `merge_group.base_sha..head_sha` and on push
+  #                   to `event.before..sha` — all via the shared
+  #                   `resolve-diff-range.sh` derivation (Story #314). Only when
+  #                   no ranged base is resolvable does it scan the full tree.
   #                   The vendored framework tree `.agents/` is ALWAYS excluded
   #                   (`--exclude '.agents'`): it is materialized from the pinned
   #                   `mandrel` package and a consumer cannot edit it, so gating
@@ -1139,44 +1149,73 @@ jobs:
           # persist GITHUB_TOKEN in .git/config while it runs (M5).
           persist-credentials: false
 
+      # Story #314: fetch the single event-agnostic diff-range derivation
+      # (`scripts/resolve-diff-range.sh`) from THIS reusable workflow at the
+      # exact resolved SHA the caller pinned (`job_workflow_sha`), so both the
+      # secret-scan-range resolver (below) and the SAST-baseline resolver source
+      # ONE canonical base/head derivation rather than duplicating it. It lives
+      # in THIS repo's `scripts/`, not the consumer's checkout, so — like the
+      # Semgrep lockfile / vendored ruleset — it comes from a dedicated
+      # side-checkout. Unconditional within the job (no `enable-sast` gate): the
+      # gitleaks sub-step consumes it even when SAST is disabled.
+      - name: Checkout diff-range resolver (mandrel-platform@resolved-sha)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field that
+          # actionlint's pinned context type model does not list, so it is read
+          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`) —
+          # same pattern as the Semgrep lockfile / vendored-ruleset checkouts.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts/resolve-diff-range.sh
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-range
+          persist-credentials: false
+
       # Resolve the gitleaks commit range so the scan is scoped to what the
-      # event INTRODUCED — pre-existing findings never block. On pull_request
-      # events the range is the commits the PR introduces (merge-base..head).
-      # On push events (Story #175 canonical `workflow_run` deploy trigger made
-      # push-to-main CI load-bearing — see also the SAST baseline below) the
-      # range is `event.before..sha`, the commits the push added; the pushed
-      # code already passed its PR's diff scan, so a full-tree re-scan on every
-      # push would block on unrelated pre-existing debt. Only when no ranged
-      # base is resolvable (no PR context, and no valid non-zero `event.before`
-      # ancestor — e.g. a branch-creation push) does it fall back to a
-      # full-tree scan. `fetch-depth: 0` on the checkout above makes the base
-      # commit reachable.
+      # event INTRODUCED — pre-existing findings never block. The base/head
+      # pair comes from the shared, event-agnostic derivation
+      # (`resolve-diff-range.sh`): pull_request → base.sha..head.sha;
+      # merge_group → merge_group.base_sha..head_sha (Story #314 — keeps the
+      # merge queue diff-scoped so a pre-existing finding outside the queued
+      # range never bounces the batch); push → event.before..sha (Story #175
+      # made push-to-main CI load-bearing; the pushed code already passed its
+      # PR's diff scan, so a full-tree re-scan would block on unrelated debt).
+      # Only when no ranged base is resolvable (no PR / merge_group context, and
+      # no valid non-zero `event.before` ancestor — e.g. a branch-creation push)
+      # does it fall back to a full-tree scan. An absent context evaluates to an
+      # empty env var, so this can never `startup_failure`. `fetch-depth: 0` on
+      # the checkout above makes the base commit reachable. `..` range semantics
+      # already exclude base-branch drift, so no explicit merge-base is needed.
       - name: Resolve secret-scan range
         id: range
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
           PUSH_HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          ZERO_SHA="0000000000000000000000000000000000000000"
-          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-            echo "mode=range" >> "$GITHUB_OUTPUT"
-            echo "range=${BASE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
-            echo "PR-diff secret scan: ${BASE_SHA}..${HEAD_SHA}"
-          elif [ "${EVENT_NAME:-}" = "push" ] && [ -n "${BEFORE_SHA:-}" ] && \
-               [ "${BEFORE_SHA}" != "${ZERO_SHA}" ] && \
-               git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-            echo "mode=range" >> "$GITHUB_OUTPUT"
-            echo "range=${BEFORE_SHA}..${PUSH_HEAD_SHA}" >> "$GITHUB_OUTPUT"
-            echo "push-diff secret scan: ${BEFORE_SHA}..${PUSH_HEAD_SHA}"
-          else
+          # `resolve-diff-range.sh` is side-checked-out at runtime (step above)
+          # and sets RESOLVED_EVENT_MODE / RESOLVED_BASE_SHA / RESOLVED_HEAD_SHA.
+          # Pre-declare them so shellcheck sees them assigned (SC2154); the
+          # source path is non-constant, so its follow is disabled (SC1090).
+          RESOLVED_EVENT_MODE="" RESOLVED_BASE_SHA="" RESOLVED_HEAD_SHA=""
+          # shellcheck disable=SC1090
+          source "${GITHUB_WORKSPACE}/_mandrel-platform-range/scripts/resolve-diff-range.sh"
+          if [ "${RESOLVED_EVENT_MODE}" = "none" ]; then
             echo "mode=full" >> "$GITHUB_OUTPUT"
             echo "range=" >> "$GITHUB_OUTPUT"
             echo "Full-tree secret scan (no ranged base)."
+          else
+            echo "mode=range" >> "$GITHUB_OUTPUT"
+            echo "range=${RESOLVED_BASE_SHA}..${RESOLVED_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "${RESOLVED_EVENT_MODE} secret scan: ${RESOLVED_BASE_SHA}..${RESOLVED_HEAD_SHA}"
           fi
 
       # Download + verify a PINNED gitleaks binary and run the blocking scan
@@ -1258,47 +1297,66 @@ jobs:
           path: _mandrel-platform-sast
           persist-credentials: false
 
-      # Resolve the Semgrep SAST baseline, mirroring the gitleaks range
-      # scoping above. On pull_request events the baseline is the MERGE BASE of
-      # base..head (M8: `github.event.pull_request.base.sha` is the base
-      # branch TIP, which drifts past the fork point once main advances — the
-      # same base-tip-vs-merge-base drift the migration guard had; the audit
-      # flags this as the milder same-family SAST case). Using the merge base
-      # makes `--baseline-commit` report only findings INTRODUCED by the PR,
-      # never findings from commits merged into base by others. On push events
-      # the baseline is `event.before` (the commits the push added), so a
-      # push-to-main CI run — load-bearing since the canonical `workflow_run`
-      # deploy trigger, Story #175 — reports only push-introduced findings
-      # instead of full-tree-blocking on pre-existing debt. Only when no
-      # baseline is resolvable (no PR context, no valid non-zero `event.before`
-      # ancestor) does it fall back to a full-tree scan. `fetch-depth: 0` on
-      # the checkout above makes the merge base / base commit resolvable.
+      # Resolve the Semgrep SAST baseline, mirroring the gitleaks range scoping
+      # above via the SAME shared derivation (`resolve-diff-range.sh`, Story
+      # #314). Semgrep `--baseline-commit` takes ONE commit, so each mode maps
+      # the shared base/head pair to a single baseline:
+      #   • pull_request → the MERGE BASE of base..head (M8:
+      #     `github.event.pull_request.base.sha` is the base branch TIP, which
+      #     drifts past the fork point once main advances — the same
+      #     base-tip-vs-merge-base drift the migration guard had). Using the
+      #     merge base reports only findings INTRODUCED by the PR.
+      #   • merge_group → `merge_group.base_sha` directly. The queued group is
+      #     built ON TOP of base_sha (the exact fork point), so it is already
+      #     the merge base — no drift to correct. This keeps the merge queue
+      #     diff-scoped so a pre-existing finding never bounces the batch.
+      #   • push → `event.before` (the commit the push built on), so a
+      #     push-to-main CI run — load-bearing since the canonical
+      #     `workflow_run` deploy trigger, Story #175 — reports only
+      #     push-introduced findings instead of full-tree-blocking on debt.
+      # Only when no baseline is resolvable (no PR / merge_group context, no
+      # valid non-zero `event.before` ancestor) does it fall back to a full-tree
+      # scan. An absent context evaluates to an empty env var, so this can never
+      # `startup_failure`. `fetch-depth: 0` on the checkout above makes the merge
+      # base / base commit resolvable.
       - name: Resolve SAST baseline
         id: sast-baseline
         if: ${{ inputs.enable-sast }}
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          ZERO_SHA="0000000000000000000000000000000000000000"
-          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-            # M8: baseline on the merge base of base..head, not the base tip.
-            merge_base="$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")"
-            echo "baseline=${merge_base}" >> "$GITHUB_OUTPUT"
-            echo "PR-diff SAST baseline (merge-base of ${BASE_SHA}..${HEAD_SHA}): ${merge_base}"
-          elif [ "${EVENT_NAME:-}" = "push" ] && [ -n "${BEFORE_SHA:-}" ] && \
-               [ "${BEFORE_SHA}" != "${ZERO_SHA}" ] && \
-               git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-            echo "baseline=${BEFORE_SHA}" >> "$GITHUB_OUTPUT"
-            echo "push-diff SAST baseline: ${BEFORE_SHA}"
-          else
-            echo "baseline=" >> "$GITHUB_OUTPUT"
-            echo "Full-tree SAST (no ranged base)."
-          fi
+          # `resolve-diff-range.sh` is side-checked-out at runtime (with the
+          # gitleaks range resolver) and sets RESOLVED_EVENT_MODE /
+          # RESOLVED_BASE_SHA / RESOLVED_HEAD_SHA. Pre-declare them so shellcheck
+          # sees them assigned (SC2154); the source path is non-constant, so its
+          # follow is disabled (SC1090).
+          RESOLVED_EVENT_MODE="" RESOLVED_BASE_SHA="" RESOLVED_HEAD_SHA=""
+          # shellcheck disable=SC1090
+          source "${GITHUB_WORKSPACE}/_mandrel-platform-range/scripts/resolve-diff-range.sh"
+          case "${RESOLVED_EVENT_MODE}" in
+            pull_request)
+              # M8: baseline on the merge base of base..head, not the base tip.
+              merge_base="$(git merge-base "${RESOLVED_BASE_SHA}" "${RESOLVED_HEAD_SHA}")"
+              echo "baseline=${merge_base}" >> "$GITHUB_OUTPUT"
+              echo "PR-diff SAST baseline (merge-base of ${RESOLVED_BASE_SHA}..${RESOLVED_HEAD_SHA}): ${merge_base}"
+              ;;
+            merge_group | push)
+              echo "baseline=${RESOLVED_BASE_SHA}" >> "$GITHUB_OUTPUT"
+              echo "${RESOLVED_EVENT_MODE} SAST baseline: ${RESOLVED_BASE_SHA}"
+              ;;
+            *)
+              echo "baseline=" >> "$GITHUB_OUTPUT"
+              echo "Full-tree SAST (no ranged base)."
+              ;;
+          esac
 
       # SAST via Semgrep, installed from PyPI at a pinned version against the
       # runner's SYSTEM python3. We deliberately do NOT use
