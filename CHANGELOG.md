@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.29.0...mandrel-platform-v0.29.1) (2026-07-22)
+
+
+### Fixed
+
+* **runner-fleet-health:** calibrate roster to live fleets (domio 7, athportal 5) (refs [#320](https://github.com/dsj1984/mandrel-platform/issues/320)) ([#322](https://github.com/dsj1984/mandrel-platform/issues/322)) ([cd20af3](https://github.com/dsj1984/mandrel-platform/commit/cd20af34b7a5ff412df406cc3ca94ec418aaa176))
+
 ## [0.29.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.28.0...mandrel-platform-v0.29.0) (2026-07-22)
 
 
