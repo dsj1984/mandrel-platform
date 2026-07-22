@@ -66,6 +66,28 @@ shasum -a 256 actions-runner-osx-arm64-<RUNNER_VERSION>.tar.gz
 tar xzf actions-runner-osx-arm64-<RUNNER_VERSION>.tar.gz
 ```
 
+## ⚠️ Read second: keep the health-monitor roster in lockstep
+
+Any change to a fleet's size — **adding or removing a runner** — **MUST** be
+accompanied by an update to that repo's `expectedCount` in
+[`scripts/runner-fleet-consumers.json`](../../scripts/runner-fleet-consumers.json).
+That file is the roster the scheduled `runner-fleet-health.yml` monitor
+(`scripts/check-runner-health.mjs`) compares the live fleet against.
+
+- **Scale up (add a runner):** bump `expectedCount` so the shortfall floor
+  keeps pace. Over-provisioning does not trip the alarm on its own (the
+  monitor is **warn-below**: `shortfall = max(0, expectedCount - matchingOnline)`),
+  but leaving the count stale hides a later drop back down to the old value.
+- **Scale down (remove a runner):** lower `expectedCount` in the same change,
+  otherwise the monitor will correctly flag the now-missing runner(s) as a
+  shortfall and page the operator for a deliberate downsizing.
+
+If the roster and the live fleet drift apart, the monitor either false-alarms
+(count too high) or goes silent on real outages above the stale threshold
+(count too low) — the exact mis-calibration this contract exists to prevent.
+See also [`runner-fleet-health.md`](runner-fleet-health.md) for the operator
+response when the monitor does fire.
+
 ## 2. Register with `config.sh` (repo-level)
 
 Registration is **repo-level** (the fleet's standing model), not org-level.
@@ -179,7 +201,10 @@ The runner loads `.env` at service start — after any `.env` change, restart:
   (§5). Mint the removal token via
   `gh api -X POST repos/<OWNER>/<REPO>/actions/runners/remove-token --jq .token`.
 - **Decommission.** Same removal sequence, then delete `<RUNNER_DIR>`.
-  Confirm the runner disappeared from *Settings → Actions → Runners*.
+  Confirm the runner disappeared from *Settings → Actions → Runners*, **and**
+  lower the repo's `expectedCount` in `scripts/runner-fleet-consumers.json`
+  (see the roster-lockstep callout above) so the health monitor does not flag
+  the intentional removal as a shortfall.
 
 ## Project-Specific Notes
 
