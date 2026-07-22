@@ -726,6 +726,21 @@ jobs:
             esac
           fi
 
+          # Defense-in-depth (Story #319): `scm_base` is the only free-form
+          # string that reaches $GITHUB_ENV here — the derived bases are git
+          # SHAs, but the `affected-base` override is a caller-authored value.
+          # A newline (or CR) in it would inject arbitrary `KEY=value` lines
+          # into the job environment via the `>>` write below. `affected-base`
+          # is a trusted workflow_call input today (no PR-author path), so this
+          # is hardening, not a live fix — reject a multiline value outright
+          # rather than silently truncating it.
+          case "${scm_base}" in
+            *[$'\n\r']*)
+              echo "::error title=Invalid affected base::the resolved affected base contains a newline; refusing to export TURBO_SCM_* to avoid \$GITHUB_ENV injection. Check the affected-base input." >&2
+              exit 1
+              ;;
+          esac
+
           if [ -n "${scm_base}" ]; then
             {
               echo "TURBO_SCM_BASE=${scm_base}"

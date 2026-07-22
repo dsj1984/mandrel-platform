@@ -293,7 +293,26 @@ Semantics and caveats:
   configured threshold unpredictable.
 - **`affected-base` override.** Set `affected-base` (e.g. `'origin/main'`) to
   replace the event-derived `TURBO_SCM_BASE` with a fixed ref; the head stays
-  the derived commit under test. Ignored when `affected` is `false`.
+  the derived commit under test. Ignored when `affected` is `false`. The value
+  flows into `$GITHUB_ENV`; a multiline / newline-bearing override is **rejected
+  before the export** (Story #319) so it can never inject extra env lines —
+  defense-in-depth over an already-trusted `workflow_call` input.
+- **Deliberate non-goals (recorded so they are not re-litigated).** Two softer
+  observations from the #314/#315 follow-up audit are intentionally left as-is:
+  - **Base-shaping duplication is accepted.** The `pull_request` →
+    merge-base vs `merge_group` | `push` → direct-base *shaping* is expressed
+    in two places — the SAST baseline resolver and this affected resolver.
+    Both consume the same shared `scripts/resolve-diff-range.sh` derivation;
+    only the per-consumer shaping differs, and folding that last step into the
+    shared script would couple two gates with different failure semantics for
+    little gain. The duplication is a conscious trade-off, not an oversight.
+  - **Affected-only on a sole required check drops the whole-repo floor —
+    by design.** A consumer who enables `affected: true` on their *only*
+    required check silently loses the whole-repo coverage floor (the floor is
+    bypassed on affected runs, above). This is the documented reconciliation,
+    not a regression: keep a non-affected required check (or a scheduled full
+    run) when a hard whole-repo floor must always assert. The visible
+    `::notice::` on every bypassed run keeps the trade-off from being silent.
 
 ### Security tier (`enable-security` / `enable-sast`)
 
