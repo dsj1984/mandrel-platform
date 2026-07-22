@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.29.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.28.0...mandrel-platform-v0.29.0) (2026-07-22)
+
+
+### Added
+
+* **pr-quality:** make the reusable workflow merge-queue-safe (refs [#314](https://github.com/dsj1984/mandrel-platform/issues/314)) ([#316](https://github.com/dsj1984/mandrel-platform/issues/316)) ([a0b4ad5](https://github.com/dsj1984/mandrel-platform/commit/a0b4ad5c77928cbf459061db45e945803125d4c8))
+* **pr-quality:** opt-in affected-only tier execution (refs [#315](https://github.com/dsj1984/mandrel-platform/issues/315)) ([#318](https://github.com/dsj1984/mandrel-platform/issues/318)) ([b95c2c0](https://github.com/dsj1984/mandrel-platform/commit/b95c2c01c5e42b07cae688780d865f6709384760))
+
 ## [0.28.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.27.1...mandrel-platform-v0.28.0) (2026-07-21)
 
 
