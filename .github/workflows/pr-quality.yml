@@ -107,6 +107,67 @@ on:
         type: boolean
         default: false
 
+      # Opt-in affected-only tier execution (Story #315). When true, the
+      # diff-scoped tiers (lint, typecheck, unit, contract, e2e) run turbo
+      # scoped to the packages the triggering event INTRODUCED, cutting the
+      # marginal CI cost of strict-required / merge-queue re-runs — where a
+      # `main` advance (or a merge-queue entry) otherwise re-runs the FULL tier
+      # matrix regardless of what the PR touched. Default false is byte-for-byte
+      # today's behaviour: every tier runs its full command set.
+      #
+      # HOW IT WORKS. The base/head SHA pair is derived by the SAME
+      # event-agnostic derivation the security tiers use (Story #314's
+      # `scripts/resolve-diff-range.sh`): pull_request → merge-base of
+      # base..head; merge_group → merge_group.base_sha; push → event.before.
+      # That pair is exported as TURBO_SCM_BASE / TURBO_SCM_HEAD onto the tier
+      # job's environment — exactly the override turbo's `--affected` reads. On
+      # pull_request turbo already auto-detects GITHUB_BASE_REF, but that ref is
+      # EMPTY on merge_group / push (the precise events where the full-matrix
+      # re-run cost bites), so supplying the derived base is what makes
+      # affected-only scoping work in the merge queue and on push-to-main. The
+      # consumer's turbo tasks MUST run with `--affected` for the scoping to
+      # take effect (documented in docs/reusable-workflows.md); a task without
+      # `--affected` — or a non-turbo task — ignores the env vars, so enabling
+      # this input can never CHANGE such a task's result. It only narrows what
+      # an already-`--affected` task runs.
+      #
+      # SAFE BY CONSTRUCTION. turbo falls back to running ALL packages when the
+      # git checkout is too shallow to resolve the base, so the worst case is a
+      # full run (today's behaviour) — never a MISSED task. When true, each
+      # diff-scoped tier's checkout deepens to full history (fetch-depth: 0) so
+      # the base is resolvable; when false the checkout stays shallow, exactly
+      # as today.
+      affected:
+        description: >
+          Opt-in affected-only execution for the diff-scoped tiers (lint,
+          typecheck, unit, contract, e2e). When true, TURBO_SCM_BASE and
+          TURBO_SCM_HEAD are derived event-agnostically (Story #314) and
+          exported to each tier so a turbo `--affected` task runs only the
+          packages the event introduced — cutting merge-queue / strict-required
+          re-run cost, especially on merge_group / push where turbo's own
+          GITHUB_BASE_REF auto-detection is empty. The consumer's turbo tasks
+          must use `--affected`. turbo falls back to a full run when it cannot
+          resolve the base, so this can never miss a task. Default false is
+          byte-for-byte today's behaviour.
+        required: false
+        type: boolean
+        default: false
+
+      # Optional explicit base override for affected mode. When set (non-empty)
+      # it REPLACES the event-derived TURBO_SCM_BASE, so a consumer can scope
+      # against a fixed ref (e.g. 'origin/main') instead of the event-derived
+      # base. Ignored when `affected` is false. HEAD is always the derived head
+      # (the commit under test); only the base is overridable.
+      affected-base:
+        description: >
+          Optional base git ref/SHA that overrides the event-derived
+          TURBO_SCM_BASE in affected mode (e.g. 'origin/main'). Empty (default)
+          uses the Story #314 event-agnostic derivation. Ignored when
+          `affected` is false.
+        required: false
+        type: string
+        default: ''
+
       # Per-tier enable toggles.
       enable-lint:
         description: 'Enable the lint + format-check tier.'
@@ -559,12 +620,121 @@ jobs:
         name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          # Affected mode (Story #315) needs full history so turbo can resolve
+          # the diff base (TURBO_SCM_BASE) and `resolve-diff-range.sh` can reach
+          # `event.before`; a shallow clone makes turbo `--affected` warn and
+          # fall back to treating every package as changed (a full run). When
+          # affected is OFF the checkout stays shallow, exactly as today (Story
+          # #235 dropped the previously-unused fetch-depth: 0 from this anchor).
+          # NOTE: the ternary yields the STRING '0'/'1' deliberately — a bare
+          # numeric `0` is FALSY in a GitHub expression, so `inputs.affected &&
+          # 0 || 1` would collapse to 1 even when affected is true. A non-empty
+          # string '0' is truthy, so the ternary resolves correctly and
+          # actions/checkout parses '0' as full depth.
+          fetch-depth: ${{ inputs.affected && '0' || '1' }}
           # No later step does authenticated git network ops, so do not leave
           # GITHUB_TOKEN persisted in .git/config while third-party code
           # (pnpm lifecycle scripts, PyPI Semgrep, Playwright) runs under a
           # token carrying `actions: write` — a compromised package could read
           # it from .git/config (M5). The side-checkouts already set this.
           persist-credentials: false
+
+      # Affected-mode setup (Story #315), aliased (`*checkout-range` /
+      # `*resolve-affected`) into every other diff-scoped tier below. BOTH steps
+      # are gated on `inputs.affected`, so a non-opted-in run skips them and
+      # behaves byte-for-byte as before. `&checkout-range` side-checks-out ONLY
+      # `resolve-diff-range.sh` (Story #314's single event-agnostic base/head
+      # derivation) from THIS repo at the exact SHA the caller pinned
+      # (`job_workflow_sha`) — the same mechanism the security tier uses — so
+      # every diff-scoped tier sources ONE canonical derivation rather than
+      # duplicating it. It must run BEFORE `&resolve-affected` (which sources
+      # it) and therefore before the tier's own command step.
+      - &checkout-range
+        name: Checkout diff-range resolver (mandrel-platform@resolved-sha)
+        if: ${{ inputs.affected }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field that
+          # actionlint's pinned context type model does not list, so it is read
+          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`) —
+          # same pattern as the security tier's diff-range side-checkout.
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts/resolve-diff-range.sh
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-range
+          persist-credentials: false
+
+      # Derive the turbo affected base/head and export them onto the job env so
+      # every later step (the tier's `pnpm run` command) inherits them. turbo
+      # `--affected` reads TURBO_SCM_BASE / TURBO_SCM_HEAD; we shape the raw
+      # base/head pair the same way the SAST baseline does — pull_request uses
+      # the MERGE BASE of base..head (base.sha is the live base-branch tip and
+      # drifts past the fork point once main advances), merge_group / push use
+      # the derived base directly (already the exact fork point). An explicit
+      # `affected-base` input overrides the base. When no ranged base is
+      # resolvable the env vars are left UNSET, so turbo uses its own default
+      # (which degrades to a full run) — never a missed task.
+      - &resolve-affected
+        name: Resolve affected SCM base/head (turbo)
+        if: ${{ inputs.affected }}
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+          AFFECTED_BASE_OVERRIDE: ${{ inputs.affected-base }}
+        run: |
+          set -euo pipefail
+          # `resolve-diff-range.sh` is side-checked-out above and sets
+          # RESOLVED_EVENT_MODE / RESOLVED_BASE_SHA / RESOLVED_HEAD_SHA. Pre-
+          # declare them so shellcheck sees them assigned (SC2154); the source
+          # path is non-constant, so its follow is disabled (SC1090).
+          RESOLVED_EVENT_MODE="" RESOLVED_BASE_SHA="" RESOLVED_HEAD_SHA=""
+          # shellcheck disable=SC1090
+          source "${GITHUB_WORKSPACE}/_mandrel-platform-range/scripts/resolve-diff-range.sh"
+
+          # Head is the commit under test; fall back to the checked-out HEAD
+          # when the derivation resolved no ranged head (mode=none).
+          scm_head="${RESOLVED_HEAD_SHA:-HEAD}"
+
+          # Base precedence: explicit override wins; else shape the derived base.
+          if [ -n "${AFFECTED_BASE_OVERRIDE:-}" ]; then
+            scm_base="${AFFECTED_BASE_OVERRIDE}"
+            echo "Affected base overridden via affected-base input: ${scm_base}"
+          else
+            case "${RESOLVED_EVENT_MODE}" in
+              pull_request)
+                # M8: baseline on the merge base of base..head, not the base
+                # tip, so only packages the PR itself changed are affected.
+                scm_base="$(git merge-base "${RESOLVED_BASE_SHA}" "${RESOLVED_HEAD_SHA}")"
+                echo "Affected base (merge-base of ${RESOLVED_BASE_SHA}..${RESOLVED_HEAD_SHA}): ${scm_base}"
+                ;;
+              merge_group | push)
+                scm_base="${RESOLVED_BASE_SHA}"
+                echo "Affected base (${RESOLVED_EVENT_MODE}): ${scm_base}"
+                ;;
+              *)
+                scm_base=""
+                echo "No ranged base resolvable — leaving TURBO_SCM_* unset so turbo uses its default (a full run)."
+                ;;
+            esac
+          fi
+
+          if [ -n "${scm_base}" ]; then
+            {
+              echo "TURBO_SCM_BASE=${scm_base}"
+              echo "TURBO_SCM_HEAD=${scm_head}"
+            } >> "${GITHUB_ENV}"
+            echo "Exported TURBO_SCM_BASE=${scm_base} TURBO_SCM_HEAD=${scm_head} for turbo --affected."
+          else
+            echo "TURBO_SCM_* not exported; turbo --affected uses its own default base/head."
+          fi
 
       - &setup-toolchain
         name: Setup toolchain
@@ -679,6 +849,13 @@ jobs:
 
       - *checkout
 
+      # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
+      # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
+      # anchors for the full rationale.
+      - *checkout-range
+
+      - *resolve-affected
+
       - *setup-toolchain
 
       - name: Typecheck
@@ -714,6 +891,13 @@ jobs:
 
       - *checkout
 
+      # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
+      # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
+      # anchors for the full rationale.
+      - *checkout-range
+
+      - *resolve-affected
+
       - *setup-toolchain
 
       - name: Unit tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
@@ -740,8 +924,21 @@ jobs:
       # documented). A script fetched at `job_workflow_sha` is exactly as
       # version-locked as inline YAML: the consumer always runs the script
       # that shipped with the workflow version it pinned, with zero drift risk.
+      #
+      # AFFECTED-MODE RECONCILIATION (Story #315). The gate reads the MERGED
+      # coverage-summary.json spanning all workspaces; under `affected` mode the
+      # unit tier runs only the changed packages' tests, so that merged number
+      # reflects a PARTIAL subset — not a whole-repo measurement — and comparing
+      # it to an absolute whole-repo floor would FALSE-FAIL. Reconciliation
+      # DECISION (documented in docs/reusable-workflows.md): BYPASS the floor on
+      # affected runs (`&& !inputs.affected` below) rather than re-derive a
+      # subset floor whose meaning drifts per run. The floor stays authoritative
+      # on non-affected (full) runs; a consumer needing a hard whole-repo floor
+      # keeps a non-affected required check (or a scheduled full run) for it. A
+      # visible `::notice::` is emitted (step below) whenever a set floor is
+      # skipped for this reason, so the bypass is never silent.
       - name: Checkout gate scripts (mandrel-platform@resolved-sha)
-        if: ${{ inputs.coverage-threshold != 0 }}
+        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
@@ -757,7 +954,7 @@ jobs:
           persist-credentials: false
 
       - name: Coverage threshold gate
-        if: ${{ inputs.coverage-threshold != 0 }}
+        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
         shell: bash
         env:
           COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
@@ -767,6 +964,18 @@ jobs:
           node _mandrel-platform-scripts/scripts/check-coverage-threshold.mjs \
             --threshold "${COVERAGE_THRESHOLD}" \
             --metric "${COVERAGE_METRIC}"
+
+      # Surface the affected-mode coverage-floor bypass (Story #315) so it is
+      # never a silent skip: this fires only when a floor IS set AND affected
+      # mode is on, exactly the case the two steps above were gated out of.
+      - name: Coverage floor bypassed (affected mode)
+        if: ${{ inputs.coverage-threshold != 0 && inputs.affected }}
+        shell: bash
+        env:
+          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+        run: |
+          set -euo pipefail
+          echo "::notice title=Coverage floor bypassed::coverage-threshold (${COVERAGE_THRESHOLD}%) is NOT asserted on this run because affected mode is on. The unit tier ran an affected subset, whose merged coverage-summary.json is a partial (not whole-repo) measurement and would false-fail an absolute floor. The floor remains authoritative on non-affected (full) runs — see docs/reusable-workflows.md."
 
       - name: Upload test results
         if: always()
@@ -801,6 +1010,13 @@ jobs:
       - *harden-runner
 
       - *checkout
+
+      # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
+      # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
+      # anchors for the full rationale.
+      - *checkout-range
+
+      - *resolve-affected
 
       - *setup-toolchain
 
@@ -841,6 +1057,13 @@ jobs:
       - *harden-runner
 
       - *checkout
+
+      # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
+      # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
+      # anchors for the full rationale.
+      - *checkout-range
+
+      - *resolve-affected
 
       - *setup-toolchain
 
