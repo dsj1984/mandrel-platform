@@ -103,6 +103,8 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `shards`           | number  | `1`              | **DEPRECATED — no longer read.** Sharding is configured solely via `shard-matrix`; the shard-count denominator is derived from the matrix size (`strategy.job-total`). Declared for backwards compatibility only (passing it is harmless and changes nothing); scheduled for removal in the next breaking release. |
 | `shard-matrix`     | string  | `'[1]'`          | JSON-encoded array of shard indices driving the test matrix (unit, contract, e2e) — e.g. `'[1,2,3]'` for 3 shards. The only sharding input: each test invocation's `--shard=<n>/<total>` denominator is derived from the matrix size, so a mismatched second input cannot under- or over-run the suite. |
 | `fail-fast`        | boolean | `false`          | **Opt-in.** Cancel the entire run on the first tier-job failure, freeing runner capacity that cannot change the outcome. Default `false` is byte-for-byte today's run-to-completion behaviour. Requires `actions: write` on the caller's token. See [Fail-fast run cancellation](#fail-fast-run-cancellation-fail-fast). |
+| `affected`         | boolean | `false`          | **Opt-in.** Run the diff-scoped tiers (lint, typecheck, unit, contract, e2e) affected-only — turbo `--affected` scoped to the packages the event introduced, cutting merge-queue / strict-required re-run cost. Exports `TURBO_SCM_BASE` / `TURBO_SCM_HEAD` (derived event-agnostically, Story #314) and deepens the checkout to full history. The consumer's turbo tasks must use `--affected`. Default `false` is byte-for-byte today's behaviour. See [Affected-only tier execution](#affected-only-tier-execution-affected). |
+| `affected-base`    | string  | `''`             | Optional base git ref/SHA that overrides the event-derived `TURBO_SCM_BASE` in affected mode (e.g. `'origin/main'`). Empty (default) uses the event-agnostic derivation. Ignored when `affected` is `false`. |
 | `enable-lint`      | boolean | `true`           | Set `false` to skip the lint + format-check tier.                                                                                              |
 | `enable-typecheck` | boolean | `true`           | Set `false` to skip the typecheck tier.                                                                                                        |
 | `enable-unit`      | boolean | `true`           | Set `false` to skip the unit-test tier.                                                                                                        |
@@ -215,6 +217,83 @@ Semantics and caveats:
   tiers wherever they are; their `if: always()` steps (artifact uploads) may
   not complete. The failing tier's own uploads do complete — the cancel step
   is deliberately the *last* step of each tier job.
+
+### Affected-only tier execution (`affected`)
+
+By default every diff-scoped tier (lint, typecheck, unit, contract, e2e) runs
+its full command set on every event. On a busy repo the expensive re-runs are
+the **strict-required / merge-queue** ones: a `main` advance (or a merge-queue
+entry) re-runs the whole tier matrix regardless of what the PR actually
+touched. `affected: true` opts into **affected-only** execution — the tiers run
+turbo scoped to just the packages the triggering event introduced.
+
+```yaml
+jobs:
+  ci:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      affected: true
+    secrets: inherit
+```
+
+How it works:
+
+- **One event-agnostic base/head derivation.** The base/head SHA pair is
+  derived by the **same** `scripts/resolve-diff-range.sh` the security tiers
+  use (Story #314): `pull_request` → the **merge base** of `base..head` (the
+  base tip drifts past the fork point once `main` advances); `merge_group` →
+  `merge_group.base_sha`; `push` → `event.before`. Each tier side-checks-out
+  that one script at the resolved `job_workflow_sha`, so gitleaks, SAST, and
+  affected mode cannot drift apart.
+- **Exported as `TURBO_SCM_BASE` / `TURBO_SCM_HEAD`.** turbo `--affected`
+  compares `main...HEAD` by default and **auto-detects `GITHUB_BASE_REF` on
+  `pull_request`**, but that ref is **empty on `merge_group` / `push`** — the
+  exact events where the full-matrix re-run cost bites. Supplying the derived
+  base via these env vars is what makes affected scoping work in the merge
+  queue and on push-to-main.
+- **The consumer's turbo tasks must use `--affected`.** This workflow exports
+  the SCM base/head onto the tier's environment; it does not rewrite your
+  opaque `pnpm run <tier>` command. A task that runs `turbo run <tier>
+  --affected` picks the env vars up automatically; a task **without**
+  `--affected` (or a non-turbo task) ignores them entirely — so enabling this
+  input can never *change* such a task's result, only narrow what an already
+  `--affected` task runs.
+- **Full history is fetched only in affected mode.** Each diff-scoped tier's
+  checkout deepens to `fetch-depth: 0` when `affected: true` (turbo and the
+  range resolver need the base commit reachable); when `false` the checkout
+  stays shallow, exactly as today.
+
+Semantics and caveats:
+
+- **Default off, unchanged behaviour.** With the input unset (or `false`) every
+  tier runs its full command set, the checkout stays shallow, and none of the
+  affected-mode steps run. Byte-for-byte identical to before the input existed.
+- **Safe by construction — never a missed task.** turbo falls back to treating
+  **all** packages as changed when the checkout is too shallow to resolve the
+  base, so the worst case is a full run (today's behaviour), never a skipped
+  task. When no ranged base is resolvable the env vars are left unset and turbo
+  uses its own default.
+- **A tier with no affected work passes green, never `cancelled`.** When the
+  event touched no package a tier depends on, turbo runs zero tasks and exits
+  `0` — the tier reports `success`, and `ci-required` counts `success` /
+  `skipped` as green. (`cancelled` only arises from `fail-fast`, an unrelated
+  input.)
+- **Coverage-floor reconciliation (decision: bypass on affected runs).** The
+  `coverage-threshold` gate reads the **merged** `coverage-summary.json`
+  spanning all workspaces. Under affected mode the unit tier runs only the
+  changed packages' tests, so that merged number reflects a **partial subset**,
+  not a whole-repo measurement — comparing it to an absolute whole-repo floor
+  would **false-fail**. The reconciliation is to **bypass the floor on affected
+  runs**: when `affected: true`, the `coverage-threshold` gate is skipped and a
+  visible `::notice::` is emitted (never a silent skip). The floor stays
+  authoritative on **non-affected (full) runs** — a consumer that wants a hard
+  whole-repo floor keeps a non-affected required check (or a scheduled full
+  run) to assert it. Re-deriving a subset-scoped floor was rejected: its
+  meaning would drift per run (which packages changed), making a single
+  configured threshold unpredictable.
+- **`affected-base` override.** Set `affected-base` (e.g. `'origin/main'`) to
+  replace the event-derived `TURBO_SCM_BASE` with a fixed ref; the head stays
+  the derived commit under test. Ignored when `affected` is `false`.
 
 ### Security tier (`enable-security` / `enable-sast`)
 
@@ -1028,6 +1107,13 @@ unchanged).
   `lines` / `statements` / `functions` / `branches` the floor asserts, read
   from `total.<metric>.pct`. The comparison is inclusive — a floor of `80`
   admits exactly `80%`.
+
+> **Interaction with `affected` mode.** When `affected: true`, this floor is
+> **bypassed** (with a visible `::notice::`): an affected-subset run's merged
+> `coverage-summary.json` is a partial measurement and would false-fail an
+> absolute whole-repo floor. Keep a non-affected required check (or a scheduled
+> full run) if you need the floor asserted. See
+> [Affected-only tier execution](#affected-only-tier-execution-affected).
 
 > **Emitting the summary.** Ensure your unit test command writes
 > `coverage/coverage-summary.json`. For vitest: enable
