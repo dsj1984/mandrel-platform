@@ -127,6 +127,8 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
 | `osv-scanner-version` | string | `'2.4.0'`     | Pinned OSV-scanner release version (no leading `v`) for the advisory tier. Bump deliberately; the per-platform asset checksum is pinned to match.                                                                                                                              |
 | `osv-allowlist-path` | string | `'.osv-allowlist.json'` | Path (relative to the consumer repo root) to an optional OSV per-finding suppression/allow-list file. A missing file is a no-op — identical gating behaviour to having no allow-list at all. See [Per-finding suppression / allow-list](#per-finding-suppression--allow-list-osv-allowlist-path). |
+| `osv-scan-mode`    | string  | `'auto'`         | How the OSV tier **attributes** findings: `auto` gates diff-aware against the PR's merge base (whole-tree on push/schedule), `diff` forces diff-aware, `full` restores unconditional whole-tree gating. An advisory already present on the base branch becomes a non-blocking warning. **This default is a behaviour change** — see [Diff-aware attribution](#diff-aware-attribution-osv-scan-mode). |
+| `osv-grace-days`   | number  | `0`              | Demote a would-block advisory **published** fewer than this many days ago to a non-blocking warning, for the window where a patched version is not yet resolvable under a package-manager release-age cooldown. A finding whose publish date cannot be resolved never enters the window. Default `0` (off). See [Publish grace window](#publish-grace-window-osv-grace-days). |
 | `enable-wrangler-baseline-check` | boolean | `true` | Enable the wrangler.toml/wrangler.jsonc baseline check (env.\* split, logpush, Analytics Engine binding, compatibility_date staleness) as a step in the `lint` tier. A consumer with no wrangler config is a no-op pass. See [Wrangler-baseline check](#wrangler-baseline-check-enable-wrangler-baseline-check). |
 | `wrangler-baseline-fail-on-violation` | boolean | `false` | When `true`, an un-excepted violation fails the `lint` tier (and therefore `ci-required`). Default `false` is the **advisory rollout** posture — violations are reported but never block until the fleet is clean. |
 | `wrangler-baseline-max-age-days` | number | `90` | Maximum age (days) of `compatibility_date` before the check flags it stale. |
@@ -769,8 +771,113 @@ are visible with no GHAS dependency.
 >       # osv-fail-on-severity: critical   # gate on criticals only (default: high)
 >       # enable-osv-scan: false           # opt out of the advisory tier entirely
 >       # osv-allowlist-path: '.osv-allowlist.json'  # per-finding suppression file
+>       # osv-scan-mode: full              # restore whole-tree gating (default: auto)
+>       # osv-grace-days: 7                # match a pnpm minimumReleaseAge cooldown
 >     secrets: inherit
 > ```
+
+#### Diff-aware attribution (`osv-scan-mode`)
+
+> **Behaviour change — `osv-scan-mode` defaults to `auto`.** On the pin bump
+> that brings this in, the OSV tier stops blocking a PR on advisories that
+> already exist on the base branch. Set `osv-scan-mode: full` to keep the
+> previous whole-tree semantics exactly.
+
+**The failure this fixes.** A whole-tree scan cannot tell an advisory *this PR
+introduced* from one published against a dependency committed weeks ago. So
+when a new advisory lands on an existing transitive dependency, the required
+`ci-required` context flips red on **every open PR simultaneously** — including
+PRs that never touched a dependency. Observed repeatedly on a consumer: postcss
+`GHSA-r28c-9q8g-f849` and brace-expansion `GHSA-mh99-v99m-4gvg` each blocked
+every open PR at once, and concurrent delivery sessions raced to open duplicate
+dependency-override PRs to unblock themselves — burning shared runner capacity
+on work nobody had asked for. Compounding it, package managers hold new
+releases behind a cooldown (pnpm's `minimumReleaseAge`, Renovate's equivalent),
+so the patched version is frequently unresolvable for days: the block is not
+just misattributed, it is **unactionable**.
+
+**How it decides.** In diff-aware mode the tier runs the **same whole-tree
+scan** a second time inside a `git worktree` at the PR's merge base, then
+subtracts:
+
+| Finding | Verdict |
+| --- | --- |
+| Present in **both** the head scan and the merge-base scan | **Pre-existing** — reported in the job summary, does **not** block |
+| Present in the **head scan only** | **PR-introduced** — blocks exactly as before |
+
+Baseline identity includes the **version**, so bumping an advisory-bearing
+dependency to *another still-vulnerable version* is a head-only finding and
+correctly blocks. Using a second scan rather than parsing lockfiles keeps the
+comparison correct for **every ecosystem** OSV-scanner supports — a
+per-ecosystem parser would silently under-block on any format it did not know.
+
+**It costs nothing on a clean tree.** The baseline scan runs *only* when the
+head scan produced at least one blocking finding. A green PR pays exactly what
+it paid before this change.
+
+**Where base-branch advisories go instead.** They are owned by the scheduled
+[`advisory-scan.yml`](#advisory-scanyml) companion,
+which scans the default branch daily and raises findings as their **own tracked
+issue**. That workflow pins `scan-mode: full` and can never inherit the
+diff-aware default.
+
+> **⚠️ Prerequisite.** Run the scheduled companion. A consumer using the PR
+> tier in `auto` mode **without** `advisory-scan.yml` has nothing watching the
+> base branch, so a real main-level advisory would go unreported entirely. If
+> you are not ready to add the scheduled workflow, set `osv-scan-mode: full`.
+
+**Requires full history.** The `osv-scan` job checks out with `fetch-depth: 0`
+for every mode except `full`, so `git merge-base` and the baseline worktree can
+reach the fork point. The merge base is derived by the same
+`scripts/resolve-diff-range.sh` every other diff-scoped tier uses, so there is
+exactly one event → base/head classification in the workflow.
+
+**Fail-closed, always.** If the baseline cannot be produced for any reason —
+the worktree cannot be created, no base ref resolves, or the baseline scan
+exits an undocumented code — the tier **degrades to whole-tree blocking** and
+says so in the job summary. Over-blocking is the safe direction; an
+unavailable baseline is never read as "everything is pre-existing."
+
+#### Publish grace window (`osv-grace-days`)
+
+Optional and **off by default** (`0`). When set to *N*, a would-block advisory
+**published fewer than N days ago** is reported as a non-blocking warning
+instead of failing the tier. This is the cooldown case: with pnpm
+`minimumReleaseAge: 7`, a patched version published today cannot be resolved
+for a week, so blocking on it gives the consumer nothing to do.
+
+The window is deliberately narrow in what it trusts:
+
+- It keys off the OSV `published` date carried by the advisory itself, taking
+  the **earliest** date across a group's aliased ids — a long-known advisory
+  cannot be laundered into the window by a freshly-assigned alias.
+- A finding whose publish date **cannot be resolved** never enters the window;
+  it blocks. The window only ever softens an advisory that can be positively
+  dated.
+- It never overrides the allow-list (see the precedence table below).
+
+Set it to match your package manager's cooldown — e.g. `osv-grace-days: 7`
+alongside pnpm `minimumReleaseAge: 7`.
+
+#### Gate precedence
+
+When more than one mechanism could apply to the same finding, they resolve in
+this order — the first match wins:
+
+| # | Condition | Outcome |
+| - | --- | --- |
+| 1 | Below `osv-fail-on-severity` | Warning (never blocks) |
+| 2 | Allow-list entry, `revisitBy` **not** passed | Suppressed |
+| 3 | Allow-list entry, `revisitBy` **passed** | **Blocks** |
+| 4 | Present at the diff-aware baseline | Pre-existing (warns) |
+| 5 | Published inside `osv-grace-days` | Grace (warns) |
+| 6 | Otherwise | **Blocks** |
+
+Row 3 is the load-bearing one: **an expired suppression still re-gates**, even
+when the finding is pre-existing and even when it falls inside the grace
+window. An expired suppression is an operator-authored time box that ran out —
+and since such a finding is by construction on a pre-existing dependency,
+letting the baseline demote it would neuter `revisitBy` on PRs entirely.
 
 #### Per-finding suppression / allow-list (`osv-allowlist-path`)
 
@@ -1924,6 +2031,14 @@ required check on an unrelated feature PR** — the failing PR's own diff is
 irrelevant, and the advisory landed after the dep did. Nothing scanned `main`
 proactively. This workflow is that proactive companion; it does **not** replace
 the PR-time gate (keep `enable-osv-scan: true` on `pr-quality.yml`).
+
+> **This workflow is now a prerequisite, not just a companion.** Since
+> `osv-scan-mode` defaults to `auto`, the PR tier deliberately **stops
+> blocking** on base-branch advisories — see
+> [Diff-aware attribution](#diff-aware-attribution-osv-scan-mode). This
+> scheduled run is what still catches them. A consumer on `auto` **without**
+> this workflow has nothing watching `main`. It pins `scan-mode: full`
+> internally, so it can never inherit the PR tier's diff-aware default.
 
 **Reuses the PR tier's machinery.** The scan step is the **same** first-party
 [`osv-scan` composite action](../.github/actions/osv-scan/action.yml) the PR

@@ -143,6 +143,14 @@ jobs:
           pnpm-dest: ${{ inputs.pnpm-dest }}
           packages-read-token: ${{ secrets.packages-read-token }}
 
+      # `scan-mode: full` is pinned, not inherited (Story #325). The PR tier
+      # now defaults to diff-aware attribution, which deliberately demotes a
+      # base-branch advisory to a non-blocking warning on an unrelated PR —
+      # THIS workflow is what still catches it. Inheriting the diff-aware
+      # default here would leave nothing owning main-level advisories. A
+      # `schedule` event resolves no diff range and would fall back to full
+      # anyway, so the explicit pin is what makes that posture assertable
+      # (scripts/check-osv-scan-mode.test.mjs) rather than incidental.
       - name: OSV advisory scan (scheduled, non-blocking)
         id: osv
         uses: dsj1984/mandrel-platform/.github/actions/osv-scan@6235d1eb8562053a342915926c77bf144e6e3756
@@ -150,6 +158,7 @@ jobs:
           osv-scanner-version: ${{ inputs.osv-scanner-version }}
           fail-on-severity: ${{ inputs.osv-fail-on-severity }}
           allowlist-path: ${{ inputs.osv-allowlist-path }}
+          scan-mode: 'full'
           non-blocking: 'true'
           findings-out: ${{ runner.temp }}/osv-findings.json
 

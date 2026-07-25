@@ -88,6 +88,36 @@ inputs:
       tracking-issue upsert. Empty (default) writes no file.
     required: false
     default: ''
+  scan-mode:
+    description: >
+      How the gate attributes findings: 'auto' (default) runs diff-aware when
+      baseline-ref names a resolvable commit and whole-tree otherwise; 'diff'
+      forces diff-aware; 'full' is unconditional whole-tree gating. In
+      diff-aware mode a finding already present at the baseline is demoted to
+      a non-blocking warning, so a newly-published advisory on an untouched
+      dependency stops blocking every open PR. Whatever the mode, a baseline
+      that cannot be produced degrades to whole-tree BLOCKING semantics —
+      over-blocking is the safe direction. Default 'auto'.
+    required: false
+    default: 'auto'
+  baseline-ref:
+    description: >
+      Commit-ish to scan as the diff-aware baseline — the merge base of the
+      PR, resolved by the caller from scripts/resolve-diff-range.sh. Requires
+      full git history in the checkout (fetch-depth: 0). Empty (default) means
+      no baseline is resolvable, which under 'auto' selects whole-tree gating.
+    required: false
+    default: ''
+  grace-days:
+    description: >
+      Publish grace window in days. A would-block advisory published fewer
+      than this many days ago is demoted to a non-blocking warning,
+      acknowledging that a patched version is frequently unresolvable inside a
+      package manager's release-age cooldown. A finding whose publish date
+      cannot be resolved NEVER enters the window — it blocks. Default '0'
+      (disabled), so no consumer's gate softens without opting in.
+    required: false
+    default: '0'
 
 outputs:
   blocking-count:
@@ -102,6 +132,21 @@ outputs:
   expired-count:
     description: Number of allow-list suppressions past revisitBy, re-gated as blocking.
     value: ${{ steps.gate.outputs.expired-count }}
+  preexisting-count:
+    description: Number of would-block findings demoted because they already exist at the diff-aware baseline.
+    value: ${{ steps.gate.outputs.preexisting-count }}
+  grace-count:
+    description: Number of would-block findings demoted because they were published inside the grace window.
+    value: ${{ steps.gate.outputs.grace-count }}
+  resolved-scan-mode:
+    description: The mode actually used after resolving 'auto' and any baseline degradation — 'diff' or 'full'.
+    value: ${{ steps.gate.outputs.resolved-scan-mode }}
+  baseline-scanned:
+    description: >
+      'true' when a merge-base baseline scan actually ran. It is 'false' in
+      full mode AND on the diff-mode fast path where nothing blocked, so the
+      clean case never pays for a second scan.
+    value: ${{ steps.gate.outputs.baseline-scanned }}
   findings-digest:
     description: Stable digest of the blocking finding set — unchanged across runs when the advisory set is unchanged.
     value: ${{ steps.gate.outputs.findings-digest }}
@@ -130,9 +175,38 @@ runs:
         OSV_ALLOWLIST_PATH: ${{ inputs.allowlist-path }}
         OSV_NON_BLOCKING: ${{ inputs.non-blocking }}
         OSV_FINDINGS_OUT: ${{ inputs.findings-out }}
+        OSV_SCAN_MODE: ${{ inputs.scan-mode }}
+        OSV_BASELINE_REF: ${{ inputs.baseline-ref }}
+        OSV_GRACE_DAYS: ${{ inputs.grace-days }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
+
+        # ── Resolve the scan mode (Story #325) ───────────────────────────
+        # 'auto' is diff-aware only when the caller resolved a baseline; a
+        # push / schedule / merge-queue-less event resolves no baseline and
+        # keeps today's whole-tree gating. 'diff' asks for diff-aware but
+        # still degrades to whole-tree BLOCKING when no baseline is available
+        # — over-blocking is the safe direction, and a silently un-baselined
+        # "diff" run that let a real PR-introduced advisory through would not
+        # be.
+        case "${OSV_SCAN_MODE}" in
+          auto|diff|full) : ;;
+          *)
+            echo "::error::Invalid scan-mode '${OSV_SCAN_MODE}' (expected: auto, diff, full)."
+            exit 1
+            ;;
+        esac
+        resolved_mode="full"
+        if [ "${OSV_SCAN_MODE}" != "full" ]; then
+          if [ -n "${OSV_BASELINE_REF}" ]; then
+            resolved_mode="diff"
+          elif [ "${OSV_SCAN_MODE}" = "diff" ]; then
+            echo "::warning::scan-mode 'diff' was requested but no baseline-ref was supplied — gating whole-tree (fail-closed)."
+          fi
+        fi
+        echo "Resolved OSV scan mode: ${resolved_mode} (requested '${OSV_SCAN_MODE}', baseline-ref '${OSV_BASELINE_REF}')"
+        echo "resolved-scan-mode=${resolved_mode}" >> "$GITHUB_OUTPUT"
 
         os="$(uname -s)"
         arch="$(uname -m)"
@@ -253,16 +327,86 @@ runs:
             echo "warning-count=0"
             echo "suppressed-count=0"
             echo "expired-count=0"
+            echo "preexisting-count=0"
+            echo "grace-count=0"
             echo "findings-digest=empty-0"
             echo "scanned=false"
+            echo "baseline-scanned=false"
           } >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
         echo "scanned=true" >> "$GITHUB_OUTPUT"
 
+        # ── Diff-aware baseline (Story #325) ─────────────────────────────
+        # Only reached in diff mode, and only when the head scan actually
+        # produced a BLOCKING finding: the classify-only probe below is a pure
+        # in-process re-read of the report the scan already wrote, so a clean
+        # tree — the overwhelmingly common case — never pays for a second
+        # scan and costs exactly what it cost before this change.
+        #
+        # The baseline is the SAME whole-tree scan run inside a worktree at
+        # the merge base, not a lockfile parse: a finding present in both
+        # trees is pre-existing and demoted, a head-only finding is
+        # PR-introduced and blocks. That keeps the comparison correct for
+        # every ecosystem OSV-scanner supports.
+        export OSV_SCAN_ROOT="${PWD}"
+        base_report=""
+        baseline_scanned="false"
+        if [ "${resolved_mode}" = "diff" ]; then
+          probe_out=""
+          if ! probe_out="$(OSV_REPORT="${report}" OSV_CLASSIFY_ONLY=true \
+              node "${ACTION_PATH}/osv-report-gate.mjs")"; then
+            echo "::error::The OSV gate could not classify the head report — failing closed."
+            exit 1
+          fi
+          probe_blocking="$(printf '%s\n' "${probe_out}" | sed -n 's/^blocking-count=//p' | tail -n 1)"
+          probe_blocking="${probe_blocking:-0}"
+          echo "Diff-aware probe: ${probe_blocking} blocking finding(s) in the head scan."
+
+          if [ "${probe_blocking}" != "0" ]; then
+            base_dir="${tmp}/osv-baseline"
+            # A baseline that cannot be produced degrades to whole-tree
+            # blocking semantics with a loud note — NEVER to "everything is
+            # pre-existing", which would open the gate on a real
+            # PR-introduced advisory.
+            if git worktree add --detach "${base_dir}" "${OSV_BASELINE_REF}" >/dev/null 2>&1; then
+              base_candidate="${tmp}/osv-base-report.json"
+              base_rc=0
+              ( cd "${base_dir}" && "${tmp}/osv-scanner" scan source -r . --format json \
+                  --output-file "${base_candidate}" ) || base_rc=$?
+              echo "Baseline OSV-scanner raw exit code: ${base_rc}"
+              case " 0 1 127 128 " in
+                *" ${base_rc} "*)
+                  base_report="${base_candidate}"
+                  baseline_scanned="true"
+                  echo "Baseline scan of ${OSV_BASELINE_REF} complete."
+                  ;;
+                *)
+                  echo "::warning::Baseline OSV-scanner exited ${base_rc} (undocumented) — gating whole-tree instead of diff-aware."
+                  ;;
+              esac
+              # 127/128 means the baseline tree had no scannable manifest, so
+              # the empty report legitimately baselines nothing: every head
+              # finding is then PR-introduced. That is the correct reading of
+              # a repo that only just gained a lockfile.
+              if [ "${baseline_scanned}" = "true" ] && [ ! -s "${base_candidate}" ]; then
+                echo '{"results":[]}' > "${base_candidate}"
+              fi
+              git worktree remove --force "${base_dir}" >/dev/null 2>&1 || true
+            else
+              echo "::warning::Could not create a git worktree at '${OSV_BASELINE_REF}' (is the checkout full-depth?) — gating whole-tree instead of diff-aware."
+            fi
+          fi
+        fi
+        echo "baseline-scanned=${baseline_scanned}" >> "$GITHUB_OUTPUT"
+
         # Severity-band gate with optional per-finding suppression
-        # (Story #145). Lives in a sibling module so it is unit-testable
+        # (Story #145), the merge-base baseline, and the publish grace window
+        # (Story #325). Lives in a sibling module so it is unit-testable
         # (scripts/osv-report-gate.test.mjs); it ships inside this action's
         # directory, so a consumer still needs NO extra file in its checkout.
-        OSV_REPORT="${report}" node "${ACTION_PATH}/osv-report-gate.mjs"
+        OSV_REPORT="${report}" \
+        OSV_BASE_REPORT="${base_report}" \
+        OSV_BASE_SCAN_ROOT="${tmp}/osv-baseline" \
+          node "${ACTION_PATH}/osv-report-gate.mjs"

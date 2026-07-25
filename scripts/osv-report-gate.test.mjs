@@ -16,17 +16,25 @@ import {
   classify,
   findingsDigest,
   renderSummary,
+  normalizeSource,
+  rowKey,
+  buildBaselineSet,
   OsvGateError,
 } from "../.github/actions/osv-scan/osv-report-gate.mjs";
 
-// Build an OSV-scanner-shaped report for one grouped advisory.
-const reportWith = (groups) => ({
+// Build an OSV-scanner-shaped report for one grouped advisory. `published`
+// rides on the per-vulnerability entries, mirroring the real OSV schema —
+// group rows carry the severity, never the date.
+const reportWith = (groups, { sourcePath = "pnpm-lock.yaml" } = {}) => ({
   results: [
     {
-      source: { path: "pnpm-lock.yaml" },
+      source: { path: sourcePath },
       packages: groups.map((g) => ({
         package: { name: g.name, version: g.version || "1.0.0", ecosystem: g.ecosystem || "npm" },
         groups: [{ ids: g.ids, max_severity: g.score }],
+        ...(g.published
+          ? { vulnerabilities: g.ids.map((id) => ({ id, published: g.published })) }
+          : {}),
       })),
     },
   ],
@@ -224,4 +232,308 @@ test("renderSummary reports a clean scan and a blocked scan distinctly", () => {
   );
   assert.match(blocked.join("\n"), /❌ BLOCKED/);
   assert.match(blocked.join("\n"), /GHSA-x/);
+});
+
+// ---------------------------------------------------------------------------
+// Diff-aware baseline + publish grace window (Story #325)
+//
+// The failure these close: a newly-published advisory against a dependency
+// that has been on `main` for weeks reds EVERY open PR simultaneously — the
+// postcss GHSA-r28c-9q8g-f849 / brace-expansion GHSA-mh99-v99m-4gvg incidents
+// on the swarm-os consumer. The gate must tell "this PR introduced it" from
+// "this was already here", without ever letting a real PR-introduced advisory
+// through and without neutering the operator-authored `revisitBy` re-gate.
+// ---------------------------------------------------------------------------
+
+// A baseline built from the SAME tree, as the merge-base worktree scan yields.
+const baselineOf = (groups, opts) => buildBaselineSet(collectRows(reportWith(groups, opts), opts));
+
+test("a finding already present at the baseline is demoted, not blocked", () => {
+  const groups = [{ name: "postcss", ids: ["GHSA-r28c-9q8g-f849"], score: "7.5" }];
+  const v = classify(collectRows(reportWith(groups)), {
+    failOn: "high",
+    baseline: baselineOf(groups),
+  });
+  assert.equal(v.blocking.length, 0);
+  assert.equal(v.preexisting.length, 1);
+  assert.equal(v.preexisting[0].ids[0], "GHSA-r28c-9q8g-f849");
+});
+
+test("a head-only finding is PR-introduced and still blocks", () => {
+  const v = classify(
+    collectRows(
+      reportWith([
+        { name: "postcss", ids: ["GHSA-r28c-9q8g-f849"], score: "7.5" },
+        { name: "brand-new-dep", ids: ["GHSA-new"], score: "8.2" },
+      ]),
+    ),
+    {
+      failOn: "high",
+      baseline: baselineOf([{ name: "postcss", ids: ["GHSA-r28c-9q8g-f849"], score: "7.5" }]),
+    },
+  );
+  assert.equal(v.blocking.length, 1);
+  assert.equal(v.blocking[0].name, "brand-new-dep");
+  assert.equal(v.preexisting.length, 1);
+  assert.equal(v.preexisting[0].name, "postcss");
+});
+
+test("bumping an advisory-bearing dep to another vulnerable version still blocks", () => {
+  // Same package, same advisory id — only the version moved. The baseline key
+  // carries @version precisely so this cannot inherit the demotion.
+  const v = classify(
+    collectRows(reportWith([{ name: "postcss", ids: ["GHSA-r28c"], score: "7.5", version: "8.4.0" }])),
+    {
+      failOn: "high",
+      baseline: baselineOf([
+        { name: "postcss", ids: ["GHSA-r28c"], score: "7.5", version: "8.3.0" },
+      ]),
+    },
+  );
+  assert.equal(v.blocking.length, 1);
+  assert.equal(v.blocking[0].version, "8.4.0");
+  assert.equal(v.preexisting.length, 0);
+});
+
+test("normalizeSource reduces worktree-rooted and workspace-rooted paths alike", () => {
+  assert.equal(normalizeSource("/tmp/osv-baseline/pnpm-lock.yaml", "/tmp/osv-baseline"), "pnpm-lock.yaml");
+  assert.equal(normalizeSource("/home/runner/work/repo/pnpm-lock.yaml", "/home/runner/work/repo"), "pnpm-lock.yaml");
+  assert.equal(normalizeSource("./pnpm-lock.yaml", "/tmp/osv-baseline"), "pnpm-lock.yaml");
+  assert.equal(normalizeSource("pnpm-lock.yaml", ""), "pnpm-lock.yaml");
+  // A trailing slash on the root must not leave a leading slash behind.
+  assert.equal(normalizeSource("/tmp/base/apps/web/pnpm-lock.yaml", "/tmp/base/"), "apps/web/pnpm-lock.yaml");
+});
+
+test("the baseline matches across differing scan roots", () => {
+  // The head scan runs in the workspace; the baseline scan runs in a git
+  // worktree at a different absolute path. Un-normalized, every head finding
+  // would look head-only and the diff-aware gate would block everything.
+  const groups = [{ name: "postcss", ids: ["GHSA-r28c"], score: "7.5" }];
+  const headRows = collectRows(
+    reportWith(groups, { sourcePath: "/home/runner/work/repo/pnpm-lock.yaml" }),
+    { scanRoot: "/home/runner/work/repo" },
+  );
+  const baseRows = collectRows(reportWith(groups, { sourcePath: "/tmp/osv-baseline/pnpm-lock.yaml" }), {
+    scanRoot: "/tmp/osv-baseline",
+  });
+  assert.equal(rowKey(headRows[0]), rowKey(baseRows[0]));
+
+  const v = classify(headRows, { failOn: "high", baseline: buildBaselineSet(baseRows) });
+  assert.equal(v.blocking.length, 0);
+  assert.equal(v.preexisting.length, 1);
+});
+
+test("an EXPIRED suppression outranks BOTH demotions and still re-gates", () => {
+  // The load-bearing precedence rule. An expired suppression is by
+  // construction on a pre-existing dependency, so letting either demotion
+  // apply would neuter `revisitBy` on PRs entirely.
+  //
+  // The fixture must be genuinely eligible for both demotions or this test
+  // passes vacuously: `published` is what puts the row inside the window, and
+  // without it `grace` is empty no matter how the precedence chain is wired.
+  const groups = [
+    {
+      name: "brace-expansion",
+      ids: ["GHSA-mh99-v99m-4gvg"],
+      score: "7.5",
+      published: "2026-07-22T00:00:00Z",
+    },
+  ];
+  const rows = collectRows(reportWith(groups));
+  const baseline = baselineOf(groups);
+  const opts = { failOn: "high", today: "2026-07-24", baseline, graceDays: 30 };
+
+  // Guard the fixture: with NO allow-list entry this row is demoted. If this
+  // ever stops holding, the assertion below has nothing left to prove.
+  const unsuppressed = classify(rows, opts);
+  assert.equal(unsuppressed.blocking.length, 0, "fixture must be demotable without an allow-list");
+  assert.equal(unsuppressed.preexisting.length, 1, "fixture must be baseline-eligible");
+  assert.notEqual(rows[0].published, null, "fixture must carry a publish date to be grace-eligible");
+
+  const v = classify(rows, {
+    ...opts,
+    allowlist: [{ id: "GHSA-mh99-v99m-4gvg", reason: "stale triage", revisitBy: "2026-01-01" }],
+  });
+  assert.equal(v.blocking.length, 1);
+  assert.equal(v.expired.length, 1);
+  assert.equal(v.preexisting.length, 0);
+  assert.equal(v.grace.length, 0);
+});
+
+test("an UNEXPIRED suppression stays suppressed and is not double-counted", () => {
+  const groups = [{ name: "brace-expansion", ids: ["GHSA-mh99-v99m-4gvg"], score: "7.5" }];
+  const v = classify(collectRows(reportWith(groups)), {
+    failOn: "high",
+    allowlist: [{ id: "GHSA-mh99-v99m-4gvg", reason: "not reachable", revisitBy: "2099-12-31" }],
+    today: "2026-07-24",
+    baseline: baselineOf(groups),
+  });
+  assert.equal(v.suppressed.length, 1);
+  assert.equal(v.blocking.length, 0);
+  assert.equal(v.preexisting.length, 0);
+});
+
+test("the grace window demotes a recent advisory and not an old one", () => {
+  const rows = collectRows(
+    reportWith([
+      { name: "fresh", ids: ["GHSA-fresh"], score: "8.0", published: "2026-07-21T00:00:00Z" },
+      { name: "stale", ids: ["GHSA-stale"], score: "8.0", published: "2026-06-24T00:00:00Z" },
+    ]),
+  );
+  const v = classify(rows, { failOn: "high", graceDays: 7, today: "2026-07-24" });
+  assert.deepEqual(
+    v.grace.map((r) => r.name),
+    ["fresh"],
+  );
+  assert.deepEqual(
+    v.blocking.map((r) => r.name),
+    ["stale"],
+  );
+});
+
+test("the grace window fails closed when the publish date is unresolvable", () => {
+  // No `published` on the vulnerability entries at all…
+  const undated = classify(collectRows(reportWith([{ name: "p", ids: ["GHSA-x"], score: "8.0" }])), {
+    failOn: "high",
+    graceDays: 7,
+    today: "2026-07-24",
+  });
+  assert.equal(undated.blocking.length, 1);
+  assert.equal(undated.grace.length, 0);
+
+  // …and a present-but-garbage date is equally not a free pass.
+  const garbage = classify(
+    collectRows(reportWith([{ name: "p", ids: ["GHSA-x"], score: "8.0", published: "not-a-date" }])),
+    { failOn: "high", graceDays: 7, today: "2026-07-24" },
+  );
+  assert.equal(garbage.blocking.length, 1);
+  assert.equal(garbage.grace.length, 0);
+});
+
+test("the grace window is off at the default of 0", () => {
+  const rows = collectRows(
+    reportWith([
+      { name: "fresh", ids: ["GHSA-fresh"], score: "8.0", published: "2026-07-23T00:00:00Z" },
+    ]),
+  );
+  const v = classify(rows, { failOn: "high", today: "2026-07-24" });
+  assert.equal(v.graceDays, 0);
+  assert.equal(v.grace.length, 0);
+  assert.equal(v.blocking.length, 1);
+});
+
+test("collectRows takes the EARLIEST published date across a group's aliased ids", () => {
+  const report = {
+    results: [
+      {
+        source: { path: "pnpm-lock.yaml" },
+        packages: [
+          {
+            package: { name: "p", version: "1.0.0", ecosystem: "npm" },
+            groups: [{ ids: ["GHSA-a", "CVE-b"], max_severity: "8.0" }],
+            vulnerabilities: [
+              { id: "GHSA-a", published: "2026-07-20T00:00:00Z" },
+              { id: "CVE-b", published: "2026-05-01T00:00:00Z" },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  assert.equal(collectRows(report)[0].published, "2026-05-01T00:00:00Z");
+
+  // …and the earliest date is what the window is judged against, so an alias
+  // published long ago cannot be laundered into the window by a fresh alias.
+  const v = classify(collectRows(report), { failOn: "high", graceDays: 7, today: "2026-07-24" });
+  assert.equal(v.blocking.length, 1);
+  assert.equal(v.grace.length, 0);
+});
+
+test("with no baseline and no grace window the partition is unchanged", () => {
+  // The backward-compatibility contract: default inputs must classify exactly
+  // as they did before diff-awareness existed.
+  const rows = collectRows(
+    reportWith([
+      { name: "crit", ids: ["C"], score: "9.9" },
+      { name: "hi", ids: ["H"], score: "7.1" },
+      { name: "med", ids: ["M"], score: "4.5" },
+      { name: "sup", ids: ["S"], score: "8.0" },
+    ]),
+  );
+  const allowlist = [{ id: "S", reason: "triaged", revisitBy: "2099-12-31" }];
+  const v = classify(rows, { failOn: "high", allowlist, today: "2026-07-24" });
+
+  assert.deepEqual(
+    v.blocking.map((r) => r.name),
+    ["crit", "hi"],
+  );
+  assert.deepEqual(
+    v.warning.map((r) => r.name),
+    ["med"],
+  );
+  assert.equal(v.suppressed.length, 1);
+  assert.equal(v.expired.length, 0);
+  // The new buckets exist but are inert.
+  assert.deepEqual(v.preexisting, []);
+  assert.deepEqual(v.grace, []);
+  assert.equal(v.baselineApplied, false);
+});
+
+test("findingsDigest ignores preexisting and grace rows entirely", () => {
+  // The scheduled tracking issue keys off this digest; a PR-side demotion must
+  // not rewrite the issue body or make an unchanged advisory set look new.
+  const groups = [
+    { name: "p1", ids: ["GHSA-a"], score: "7.5" },
+    { name: "p2", ids: ["GHSA-b"], score: "9.1", published: "2026-07-23T00:00:00Z" },
+  ];
+  const plain = classify(collectRows(reportWith(groups)), { failOn: "high", today: "2026-07-24" });
+  const demoted = classify(collectRows(reportWith(groups)), {
+    failOn: "high",
+    today: "2026-07-24",
+    baseline: baselineOf([groups[0]]),
+    graceDays: 7,
+  });
+
+  assert.equal(demoted.blocking.length, 0);
+  assert.equal(demoted.preexisting.length, 1);
+  assert.equal(demoted.grace.length, 1);
+  assert.equal(findingsDigest(demoted.blocking), findingsDigest([]));
+  assert.notEqual(findingsDigest(plain.blocking), findingsDigest(demoted.blocking));
+});
+
+test("renderSummary names both demotion buckets with one table row each", () => {
+  const groups = [
+    { name: "postcss", ids: ["GHSA-r28c-9q8g-f849"], score: "7.5" },
+    { name: "fresh", ids: ["GHSA-fresh"], score: "8.0", published: "2026-07-23T00:00:00Z" },
+  ];
+  const v = classify(collectRows(reportWith(groups)), {
+    failOn: "high",
+    today: "2026-07-24",
+    baseline: baselineOf([groups[0]]),
+    graceDays: 7,
+  });
+  const out = renderSummary(v).join("\n");
+
+  assert.match(out, /Pre-existing on the base branch — not introduced by this PR \(1\)/);
+  assert.match(out, /Within the publish grace window \(1\)/);
+  assert.match(out, /GHSA-r28c-9q8g-f849/);
+  assert.match(out, /GHSA-fresh/);
+  // Demotions are not a pass-with-nothing-to-say: the verdict line must not
+  // claim BLOCKED when everything was demoted.
+  assert.doesNotMatch(out, /❌ BLOCKED/);
+  // The grace table carries the publish date that justified the demotion.
+  assert.match(out, /\| 2026-07-23T00:00:00Z \|/);
+});
+
+test("a fully-demoted verdict set is not rendered as a clean scan", () => {
+  // Demoted findings still have to be visible — silently reporting "no known
+  // advisories" would hide exactly what the diff-aware mode chose not to gate.
+  const groups = [{ name: "postcss", ids: ["GHSA-r28c"], score: "7.5" }];
+  const v = classify(collectRows(reportWith(groups)), {
+    failOn: "high",
+    baseline: baselineOf(groups),
+  });
+  const out = renderSummary(v).join("\n");
+  assert.doesNotMatch(out, /no known advisories/);
+  assert.match(out, /GHSA-r28c/);
 });
