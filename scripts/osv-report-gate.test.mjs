@@ -323,17 +323,36 @@ test("the baseline matches across differing scan roots", () => {
   assert.equal(v.preexisting.length, 1);
 });
 
-test("an EXPIRED suppression outranks the baseline demotion and still re-gates", () => {
+test("an EXPIRED suppression outranks BOTH demotions and still re-gates", () => {
   // The load-bearing precedence rule. An expired suppression is by
-  // construction on a pre-existing dependency, so letting the baseline demote
-  // it would neuter `revisitBy` on PRs entirely.
-  const groups = [{ name: "brace-expansion", ids: ["GHSA-mh99-v99m-4gvg"], score: "7.5" }];
-  const v = classify(collectRows(reportWith(groups)), {
-    failOn: "high",
+  // construction on a pre-existing dependency, so letting either demotion
+  // apply would neuter `revisitBy` on PRs entirely.
+  //
+  // The fixture must be genuinely eligible for both demotions or this test
+  // passes vacuously: `published` is what puts the row inside the window, and
+  // without it `grace` is empty no matter how the precedence chain is wired.
+  const groups = [
+    {
+      name: "brace-expansion",
+      ids: ["GHSA-mh99-v99m-4gvg"],
+      score: "7.5",
+      published: "2026-07-22T00:00:00Z",
+    },
+  ];
+  const rows = collectRows(reportWith(groups));
+  const baseline = baselineOf(groups);
+  const opts = { failOn: "high", today: "2026-07-24", baseline, graceDays: 30 };
+
+  // Guard the fixture: with NO allow-list entry this row is demoted. If this
+  // ever stops holding, the assertion below has nothing left to prove.
+  const unsuppressed = classify(rows, opts);
+  assert.equal(unsuppressed.blocking.length, 0, "fixture must be demotable without an allow-list");
+  assert.equal(unsuppressed.preexisting.length, 1, "fixture must be baseline-eligible");
+  assert.notEqual(rows[0].published, null, "fixture must carry a publish date to be grace-eligible");
+
+  const v = classify(rows, {
+    ...opts,
     allowlist: [{ id: "GHSA-mh99-v99m-4gvg", reason: "stale triage", revisitBy: "2026-01-01" }],
-    today: "2026-07-24",
-    baseline: baselineOf(groups),
-    graceDays: 3650,
   });
   assert.equal(v.blocking.length, 1);
   assert.equal(v.expired.length, 1);
