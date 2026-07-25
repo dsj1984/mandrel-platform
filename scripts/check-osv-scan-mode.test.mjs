@@ -99,18 +99,15 @@ function runScript(stepBlock) {
  * nothing.
  */
 function blockUnder(text, key, indent) {
-  const pad = " ".repeat(indent);
   const lines = text.split("\n");
-  const start = lines.findIndex((l) => l === `${pad}${key}:`);
+  const start = lines.findIndex((l) => l === `${" ".repeat(indent)}${key}:`);
   assert.notEqual(start, -1, `key "${key}" not found at indent ${indent}`);
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
     if (/^\s*$/.test(lines[i])) continue;
-    if (new RegExp(`^${pad}\\S`).test(lines[i])) {
-      end = i;
-      break;
-    }
-    if (lines[i].match(/^(\s*)/)[1].length < indent) {
+    // The block ends at the next sibling key (same indent) or any dedent —
+    // both are just "leading whitespace no deeper than the key's own".
+    if (lines[i].match(/^(\s*)/)[1].length <= indent) {
       end = i;
       break;
     }
@@ -187,10 +184,10 @@ test("the composite declares the diff-aware surface with matching defaults", () 
     "composite baseline-ref must default to empty (no baseline → whole-tree)",
   );
 
+  const compositeLines = composite.split("\n");
   for (const out of ["preexisting-count", "grace-count", "resolved-scan-mode", "baseline-scanned"]) {
-    assert.match(
-      composite,
-      new RegExp(`^ {2}${out}:$`, "m"),
+    assert.ok(
+      compositeLines.includes(`  ${out}:`),
       `composite must expose the ${out} output`,
     );
   }
