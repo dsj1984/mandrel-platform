@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.29.1...mandrel-platform-v1.0.0) (2026-07-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* osv-scan-mode defaults to 'auto', so the OSV tier stops blocking PRs on advisories already present on the base branch. Those are now owned by the scheduled advisory-scan.yml companion, which becomes a prerequisite rather than an optional extra — a consumer on 'auto' without it has nothing watching main. Set osv-scan-mode: full to keep the previous whole-tree semantics exactly.
+* osv-scan-mode defaults to 'auto', so the OSV tier stops blocking PRs on advisories already present on the base branch. Those are now owned by the scheduled advisory-scan.yml companion, which becomes a prerequisite rather than an optional extra — a consumer on 'auto' without it has nothing watching main. Set osv-scan-mode: full to keep the previous whole-tree semantics exactly.
+
+### Added
+
+* make the OSV advisory PR gate diff-aware against the merge base, with an optional publish grace window ([#325](https://github.com/dsj1984/mandrel-platform/issues/325)) ([#326](https://github.com/dsj1984/mandrel-platform/issues/326)) ([f879a08](https://github.com/dsj1984/mandrel-platform/commit/f879a081e9801f66da62d65cf9861f5973988546))
+* make the OSV advisory PR gate diff-aware against the merge base, with an optional publish grace window ([#325](https://github.com/dsj1984/mandrel-platform/issues/325)) ([#328](https://github.com/dsj1984/mandrel-platform/issues/328)) ([b41e4db](https://github.com/dsj1984/mandrel-platform/commit/b41e4db37432a0afc8ab59e886d0b1ba982f9034))
+
 ## [0.29.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.29.0...mandrel-platform-v0.29.1) (2026-07-22)
 
 
