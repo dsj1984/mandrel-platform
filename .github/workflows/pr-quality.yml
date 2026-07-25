@@ -485,6 +485,46 @@ on:
         type: string
         default: '.osv-allowlist.json'
 
+      # Diff-aware attribution for the OSV tier (Story #325). A whole-tree
+      # scan cannot tell an advisory this PR introduced from one published
+      # against a dependency committed weeks ago — so a single new advisory
+      # reds EVERY open PR at once, including PRs that never touched a
+      # dependency, and concurrent sessions race to open duplicate override
+      # PRs. Diff-aware mode baselines the scan against the PR's merge base
+      # and demotes anything already present there to a non-blocking warning.
+      #
+      # BEHAVIOUR CHANGE: this defaults to 'auto', so consumers inherit
+      # diff-aware PR gating on pin bump. Base-branch advisories are then
+      # owned by the SCHEDULED advisory-scan.yml companion (which pins
+      # scan-mode: full) — a consumer running this tier without that daily
+      # companion loses main-level advisory coverage. Set 'full' to keep the
+      # previous whole-tree semantics.
+      osv-scan-mode:
+        description: >
+          OSV attribution mode: 'auto' (default) gates diff-aware against the
+          PR merge base and whole-tree elsewhere, 'diff' forces diff-aware,
+          'full' restores unconditional whole-tree gating. A baseline that
+          cannot be produced always degrades to whole-tree BLOCKING.
+        required: false
+        type: string
+        default: 'auto'
+
+      # Publish grace window for the OSV tier (Story #325). Package managers
+      # commonly hold new releases behind a cooldown (pnpm's
+      # minimumReleaseAge, Renovate's minimumReleaseAge), so the patched
+      # version for a just-published advisory is frequently unresolvable for
+      # days — a hard block the consumer cannot act on. Default 0 (off), so no
+      # consumer's gate softens without opting in.
+      osv-grace-days:
+        description: >
+          Demote a would-block advisory published fewer than this many days
+          ago to a non-blocking warning. A finding whose publish date cannot
+          be resolved never enters the window — it blocks. Default 0
+          (disabled).
+        required: false
+        type: number
+        default: 0
+
       # Wrangler-baseline tier (Story #177, roadmap §2a.3). Four wrangler
       # invariants — env.* named-Environment split, logpush: true, an
       # Analytics Engine binding, and a compatibility_date staleness policy —
@@ -1836,7 +1876,103 @@ jobs:
     steps:
       - *harden-runner
 
-      - *checkout
+      # This tier does NOT reuse the `&checkout` anchor: diff-aware mode
+      # (Story #325) needs full history so `git merge-base` and the baseline
+      # worktree can reach the fork point, and a YAML anchor cannot be
+      # partially overridden without merge keys. Same reason migration-guard
+      # and security carry their own full-history checkouts. Depth collapses
+      # back to a shallow clone only under `osv-scan-mode: full`, where no
+      # baseline is ever resolved.
+      #
+      # NOTE: the ternary yields the STRING '1'/'0' deliberately — a bare
+      # numeric `0` is FALSY in a GitHub expression, so the false arm would
+      # collapse. A non-empty string '0' is truthy and actions/checkout parses
+      # it as full depth.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: ${{ inputs.osv-scan-mode == 'full' && '1' || '0' }}
+          persist-credentials: false
+
+      # Side-check-out ONLY the canonical diff-range derivation from THIS repo
+      # at the exact SHA the caller pinned (`job_workflow_sha`) — the same
+      # mechanism the security and affected-mode tiers use. Reusing
+      # `resolve-diff-range.sh` is what keeps a SECOND event → base/head
+      # classification from existing; the `&checkout-range` anchor itself is
+      # gated on `inputs.affected` (a different toggle), so this tier needs
+      # its own copy rather than the alias.
+      - name: Checkout diff-range resolver (mandrel-platform@resolved-sha)
+        if: ${{ inputs.osv-scan-mode != 'full' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          # `job_workflow_sha` is a valid runtime github-context field that
+          # actionlint's pinned context type model does not list, so it is read
+          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`).
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          sparse-checkout: |
+            scripts/resolve-diff-range.sh
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-osv-range
+          persist-credentials: false
+
+      # Resolve the merge-base commit the composite baselines against. Shaped
+      # exactly like the affected resolver: pull_request takes the MERGE BASE
+      # of base..head (base.sha is the live base-branch tip and drifts past
+      # the fork point once main advances), merge_group / push use the derived
+      # base directly (already the exact fork point). `TURBO_SCM_BASE` cannot
+      # be reused here — it is written to $GITHUB_ENV inside OTHER tier jobs,
+      # and $GITHUB_ENV does not cross job boundaries.
+      #
+      # An unresolvable base exports an EMPTY ref, which the composite reads
+      # as "no baseline" and gates whole-tree — never a silently skipped scan.
+      - name: Resolve OSV diff baseline (merge base)
+        id: osv-baseline
+        if: ${{ inputs.osv-scan-mode != 'full' }}
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # `resolve-diff-range.sh` is side-checked-out above and sets
+          # RESOLVED_EVENT_MODE / RESOLVED_BASE_SHA / RESOLVED_HEAD_SHA. Pre-
+          # declare them so shellcheck sees them assigned (SC2154); the source
+          # path is non-constant, so its follow is disabled (SC1090).
+          RESOLVED_EVENT_MODE="" RESOLVED_BASE_SHA="" RESOLVED_HEAD_SHA=""
+          # shellcheck disable=SC1090
+          source "${GITHUB_WORKSPACE}/_mandrel-platform-osv-range/scripts/resolve-diff-range.sh"
+
+          baseline_ref=""
+          case "${RESOLVED_EVENT_MODE}" in
+            pull_request)
+              baseline_ref="$(git merge-base "${RESOLVED_BASE_SHA}" "${RESOLVED_HEAD_SHA}" || true)"
+              echo "OSV baseline (merge-base of ${RESOLVED_BASE_SHA}..${RESOLVED_HEAD_SHA}): ${baseline_ref:-<unresolved>}"
+              ;;
+            merge_group | push)
+              baseline_ref="${RESOLVED_BASE_SHA}"
+              echo "OSV baseline (${RESOLVED_EVENT_MODE}): ${baseline_ref}"
+              ;;
+            *)
+              echo "No ranged base resolvable — the OSV tier will gate whole-tree."
+              ;;
+          esac
+
+          # Only ever a git SHA derived above, but assert the shape anyway
+          # before it reaches $GITHUB_OUTPUT: a newline would inject an
+          # arbitrary output line (the Story #319 hardening, applied here too).
+          case "${baseline_ref}" in
+            *[$'\n\r']*)
+              echo "::error title=Invalid OSV baseline::the resolved baseline contains a newline; refusing to export it." >&2
+              exit 1
+              ;;
+          esac
+          echo "baseline-ref=${baseline_ref}" >> "${GITHUB_OUTPUT}"
 
       # OSV-scanner advisory tier via the shared first-party osv-scan
       # composite action (Story #310), which owns the pinned OSV-scanner
@@ -1845,9 +1981,10 @@ jobs:
       # this step replaced). Pinning the BINARY inside the composite keeps the
       # gate SHA-action-ratchet-exempt and GHAS-free — findings surface via
       # the run log / job summary, load-bearing on a private repo with no
-      # GitHub Advanced Security. Behaviour is unchanged: same inputs, same
-      # blocking semantics, same job summary. The scheduled advisory-scan.yml
-      # workflow calls the SAME composite in non-blocking mode.
+      # GitHub Advanced Security. The scheduled advisory-scan.yml workflow
+      # calls the SAME composite in non-blocking mode, pinned to
+      # `scan-mode: full` so it can never inherit this tier's diff-aware
+      # default — it is the owner of base-branch advisories.
       #
       # Portability contract (scripts/check-workflow-portability.mjs): a
       # reusable workflow references a first-party composite by absolute
@@ -1858,6 +1995,9 @@ jobs:
           osv-scanner-version: ${{ inputs.osv-scanner-version }}
           fail-on-severity: ${{ inputs.osv-fail-on-severity }}
           allowlist-path: ${{ inputs.osv-allowlist-path }}
+          scan-mode: ${{ inputs.osv-scan-mode }}
+          baseline-ref: ${{ steps.osv-baseline.outputs.baseline-ref }}
+          grace-days: ${{ inputs.osv-grace-days }}
 
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
