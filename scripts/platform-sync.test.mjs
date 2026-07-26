@@ -737,3 +737,33 @@ test("no read in the sync path is guarded by a prior existence check", () => {
   );
   assert.match(uses[0].line, /opts\.consumer/);
 });
+
+test("a missing runbook-template dir fails with the message naming it, not a raw ENOENT", () => {
+  // The precondition is fatal by design. Converting the guard to a
+  // perform-then-classify read must not degrade it to an unhandled ENOENT.
+  const emptyTemplates = mkdtempSync(join(tmpdir(), "platform-sync-templates-"));
+  try {
+    const out = runExpectingFailure(["--templates", emptyTemplates]);
+    assert.match(out, /runbook templates not found at/);
+    assert.ok(out.includes(join(emptyTemplates, "runbooks")), "names the directory it looked in");
+    assert.doesNotMatch(out, /ENOENT/, "no raw errno leaks to the operator");
+  } finally {
+    rmSync(emptyTemplates, { recursive: true, force: true });
+  }
+});
+
+test("a missing workflow-template dir is a soft no-op, not a failure", () => {
+  // Deliberately NOT symmetrical with the runbook precondition above: an
+  // absent workflow-template directory yields an empty result set rather than
+  // a fatal. Pinned so the read conversion cannot quietly make it fatal.
+  const templates = mkdtempSync(join(tmpdir(), "platform-sync-templates-"));
+  try {
+    mkdirSync(join(templates, "runbooks"), { recursive: true });
+    const out = JSON.parse(run(["--templates", templates]));
+    assert.deepEqual(out.workflowStubs.created, []);
+    assert.deepEqual(out.workflowStubs.skipped, []);
+    assert.deepEqual(out.workflowStubs.localCopies, []);
+  } finally {
+    rmSync(templates, { recursive: true, force: true });
+  }
+});
