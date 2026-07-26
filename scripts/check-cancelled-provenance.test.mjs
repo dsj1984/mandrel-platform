@@ -396,6 +396,28 @@ test(
 );
 
 test(
+  "a cancel just UNDER a ceiling is not claimed as a timeout",
+  semantics,
+  () => {
+    // GitHub never kills a job early, so a duration below the ceiling is
+    // positive evidence AGAINST a timeout — and the seconds just under one are
+    // exactly where an ordinary fail-fast or superseded cancel of a
+    // long-running job lands. Matching there would be a confident wrong answer;
+    // the classifier must prefer a missing label to a false one.
+    const r = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture([
+        timedJob("Unit (1/2)", "success", ranSteps, 90),
+        timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 45 * 60 - 20),
+      ]),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /E2E \/ Smoke \(1\/1\): stopped-mid-step/);
+    assert.doesNotMatch(r.stderr, /provenance: timed-out/);
+  }
+);
+
+test(
   "a ceiling the set omits under-detects rather than mis-detects",
   semantics,
   () => {

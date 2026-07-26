@@ -2341,15 +2341,20 @@ jobs:
             if [ -n "${run_json}" ]; then
               # Per-cancelled-job detail, for the human reading the report. A
               # job GitHub killed at its ceiling reports a wall duration landing
-              # ON that ceiling — the window is one-sided by 30s below (clock
-              # granularity) and 60s above (the kill delay), so a job cancelled
-              # long before or long after any ceiling does NOT match and keeps
-              # its existing classification.
+              # ON that ceiling. GitHub never kills EARLY, so the window below
+              # the ceiling is only the 5s that second-resolution timestamps can
+              # round away; above it, 60s absorbs the kill delay. Keeping the
+              # low side tight matters: the seconds just UNDER a ceiling are
+              # where an ordinary fail-fast or superseded cancel of a
+              # long-running job is most likely to land, and a false `timed-out`
+              # there would be a confident wrong answer rather than a missing
+              # one. A cancelled job matching no ceiling keeps its existing
+              # classification.
               detail="$(jq -r --argjson ceilings "${ceilings}" '
                 def matched_ceiling:
                   (try ((.completedAt | fromdateiso8601) - (.startedAt | fromdateiso8601)) catch null) as $d
                   | if $d == null then null
-                    else [ $ceilings[] | select(($d >= ((. * 60) - 30)) and ($d <= ((. * 60) + 60))) ] | first
+                    else [ $ceilings[] | select(($d >= ((. * 60) - 5)) and ($d <= ((. * 60) + 60))) ] | first
                     end;
                 [ .jobs[]? | select(.conclusion == "cancelled") ] as $stopped
                 | ([ .jobs[]? | select(.conclusion == "failure") ] | length > 0) as $any_failed
@@ -2366,7 +2371,7 @@ jobs:
                 def matched_ceiling:
                   (try ((.completedAt | fromdateiso8601) - (.startedAt | fromdateiso8601)) catch null) as $d
                   | if $d == null then null
-                    else [ $ceilings[] | select(($d >= ((. * 60) - 30)) and ($d <= ((. * 60) + 60))) ] | first
+                    else [ $ceilings[] | select(($d >= ((. * 60) - 5)) and ($d <= ((. * 60) + 60))) ] | first
                     end;
                 [ .jobs[]? | select(.conclusion == "cancelled") | select(matched_ceiling != null) ] | length
               ' <<<"${run_json}" 2>/dev/null || echo 0)"

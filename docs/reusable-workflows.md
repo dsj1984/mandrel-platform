@@ -352,7 +352,24 @@ The timeout signal is a **duration match**, not GitHub's own annotation text.
 scope declared by a reusable workflow is validated against the **caller's**
 grant at compile time (ignoring every job's `if:` gate), so adding one fails the
 entire call with `startup_failure` for any consumer that has not granted it. A cancelled job whose duration matches no ceiling keeps its previous
-classification; the class only ever fires on positive evidence.
+classification; the class only ever fires on positive evidence, and because
+GitHub never kills a job *early*, a duration below a ceiling counts as evidence
+against a timeout rather than for one.
+
+The match is by duration, so it is not scoped to a particular job: a cancelled
+job that coincidentally ends within about a minute of one of the workflow's
+ceilings is labelled `timed-out`. Two consequences worth knowing, both fail-safe
+but neither invisible:
+
+- Under `provenance-aware`, `timed-out` is resolved **before** the superseded
+  probe, so such a coincidence leaves the gate red where it might otherwise have
+  been neutralized. Red is the conservative direction — the same direction a
+  `never-started` cancel already takes — but it is a real interaction, not a
+  no-op.
+- A workflow's ceiling list covers **its own** jobs. A nested reusable-workflow
+  call's inner jobs run under the called workflow's ceilings and are classified
+  by its aggregator; they are labelled here only if they coincide, and are
+  otherwise simply not detected.
 
 The classification is printed to the log and the job summary under **both**
 policies. `cancelled-policy` only decides whether it changes the verdict:
