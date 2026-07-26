@@ -849,6 +849,59 @@ jobs:
           fi
           node "${script}" "${args[@]}"
 
+      # Fail-fast collateral explainer (Story #331). A run-wide fail-fast cancel
+      # stops every sibling tier mid-flight, and GitHub records only a bare
+      # `cancelled` conclusion on each — with no pointer to the tier that
+      # actually failed. A job-status scan then reads N red jobs and blames the
+      # wrong one (the swarm-os run 30168441137 triage failure). This step is
+      # the collateral-side half of the attribution: it fires ONLY when this
+      # job was cancelled (never when it failed — the two gates are mutually
+      # exclusive), states that this tier did not itself fail, and best-effort
+      # names the tier that did by reading the run's job conclusions back.
+      #
+      # Loud-but-non-fatal on exactly the cancel step's terms: every lookup
+      # failure degrades to the generic collateral message and exits 0.
+      # `timeout-minutes: 1` is load-bearing — a cancelled job runs its
+      # remaining `cancelled()`/`always()` steps inside a bounded runner grace
+      # period, so an unbounded API call here could eat the budget the tier's
+      # own artifact uploads need. Anchored (`&explain-cancellation`) and
+      # aliased IMMEDIATELY BEFORE `*cancel-on-failure` in every tier job, so
+      # the cancel step remains the last step of every job.
+      - &explain-cancellation
+        name: Explain fail-fast cancellation (collateral)
+        if: ${{ cancelled() && inputs.fail-fast }}
+        shell: bash
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          TIER_ID: ${{ github.job }}
+        run: |
+          set -uo pipefail
+          culprit=""
+          if command -v gh >/dev/null 2>&1; then
+            culprit="$(gh run view "${RUN_ID}" --repo "${REPO}" --json jobs \
+              --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")' \
+              2>/dev/null || true)"
+          fi
+          if [ -n "${culprit}" ]; then
+            detail="the failing tier is: ${culprit}"
+          else
+            detail="the failing tier could not be resolved from the Actions API — open the run summary and look for the 'fail-fast triggered by' annotation"
+          fi
+          echo "::notice title=fail-fast collateral::Tier '${TIER_ID}' was CANCELLED by fail-fast, not by its own failure — ${detail}."
+          {
+            echo "### ⏹️ Cancelled as fail-fast collateral"
+            echo
+            echo "Tier \`${TIER_ID}\` did **not** fail. It was cancelled because a sibling"
+            echo "tier failed and \`fail-fast: true\` cancelled run \`${RUN_ID}\`."
+            echo
+            echo "- ${detail}"
+            echo "- Do not triage this job — triage the failing tier above."
+          } >>"${GITHUB_STEP_SUMMARY}"
+          exit 0
+
       # Opt-in fail-fast (Story #223): on this tier's failure, cancel the whole
       # run so doomed sibling tiers stop consuming runner capacity. MUST be the
       # LAST step of the job, so `if: always()` steps (artifact uploads) finish
@@ -861,6 +914,13 @@ jobs:
       # (`&cancel-on-failure`) and aliased as the LAST step of every tier job
       # below — a whole-step YAML alias keeps the `if:` gate visible on the
       # workflow surface (a composite action would hide it).
+      #
+      # ATTRIBUTION (Story #331): this step is the trigger-side half, and the
+      # authoritative one — it runs in a job whose conclusion is `failure`, not
+      # `cancelled`, so it is never subject to the cancellation grace budget.
+      # It records WHICH tier tripped fail-fast (run-level `::error::`
+      # annotation + job summary) BEFORE requesting the cancel, so the record
+      # survives even if the cancel call itself fails.
       - &cancel-on-failure
         name: Cancel run on tier failure (fail-fast)
         if: ${{ failure() && inputs.fail-fast }}
@@ -869,8 +929,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
+          TIER_ID: ${{ github.job }}
         run: |
           set -uo pipefail
+          echo "::error title=fail-fast::fail-fast triggered by tier '${TIER_ID}' — this tier FAILED; every sibling tier reported as cancelled below is collateral, not a distinct failure."
+          {
+            echo "### 🚨 fail-fast triggered by \`${TIER_ID}\`"
+            echo
+            echo "Tier \`${TIER_ID}\` failed and cancelled run \`${RUN_ID}\`."
+            echo
+            echo "- **Triage this tier.** Sibling tiers reporting \`cancelled\` are collateral."
+            echo "- Disable the \`fail-fast\` input to let every tier report its own result."
+          } >>"${GITHUB_STEP_SUMMARY}"
           echo "fail-fast: tier failed — requesting cancellation of run ${RUN_ID}."
           if command -v gh >/dev/null 2>&1; then
             if gh run cancel "${RUN_ID}" --repo "${REPO}"; then
@@ -918,6 +988,11 @@ jobs:
         env:
           TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
           TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+      # Fail-fast attribution (Story #331) — aliased collateral explainer; see
+      # the lint tier's anchor (`&explain-cancellation`). MUST stay immediately
+      # before the cancel alias so the cancel step remains this job's last one.
+      - *explain-cancellation
 
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
@@ -1042,6 +1117,11 @@ jobs:
             **/coverage/
           retention-days: 7
 
+      # Fail-fast attribution (Story #331) — aliased collateral explainer; see
+      # the lint tier's anchor (`&explain-cancellation`). MUST stay immediately
+      # before the cancel alias so the cancel step remains this job's last one.
+      - *explain-cancellation
+
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
       # the LAST step; loud-but-non-fatal; ci-required counts cancelled as
@@ -1088,6 +1168,11 @@ jobs:
           name: contract-results-${{ matrix.shard }}
           path: '**/test-results/'
           retention-days: 7
+
+      # Fail-fast attribution (Story #331) — aliased collateral explainer; see
+      # the lint tier's anchor (`&explain-cancellation`). MUST stay immediately
+      # before the cancel alias so the cancel step remains this job's last one.
+      - *explain-cancellation
 
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
@@ -1161,6 +1246,11 @@ jobs:
             **/playwright-report/
             **/test-results/
           retention-days: 14
+
+      # Fail-fast attribution (Story #331) — aliased collateral explainer; see
+      # the lint tier's anchor (`&explain-cancellation`). MUST stay immediately
+      # before the cancel alias so the cancel step remains this job's last one.
+      - *explain-cancellation
 
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
@@ -1357,6 +1447,11 @@ jobs:
           fi
           git diff --name-only --diff-filter=ACMRD "${merge_base}" "${HEAD_SHA}" \
             | node _mandrel-platform-scripts/scripts/check-destructive-migration.mjs "${args[@]}"
+
+      # Fail-fast attribution (Story #331) — aliased collateral explainer; see
+      # the lint tier's anchor (`&explain-cancellation`). MUST stay immediately
+      # before the cancel alias so the cancel step remains this job's last one.
+      - *explain-cancellation
 
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
@@ -1824,6 +1919,11 @@ jobs:
           run_semgrep
           echo "✅ Semgrep found no blocking findings."
 
+      # Fail-fast attribution (Story #331) — aliased collateral explainer; see
+      # the lint tier's anchor (`&explain-cancellation`). MUST stay immediately
+      # before the cancel alias so the cancel step remains this job's last one.
+      - *explain-cancellation
+
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
       # the LAST step; loud-but-non-fatal; ci-required counts cancelled as
@@ -1999,6 +2099,11 @@ jobs:
           baseline-ref: ${{ steps.osv-baseline.outputs.baseline-ref }}
           grace-days: ${{ inputs.osv-grace-days }}
 
+      # Fail-fast attribution (Story #331) — aliased collateral explainer; see
+      # the lint tier's anchor (`&explain-cancellation`). MUST stay immediately
+      # before the cancel alias so the cancel step remains this job's last one.
+      - *explain-cancellation
+
       # Opt-in fail-fast (Story #223) — aliased cancel step; see the lint
       # tier's anchor (`&cancel-on-failure`) for the full rationale (must be
       # the LAST step; loud-but-non-fatal; ci-required counts cancelled as
@@ -2041,6 +2146,16 @@ jobs:
       # runner (preinstalled on GitHub-hosted images). Guarded by
       # scripts/check-ci-required-aggregator.test.mjs — do not reintroduce a
       # hardcoded per-job env/loop list here.
+      #
+      # TRIAGE PARTITION (Story #331): a red aggregate used to print one flat
+      # `job(result)` list, so a fail-fast run — where ONE tier failed and the
+      # rest were cancelled as collateral — read as N equally-guilty jobs and
+      # triage blamed the wrong one. The results are now partitioned into jobs
+      # that failed on their own and jobs that were merely `cancelled`, on both
+      # the log and the job summary. This block is mirrored byte-for-byte
+      # between pr-quality.yml and ci.yml (the PARITY test) and must therefore
+      # stay free of any `inputs.*` reference — ci.yml has no workflow_call
+      # inputs, so `inputs.fail-fast` is unavailable to it.
       - name: Check all required job results
         shell: bash
         env:
@@ -2053,7 +2168,48 @@ jobs:
             | join(" ")
           ' <<<"${NEEDS_JSON}")"
 
+          # Jobs that reported their OWN failure — the ones worth triaging.
+          genuine="$(jq -r '
+            to_entries
+            | map(select(
+                .value.result != "success"
+                and .value.result != "skipped"
+                and .value.result != "cancelled"))
+            | map("\(.key)(\(.value.result))")
+            | join(" ")
+          ' <<<"${NEEDS_JSON}")"
+
+          # Jobs stopped by someone else — collateral of a fail-fast cancel.
+          collateral="$(jq -r '
+            to_entries
+            | map(select(.value.result == "cancelled"))
+            | map("\(.key)(\(.value.result))")
+            | join(" ")
+          ' <<<"${NEEDS_JSON}")"
+
           if [ -n "${failed}" ]; then
+            {
+              echo "### ❌ ci-required failed"
+              echo
+              if [ -n "${genuine}" ]; then
+                echo "**Failed on their own — triage these:** ${genuine}"
+              else
+                echo "**No job reported its own failure.** Every non-passing job"
+                echo "was cancelled; look for the run-level fail-fast annotation"
+                echo "naming the tier that tripped the cancellation."
+              fi
+              if [ -n "${collateral}" ]; then
+                echo
+                echo "**Cancelled — collateral, do not triage:** ${collateral}"
+              fi
+            } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+            if [ -n "${genuine}" ]; then
+              echo "❌ Failed on their own (triage these): ${genuine}" >&2
+            fi
+            if [ -n "${collateral}" ]; then
+              echo "⏹️  Cancelled — collateral, do not triage: ${collateral}" >&2
+            fi
             echo "❌ Failed jobs: ${failed}" >&2
             exit 1
           fi

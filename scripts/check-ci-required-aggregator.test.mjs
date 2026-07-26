@@ -176,7 +176,7 @@ function jqAvailable() {
   }
 }
 
-function runAggregator(needsResults) {
+function runAggregator(needsResults, { captureSummary = false } = {}) {
   const script = extractRunScript(blocks[0].steps);
   const dir = mkdtempSync(join(tmpdir(), "ci-required-"));
   try {
@@ -185,10 +185,22 @@ function runAggregator(needsResults) {
     const needsJson = Object.fromEntries(
       Object.entries(needsResults).map(([k, result]) => [k, { result, outputs: {} }])
     );
-    return spawnSync("bash", [file], {
-      encoding: "utf8",
-      env: { ...process.env, NEEDS_JSON: JSON.stringify(needsJson) },
-    });
+    const env = { ...process.env, NEEDS_JSON: JSON.stringify(needsJson) };
+    // The step-summary write must degrade when GITHUB_STEP_SUMMARY is unset
+    // (this harness, and any `act`-style local runner), so only define it when
+    // a test is actually asserting on the summary body.
+    const summaryPath = join(dir, "summary.md");
+    if (captureSummary) {
+      writeFileSync(summaryPath, "");
+      env.GITHUB_STEP_SUMMARY = summaryPath;
+    } else {
+      delete env.GITHUB_STEP_SUMMARY;
+    }
+    const r = spawnSync("bash", [file], { encoding: "utf8", env });
+    return {
+      ...r,
+      summary: captureSummary ? readFileSync(summaryPath, "utf8") : "",
+    };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -224,4 +236,71 @@ test("run script: every non-passing job is named", semantics, () => {
   assert.match(r.stderr, /lint\(failure\)/);
   assert.match(r.stderr, /unit\(cancelled\)/);
   assert.doesNotMatch(r.stderr, /e2e/);
+});
+
+// ---------------------------------------------------------------------------
+// 4. TRIAGE PARTITION (Story #331) — a fail-fast run reds N jobs but only one
+//    of them actually failed. The aggregate must say WHICH, so triage does not
+//    land on a collateral cancel.
+// ---------------------------------------------------------------------------
+
+test("run script: partitions own-failures from collateral cancels", semantics, () => {
+  const r = runAggregator({
+    lint: "success",
+    security: "failure",
+    unit: "cancelled",
+    e2e: "cancelled",
+  });
+  assert.equal(r.status, 1);
+
+  const own = r.stderr
+    .split("\n")
+    .find((l) => l.includes("Failed on their own"));
+  const collateral = r.stderr.split("\n").find((l) => l.includes("Cancelled"));
+
+  assert.ok(own, `no own-failure line in stderr:\n${r.stderr}`);
+  assert.ok(collateral, `no collateral line in stderr:\n${r.stderr}`);
+
+  // The tier that actually failed is named ONLY on the triage line, and the
+  // cancelled siblings ONLY on the collateral line — a partition, not two
+  // copies of the same flat list.
+  assert.match(own, /security\(failure\)/);
+  assert.doesNotMatch(own, /unit|e2e/);
+  assert.match(collateral, /unit\(cancelled\)/);
+  assert.match(collateral, /e2e\(cancelled\)/);
+  assert.doesNotMatch(collateral, /security/);
+});
+
+test("run script: an all-cancelled aggregate says no job failed on its own", semantics, () => {
+  const r = runAggregator({ lint: "success", unit: "cancelled" }, { captureSummary: true });
+  assert.equal(r.status, 1);
+  assert.doesNotMatch(r.stderr, /Failed on their own/);
+  assert.match(r.summary, /No job reported its own failure/);
+});
+
+test("run script: writes the triage partition to the job summary", semantics, () => {
+  const r = runAggregator(
+    { security: "failure", unit: "cancelled" },
+    { captureSummary: true }
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.summary, /ci-required failed/);
+  assert.match(r.summary, /Failed on their own[^\n]*security\(failure\)/);
+  assert.match(r.summary, /Cancelled[^\n]*do not triage:[^\n]*unit\(cancelled\)/);
+});
+
+test("run script: a green aggregate writes no summary", semantics, () => {
+  const r = runAggregator({ lint: "success", unit: "success" }, { captureSummary: true });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.summary, "");
+});
+
+test("run script: survives an unset GITHUB_STEP_SUMMARY", semantics, () => {
+  // The failure path writes a summary; with the variable unset (local runners,
+  // `act`, this harness) the redirect must degrade rather than error out and
+  // swallow the exit-1 verdict.
+  const r = runAggregator({ unit: "failure" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /unit\(failure\)/);
+  assert.doesNotMatch(r.stderr, /ambiguous redirect|No such file or directory/);
 });
