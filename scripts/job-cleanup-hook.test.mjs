@@ -136,11 +136,20 @@ test("removes this runner's own stale tool-download and pnpm-shim leftovers", ()
   assert.equal(existsSync(join(runnerTmp, "gh-api-err.AbCdEf")), false);
 });
 
-test("leaves the shared temp root untouched even when it is large", () => {
-  // 5,000 entries stands in for the 841,690 observed on the swarm-os host —
-  // enough that an accidental enumeration is real work, small enough to plant
-  // quickly. The assertion is on effect, not duration.
-  const sandbox = makeSandbox({ sharedEntries: 5000 });
+test("leaves the shared temp root untouched", () => {
+  // The decoy is deliberately SMALL. An earlier draft planted 5,000 entries to
+  // evoke the 841,690 seen on the swarm-os host, but that bought no signal: the
+  // assertion below is on effect (nothing deleted), which is count-independent,
+  // and the companion structural test — not a stopwatch — is what pins the
+  // cost property. Planting alone cost ~87s on a dev Mac whose endpoint
+  // security scans every write (~17ms/file), which would have made this the
+  // slowest test in the suite by two orders of magnitude, and a flaky one.
+  //
+  // What actually matters is pattern COVERAGE, and makeSandbox plants every
+  // shape — both the retired sweep's names and the current runner-scoped
+  // globs — so a sweep pointed back at the shared root is caught by the first
+  // entry it would match.
+  const sandbox = makeSandbox({ sharedEntries: 20 });
   const { sharedTmp } = sandbox;
 
   const before = readdirSync(sharedTmp).sort();
@@ -157,12 +166,43 @@ test("leaves the shared temp root untouched even when it is large", () => {
 test("the script text contains no enumeration rooted at the shared temp root", () => {
   const source = readFileSync(SCRIPT, "utf8");
 
-  // A `find` over the shared root is the #343 defect itself: unbounded cost,
-  // charged to the job, hunting names the platform never creates.
+  // Assert the PROPERTY (the hook cannot reach the shared root at all), not
+  // one syntactic form of violating it. Pinning a specific `find "${TMP…"`
+  // shape would miss an unbraced `$TMPDIR`, an `ls | grep`, a `for f in
+  // "${TMP}"/…` loop, or a renamed intermediate variable — all of which
+  // reintroduce the unbounded read this Story removed.
+  //
+  // Every one of those must name the shared root to reach it, and the hook has
+  // no legitimate use for it: RUNNER_TMP derives from RUNNER_DIR. So the
+  // absence of the name is both necessary and sufficient, and it stays a true
+  // invariant rather than a regex chasing syntax.
+  //
+  // Comments are stripped first: the header documents the #343 incident by
+  // name, and that prose is the reason the next maintainer will not re-add the
+  // sweep. Asserting over raw text would force the fix to delete its own
+  // rationale.
+  const code = source
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+
   assert.equal(
-    /find\s+"\$\{TMP[^R]/.test(source),
+    /TMPDIR/.test(code),
     false,
-    "the hook enumerates the shared temp root — cost must scale with runner-owned state only",
+    "the hook references the shared temp root — its cost must scale with runner-owned state only",
+  );
+
+  // Second half of the property: no directory enumeration, anywhere. Naming
+  // the shared root is one way to reintroduce unbounded cost; a `find` rooted
+  // at an intermediate variable is another, and it would not have to mention
+  // TMPDIR on the same line. The hook has no legitimate need to enumerate —
+  // it addresses known paths under RUNNER_TMP directly — so the absence of
+  // `find` is a stronger and more durable invariant than any pattern match
+  // over its arguments.
+  assert.equal(
+    /\bfind\b/.test(code),
+    false,
+    "the hook enumerates a directory — address known runner-owned paths directly instead",
   );
 
   // The age gate existed solely to make deleting from the SHARED root safe.
