@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.0.1...mandrel-platform-v1.1.0) (2026-07-26)
+
+
+### Added
+
+* **pr-quality:** add caller-tunable `tier-timeouts` and the `timed-out` provenance class ([#349](https://github.com/dsj1984/mandrel-platform/issues/349)) ([745bb7b](https://github.com/dsj1984/mandrel-platform/commit/745bb7b901216c32b569f950b96c99db6029379e))
+
+
+### Fixed
+
+* runner-kit: scope platform temp artifacts to $RUNNER_TEMP and bound the job-started hook's sweep ([#345](https://github.com/dsj1984/mandrel-platform/issues/345)) ([#347](https://github.com/dsj1984/mandrel-platform/issues/347)) ([6edf53e](https://github.com/dsj1984/mandrel-platform/commit/6edf53e9d18c59b996f84a78e0ae5eeae5d71950))
+* **scripts:** make the docs-staleness rules precise (JSON expiries, bare quality.yml) ([#350](https://github.com/dsj1984/mandrel-platform/issues/350)) ([92adac1](https://github.com/dsj1984/mandrel-platform/commit/92adac1ed7f01224b91fc9b7bd8b0db5fe082ed9))
+* **scripts:** validate CVE allowlist expiry dates instead of string-comparing them ([#351](https://github.com/dsj1984/mandrel-platform/issues/351)) ([f0eff71](https://github.com/dsj1984/mandrel-platform/commit/f0eff718ad6a9fcfed7042d055027b71575afefa))
+
 ## [1.0.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.0.0...mandrel-platform-v1.0.1) (2026-07-26)
 
 
