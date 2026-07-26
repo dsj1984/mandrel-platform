@@ -34,9 +34,15 @@
  *     {
  *       "id": "GHSA-xxxx-xxxx-xxxx",  // GitHub Advisory ID or CVE ID
  *       "reason": "No fix available; mitigated by X",
- *       "expires": "2026-12-31"        // ISO 8601 date — REQUIRED
+ *       "expires": "2026-12-31"        // REQUIRED — strictly YYYY-MM-DD
  *     }
  *   ]
+ *
+ * `expires` is validated, not merely read: it must be exactly `YYYY-MM-DD` and
+ * a real calendar date. Anything else (a `<YYYY-MM-DD>` placeholder, a
+ * `12/31/2026`, an impossible `2026-02-30`) is a hard configuration error that
+ * exits 1 — it is NEVER treated as a distant future date, which would suppress
+ * the advisory forever.
  *
  * The allowlist file path defaults to `audit-allowlist.json` in the
  * directory from which this script is invoked (i.e. the project root).
@@ -58,30 +64,116 @@ const BLOCKING_SEVERITIES = new Set(["high", "critical"]);
  */
 
 /**
+ * Strictly parse a `YYYY-MM-DD` calendar date, returning UTC midnight in ms —
+ * or `null` when the value is not exactly that.
+ *
+ * Deliberately strict, because this validates a *config field* that decides
+ * whether a High/Critical CVE stays suppressed. Anything unparseable must be
+ * rejected outright rather than coerced, so:
+ *
+ *   - The regex is anchored. A value that merely CONTAINS a date is not a date,
+ *     which is what rejects `<YYYY-MM-DD>`, `expires 2026-01-01`, `12/31/2026`
+ *     and `2026-01-01T00:00:00Z`.
+ *   - The result is round-tripped. `Date.UTC` silently rolls overflow over
+ *     (`2026-13-45` → 2027-01-14, `2026-02-30` → 2026-03-02) and never returns
+ *     NaN for it, so comparing the parsed instant's calendar fields back
+ *     against the input is the only way to reject an impossible date.
+ *
+ * One consequence of the round-trip, noted rather than worked around: years
+ * 0–99 are rejected, because `Date.UTC` maps them into 1900–1999 (legacy
+ * two-digit-year behaviour) and so fail the comparison. No real expiry lands
+ * there, and rejecting is the fail-closed direction.
+ *
+ * @param {unknown} value
+ * @returns {number|null} UTC ms at midnight, or null when not a valid date
+ */
+export function parseIsoDateUtc(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) {
+    return null;
+  }
+
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const ms = Date.UTC(year, month - 1, day);
+  const back = new Date(ms);
+
+  if (
+    back.getUTCFullYear() !== year ||
+    back.getUTCMonth() !== month - 1 ||
+    back.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return ms;
+}
+
+/**
  * Partition allowlist entries into the active (non-expired) suppression set
  * and the list of expired entries, relative to `today` (a `YYYY-MM-DD`
- * string). Entries missing a required `id` or `expires` field are surfaced
- * in `invalid` so the caller can fail closed on a malformed allowlist.
+ * string).
+ *
+ * Entries that are unusable — missing/non-string `id`, or an `expires` that is
+ * not a valid `YYYY-MM-DD` calendar date — are surfaced in `invalid` with the
+ * specific `problem`, so the caller can fail closed and name what is wrong.
+ * Treating `expires` as an opaque string was a fail-OPEN: the comparison was
+ * lexicographic, and every non-date value a caller might plausibly write
+ * (`<YYYY-MM-DD>` copy-pasted from the runbook, `not-a-date`, a typo) sorts
+ * ABOVE a real `20xx-..-..` date and so read as "not yet expired" — turning a
+ * malformed field into a permanent, silent CVE suppression.
  *
  * @param {AllowlistEntry[]} allowlist
  * @param {string} today `YYYY-MM-DD`
- * @returns {{ suppressed: Set<string>; expired: AllowlistEntry[]; invalid: AllowlistEntry[] }}
+ * @returns {{ suppressed: Set<string>; expired: AllowlistEntry[]; invalid: Array<{ entry: unknown; problem: string }> }}
  */
 export function partitionAllowlist(allowlist, today) {
   /** @type {Set<string>} */
   const suppressed = new Set();
   /** @type {AllowlistEntry[]} */
   const expired = [];
-  /** @type {AllowlistEntry[]} */
+  /** @type {Array<{ entry: unknown; problem: string }>} */
   const invalid = [];
 
+  const todayMs = parseIsoDateUtc(today);
+  if (todayMs === null) {
+    // Caller bug, not user data: `today` is derived from the system clock via
+    // toISOString(). Throwing beats any fallback, both of which would silently
+    // mis-classify every entry.
+    throw new Error(
+      `partitionAllowlist: "today" must be a YYYY-MM-DD date, got ${JSON.stringify(today)}.`,
+    );
+  }
+
   for (const entry of allowlist) {
-    if (!entry || !entry.id || !entry.expires) {
-      invalid.push(entry);
+    if (!entry || typeof entry !== "object") {
+      invalid.push({ entry, problem: "entry is not an object" });
       continue;
     }
 
-    if (entry.expires < today) {
+    if (typeof entry.id !== "string" || entry.id.trim() === "") {
+      invalid.push({ entry, problem: 'missing or non-string "id"' });
+      continue;
+    }
+
+    const expiresMs = parseIsoDateUtc(entry.expires);
+    if (expiresMs === null) {
+      invalid.push({
+        entry,
+        problem:
+          entry.expires === undefined || entry.expires === null
+            ? 'missing required "expires"'
+            : `"expires" is not a valid YYYY-MM-DD date: ${JSON.stringify(entry.expires)}`,
+      });
+      continue;
+    }
+
+    if (expiresMs < todayMs) {
       expired.push(entry);
     } else {
       suppressed.add(entry.id);
@@ -299,11 +391,19 @@ export function runCli(argv) {
   const { suppressed, expired, invalid } = partitionAllowlist(allowlist, today);
 
   if (invalid.length > 0) {
-    for (const entry of invalid) {
-      console.error(
-        `[audit-check] ERROR: Allowlist entry missing required "id" or "expires" field: ${JSON.stringify(entry)}`,
-      );
+    console.error("[audit-check] INVALID allowlist entries detected:");
+    for (const { entry, problem } of invalid) {
+      const id =
+        entry && typeof entry === "object" && typeof entry.id === "string"
+          ? entry.id
+          : "<no id>";
+      console.error(`  - ${id}: ${problem}`);
     }
+    console.error(
+      "[audit-check] An entry whose expiry cannot be read is never suppressed. " +
+        'Fix each entry to carry a non-empty "id" and an "expires" of the form ' +
+        "YYYY-MM-DD. Exit 1.",
+    );
     return 1;
   }
 
