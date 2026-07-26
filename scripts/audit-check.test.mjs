@@ -8,6 +8,16 @@
  *   - a validly-suppressed high advisory (by GHSA id and by CVE id) passes
  *   - an expired allowlist entry fails closed (exit 1)
  *   - an unsuppressed critical fails closed (exit 1)
+ *   - a MALFORMED `expires` fails closed rather than suppressing forever
+ *
+ * That last one was a fail-OPEN. `expires` was compared as an opaque string
+ * (`entry.expires < today`), so any non-date value sorted lexicographically
+ * above a real `20xx-..-..` date and read as "not yet expired" — making a
+ * typo'd or placeholder expiry a permanent, silent CVE suppression. The
+ * `<YYYY-MM-DD>` placeholder the dependency-update runbook shows as its example
+ * value is the realistic way in. `parseIsoDateUtc` now validates the field, and
+ * the tests below assert the invariant (nothing unreadable is ever suppressed)
+ * across every malformed shape rather than the one spelling that motivated it.
  *
  * The suppression/expiry/interpretation logic is exercised through the pure
  * functions (`partitionAllowlist`, `isInterpretableReport`,
@@ -26,6 +36,7 @@ import { join } from "node:path";
 
 import {
   partitionAllowlist,
+  parseIsoDateUtc,
   isInterpretableReport,
   extractBlockingAdvisories,
   evaluateReport,
@@ -97,6 +108,154 @@ test("partitionAllowlist: entry missing id or expires is invalid", () => {
     TODAY,
   );
   assert.equal(invalid.length, 2);
+});
+
+test("partitionAllowlist: an expiry equal to today is still active, not expired", () => {
+  const { suppressed, expired } = partitionAllowlist(
+    [{ id: "GHSA-today", expires: TODAY }],
+    TODAY,
+  );
+  assert.ok(suppressed.has("GHSA-today"));
+  assert.equal(expired.length, 0);
+});
+
+// ── partitionAllowlist: the malformed-expiry fail-open ──────────────────────
+//
+// `expires` used to be compared as an opaque string (`entry.expires < today`),
+// so any non-date value sorted lexicographically ABOVE a real `20xx-..-..`
+// date and read as "not yet expired". A malformed field therefore became a
+// PERMANENT, SILENT CVE suppression — the exact inverse of what an expiry is
+// for. The realistic path in: `docs/runbooks/dependency-update.md` shows
+// `"expires": "<YYYY-MM-DD>"` as the example value, and `<` (0x3C) sorts above
+// `2` (0x32).
+//
+// The assertion below is on the invariant — nothing unreadable is EVER
+// suppressed — rather than on the handful of spellings that motivated it.
+
+const MALFORMED_EXPIRIES = [
+  ["<YYYY-MM-DD>", "runbook placeholder, copy-pasted verbatim"],
+  ["YYYY-MM-DD", "placeholder without brackets"],
+  ["not-a-date", "free text"],
+  ["expres 2026", "typo'd key/value smashed together"],
+  ["12/31/2026", "US-style separators"],
+  ["31-12-2026", "day-first ordering"],
+  ["2026-1-1", "unpadded month/day"],
+  ["2026-01-01T00:00:00Z", "full ISO 8601 timestamp, not a bare date"],
+  [" 2026-01-01 ", "surrounding whitespace"],
+  ["2026-01-01extra", "trailing junk"],
+  ["2026-13-01", "impossible month"],
+  ["2026-02-30", "impossible day for the month"],
+  ["", "empty string"],
+  [0, "number"],
+  [20261231, "date-ish number"],
+  [null, "null"],
+  [undefined, "undefined"],
+  [{ year: 2026 }, "object"],
+  [["2026-01-01"], "array"],
+  [true, "boolean"],
+];
+
+test("partitionAllowlist: no malformed expiry is ever suppressed (fail closed)", () => {
+  for (const [expires, label] of MALFORMED_EXPIRIES) {
+    const { suppressed, expired, invalid } = partitionAllowlist(
+      [{ id: "GHSA-aaaa-bbbb-cccc", reason: "why", expires }],
+      TODAY,
+    );
+    assert.equal(
+      suppressed.size,
+      0,
+      `${label} (${JSON.stringify(expires)}) must not suppress`,
+    );
+    assert.equal(
+      expired.length,
+      0,
+      `${label} (${JSON.stringify(expires)}) is unreadable, not expired`,
+    );
+    assert.equal(
+      invalid.length,
+      1,
+      `${label} (${JSON.stringify(expires)}) must be reported invalid`,
+    );
+  }
+});
+
+test("partitionAllowlist: an invalid entry names the offending id and problem", () => {
+  const { invalid } = partitionAllowlist(
+    [{ id: "GHSA-aaaa-bbbb-cccc", expires: "<YYYY-MM-DD>" }],
+    TODAY,
+  );
+  assert.equal(invalid.length, 1);
+  assert.equal(invalid[0].entry.id, "GHSA-aaaa-bbbb-cccc");
+  assert.match(invalid[0].problem, /expires/);
+  assert.match(invalid[0].problem, /YYYY-MM-DD/);
+});
+
+test("partitionAllowlist: a valid entry alongside a malformed one still fails closed", () => {
+  // The malformed entry must not be quietly skipped while the good one passes:
+  // the CLI gates on `invalid.length`, so the run has to stop.
+  const { suppressed, invalid } = partitionAllowlist(
+    [
+      { id: "GHSA-good", expires: FUTURE },
+      { id: "GHSA-bad", expires: "<YYYY-MM-DD>" },
+    ],
+    TODAY,
+  );
+  assert.ok(suppressed.has("GHSA-good"));
+  assert.equal(invalid.length, 1);
+  assert.equal(invalid[0].entry.id, "GHSA-bad");
+});
+
+test("partitionAllowlist: a non-string id is invalid, never a suppression key", () => {
+  for (const id of [42, null, undefined, "", "   ", {}, ["GHSA-x"]]) {
+    const { suppressed, invalid } = partitionAllowlist(
+      [{ id, expires: FUTURE }],
+      TODAY,
+    );
+    assert.equal(suppressed.size, 0, `id ${JSON.stringify(id)} must not suppress`);
+    assert.equal(invalid.length, 1);
+  }
+});
+
+test("partitionAllowlist: throws when `today` is not a YYYY-MM-DD date", () => {
+  assert.throws(
+    () => partitionAllowlist([{ id: "GHSA-x", expires: FUTURE }], "not-a-date"),
+    /must be a YYYY-MM-DD date/,
+  );
+});
+
+// ── parseIsoDateUtc ─────────────────────────────────────────────────────────
+
+test("parseIsoDateUtc: accepts a real calendar date and returns UTC midnight", () => {
+  assert.equal(parseIsoDateUtc("2026-07-02"), Date.UTC(2026, 6, 2));
+  assert.equal(parseIsoDateUtc("2024-02-29"), Date.UTC(2024, 1, 29)); // leap year
+  assert.equal(parseIsoDateUtc("2999-12-31"), Date.UTC(2999, 11, 31));
+});
+
+test("parseIsoDateUtc: rejects overflow dates that Date.UTC would roll over", () => {
+  // Date.UTC(2026, 12, 45) is 2027-01-14, not NaN — only a round-trip catches it.
+  assert.equal(parseIsoDateUtc("2026-13-45"), null);
+  assert.equal(parseIsoDateUtc("2026-02-30"), null);
+  assert.equal(parseIsoDateUtc("2025-02-29"), null); // 2025 is not a leap year
+  assert.equal(parseIsoDateUtc("2026-00-10"), null);
+  assert.equal(parseIsoDateUtc("2026-01-00"), null);
+});
+
+test("parseIsoDateUtc: rejects every malformed shape", () => {
+  for (const [value, label] of MALFORMED_EXPIRIES) {
+    assert.equal(
+      parseIsoDateUtc(value),
+      null,
+      `${label} (${JSON.stringify(value)}) must not parse`,
+    );
+  }
+});
+
+test("parseIsoDateUtc: ordering is chronological, not lexicographic", () => {
+  // The bug in one line: as strings, "<YYYY-MM-DD>" > "2026-07-02".
+  assert.ok("<YYYY-MM-DD>" > "2026-07-02");
+  // Parsed, it has no ordering at all — it is simply not a date.
+  assert.equal(parseIsoDateUtc("<YYYY-MM-DD>"), null);
+  assert.ok(parseIsoDateUtc("2026-01-01") < parseIsoDateUtc("2026-07-02"));
 });
 
 // ── isInterpretableReport ───────────────────────────────────────────────────
@@ -214,6 +373,42 @@ test("runCli: malformed allowlist entry (missing expires) → exit non-zero", ()
     );
     const exit = runCli(["--allowlist", allowlistPath]);
     assert.equal(exit, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCli: placeholder expiry copy-pasted from the runbook → exit non-zero", () => {
+  // The end-to-end shape of the fail-open: before validation this entry was
+  // suppressed forever, and runCli went on to pass the advisory it covered.
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-placeholder-"));
+  try {
+    const allowlistPath = join(dir, "audit-allowlist.json");
+    writeFileSync(
+      allowlistPath,
+      JSON.stringify([
+        {
+          id: "GHSA-aaaa-bbbb-cccc",
+          reason: "No fix available; upstream tracking issue: <URL>",
+          expires: "<YYYY-MM-DD>",
+        },
+      ]),
+    );
+    assert.equal(runCli(["--allowlist", allowlistPath]), 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCli: impossible calendar date in expires → exit non-zero", () => {
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-impossible-"));
+  try {
+    const allowlistPath = join(dir, "audit-allowlist.json");
+    writeFileSync(
+      allowlistPath,
+      JSON.stringify([{ id: "GHSA-aaaa-bbbb-cccc", expires: "2026-02-30" }]),
+    );
+    assert.equal(runCli(["--allowlist", allowlistPath]), 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
