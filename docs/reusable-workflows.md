@@ -220,6 +220,40 @@ Semantics and caveats:
   not complete. The failing tier's own uploads do complete — the cancel step
   is deliberately the *last* step of each tier job.
 
+#### Triaging a fail-fast cancel
+
+GitHub records a bare `cancelled` conclusion on every sibling tier a fail-fast
+cancel stops, with nothing to distinguish it from a tier that failed on its own.
+A job-status scan then reads N red jobs and blames the wrong one — the
+swarm-os run 30168441137 triage failure, where the Accessibility tier failed on
+a transient build flake and Typecheck (which had already passed its own work
+step) took the blame.
+
+The workflow therefore writes the attribution itself, at three independent
+surfaces — so no single one is load-bearing:
+
+| Surface | Where it appears | What it tells you |
+| --- | --- | --- |
+| **Trigger annotation** (authoritative) | Run-level `::error title=fail-fast::` + the failing job's summary | Which tier tripped fail-fast. Written by the failing tier *before* it requests the cancel, so it survives a cancel call that fails for lack of `actions: write`. |
+| **Collateral explainer** (best effort) | Each cancelled tier's `::notice::` + job summary | "This tier did **not** fail — it was cancelled as collateral", plus the real culprit resolved from the Actions API. |
+| **Aggregate partition** | The `ci-required` log and job summary | Non-passing jobs split into *failed on their own* vs *cancelled — collateral, do not triage*. |
+
+Read them in that order: the trigger annotation is the ground truth. The
+collateral explainer is best-effort by design — it runs inside the runner's
+bounded cancellation grace period (hence its `timeout-minutes: 1`), so when the
+API lookup does not land in time it says so and points you at the run-level
+annotation rather than guessing. Neither step can fail a job: both exit `0`
+unconditionally, exactly like the cancel step itself.
+
+Two consequences worth stating explicitly:
+
+- **A cancelled tier is still red for branch protection.** Attribution changes
+  what the *operator* reads, never what `ci-required` decides — a `cancelled`
+  tier remains non-success, as the fail-fast design requires.
+- **No new permission is required.** The culprit lookup uses `gh run view`,
+  which needs only `actions: read` — already covered by the `actions: write`
+  the cancel step required. Callers that already run fail-fast need no change.
+
 ### Affected-only tier execution (`affected`)
 
 By default every diff-scoped tier (lint, typecheck, unit, contract, e2e) runs

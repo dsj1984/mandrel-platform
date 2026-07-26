@@ -272,6 +272,16 @@ jobs:
       # runner (preinstalled on GitHub-hosted images). Guarded by
       # scripts/check-ci-required-aggregator.test.mjs — do not reintroduce a
       # hardcoded per-job env/loop list here.
+      #
+      # TRIAGE PARTITION (Story #331): a red aggregate used to print one flat
+      # `job(result)` list, so a fail-fast run — where ONE tier failed and the
+      # rest were cancelled as collateral — read as N equally-guilty jobs and
+      # triage blamed the wrong one. The results are now partitioned into jobs
+      # that failed on their own and jobs that were merely `cancelled`, on both
+      # the log and the job summary. This block is mirrored byte-for-byte
+      # between pr-quality.yml and ci.yml (the PARITY test) and must therefore
+      # stay free of any `inputs.*` reference — ci.yml has no workflow_call
+      # inputs, so `inputs.fail-fast` is unavailable to it.
       - name: Check all required job results
         shell: bash
         env:
@@ -284,7 +294,48 @@ jobs:
             | join(" ")
           ' <<<"${NEEDS_JSON}")"
 
+          # Jobs that reported their OWN failure — the ones worth triaging.
+          genuine="$(jq -r '
+            to_entries
+            | map(select(
+                .value.result != "success"
+                and .value.result != "skipped"
+                and .value.result != "cancelled"))
+            | map("\(.key)(\(.value.result))")
+            | join(" ")
+          ' <<<"${NEEDS_JSON}")"
+
+          # Jobs stopped by someone else — collateral of a fail-fast cancel.
+          collateral="$(jq -r '
+            to_entries
+            | map(select(.value.result == "cancelled"))
+            | map("\(.key)(\(.value.result))")
+            | join(" ")
+          ' <<<"${NEEDS_JSON}")"
+
           if [ -n "${failed}" ]; then
+            {
+              echo "### ❌ ci-required failed"
+              echo
+              if [ -n "${genuine}" ]; then
+                echo "**Failed on their own — triage these:** ${genuine}"
+              else
+                echo "**No job reported its own failure.** Every non-passing job"
+                echo "was cancelled; look for the run-level fail-fast annotation"
+                echo "naming the tier that tripped the cancellation."
+              fi
+              if [ -n "${collateral}" ]; then
+                echo
+                echo "**Cancelled — collateral, do not triage:** ${collateral}"
+              fi
+            } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+            if [ -n "${genuine}" ]; then
+              echo "❌ Failed on their own (triage these): ${genuine}" >&2
+            fi
+            if [ -n "${collateral}" ]; then
+              echo "⏹️  Cancelled — collateral, do not triage: ${collateral}" >&2
+            fi
             echo "❌ Failed jobs: ${failed}" >&2
             exit 1
           fi
