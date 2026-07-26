@@ -290,6 +290,8 @@ jobs:
       #                   explains every cancel in the run. Checked FIRST: a
       #                   queued job cancelled before it started would
       #                   otherwise be misread as an infra hang.
+      #   timed-out     — the job ran for its own `timeout-minutes` ceiling and
+      #                   GitHub killed it. A CONFIG fault, not infra.
       #   never-started — a cancelled job executed no step (empty `steps[]`, or
       #                   every step `skipped`/null). The infra signature: a
       #                   provisioning hook hung and the job never ran.
@@ -297,23 +299,51 @@ jobs:
       #                   so this run is not authoritative.
       #   unknown       — the lookup failed, `gh` is absent, or nothing matched.
       #
+      # TIMED-OUT (Story #342): a job GitHub killed at its own ceiling used to
+      # be reported as `stopped-mid-step` — or, when it was killed before
+      # completing a step, misreported as `never-started`. Both readings send
+      # triage at the runner fleet, when the fix is to change a number in the
+      # workflow. Detection compares each cancelled job's wall duration against
+      # its own ceiling, passed in as TIER_TIMEOUT_MINUTES below; the check-run
+      # annotations API carrying GitHub's own timeout message is deliberately
+      # NOT used, because reading it needs `checks: read` and pr-quality.yml
+      # cannot declare a new scope without breaking every consumer at compile
+      # time. See the fuller note on the pr-quality.yml side of this mirror.
+      #
       # The classification is REPORTED under both policies; `CANCELLED_POLICY`
       # only decides whether a `superseded` run's cancels still red the gate.
-      # A `never-started` cancel is never neutralized: that tier produced no
-      # test signal, and passing on a tier that never ran is the same vacuous
-      # pass the all-skipped guard below refuses.
+      # Neither a `never-started` nor a `timed-out` cancel is ever neutralized:
+      # that tier produced no test signal, and passing on a tier that never
+      # ran — or was killed before finishing — is the same vacuous pass the
+      # all-skipped guard below refuses.
       #
       # This block is mirrored between pr-quality.yml and ci.yml: the `run:`
       # script is byte-identical and both declare the same `env:` keys (the
-      # PARITY test). Only how `CANCELLED_POLICY` is SOURCED may differ —
-      # ci.yml has no workflow_call inputs — so the script must read it from
-      # the environment and never reference `inputs.*` directly.
+      # PARITY test). Only how `CANCELLED_POLICY` and `TIER_TIMEOUT_MINUTES`
+      # are SOURCED may differ — ci.yml has no workflow_call inputs and has its
+      # own tiers — so the script must read them from the environment and never
+      # reference `inputs.*` directly.
       - name: Check all required job results
         shell: bash
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           # ci.yml has no workflow_call inputs — source the literal default.
           CANCELLED_POLICY: strict
+          # This repo's own base budgets. ci.yml has no workflow_call inputs,
+          # so there is no caller override map to union in. The `security` tier
+          # is a pr-quality.yml self-call whose inner jobs run under THAT
+          # workflow's ceilings and are classified by its own aggregator; they
+          # are not listed here.
+          #
+          # Note the match is by duration, not by job, so it cannot be scoped to
+          # this repo's own jobs: a nested pr-quality job ending at 5 or 10
+          # minutes would also be labelled `timed-out`. That is bounded and
+          # benign in both directions — a nested job killed at a ceiling this
+          # list omits (15/20/45) simply keeps its previous label, and every
+          # class here is red either way, so the only thing at stake is which
+          # word the summary prints.
+          TIER_TIMEOUT_BASES: '[5, 10]'
+          TIER_TIMEOUT_OVERRIDES: '{}'
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
@@ -362,19 +392,60 @@ jobs:
                 --json jobs,workflowDatabaseId,headBranch,createdAt 2>/dev/null || true)"
             fi
 
+            # The distinct ceilings in force = this workflow's base budgets ∪ the
+            # caller's override values. Either input being unset or unparseable
+            # degrades that side to empty, which only ever costs the `timed-out`
+            # label — never a misclassification, and never a pass, since every
+            # class here is red.
+            bases="${TIER_TIMEOUT_BASES:-}"
+            if [ -z "${bases}" ] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"${bases}"; then
+              bases='[]'
+            fi
+            overrides="${TIER_TIMEOUT_OVERRIDES:-}"
+            if [ -z "${overrides}" ] || ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${overrides}"; then
+              overrides='{}'
+            fi
+            ceilings="$(jq -cn --argjson b "${bases}" --argjson o "${overrides}" \
+              '($b + [ $o[] ]) | map(select(type == "number" and . > 0)) | unique' \
+              2>/dev/null || echo '[]')"
+
             if [ -n "${run_json}" ]; then
-              # Per-cancelled-job detail, for the human reading the report.
-              detail="$(jq -r '
+              # Per-cancelled-job detail, for the human reading the report. A
+              # job GitHub killed at its ceiling reports a wall duration landing
+              # ON that ceiling. GitHub never kills EARLY, so the window below
+              # the ceiling is only the 5s that second-resolution timestamps can
+              # round away; above it, 60s absorbs the kill delay. Keeping the
+              # low side tight matters: the seconds just UNDER a ceiling are
+              # where an ordinary fail-fast or superseded cancel of a
+              # long-running job is most likely to land, and a false `timed-out`
+              # there would be a confident wrong answer rather than a missing
+              # one. A cancelled job matching no ceiling keeps its existing
+              # classification.
+              detail="$(jq -r --argjson ceilings "${ceilings}" '
+                def matched_ceiling:
+                  (try ((.completedAt | fromdateiso8601) - (.startedAt | fromdateiso8601)) catch null) as $d
+                  | if $d == null then null
+                    else [ $ceilings[] | select(($d >= ((. * 60) - 5)) and ($d <= ((. * 60) + 60))) ] | first
+                    end;
                 [ .jobs[]? | select(.conclusion == "cancelled") ] as $stopped
                 | ([ .jobs[]? | select(.conclusion == "failure") ] | length > 0) as $any_failed
                 | $stopped
                 | map(
                     ((.steps // []) | map(select(.conclusion != null and .conclusion != "skipped")) | length) as $ran
-                    | "\(.name): " + (if $any_failed then "fail-fast" elif $ran == 0 then "never-started" else "stopped-mid-step" end))
+                    | matched_ceiling as $ceiling
+                    | "\(.name): " + (if $any_failed then "fail-fast" elif $ceiling != null then "timed-out (hit its \($ceiling)m ceiling)" elif $ran == 0 then "never-started" else "stopped-mid-step" end))
                 | join("; ")
               ' <<<"${run_json}" 2>/dev/null || true)"
 
               any_failed="$(jq -r '[ .jobs[]? | select(.conclusion == "failure") ] | length' <<<"${run_json}" 2>/dev/null || echo 0)"
+              timed_out="$(jq -r --argjson ceilings "${ceilings}" '
+                def matched_ceiling:
+                  (try ((.completedAt | fromdateiso8601) - (.startedAt | fromdateiso8601)) catch null) as $d
+                  | if $d == null then null
+                    else [ $ceilings[] | select(($d >= ((. * 60) - 5)) and ($d <= ((. * 60) + 60))) ] | first
+                    end;
+                [ .jobs[]? | select(.conclusion == "cancelled") | select(matched_ceiling != null) ] | length
+              ' <<<"${run_json}" 2>/dev/null || echo 0)"
               never_started="$(jq -r '
                 [ .jobs[]?
                   | select(.conclusion == "cancelled")
@@ -384,6 +455,8 @@ jobs:
 
               if [ "${any_failed:-0}" -gt 0 ]; then
                 run_class="fail-fast"
+              elif [ "${timed_out:-0}" -gt 0 ]; then
+                run_class="timed-out"
               elif [ "${never_started:-0}" -gt 0 ]; then
                 run_class="never-started"
               else
@@ -461,6 +534,19 @@ jobs:
                   echo "step, so it produced no test signal. It is not neutralized by any"
                   echo "policy — a gate that passes on a tier which never ran is a"
                   echo "vacuous pass."
+                fi
+                if [ "${run_class}" = "timed-out" ]; then
+                  echo
+                  echo "A \`timed-out\` cancel is a CONFIG fault, not an infra one: the tier"
+                  echo "named above exceeded its own \`timeout-minutes\` ceiling and GitHub"
+                  echo "killed it. Nothing hung — do NOT escalate to whoever owns the"
+                  echo "runners. Raise that tier's entry in the \`tier-timeouts\` input"
+                  echo "(or cut its work): on a self-hosted fleet the pre-job"
+                  echo "\`Set up runner\` wait is charged against the same clock, so a"
+                  echo "tier's real budget is work + queue wait. Size the entry as the"
+                  echo "tier's default budget plus your pool's p90 setup time. Like"
+                  echo "\`never-started\`, it produced no complete signal, so no policy"
+                  echo "neutralizes it."
                 fi
               fi
             } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
