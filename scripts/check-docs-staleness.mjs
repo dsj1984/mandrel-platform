@@ -90,7 +90,14 @@ export const RULES = [
   {
     id: 'quality-yml-ref',
     description: 'References `quality.yml` — verify this file exists in the project (swarm-os ships `ci.yml` instead)',
-    pattern: /quality\.yml/g,
+    // The bare filename only — the lookbehind stops the platform's OWN
+    // `pr-quality.yml` (and any other `<prefix>-quality.yml`) from matching as
+    // a substring. Without it this rule produced 58 findings against
+    // mandrel-platform's docs and 1 was a real bare reference, drowning a
+    // genuine `expired-placeholder` error in known-benign warnings. Guarding on
+    // `[-\w]` rather than spelling out `pr-` keeps it correct for a consumer
+    // that names its own caller `ci-quality.yml`.
+    pattern: /(?<![-\w])quality\.yml/g,
     severity: 'warning',
   },
   {
@@ -102,7 +109,13 @@ export const RULES = [
     // 4-digit 20xx year and defer the "is it actually in the past?" decision
     // to `matchFilter`, so the rule stays correct as the calendar advances and
     // never flags a still-valid FUTURE expiry.
-    pattern: /expires[:\s]+(20\d{2}-\d{2}-\d{2})/gi,
+    // The optional quotes either side of the separator are load-bearing: the
+    // CVE allowlist's own shape is JSON (`"expires": "2026-12-31"` — see
+    // audit-check.mjs), and `expires"` is neither `:` nor whitespace, so the
+    // unquoted-only form skipped every documented allowlist entry. That is the
+    // same fail-open class as the 202[0-4] year window this rule already fixed;
+    // it was hiding a second lapsed date in docs/runbooks/dependency-update.md.
+    pattern: /expires['"]?[:\s]+['"]?(20\d{2}-\d{2}-\d{2})/gi,
     severity: 'error',
     // Only flag when the captured date is strictly before today (UTC). Future
     // expiries are still valid and must not be reported.

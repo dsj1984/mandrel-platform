@@ -87,7 +87,7 @@ The gate **blocks** on any High or Critical severity vulnerability in the produc
    // In the CVE allowlist (project-specific location — see docs/environments.md)
    {
      "id": "GHSA-xxxx-xxxx-xxxx",
-     "expires": "2025-12-31",
+     "expires": "<YYYY-MM-DD>",
      "reason": "No fix available; upstream tracking issue: <URL>"
    }
    ```
@@ -132,10 +132,12 @@ Security-critical overrides that force a minimum safe version for transitive dep
 ```yaml
 # pnpm-workspace.yaml
 overrides:
-  "minimatch@<3.0.8": ">=3.0.8"   # CVE-2022-3517 — expires 2026-06-01
+  "minimatch@<3.0.8": ">=3.0.8"   # CVE-2022-3517 — expires <YYYY-MM-DD>
 ```
 
 Overrides require both a reason comment and an expiry date. Remove expired overrides once the upstream package has been updated.
+
+`<YYYY-MM-DD>` is a placeholder, not a value to copy. The examples in this runbook deliberately carry no concrete expiry: a real date baked into a runbook lapses, and then models the exact drift this section tells you to avoid. `check-docs-staleness.mjs` flags a lapsed one as `expired-placeholder` — which is how the previous example dates here were caught.
 
 ---
 
