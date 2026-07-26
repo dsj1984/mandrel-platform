@@ -642,3 +642,128 @@ test("a hand-authored deploy-staging.yml is flagged, not overwritten", () => {
     "operator's hand-authored caller is never clobbered"
   );
 });
+
+// ---------------------------------------------------------------------------
+// Filesystem access — perform, don't pre-check (Story #337)
+//
+// Every read used to be guarded by `existsSync(p)` before `readFileSync(p)` —
+// a time-of-check/time-of-use race (CodeQL js/file-system-race, high) that
+// also collapsed "unreadable" into "absent". These pin the replacement
+// contract: ENOENT still means absent, and every other error is reported as a
+// READ failure rather than being mistaken for a missing file or a parse error.
+// ---------------------------------------------------------------------------
+
+/** Run the CLI expecting a non-zero exit; return the combined output. */
+function runExpectingFailure(extraArgs) {
+  try {
+    run(extraArgs);
+  } catch (err) {
+    return `${err.stdout ?? ""}${err.stderr ?? ""}`;
+  }
+  assert.fail("expected the CLI to exit non-zero");
+}
+
+test("an absent tsconfig is reported absent, not as an error", () => {
+  rmSync(join(consumer, "tsconfig.json"));
+  const out = JSON.parse(run([]));
+  assert.equal(out.tsconfig.action, "absent");
+  assert.equal(out.tsconfig.file, null);
+});
+
+test("an absent renovate config is reported absent, not as an error", () => {
+  rmSync(join(consumer, "renovate.json"));
+  const out = JSON.parse(run([]));
+  assert.equal(out.renovate.action, "absent");
+  assert.equal(out.renovate.file, null);
+});
+
+test("an unreadable tsconfig fails as a READ error, never as absent", () => {
+  // A directory where the file should be is the portable stand-in for an
+  // unreadable path (EISDIR). The old shape reported this as a *parse*
+  // failure, because the read happened inside the parse try/catch.
+  rmSync(join(consumer, "tsconfig.json"));
+  mkdirSync(join(consumer, "tsconfig.json"));
+  const out = runExpectingFailure([]);
+  assert.match(out, /could not read tsconfig/);
+  assert.doesNotMatch(out, /could not parse tsconfig/);
+});
+
+test("an unreadable renovate config fails as a READ error, never as absent", () => {
+  rmSync(join(consumer, "renovate.json"));
+  mkdirSync(join(consumer, "renovate.json"));
+  const out = runExpectingFailure([]);
+  assert.match(out, /could not read Renovate config/);
+  assert.doesNotMatch(out, /could not parse Renovate config/);
+});
+
+test("a malformed tsconfig still fails as a PARSE error", () => {
+  // The read/parse split must not blur the other way either.
+  writeFileSync(join(consumer, "tsconfig.json"), "{ not json at all");
+  const out = runExpectingFailure([]);
+  assert.match(out, /could not parse tsconfig/);
+  assert.doesNotMatch(out, /could not read tsconfig/);
+});
+
+test("an existing runbook stub is skipped, an unreadable one is not silently created", () => {
+  // First pass materializes; second must skip via the read, not a pre-check.
+  run([]);
+  const stub = join(consumer, "docs", "runbooks", "observability.md");
+  const body = readFileSync(stub, "utf8");
+  const out = JSON.parse(run([]));
+  assert.ok(
+    out.runbooks.skipped.some((f) => f.endsWith("observability.md")),
+    "already-materialized stub is skipped on the second pass"
+  );
+  assert.equal(readFileSync(stub, "utf8"), body, "skipped stub is byte-identical");
+  assert.equal(out.runbooks.created.length, 0);
+});
+
+test("no read in the sync path is guarded by a prior existence check", () => {
+  // The regression guard for the defect class itself: `existsSync` may survive
+  // only as the import and the one CLI-argument precondition that has no
+  // paired read. Anything else is a reintroduced check-then-use race.
+  const source = readFileSync(join(__dirname, "platform-sync.mjs"), "utf8");
+  const uses = source
+    .split("\n")
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter(({ line }) => /(?<![A-Za-z])existsSync\s*\(/.test(line))
+    .filter(({ line }) => !/^\s*(\/\/|\*)/.test(line));
+  assert.equal(
+    uses.length,
+    1,
+    `expected exactly one existsSync call site (the --consumer precondition); found: ${JSON.stringify(
+      uses
+    )}`
+  );
+  assert.match(uses[0].line, /opts\.consumer/);
+});
+
+test("a missing runbook-template dir fails with the message naming it, not a raw ENOENT", () => {
+  // The precondition is fatal by design. Converting the guard to a
+  // perform-then-classify read must not degrade it to an unhandled ENOENT.
+  const emptyTemplates = mkdtempSync(join(tmpdir(), "platform-sync-templates-"));
+  try {
+    const out = runExpectingFailure(["--templates", emptyTemplates]);
+    assert.match(out, /runbook templates not found at/);
+    assert.ok(out.includes(join(emptyTemplates, "runbooks")), "names the directory it looked in");
+    assert.doesNotMatch(out, /ENOENT/, "no raw errno leaks to the operator");
+  } finally {
+    rmSync(emptyTemplates, { recursive: true, force: true });
+  }
+});
+
+test("a missing workflow-template dir is a soft no-op, not a failure", () => {
+  // Deliberately NOT symmetrical with the runbook precondition above: an
+  // absent workflow-template directory yields an empty result set rather than
+  // a fatal. Pinned so the read conversion cannot quietly make it fatal.
+  const templates = mkdtempSync(join(tmpdir(), "platform-sync-templates-"));
+  try {
+    mkdirSync(join(templates, "runbooks"), { recursive: true });
+    const out = JSON.parse(run(["--templates", templates]));
+    assert.deepEqual(out.workflowStubs.created, []);
+    assert.deepEqual(out.workflowStubs.skipped, []);
+    assert.deepEqual(out.workflowStubs.localCopies, []);
+  } finally {
+    rmSync(templates, { recursive: true, force: true });
+  }
+});

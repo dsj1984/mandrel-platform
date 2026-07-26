@@ -198,6 +198,52 @@ function log(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Filesystem access — perform, don't pre-check (Story #337)
+// ---------------------------------------------------------------------------
+//
+// Every read in this script used to be guarded by `existsSync(p)` before
+// `readFileSync(p)` / `readdirSync(p)`. That check-then-use shape is a
+// time-of-check/time-of-use race (CodeQL js/file-system-race, high) — the path
+// can change between the two calls, and the code then acts on a stale answer.
+// It is also lossy in a way that matters here: `existsSync` returns false for
+// a path that exists but cannot be stat'd, so a permission or type error was
+// silently reinterpreted as "absent" and the script took its create branch.
+//
+// These helpers invert it: attempt the operation, and treat ONLY `ENOENT` as
+// "not there". Every other error (EACCES, EISDIR, ELOOP, …) propagates, which
+// is both race-free and strictly more informative. One syscall, not two.
+
+/**
+ * Read a UTF-8 file, or `null` when it does not exist.
+ *
+ * @param {string} path
+ * @returns {string|null}
+ */
+function readFileIfPresent(path) {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/**
+ * List a directory's entries, or `null` when it does not exist.
+ *
+ * @param {string} path
+ * @returns {string[]|null}
+ */
+function readdirIfPresent(path) {
+  try {
+    return readdirSync(path);
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Defaults requiring resolution
 // ---------------------------------------------------------------------------
 
@@ -282,8 +328,9 @@ function resolveSha() {
 /** Recursively collect `.yml`/`.yaml` files under a directory. */
 function collectYaml(dir) {
   const found = [];
-  if (!existsSync(dir)) return found;
-  for (const entry of readdirSync(dir)) {
+  const entries = readdirIfPresent(dir);
+  if (entries === null) return found;
+  for (const entry of entries) {
     const full = join(dir, entry);
     const st = statSync(full);
     if (st.isDirectory()) found.push(...collectYaml(full));
@@ -401,17 +448,18 @@ function materializeRunbooks() {
   const created = [];
   const skipped = [];
   const localCopies = [];
-  if (!existsSync(runbookTemplatesDir)) {
+  const templates = readdirIfPresent(runbookTemplatesDir);
+  if (templates === null) {
     fail(`runbook templates not found at ${runbookTemplatesDir}.`);
   }
   const destDir = join(opts.consumer, "docs", "runbooks");
-  for (const entry of readdirSync(runbookTemplatesDir)) {
+  for (const entry of templates) {
     if (!entry.endsWith(".md")) continue;
     if (entry.toLowerCase() === "readme.md") continue; // index, not a stub
     const src = join(runbookTemplatesDir, entry);
     const dest = join(destDir, entry);
-    if (existsSync(dest)) {
-      const body = readFileSync(dest, "utf8");
+    const body = readFileIfPresent(dest);
+    if (body !== null) {
       if (body.includes(STUB_MARKER)) {
         skipped.push(rel(dest)); // already a reference stub — idempotent no-op
       } else {
@@ -451,16 +499,19 @@ function materializeWorkflowStubs() {
   const created = [];
   const skipped = [];
   const localCopies = [];
-  if (!existsSync(workflowTemplatesDir)) {
+  // Unlike the runbook templates above, an absent workflow-template directory
+  // is a soft no-op rather than a fatal — preserved exactly.
+  const templates = readdirIfPresent(workflowTemplatesDir);
+  if (templates === null) {
     return { created, skipped, localCopies };
   }
   const destDir = join(opts.consumer, ".github", "workflows");
-  for (const entry of readdirSync(workflowTemplatesDir)) {
+  for (const entry of templates) {
     if (!/\.ya?ml$/.test(entry)) continue;
     const src = join(workflowTemplatesDir, entry);
     const dest = join(destDir, entry);
-    if (existsSync(dest)) {
-      const body = readFileSync(dest, "utf8");
+    const body = readFileIfPresent(dest);
+    if (body !== null) {
       if (body.includes(WORKFLOW_TEMPLATE_MARKER)) {
         skipped.push(rel(dest)); // already materialized — idempotent no-op
       } else {
@@ -501,11 +552,26 @@ function reconcileRenovate() {
     ".github/renovate.json",
     ".renovaterc.json",
   ].map((p) => join(opts.consumer, p));
-  const path = candidates.find((p) => existsSync(p));
-  if (!path) return { action: "absent", file: null };
+  // Read-through rather than find-then-read: the first candidate that yields
+  // content IS the config, with no window in which it can vanish between the
+  // probe and the read.
+  let path = null;
+  let raw = null;
+  for (const candidate of candidates) {
+    try {
+      raw = readFileIfPresent(candidate);
+    } catch (err) {
+      fail(`could not read Renovate config at ${rel(candidate)}: ${err.message}`);
+    }
+    if (raw !== null) {
+      path = candidate;
+      break;
+    }
+  }
+  if (path === null) return { action: "absent", file: null };
   let cfg;
   try {
-    cfg = parseJsonc(readFileSync(path, "utf8"));
+    cfg = parseJsonc(raw);
   } catch (err) {
     fail(`could not parse Renovate config at ${rel(path)}: ${err.message}`);
   }
@@ -521,10 +587,18 @@ function reconcileRenovate() {
 
 function reconcileTsconfig() {
   const path = join(opts.consumer, "tsconfig.json");
-  if (!existsSync(path)) return { action: "absent", file: null };
+  // Read and parse failures are reported separately: conflating them (as the
+  // old check-then-read did) reported an unreadable file as a parse error.
+  let raw;
+  try {
+    raw = readFileIfPresent(path);
+  } catch (err) {
+    fail(`could not read tsconfig at ${rel(path)}: ${err.message}`);
+  }
+  if (raw === null) return { action: "absent", file: null };
   let cfg;
   try {
-    cfg = parseJsonc(readFileSync(path, "utf8"));
+    cfg = parseJsonc(raw);
   } catch (err) {
     fail(`could not parse tsconfig at ${rel(path)}: ${err.message}`);
   }
