@@ -29,6 +29,24 @@
  * cancel is likewise never neutralized under any policy: that tier produced no
  * signal, and passing on a tier that never ran is a vacuous pass.
  *
+ * TIMED-OUT + TIMEOUT HEADROOM (Story #342)
+ * -----------------------------------------
+ * A fifth cause was missing: GitHub killing a job that exceeded its own
+ * `timeout-minutes`. It reported as `stopped-mid-step`, or as `never-started`
+ * when the kill landed before a step completed — both of which point triage at
+ * the runner fleet when the fix is a number in the workflow. swarm-os run
+ * 30179418666 cost a full forensic misdiagnosis to exactly that.
+ *
+ * The ceilings themselves were also unreachable by callers, which is what made
+ * the class necessary: GitHub charges the pre-job `Set up runner` wait against
+ * the same clock, so on a saturated self-hosted pool a hardcoded 5-minute
+ * aggregator budget passes by luck. This suite therefore pins BOTH halves —
+ * the `tier-timeouts` override surface and the `timed-out` inference —
+ * plus the negative that makes them shippable: pr-quality.yml declares no new
+ * permission scope, because a reusable workflow's permissions are validated
+ * against the caller's grant at compile time and a new scope breaks every
+ * consumer (Story #292's `pull-requests: read` is the precedent).
+ *
  * Run: node --test scripts/check-cancelled-provenance.test.mjs
  */
 
@@ -104,6 +122,28 @@ function runFixture(jobs, { createdAt = "2026-07-25T10:00:00Z" } = {}) {
   };
 }
 
+// pr-quality.yml's own base budgets — what the workflow passes as
+// TIER_TIMEOUT_BASES. The caller's override map (TIER_TIMEOUT_OVERRIDES) is
+// unioned in by the script, so tests that care about an override state it.
+const CEILINGS = "[5, 10, 15, 20, 45]";
+
+/**
+ * A job with a wall duration, in seconds. Duration is the ONLY signal that
+ * separates a timeout from any other cancel, so every timed-out fixture is
+ * built by stating it explicitly rather than by hand-writing timestamps.
+ */
+function timedJob(name, conclusion, steps, durationSeconds) {
+  const startedAt = "2026-07-25T10:00:00Z";
+  // Whole-second ISO-8601 with no fractional part — the exact shape
+  // `gh run view --json jobs` emits for startedAt/completedAt. jq's
+  // `fromdateiso8601` rejects a `.000` fraction, so a fixture carrying one
+  // would exercise the degradation path instead of the classifier.
+  const completedAt = new Date(Date.parse(startedAt) + durationSeconds * 1000)
+    .toISOString()
+    .replace(/\.\d+Z$/, "Z");
+  return { name, conclusion, steps, startedAt, completedAt };
+}
+
 const FIXTURES = {
   // A sibling genuinely failed; the rest are fail-fast collateral.
   failFast: runFixture([
@@ -156,7 +196,14 @@ const semantics = {
 
 function runAggregator(
   needsResults,
-  { policy = "strict", runJson = null, runList = null, ghFails = false } = {}
+  {
+    policy = "strict",
+    runJson = null,
+    runList = null,
+    ghFails = false,
+    ceilings = CEILINGS,
+    overrides = "{}",
+  } = {}
 ) {
   const dir = mkdtempSync(join(tmpdir(), "cancelled-provenance-"));
   try {
@@ -208,6 +255,8 @@ function runAggregator(
         PATH: `${bin}:${process.env.PATH}`,
         NEEDS_JSON: JSON.stringify(needsJson),
         CANCELLED_POLICY: policy,
+        TIER_TIMEOUT_BASES: ceilings,
+        TIER_TIMEOUT_OVERRIDES: overrides,
         GH_TOKEN: "stub-token",
         RUN_ID,
         REPO: "Beestera/swarm-os",
@@ -277,11 +326,218 @@ test("a failed sibling outranks a never-started job", semantics, () => {
   assert.doesNotMatch(r.stderr, /provenance: never-started/);
 });
 
+test(
+  "classifies a job killed at its ceiling as timed-out, not stopped-mid-step",
+  semantics,
+  () => {
+    // It ran steps, so the old classifier called this `stopped-mid-step` —
+    // "something external stopped a running job", which is not what happened.
+    const r = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture([
+        timedJob("Unit (1/2)", "success", ranSteps, 90),
+        timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 45 * 60),
+      ]),
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Cancelled provenance: timed-out/);
+    // The ceiling is named, so the operator knows WHICH number to raise.
+    assert.match(r.stderr, /E2E \/ Smoke \(1\/1\): timed-out \(hit its 45m ceiling\)/);
+  }
+);
+
+test(
+  "classifies a job killed at its ceiling before any step as timed-out, not never-started",
+  semantics,
+  () => {
+    // The swarm-os run 30179418666 shape: `Set up runner` ate the whole budget,
+    // so the job was killed with every step still SKIPPED. Reporting that as
+    // `never-started` asserts an infra provisioning hang and is what sent the
+    // consumer to file a runner investigation for a config fault.
+    const r = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture([
+        timedJob("Unit (1/2)", "success", ranSteps, 90),
+        timedJob("Typecheck", "cancelled", neverStartedSteps, 15 * 60),
+      ]),
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Cancelled provenance: timed-out/);
+    assert.match(r.stderr, /Typecheck: timed-out \(hit its 15m ceiling\)/);
+    assert.doesNotMatch(r.stderr, /provenance: never-started/);
+  }
+);
+
+test("a failed sibling outranks a timed-out job", semantics, () => {
+  // A fail-fast cancel can race a ceiling. The failing sibling is still the
+  // thing to triage, so `fail-fast` stays first in the precedence order.
+  const r = runAggregator(ONE_CANCELLED, {
+    runJson: runFixture([
+      timedJob("Accessibility (2/3)", "failure", ranSteps, 120),
+      timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 45 * 60),
+    ]),
+  });
+  assert.match(r.stderr, /Cancelled provenance: fail-fast/);
+  assert.doesNotMatch(r.stderr, /provenance: timed-out/);
+});
+
+test(
+  "a cancel far from every ceiling keeps its existing classification",
+  semantics,
+  () => {
+    // Positive evidence only: a duration that matches no ceiling must not be
+    // relabelled. 30 minutes sits between the 20m and 45m tiers.
+    const r = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture([
+        timedJob("Unit (1/2)", "success", ranSteps, 90),
+        timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 30 * 60),
+      ]),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /E2E \/ Smoke \(1\/1\): stopped-mid-step/);
+    assert.doesNotMatch(r.stderr, /provenance: timed-out/);
+  }
+);
+
+test(
+  "a cancel just UNDER a ceiling is not claimed as a timeout",
+  semantics,
+  () => {
+    // GitHub never kills a job early, so a duration below the ceiling is
+    // positive evidence AGAINST a timeout — and the seconds just under one are
+    // exactly where an ordinary fail-fast or superseded cancel of a
+    // long-running job lands. Matching there would be a confident wrong answer;
+    // the classifier must prefer a missing label to a false one.
+    const r = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture([
+        timedJob("Unit (1/2)", "success", ranSteps, 90),
+        timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 45 * 60 - 20),
+      ]),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /E2E \/ Smoke \(1\/1\): stopped-mid-step/);
+    assert.doesNotMatch(r.stderr, /provenance: timed-out/);
+  }
+);
+
+test(
+  "a caller's override value is detectable as a ceiling",
+  semantics,
+  () => {
+    // The whole point of the override map: a caller that raises `e2e` to 57m
+    // must still get `timed-out` when that tier is killed at 57m. If only the
+    // platform's base list were consulted, every override would silently make
+    // its own tier undetectable — the failure mode would arrive exactly for the
+    // fleets that needed the input in the first place.
+    const jobs = [
+      timedJob("Unit (1/2)", "success", ranSteps, 90),
+      timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 57 * 60),
+    ];
+    const overridden = runAggregator(ONE_CANCELLED, {
+      overrides: '{"e2e": 57}',
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(overridden.status, 1);
+    assert.match(overridden.stderr, /Cancelled provenance: timed-out/);
+    assert.match(overridden.stderr, /E2E \/ Smoke \(1\/1\): timed-out \(hit its 57m ceiling\)/);
+
+    // Same run without the override — 57m matches no base budget, so the label
+    // is not claimed. This is what proves the override is what carried it.
+    const plain = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.match(plain.stderr, /E2E \/ Smoke \(1\/1\): stopped-mid-step/);
+  }
+);
+
+test(
+  "a ceiling the set omits under-detects rather than mis-detects",
+  semantics,
+  () => {
+    // The set is per-WORKFLOW, so a run can contain a job governed by a
+    // ceiling the set does not list — most concretely ci.yml, whose `[5, 10]`
+    // omits the nested pr-quality tiers' 15/20/45m budgets. The direction of
+    // that gap is the load-bearing part: a job killed at an unlisted ceiling
+    // keeps its previous label (a lost `timed-out`, still red), never a
+    // confident wrong one. Both halves are asserted here, since only the pair
+    // rules out the mirror-image bug where a narrow set relabels everything.
+    const jobs = [
+      timedJob("Node-script checks", "success", ranSteps, 90),
+      timedJob("security / E2E / Smoke (1/1)", "cancelled", ranSteps, 45 * 60),
+    ];
+    const narrow = runAggregator(ONE_CANCELLED, {
+      ceilings: "[5, 10]",
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(narrow.status, 1);
+    assert.match(narrow.stderr, /security \/ E2E \/ Smoke \(1\/1\): stopped-mid-step/);
+    assert.doesNotMatch(narrow.stderr, /provenance: timed-out/);
+
+    // Same job, same duration, against a set that DOES list 45 — proving the
+    // assertion above turns on the omission and not on the fixture.
+    const wide = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(wide.status, 1);
+    assert.match(wide.stderr, /Cancelled provenance: timed-out/);
+  }
+);
+
+test(
+  "an unusable ceiling set degrades to the pre-existing classification",
+  semantics,
+  () => {
+    // An absent or malformed TIER_TIMEOUT_MINUTES costs the label and nothing
+    // else — never a misclassification, and never a pass.
+    for (const ceilings of ["", "not json", '{"Unit": 20}']) {
+      const r = runAggregator(ONE_CANCELLED, {
+        ceilings,
+        runJson: runFixture([
+          timedJob("Unit (1/2)", "success", ranSteps, 90),
+          timedJob("Typecheck", "cancelled", neverStartedSteps, 15 * 60),
+        ]),
+      });
+      assert.equal(r.status, 1, `ceilings=${JSON.stringify(ceilings)}`);
+      assert.match(
+        r.stderr,
+        /Cancelled provenance: never-started/,
+        `ceilings=${JSON.stringify(ceilings)} should fall back, not throw`
+      );
+    }
+  }
+);
+
 test("classification is reported on the job summary too", semantics, () => {
   const r = runAggregator(ONE_CANCELLED, { runJson: FIXTURES.neverStarted });
   assert.match(r.summary, /Provenance: `never-started`/);
   assert.match(r.summary, /INFRA fault/);
 });
+
+test(
+  "a timed-out summary names the tier, its ceiling, and the remediation input",
+  semantics,
+  () => {
+    // The whole value of the class is legibility: the operator must be able to
+    // read the summary and know to edit a number, not to open a runner ticket.
+    const r = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture([
+        timedJob("Unit (1/2)", "success", ranSteps, 90),
+        timedJob("Typecheck", "cancelled", neverStartedSteps, 15 * 60),
+      ]),
+    });
+    assert.match(r.summary, /Provenance: `timed-out`/);
+    assert.match(r.summary, /Typecheck: timed-out \(hit its 15m ceiling\)/);
+    assert.match(r.summary, /CONFIG fault/);
+    assert.match(r.summary, /tier-timeouts/);
+    // It must not send the reader at the runner fleet — the misdiagnosis this
+    // class exists to prevent.
+    assert.match(r.summary, /do NOT escalate/);
+  }
+);
 
 test("a green run performs no provenance lookup at all", semantics, () => {
   const r = runAggregator({ unit: "success", e2e: "success" });
@@ -341,6 +597,28 @@ test(
     });
     assert.equal(r.status, 1);
     assert.match(r.summary, /never-started/);
+  }
+);
+
+test(
+  "provenance-aware keeps a timed-out cancel red even when a newer run exists",
+  semantics,
+  () => {
+    // `timed-out` carries the same verdict semantics as `never-started`: the
+    // tier produced no complete signal. A newer sibling run is present here
+    // precisely so the test proves the timeout is what holds the gate red —
+    // the superseded probe never gets to run.
+    const r = runAggregator(ONE_CANCELLED, {
+      policy: "provenance-aware",
+      runJson: runFixture([
+        timedJob("Unit (1/2)", "success", ranSteps, 90),
+        timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 45 * 60),
+      ]),
+      runList: NEWER_RUNS,
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.summary, /Provenance: `timed-out`/);
+    assert.doesNotMatch(r.summary, /neutral \(superseded run\)/);
   }
 );
 
@@ -491,4 +769,218 @@ test("cancelled-policy is declared with a strict default", () => {
     "`cancelled-policy` must default to `strict` so existing consumers are unaffected; " +
       `declared instead: ${JSON.stringify(block)}`
   );
+});
+
+test("tier-timeouts is declared with an empty-map default", () => {
+  // Same indentation walk as the sibling above, and the same reason for the
+  // default: an empty override map is byte-for-byte the behaviour every
+  // existing caller already gets, so adopting the input is opt-in.
+  const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8").split("\n");
+  const start = lines.findIndex((l) => l === "      tier-timeouts:");
+  assert.notEqual(start, -1, "`tier-timeouts:` input not declared");
+
+  const block = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*$/.test(lines[i])) continue;
+    if (lines[i].match(/^(\s*)/)[1].length <= 6) break;
+    block.push(lines[i].trim());
+  }
+
+  assert.ok(
+    block.includes("type: string"),
+    `\`tier-timeouts\` carries a JSON object, so it must be a string input; declared: ${JSON.stringify(block)}`
+  );
+  assert.ok(
+    block.includes("default: '{}'"),
+    "`tier-timeouts` must default to an empty map so existing consumers are unaffected; " +
+      `declared instead: ${JSON.stringify(block)}`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 5. TIMEOUT SURFACE — every tier's ceiling is caller-tunable (Story #342).
+//
+// GitHub charges the pre-job `Set up runner` wait against the job's own
+// `timeout-minutes`, so on a self-hosted pool a tier's real budget is
+// `work + queue wait` and only the caller knows its own queue distribution. A
+// literal ceiling left behind here is a tier the caller cannot reach — which is
+// exactly the gap #340 filed, so it is asserted rather than trusted to review.
+//
+// The override is a `fromJSON(...)['<tier>'] || <base>` lookup rather than the
+// single headroom addend #340 preferred, because GitHub Actions expressions
+// have no arithmetic operators at all — `${{ 15 + inputs.x }}` fails to LEX,
+// taking the whole workflow down with a "workflow file issue" and zero jobs.
+// The `|| <base>` tail is what keeps a partial override map working, so it is
+// asserted too: without it an unlisted tier would resolve to null.
+// ---------------------------------------------------------------------------
+
+/** Every `timeout-minutes:` declaration, tagged with its nesting depth. */
+function timeoutDeclarations(rel) {
+  const lines = readFileSync(join(repoRoot, rel), "utf8").split("\n");
+  const found = [];
+  for (const [i, line] of lines.entries()) {
+    const m = line.match(/^(\s*)timeout-minutes:\s*(.+?)\s*$/);
+    if (m) found.push({ line: i + 1, indent: m[1].length, value: m[2] });
+  }
+  return found;
+}
+
+test("every job-level ceiling in pr-quality.yml is caller-overridable", () => {
+  // Job-level keys sit at 4 spaces (`jobs:` → `<job>:` → key); anything deeper
+  // is a step-level budget, covered by the next test.
+  const jobLevel = timeoutDeclarations(WORKFLOW).filter((d) => d.indent === 4);
+  assert.ok(
+    jobLevel.length >= 8,
+    `expected every tier plus the aggregator to declare a ceiling; found ${jobLevel.length}`
+  );
+  for (const d of jobLevel) {
+    assert.match(
+      d.value,
+      /^\$\{\{ fromJSON\(inputs\.tier-timeouts\)\['[a-z0-9-]+'\] \|\| \d+ \}\}$/,
+      `${WORKFLOW}:${d.line} declares a job-level ceiling the caller cannot reach ` +
+        `(${d.value}) — its budget is then work + queue wait with no way to raise ` +
+        "the clock, and without the `|| <base>` tail a partial override map would " +
+        "resolve an unlisted tier to null"
+    );
+  }
+});
+
+test("each tier's override key matches its own job id", () => {
+  // A copy-paste that points two tiers at one key silently makes one of them
+  // unreachable — the caller sets `e2e` and the e2e job keeps its default.
+  const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8").split("\n");
+  let job = null;
+  const seen = new Set();
+  for (const line of lines) {
+    const j = line.match(/^  ([a-z][a-z0-9-]*):$/);
+    if (j) job = j[1];
+    const t = line.match(
+      /^    timeout-minutes: \$\{\{ fromJSON\(inputs\.tier-timeouts\)\['([a-z0-9-]+)'\]/
+    );
+    if (!t) continue;
+    assert.equal(
+      t[1],
+      job,
+      `job \`${job}\` reads override key \`${t[1]}\` — the key must be the job id, ` +
+        "or the caller's override for that tier lands on the wrong job (or nowhere)"
+    );
+    assert.ok(!seen.has(t[1]), `override key \`${t[1]}\` is claimed by two jobs`);
+    seen.add(t[1]);
+  }
+  assert.ok(seen.size >= 8, `expected every tier to be overridable; found ${seen.size}`);
+});
+
+test("the fail-fast cancel step's own budget carries no headroom", () => {
+  // `timeout-minutes: 1` on that step bounds a single API call inside an
+  // ALREADY-RUNNING job, so no queue wait is charged against it. Adding
+  // headroom there would slow a cancelled run down for no reason.
+  const stepLevel = timeoutDeclarations(WORKFLOW).filter((d) => d.indent > 4);
+  assert.ok(stepLevel.length > 0, "expected the fail-fast cancel step budget");
+  for (const d of stepLevel) {
+    assert.match(
+      d.value,
+      /^\d+$/,
+      `${WORKFLOW}:${d.line} is a step-level budget and must stay a literal; got ${d.value}`
+    );
+  }
+});
+
+test("the aggregator's base list carries every tier's default budget", () => {
+  // TIER_TIMEOUT_BASES is what makes `timed-out` detectable for a tier the
+  // caller did NOT override. If a tier's default budget changes and the list
+  // does not, that tier's timeouts silently fall back to `stopped-mid-step` —
+  // the misdiagnosis this Story removed. The caller's override values are
+  // unioned in at runtime, so they need no counterpart here.
+  const raw = readFileSync(join(repoRoot, WORKFLOW), "utf8");
+  const onJobs = new Set(
+    [
+      ...raw.matchAll(
+        /^ {4}timeout-minutes: \$\{\{ fromJSON\(inputs\.tier-timeouts\)\['[a-z0-9-]+'\] \|\| (\d+) \}\}$/gm
+      ),
+    ].map((m) => m[1])
+  );
+  assert.ok(onJobs.size > 0, "no job-level ceilings found");
+
+  const decl = raw.match(/^\s*TIER_TIMEOUT_BASES: '(\[[^\]]*\])'$/m);
+  assert.ok(decl, "`TIER_TIMEOUT_BASES` not declared as a JSON array literal");
+  const declared = new Set(JSON.parse(decl[1]).map(String));
+
+  for (const base of onJobs) {
+    assert.ok(
+      declared.has(base),
+      `a tier defaults to a ${base}m budget but TIER_TIMEOUT_BASES does not list ` +
+        `it (${decl[1]}) — a timeout on that tier would be misreported as ` +
+        "stopped-mid-step"
+    );
+  }
+});
+
+test("the aggregator env carries no job name (self-maintaining)", () => {
+  // The reason the caller's override map is threaded through RAW rather than
+  // resolved per tier: a per-tier map in this env block would name every job,
+  // which is exactly the bookkeeping check-ci-required-aggregator.test.mjs
+  // forbids. That suite checks `needs:` ids; this one pins the narrower rule
+  // that made the design what it is, next to the code it constrains.
+  const raw = readFileSync(join(repoRoot, WORKFLOW), "utf8");
+  const start = raw.indexOf("TIER_TIMEOUT_BASES:");
+  const end = raw.indexOf("GH_TOKEN:", start);
+  assert.ok(start !== -1 && end > start, "ceiling env block not found");
+  const block = raw.slice(start, end);
+  assert.doesNotMatch(
+    block,
+    /fromJSON\(inputs\.tier-timeouts\)\[/,
+    "the ceiling env block resolves per-tier overrides by name — thread " +
+      "`inputs.tier-timeouts` through raw and union it in the script instead, so " +
+      "adding a job to `needs:` stays the only edit"
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 6. PERMISSION RATCHET — the negative that makes this shippable (Story #342).
+//
+// #341 proposed reading GitHub's own timeout annotation via
+// `GET /repos/{owner}/{repo}/check-runs/{id}/annotations`, which needs
+// `checks: read`. GitHub validates a called reusable workflow's declared
+// permissions against the CALLER's grant at compile time, ignoring every job's
+// `if:` gate — so a new scope fails the entire call with `startup_failure` for
+// any consumer that has not granted it. Story #292 added `pull-requests: read`
+// to one job and broke ci.yml, the cross-repo smoke consumer, and a release.
+// This is why the classifier infers from duration instead, and the allowlist
+// below is what keeps a future change from quietly reintroducing the break.
+// ---------------------------------------------------------------------------
+
+test("pr-quality.yml declares no permission grant outside the allowlist", () => {
+  // Scope AND level, not scope alone: escalating an existing `contents: read`
+  // to `contents: write` is the same class of compile-time consumer break as
+  // adding a brand-new scope, and a name-only allowlist would wave it through.
+  const ALLOWED = new Set([
+    "contents:read",
+    "actions:write",
+    "pull-requests:read",
+  ]);
+  const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8").split("\n");
+  const grants = new Set();
+
+  for (const [i, line] of lines.entries()) {
+    if (!/^\s*permissions:\s*$/.test(line)) continue;
+    const blockIndent = line.match(/^(\s*)/)[1].length;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (/^\s*$/.test(lines[j]) || /^\s*#/.test(lines[j])) continue;
+      if (lines[j].match(/^(\s*)/)[1].length <= blockIndent) break;
+      const m = lines[j].match(/^\s*([a-z-]+):\s*(read|write|none)\s*$/);
+      if (m) grants.add(`${m[1]}:${m[2]}`);
+    }
+  }
+
+  assert.ok(grants.size > 0, "no `permissions:` block found to check");
+  for (const grant of grants) {
+    assert.ok(
+      ALLOWED.has(grant),
+      `pr-quality.yml declares \`${grant.replace(":", ": ")}\` — a reusable workflow's ` +
+        "permissions are validated against the caller's grant at COMPILE time regardless " +
+        "of any `if:` gate, so a new or escalated scope breaks every consumer that has " +
+        "not granted it (startup_failure, zero jobs). Widen this allowlist only alongside " +
+        "a lockstep update to ci.yml, the smoke consumer, and docs/reusable-workflows.md."
+    );
+  }
 });
