@@ -150,7 +150,14 @@ runs:
 
         asset="gitleaks_${GITLEAKS_VERSION}_${gl_os}_${gl_arch}.tar.gz"
         url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
-        tmp="$(mktemp -d)"
+        # Runner-scoped extraction dir (issue #343). A bare `mktemp -d` lands
+        # in the host-shared $TMPDIR, which on a persistent self-hosted runner
+        # is never reaped and is shared with every co-resident runner. The
+        # template form (not GNU-only `-p`) keeps this working under macOS's
+        # BSD mktemp; the `:-` chain keeps the action runnable outside a
+        # runner context. The runner kit's job-started hook sweeps exactly
+        # this `gitleaks.*` glob under RUNNER_TEMP.
+        tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gitleaks.XXXXXX")"
         echo "Downloading pinned gitleaks: ${url}"
         curl -fsSL "$url" -o "${tmp}/${asset}"
 
