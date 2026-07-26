@@ -225,6 +225,16 @@ Semantics:
   see [Cancelled-tier provenance](#cancelled-tier-provenance-cancelled-policy).
   Your override values are detected as ceilings too, not just the defaults.
 
+**Availability — bump the pin before you pass it.** `tier-timeouts` and the
+`timed-out` provenance class ship together, from platform release `1.1.0`.
+GitHub validates a `workflow_call`'s inputs against the **pinned** revision, so
+a caller that passes `tier-timeouts` while still pinned to an older platform SHA
+does not fall back to the defaults — the run fails at input validation, before
+any tier job starts, naming the input as undefined in the referenced workflow.
+Bump the pin first; Renovate does that automatically for pins carrying a
+trailing `# <tag>` comment (see
+[Versioning & compatibility](#versioning--compatibility)).
+
 ### Fail-fast run cancellation (`fail-fast`)
 
 The tier jobs run fully in parallel with no cross-tier `needs:` edges. By
@@ -2855,7 +2865,9 @@ SHA-pinned `uses:` with a trailing version comment:
 uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<40-hex-sha> # <tag>
 ```
 
-The platform stays on `0.x`. The contract guarantees today are:
+The platform is on `1.x`. That is a version number, not a new pinning
+mechanism — there is still no floating major tag, per the note at the end of
+this section. The contract guarantees today are:
 
 - **SHA-pinning** — every first-party `uses:` resolves to an exact commit, so
   a consumer's CI is reproducible and never silently picks up a new revision.
