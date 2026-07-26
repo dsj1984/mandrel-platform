@@ -332,7 +332,16 @@ jobs:
           # This repo's own distinct ceilings. The `security` tier is a
           # pr-quality.yml self-call whose inner jobs run under THAT workflow's
           # ceilings and are classified by its own aggregator, so its values are
-          # deliberately absent here rather than guessed at.
+          # not listed here.
+          #
+          # Note this is a ceiling SET, not a per-job map (the aggregator must
+          # stay self-maintaining), so it cannot scope the match to this repo's
+          # own jobs: a nested pr-quality job that happens to end at 5 or 10
+          # minutes would also be labelled `timed-out`. That is bounded and
+          # benign in both directions — a nested job killed at a ceiling this
+          # set omits (15/20/45) simply keeps its previous label, and every
+          # class here is red either way, so the only thing at stake is which
+          # word the summary prints.
           TIER_TIMEOUT_MINUTES: '[5, 10]'
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}

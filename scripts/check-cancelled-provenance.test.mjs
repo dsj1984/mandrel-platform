@@ -396,6 +396,41 @@ test(
 );
 
 test(
+  "a ceiling the set omits under-detects rather than mis-detects",
+  semantics,
+  () => {
+    // The set is per-WORKFLOW, so a run can contain a job governed by a
+    // ceiling the set does not list — most concretely ci.yml, whose `[5, 10]`
+    // omits the nested pr-quality tiers' 15/20/45m budgets. The direction of
+    // that gap is the load-bearing part: a job killed at an unlisted ceiling
+    // keeps its previous label (a lost `timed-out`, still red), never a
+    // confident wrong one. Both halves are asserted here, since only the pair
+    // rules out the mirror-image bug where a narrow set relabels everything.
+    const jobs = [
+      timedJob("Node-script checks", "success", ranSteps, 90),
+      timedJob("security / E2E / Smoke (1/1)", "cancelled", ranSteps, 45 * 60),
+    ];
+    const narrow = runAggregator(ONE_CANCELLED, {
+      ceilings: "[5, 10]",
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(narrow.status, 1);
+    assert.match(narrow.stderr, /security \/ E2E \/ Smoke \(1\/1\): stopped-mid-step/);
+    assert.doesNotMatch(narrow.stderr, /provenance: timed-out/);
+
+    // Same job, same duration, against a set that DOES list 45 — proving the
+    // assertion above turns on the omission and not on the fixture.
+    const wide = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(wide.status, 1);
+    assert.match(wide.stderr, /Cancelled provenance: timed-out/);
+  }
+);
+
+test(
   "an unusable ceiling set degrades to the pre-existing classification",
   semantics,
   () => {
@@ -800,10 +835,17 @@ test("the aggregator's ceiling set mirrors the tiers' own budgets", () => {
 // below is what keeps a future change from quietly reintroducing the break.
 // ---------------------------------------------------------------------------
 
-test("pr-quality.yml declares no permission scope outside the allowlist", () => {
-  const ALLOWED = new Set(["contents", "actions", "pull-requests"]);
+test("pr-quality.yml declares no permission grant outside the allowlist", () => {
+  // Scope AND level, not scope alone: escalating an existing `contents: read`
+  // to `contents: write` is the same class of compile-time consumer break as
+  // adding a brand-new scope, and a name-only allowlist would wave it through.
+  const ALLOWED = new Set([
+    "contents:read",
+    "actions:write",
+    "pull-requests:read",
+  ]);
   const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8").split("\n");
-  const scopes = new Set();
+  const grants = new Set();
 
   for (const [i, line] of lines.entries()) {
     if (!/^\s*permissions:\s*$/.test(line)) continue;
@@ -812,19 +854,19 @@ test("pr-quality.yml declares no permission scope outside the allowlist", () => 
       if (/^\s*$/.test(lines[j]) || /^\s*#/.test(lines[j])) continue;
       if (lines[j].match(/^(\s*)/)[1].length <= blockIndent) break;
       const m = lines[j].match(/^\s*([a-z-]+):\s*(read|write|none)\s*$/);
-      if (m) scopes.add(m[1]);
+      if (m) grants.add(`${m[1]}:${m[2]}`);
     }
   }
 
-  assert.ok(scopes.size > 0, "no `permissions:` block found to check");
-  for (const scope of scopes) {
+  assert.ok(grants.size > 0, "no `permissions:` block found to check");
+  for (const grant of grants) {
     assert.ok(
-      ALLOWED.has(scope),
-      `pr-quality.yml declares \`${scope}\` — a reusable workflow's permissions are ` +
-        "validated against the caller's grant at COMPILE time regardless of any `if:` " +
-        "gate, so a new scope breaks every consumer that has not granted it " +
-        "(startup_failure, zero jobs). Widen this allowlist only alongside a lockstep " +
-        "update to ci.yml, the smoke consumer, and docs/reusable-workflows.md."
+      ALLOWED.has(grant),
+      `pr-quality.yml declares \`${grant.replace(":", ": ")}\` — a reusable workflow's ` +
+        "permissions are validated against the caller's grant at COMPILE time regardless " +
+        "of any `if:` gate, so a new or escalated scope breaks every consumer that has " +
+        "not granted it (startup_failure, zero jobs). Widen this allowlist only alongside " +
+        "a lockstep update to ci.yml, the smoke consumer, and docs/reusable-workflows.md."
     );
   }
 });
