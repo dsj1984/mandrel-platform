@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.0.0...mandrel-platform-v1.0.1) (2026-07-26)
+
+
+### Fixed
+
+* **ci:** replace the ReDoS-prone cancelled-policy assertion with a line scan ([#335](https://github.com/dsj1984/mandrel-platform/issues/335)) ([a7d97d3](https://github.com/dsj1984/mandrel-platform/commit/a7d97d36cfd2d335d3c548d8e1db7ba07f91b4c1))
+* **test:** assert globToRegExp's output as a string, not a regex literal ([#339](https://github.com/dsj1984/mandrel-platform/issues/339)) ([c26e4d0](https://github.com/dsj1984/mandrel-platform/commit/c26e4d0667a955104bfa4bf1482cfe2925459def))
+
 ## [1.0.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v0.29.1...mandrel-platform-v1.0.0) (2026-07-25)
 
 
