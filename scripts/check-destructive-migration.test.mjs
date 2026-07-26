@@ -56,6 +56,38 @@ test("globToRegExp: `**` crosses path separators, `*` does not", () => {
   assert.ok(globToRegExp("*.sql").test("x.sql"));
 });
 
+// The glob set reaches this function from a CLI argument, so CodeQL reports
+// `js/regex-injection` (high) on the `new RegExp` it builds. That alert is a
+// false positive ONLY for as long as the translator escapes every regex
+// metacharacter — the input must be able to control `*` / `**` semantics and
+// nothing else. These two tests are the evidence that claim rests on; if a
+// future edit drops a character from the escape set, they fail rather than
+// letting a stale dismissal stand.
+test("globToRegExp: escapes every regex metacharacter to a literal", () => {
+  // `*` is excluded deliberately — it is the one character the glob syntax
+  // gives meaning to. `/` is not a metacharacter in the RegExp *constructor*
+  // (only in literal notation), but is asserted anyway.
+  const METACHARS = [".", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]", "\\", "/"];
+  for (const meta of METACHARS) {
+    const glob = `a${meta}b`;
+    const re = globToRegExp(glob);
+    assert.ok(re.test(glob), `\`${meta}\` must match itself literally (got ${re})`);
+    assert.ok(
+      !re.test("aXb"),
+      `\`${meta}\` leaked regex meaning — it matched an arbitrary character (got ${re})`
+    );
+  }
+});
+
+test("globToRegExp: a regex-injection payload translates to a literal pattern", () => {
+  // The classic catastrophic-backtracking payload. If any of it survived
+  // unescaped, this pattern would carry regex semantics into the matcher.
+  const re = globToRegExp("(a+)+$");
+  assert.equal(String(re), String(/^\(a\+\)\+\$$/));
+  assert.ok(re.test("(a+)+$"), "the payload matches only its literal self");
+  assert.ok(!re.test("aaaaaaaa"), "the payload carries no quantifier semantics");
+});
+
 test("isMigrationFile: matches migration globs and any .sql tail", () => {
   assert.ok(isMigrationFile("apps/api/migrations/0007_drop.ts"));
   assert.ok(isMigrationFile("drizzle/0001_init.sql"));
