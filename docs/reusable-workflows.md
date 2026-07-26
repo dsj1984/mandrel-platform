@@ -100,10 +100,11 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | Input              | Type    | Default          | When to override                                                                                                                              |
 | ------------------ | ------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `runner`           | string  | `'ubuntu-latest'`| Runs-on label for all jobs. Pass a JSON-encoded array string (e.g. `'["self-hosted","domio-runner"]'`) to target a self-hosted runner.        |
+| `timeout-headroom-minutes` | number | `0` | Minutes added to **every** tier's own work budget. GitHub charges the pre-job `Set up runner` wait against each job's `timeout-minutes`, so on a self-hosted pool a tier's real budget is `work + queue wait` — and only you know your fleet's queue distribution. Default `0` is byte-for-byte today's behaviour. See [Tier timeout headroom](#tier-timeout-headroom-timeout-headroom-minutes). |
 | `shards`           | number  | `1`              | **DEPRECATED — no longer read.** Sharding is configured solely via `shard-matrix`; the shard-count denominator is derived from the matrix size (`strategy.job-total`). Declared for backwards compatibility only (passing it is harmless and changes nothing); scheduled for removal in the next breaking release. |
 | `shard-matrix`     | string  | `'[1]'`          | JSON-encoded array of shard indices driving the test matrix (unit, contract, e2e) — e.g. `'[1,2,3]'` for 3 shards. The only sharding input: each test invocation's `--shard=<n>/<total>` denominator is derived from the matrix size, so a mismatched second input cannot under- or over-run the suite. |
 | `fail-fast`        | boolean | `false`          | **Opt-in.** Cancel the entire run on the first tier-job failure, freeing runner capacity that cannot change the outcome. Default `false` is byte-for-byte today's run-to-completion behaviour. Requires `actions: write` on the caller's token. See [Fail-fast run cancellation](#fail-fast-run-cancellation-fail-fast). |
-| `cancelled-policy` | string  | `strict`         | How `ci-required` treats a cancelled tier. `strict` (default) fails on any cancelled tier — byte-for-byte today's behaviour. `provenance-aware` additionally lets a **superseded** run's cancels pass; fail-fast, infra (`never-started`) and unclassifiable cancels still fail. Both policies report each cancelled tier's inferred provenance. See [Cancelled-tier provenance](#cancelled-tier-provenance-cancelled-policy). |
+| `cancelled-policy` | string  | `strict`         | How `ci-required` treats a cancelled tier. `strict` (default) fails on any cancelled tier — byte-for-byte today's behaviour. `provenance-aware` additionally lets a **superseded** run's cancels pass; fail-fast, infra (`never-started`), config (`timed-out`) and unclassifiable cancels still fail. Both policies report each cancelled tier's inferred provenance. See [Cancelled-tier provenance](#cancelled-tier-provenance-cancelled-policy). |
 | `affected`         | boolean | `false`          | **Opt-in.** Run the diff-scoped tiers (lint, typecheck, unit, contract, e2e) affected-only — turbo `--affected` scoped to the packages the event introduced, cutting merge-queue / strict-required re-run cost. Exports `TURBO_SCM_BASE` / `TURBO_SCM_HEAD` (derived event-agnostically, Story #314) and deepens the checkout to full history. The consumer's turbo tasks must use `--affected`. Default `false` is byte-for-byte today's behaviour. See [Affected-only tier execution](#affected-only-tier-execution-affected). |
 | `affected-base`    | string  | `''`             | Optional base git ref/SHA that overrides the event-derived `TURBO_SCM_BASE` in affected mode (e.g. `'origin/main'`). Empty (default) uses the event-agnostic derivation. Ignored when `affected` is `false`. |
 | `enable-lint`      | boolean | `true`           | Set `false` to skip the lint + format-check tier.                                                                                              |
@@ -147,6 +148,59 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 > (`'ubuntu-latest'`). Multi-label / self-hosted targets must be a
 > **JSON-encoded string** (`'["self-hosted","domio-runner"]'`), not a YAML
 > sequence.
+
+### Tier timeout headroom (`timeout-headroom-minutes`)
+
+Every tier job declares a `timeout-minutes` ceiling — the guard that stops a
+genuinely wedged job from burning six hours of runner capacity. Those ceilings
+are sized for the tier's **work**, but GitHub does not charge the clock that
+way: the pre-job `Set up runner` wait counts **inside** `timeout-minutes`. A
+tier's real budget is therefore `work + queue wait`, and the queue wait is a
+property of *your* runner pool, not of this workflow.
+
+On GitHub-hosted runners that wait is negligible and the defaults are right. On
+a saturated self-hosted fleet it dominates. Measured across 17 consecutive runs
+on one such pool (n=141 `Set up runner` durations):
+
+| statistic | value |
+| --- | --- |
+| median | 336s (5m36s) |
+| p75 | 362s |
+| p90 | 415s |
+| max | 601s (10m01s) |
+| share > 120s | 100% |
+
+Against that distribution the `ci-required` aggregator's 5-minute ceiling has a
+*median setup cost exceeding its entire budget* — it passes by luck. Raising the
+constants is not the fix, because the same constant then over-serves every
+GitHub-hosted caller. The headroom is the caller's to state:
+
+```yaml
+jobs:
+  ci:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      runner: '["self-hosted","my-runner"]'
+      timeout-headroom-minutes: 12
+    secrets: inherit
+```
+
+Semantics:
+
+- **Default `0` is byte-for-byte today's behaviour.** Adopting the input is
+  opt-in; not passing it changes nothing.
+- **It is headroom, not an override.** The value is *added* to each tier's own
+  work budget, so the relative sizing between tiers is preserved and you cannot
+  accidentally disarm the guard for a tier whose real work cost you do not know.
+  There is deliberately no per-tier override map.
+- **Size it from your pool's p90 setup time**, not its median — the median only
+  buys you a coin flip on the tail.
+- **It does not apply to step-level budgets.** The fail-fast cancel step's own
+  `timeout-minutes: 1` bounds a single API call inside an already-running job,
+  where no queue wait is charged.
+- **Undersizing is now legible.** A tier killed at its ceiling is classified
+  `timed-out` by the aggregator and the summary names which ceiling was hit —
+  see [Cancelled-tier provenance](#cancelled-tier-provenance-cancelled-policy).
 
 ### Fail-fast run cancellation (`fail-fast`)
 
@@ -259,12 +313,14 @@ Two consequences worth stating explicitly:
 
 `ci-required` counts `cancelled` as non-success — a tier stopped mid-flight
 proved nothing, so it cannot read as green. But a `cancelled` result on its own
-says nothing about **why**, and the three common causes call for three
-completely different responses:
+says nothing about **why**, and the common causes call for completely
+different responses — one of them ("raise a number in the workflow") having
+nothing to do with the runners at all:
 
 | Provenance | What happened | What to do |
 | --- | --- | --- |
 | `fail-fast` | A sibling tier genuinely failed and `fail-fast` cancelled the run. | Triage the failing tier — see [Triaging a fail-fast cancel](#triaging-a-fail-fast-cancel). The cancels are collateral. |
+| `timed-out` | The job exceeded its **own** `timeout-minutes` and GitHub killed it. Nothing hung. | **Config fault.** Raise [`timeout-headroom-minutes`](#tier-timeout-headroom-timeout-headroom-minutes) or cut that tier's work. Do **not** escalate to whoever owns the runners. |
 | `never-started` | The job was cancelled having **executed no step** — a runner provisioning hook hung. No test signal was produced. | Infra fault, not a code defect. Nothing in the diff can fix it. |
 | `superseded` | A newer run exists for the same workflow and branch. | Nothing — the newer run is authoritative. |
 | `unknown` | The classification lookup failed, `gh` is unavailable, or nothing matched. | Treat as red, exactly as before this input existed. |
@@ -272,10 +328,31 @@ completely different responses:
 There is **no cancellation-reason field to read.** Neither `gh run view --json`
 nor `GET /repos/{owner}/{repo}/actions/runs/{id}` exposes one, so the aggregator
 infers provenance from observable run state: a job with conclusion `failure`
-anywhere in the run, a cancelled job whose every step is `skipped`, and a newer
-run on the same workflow and branch. `fail-fast` is checked **first** — a job
-cancelled while still queued has also executed no step, so testing for
-`never-started` first would report a phantom infra hang on every fail-fast run.
+anywhere in the run, a cancelled job whose wall duration lands on one of the
+ceilings this workflow's tiers run under, a cancelled job whose every step is
+`skipped`, and a newer run on the same workflow and branch. Precedence is
+`fail-fast` → `timed-out` → `never-started` → `superseded`, and the first two
+positions are load-bearing:
+
+- **`fail-fast` first** — a job cancelled while still queued has also executed
+  no step, so testing for `never-started` first would report a phantom infra
+  hang on every fail-fast run. A fail-fast cancel can also race a ceiling, and
+  the failing sibling is still the thing to triage.
+- **`timed-out` before `never-started`** — a job killed at its ceiling before
+  finishing a step looks identical to a provisioning hang by step count alone.
+  That misreading is not academic: it is what sent one consumer to file a
+  runner-provisioning investigation for a workflow whose ceilings were simply
+  too low for its fleet.
+
+The timeout signal is a **duration match**, not GitHub's own annotation text.
+`GET /repos/{owner}/{repo}/check-runs/{id}/annotations` does carry
+`The job has exceeded the maximum execution time of Nm0s`, but reading it needs
+`checks: read` — and as the permissions note under
+[Fail-fast run cancellation](#fail-fast-run-cancellation-fail-fast) explains, a
+scope declared by a reusable workflow is validated against the **caller's**
+grant at compile time (ignoring every job's `if:` gate), so adding one fails the
+entire call with `startup_failure` for any consumer that has not granted it. A cancelled job whose duration matches no ceiling keeps its previous
+classification; the class only ever fires on positive evidence.
 
 The classification is printed to the log and the job summary under **both**
 policies. `cancelled-policy` only decides whether it changes the verdict:
@@ -298,6 +375,11 @@ Semantics and caveats:
   wrong*: no job failed, no cancelled job was an infra hang, and at least one
   tier actually passed. A run with zero successes can never be neutralized —
   that is the same vacuous pass the all-tiers-skipped guard refuses.
+- **A `timed-out` cancel stays red under both policies**, for the same reason
+  an infra one does: the tier was killed before it finished, so it produced no
+  complete signal. The class buys legibility, not leniency — the summary names
+  the tier, names the ceiling it hit, and points at `timeout-headroom-minutes`,
+  so the response is to edit a number rather than to open a runner ticket.
 - **An infra cancel stays red on purpose.** It is the most painful case — one
   hung self-hosted runner reds an innocent PR — but the tier produced no test
   signal, and a required gate that passes on a tier which never ran is not a
