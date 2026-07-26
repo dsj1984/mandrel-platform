@@ -41,7 +41,7 @@
  * the class necessary: GitHub charges the pre-job `Set up runner` wait against
  * the same clock, so on a saturated self-hosted pool a hardcoded 5-minute
  * aggregator budget passes by luck. This suite therefore pins BOTH halves —
- * the `timeout-headroom-minutes` input surface and the `timed-out` inference —
+ * the `tier-timeouts` override surface and the `timed-out` inference —
  * plus the negative that makes them shippable: pr-quality.yml declares no new
  * permission scope, because a reusable workflow's permissions are validated
  * against the caller's grant at compile time and a new scope breaks every
@@ -122,8 +122,9 @@ function runFixture(jobs, { createdAt = "2026-07-25T10:00:00Z" } = {}) {
   };
 }
 
-// The distinct ceilings pr-quality.yml's tiers run under at headroom 0 — what
-// the workflow itself passes as TIER_TIMEOUT_MINUTES.
+// pr-quality.yml's own base budgets — what the workflow passes as
+// TIER_TIMEOUT_BASES. The caller's override map (TIER_TIMEOUT_OVERRIDES) is
+// unioned in by the script, so tests that care about an override state it.
 const CEILINGS = "[5, 10, 15, 20, 45]";
 
 /**
@@ -201,6 +202,7 @@ function runAggregator(
     runList = null,
     ghFails = false,
     ceilings = CEILINGS,
+    overrides = "{}",
   } = {}
 ) {
   const dir = mkdtempSync(join(tmpdir(), "cancelled-provenance-"));
@@ -253,7 +255,8 @@ function runAggregator(
         PATH: `${bin}:${process.env.PATH}`,
         NEEDS_JSON: JSON.stringify(needsJson),
         CANCELLED_POLICY: policy,
-        TIER_TIMEOUT_MINUTES: ceilings,
+        TIER_TIMEOUT_BASES: ceilings,
+        TIER_TIMEOUT_OVERRIDES: overrides,
         GH_TOKEN: "stub-token",
         RUN_ID,
         REPO: "Beestera/swarm-os",
@@ -418,6 +421,38 @@ test(
 );
 
 test(
+  "a caller's override value is detectable as a ceiling",
+  semantics,
+  () => {
+    // The whole point of the override map: a caller that raises `e2e` to 57m
+    // must still get `timed-out` when that tier is killed at 57m. If only the
+    // platform's base list were consulted, every override would silently make
+    // its own tier undetectable — the failure mode would arrive exactly for the
+    // fleets that needed the input in the first place.
+    const jobs = [
+      timedJob("Unit (1/2)", "success", ranSteps, 90),
+      timedJob("E2E / Smoke (1/1)", "cancelled", ranSteps, 57 * 60),
+    ];
+    const overridden = runAggregator(ONE_CANCELLED, {
+      overrides: '{"e2e": 57}',
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.equal(overridden.status, 1);
+    assert.match(overridden.stderr, /Cancelled provenance: timed-out/);
+    assert.match(overridden.stderr, /E2E \/ Smoke \(1\/1\): timed-out \(hit its 57m ceiling\)/);
+
+    // Same run without the override — 57m matches no base budget, so the label
+    // is not claimed. This is what proves the override is what carried it.
+    const plain = runAggregator(ONE_CANCELLED, {
+      runJson: runFixture(jobs),
+      runList: NO_NEWER_RUNS,
+    });
+    assert.match(plain.stderr, /E2E \/ Smoke \(1\/1\): stopped-mid-step/);
+  }
+);
+
+test(
   "a ceiling the set omits under-detects rather than mis-detects",
   semantics,
   () => {
@@ -497,7 +532,7 @@ test(
     assert.match(r.summary, /Provenance: `timed-out`/);
     assert.match(r.summary, /Typecheck: timed-out \(hit its 15m ceiling\)/);
     assert.match(r.summary, /CONFIG fault/);
-    assert.match(r.summary, /timeout-headroom-minutes/);
+    assert.match(r.summary, /tier-timeouts/);
     // It must not send the reader at the runner fleet — the misdiagnosis this
     // class exists to prevent.
     assert.match(r.summary, /do NOT escalate/);
@@ -736,13 +771,13 @@ test("cancelled-policy is declared with a strict default", () => {
   );
 });
 
-test("timeout-headroom-minutes is declared with a zero default", () => {
+test("tier-timeouts is declared with an empty-map default", () => {
   // Same indentation walk as the sibling above, and the same reason for the
-  // default: zero headroom is byte-for-byte the behaviour every existing
-  // caller already gets, so adopting the input is opt-in.
+  // default: an empty override map is byte-for-byte the behaviour every
+  // existing caller already gets, so adopting the input is opt-in.
   const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8").split("\n");
-  const start = lines.findIndex((l) => l === "      timeout-headroom-minutes:");
-  assert.notEqual(start, -1, "`timeout-headroom-minutes:` input not declared");
+  const start = lines.findIndex((l) => l === "      tier-timeouts:");
+  assert.notEqual(start, -1, "`tier-timeouts:` input not declared");
 
   const block = [];
   for (let i = start + 1; i < lines.length; i++) {
@@ -752,12 +787,12 @@ test("timeout-headroom-minutes is declared with a zero default", () => {
   }
 
   assert.ok(
-    block.includes("type: number"),
-    `\`timeout-headroom-minutes\` must be a number input; declared: ${JSON.stringify(block)}`
+    block.includes("type: string"),
+    `\`tier-timeouts\` carries a JSON object, so it must be a string input; declared: ${JSON.stringify(block)}`
   );
   assert.ok(
-    block.includes("default: 0"),
-    "`timeout-headroom-minutes` must default to 0 so existing consumers are unaffected; " +
+    block.includes("default: '{}'"),
+    "`tier-timeouts` must default to an empty map so existing consumers are unaffected; " +
       `declared instead: ${JSON.stringify(block)}`
   );
 });
@@ -770,6 +805,13 @@ test("timeout-headroom-minutes is declared with a zero default", () => {
 // `work + queue wait` and only the caller knows its own queue distribution. A
 // literal ceiling left behind here is a tier the caller cannot reach — which is
 // exactly the gap #340 filed, so it is asserted rather than trusted to review.
+//
+// The override is a `fromJSON(...)['<tier>'] || <base>` lookup rather than the
+// single headroom addend #340 preferred, because GitHub Actions expressions
+// have no arithmetic operators at all — `${{ 15 + inputs.x }}` fails to LEX,
+// taking the whole workflow down with a "workflow file issue" and zero jobs.
+// The `|| <base>` tail is what keeps a partial override map working, so it is
+// asserted too: without it an unlisted tier would resolve to null.
 // ---------------------------------------------------------------------------
 
 /** Every `timeout-minutes:` declaration, tagged with its nesting depth. */
@@ -783,7 +825,7 @@ function timeoutDeclarations(rel) {
   return found;
 }
 
-test("every job-level ceiling in pr-quality.yml adds the caller's headroom", () => {
+test("every job-level ceiling in pr-quality.yml is caller-overridable", () => {
   // Job-level keys sit at 4 spaces (`jobs:` → `<job>:` → key); anything deeper
   // is a step-level budget, covered by the next test.
   const jobLevel = timeoutDeclarations(WORKFLOW).filter((d) => d.indent === 4);
@@ -794,12 +836,38 @@ test("every job-level ceiling in pr-quality.yml adds the caller's headroom", () 
   for (const d of jobLevel) {
     assert.match(
       d.value,
-      /^\$\{\{\s*\d+\s*\+\s*inputs\.timeout-headroom-minutes\s*\}\}$/,
-      `${WORKFLOW}:${d.line} declares a literal job-level ceiling (${d.value}) — ` +
-        "a self-hosted caller cannot reach it, so its budget is work + queue wait " +
-        "with no way to raise the clock"
+      /^\$\{\{ fromJSON\(inputs\.tier-timeouts\)\['[a-z0-9-]+'\] \|\| \d+ \}\}$/,
+      `${WORKFLOW}:${d.line} declares a job-level ceiling the caller cannot reach ` +
+        `(${d.value}) — its budget is then work + queue wait with no way to raise ` +
+        "the clock, and without the `|| <base>` tail a partial override map would " +
+        "resolve an unlisted tier to null"
     );
   }
+});
+
+test("each tier's override key matches its own job id", () => {
+  // A copy-paste that points two tiers at one key silently makes one of them
+  // unreachable — the caller sets `e2e` and the e2e job keeps its default.
+  const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8").split("\n");
+  let job = null;
+  const seen = new Set();
+  for (const line of lines) {
+    const j = line.match(/^  ([a-z][a-z0-9-]*):$/);
+    if (j) job = j[1];
+    const t = line.match(
+      /^    timeout-minutes: \$\{\{ fromJSON\(inputs\.tier-timeouts\)\['([a-z0-9-]+)'\]/
+    );
+    if (!t) continue;
+    assert.equal(
+      t[1],
+      job,
+      `job \`${job}\` reads override key \`${t[1]}\` — the key must be the job id, ` +
+        "or the caller's override for that tier lands on the wrong job (or nowhere)"
+    );
+    assert.ok(!seen.has(t[1]), `override key \`${t[1]}\` is claimed by two jobs`);
+    seen.add(t[1]);
+  }
+  assert.ok(seen.size >= 8, `expected every tier to be overridable; found ${seen.size}`);
 });
 
 test("the fail-fast cancel step's own budget carries no headroom", () => {
@@ -817,30 +885,54 @@ test("the fail-fast cancel step's own budget carries no headroom", () => {
   }
 });
 
-test("the aggregator's ceiling set mirrors the tiers' own budgets", () => {
-  // TIER_TIMEOUT_MINUTES is what makes `timed-out` detectable. If a tier's base
-  // budget changes and the set does not, that tier's timeouts silently fall
-  // back to `stopped-mid-step` — the misdiagnosis this Story removed.
-  const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8");
-  const bases = new Set(
-    [...lines.matchAll(/^ {4}timeout-minutes: \$\{\{ (\d+) \+ /gm)].map((m) => m[1])
-  );
-  const declared = new Set(
+test("the aggregator's base list carries every tier's default budget", () => {
+  // TIER_TIMEOUT_BASES is what makes `timed-out` detectable for a tier the
+  // caller did NOT override. If a tier's default budget changes and the list
+  // does not, that tier's timeouts silently fall back to `stopped-mid-step` —
+  // the misdiagnosis this Story removed. The caller's override values are
+  // unioned in at runtime, so they need no counterpart here.
+  const raw = readFileSync(join(repoRoot, WORKFLOW), "utf8");
+  const onJobs = new Set(
     [
-      ...lines.matchAll(
-        /^\s*\$?\{?\{?\s*(\d+) \+ inputs\.timeout-headroom-minutes \}\},?\]?$/gm
+      ...raw.matchAll(
+        /^ {4}timeout-minutes: \$\{\{ fromJSON\(inputs\.tier-timeouts\)\['[a-z0-9-]+'\] \|\| (\d+) \}\}$/gm
       ),
     ].map((m) => m[1])
   );
-  const setBlock = lines.slice(lines.indexOf("TIER_TIMEOUT_MINUTES:"));
-  for (const base of bases) {
+  assert.ok(onJobs.size > 0, "no job-level ceilings found");
+
+  const decl = raw.match(/^\s*TIER_TIMEOUT_BASES: '(\[[^\]]*\])'$/m);
+  assert.ok(decl, "`TIER_TIMEOUT_BASES` not declared as a JSON array literal");
+  const declared = new Set(JSON.parse(decl[1]).map(String));
+
+  for (const base of onJobs) {
     assert.ok(
-      declared.has(base) ||
-        setBlock.includes(`${base} + inputs.timeout-headroom-minutes`),
-      `a tier runs under a ${base}m base budget but TIER_TIMEOUT_MINUTES does not ` +
-        "list it — timeouts on that tier would be misreported as stopped-mid-step"
+      declared.has(base),
+      `a tier defaults to a ${base}m budget but TIER_TIMEOUT_BASES does not list ` +
+        `it (${decl[1]}) — a timeout on that tier would be misreported as ` +
+        "stopped-mid-step"
     );
   }
+});
+
+test("the aggregator env carries no job name (self-maintaining)", () => {
+  // The reason the caller's override map is threaded through RAW rather than
+  // resolved per tier: a per-tier map in this env block would name every job,
+  // which is exactly the bookkeeping check-ci-required-aggregator.test.mjs
+  // forbids. That suite checks `needs:` ids; this one pins the narrower rule
+  // that made the design what it is, next to the code it constrains.
+  const raw = readFileSync(join(repoRoot, WORKFLOW), "utf8");
+  const start = raw.indexOf("TIER_TIMEOUT_BASES:");
+  const end = raw.indexOf("GH_TOKEN:", start);
+  assert.ok(start !== -1 && end > start, "ceiling env block not found");
+  const block = raw.slice(start, end);
+  assert.doesNotMatch(
+    block,
+    /fromJSON\(inputs\.tier-timeouts\)\[/,
+    "the ceiling env block resolves per-tier overrides by name — thread " +
+      "`inputs.tier-timeouts` through raw and union it in the script instead, so " +
+      "adding a job to `needs:` stays the only edit"
+  );
 });
 
 // ---------------------------------------------------------------------------

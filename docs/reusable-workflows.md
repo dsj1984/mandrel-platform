@@ -100,7 +100,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | Input              | Type    | Default          | When to override                                                                                                                              |
 | ------------------ | ------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `runner`           | string  | `'ubuntu-latest'`| Runs-on label for all jobs. Pass a JSON-encoded array string (e.g. `'["self-hosted","domio-runner"]'`) to target a self-hosted runner.        |
-| `timeout-headroom-minutes` | number | `0` | Minutes added to **every** tier's own work budget. GitHub charges the pre-job `Set up runner` wait against each job's `timeout-minutes`, so on a self-hosted pool a tier's real budget is `work + queue wait` — and only you know your fleet's queue distribution. Default `0` is byte-for-byte today's behaviour. See [Tier timeout headroom](#tier-timeout-headroom-timeout-headroom-minutes). |
+| `tier-timeouts`    | string  | `'{}'`           | JSON object of per-tier `timeout-minutes` overrides, keyed by tier (e.g. `'{"ci-required": 17, "e2e": 57}'`). GitHub charges the pre-job `Set up runner` wait against each job's `timeout-minutes`, so on a self-hosted pool a tier's real budget is `work + queue wait` — and only you know your fleet's queue distribution. Unlisted tiers keep their default. Default `'{}'` is byte-for-byte today's behaviour. See [Caller-addressable tier timeouts](#caller-addressable-tier-timeouts-tier-timeouts). |
 | `shards`           | number  | `1`              | **DEPRECATED — no longer read.** Sharding is configured solely via `shard-matrix`; the shard-count denominator is derived from the matrix size (`strategy.job-total`). Declared for backwards compatibility only (passing it is harmless and changes nothing); scheduled for removal in the next breaking release. |
 | `shard-matrix`     | string  | `'[1]'`          | JSON-encoded array of shard indices driving the test matrix (unit, contract, e2e) — e.g. `'[1,2,3]'` for 3 shards. The only sharding input: each test invocation's `--shard=<n>/<total>` denominator is derived from the matrix size, so a mismatched second input cannot under- or over-run the suite. |
 | `fail-fast`        | boolean | `false`          | **Opt-in.** Cancel the entire run on the first tier-job failure, freeing runner capacity that cannot change the outcome. Default `false` is byte-for-byte today's run-to-completion behaviour. Requires `actions: write` on the caller's token. See [Fail-fast run cancellation](#fail-fast-run-cancellation-fail-fast). |
@@ -149,7 +149,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 > **JSON-encoded string** (`'["self-hosted","domio-runner"]'`), not a YAML
 > sequence.
 
-### Tier timeout headroom (`timeout-headroom-minutes`)
+### Caller-addressable tier timeouts (`tier-timeouts`)
 
 Every tier job declares a `timeout-minutes` ceiling — the guard that stops a
 genuinely wedged job from burning six hours of runner capacity. Those ceilings
@@ -173,7 +173,7 @@ on one such pool (n=141 `Set up runner` durations):
 Against that distribution the `ci-required` aggregator's 5-minute ceiling has a
 *median setup cost exceeding its entire budget* — it passes by luck. Raising the
 constants is not the fix, because the same constant then over-serves every
-GitHub-hosted caller. The headroom is the caller's to state:
+GitHub-hosted caller. The ceilings are yours to state:
 
 ```yaml
 jobs:
@@ -181,26 +181,49 @@ jobs:
     uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
     with:
       runner: '["self-hosted","my-runner"]'
-      timeout-headroom-minutes: 12
+      # Each tier's default budget plus this pool's p90 setup time (~7m).
+      tier-timeouts: '{"ci-required": 12, "migration-guard": 17, "e2e": 52}'
     secrets: inherit
 ```
 
+The keys are tier names — `lint`, `typecheck`, `unit`, `contract`, `e2e`,
+`migration-guard`, `security`, `osv-scan`, `ci-required`. Defaults, for sizing:
+
+| tier | default `timeout-minutes` |
+| --- | --- |
+| `ci-required` | 5 |
+| `migration-guard` | 10 |
+| `lint`, `typecheck`, `osv-scan` | 15 |
+| `unit`, `contract`, `security` | 20 |
+| `e2e` | 45 |
+
 Semantics:
 
-- **Default `0` is byte-for-byte today's behaviour.** Adopting the input is
+- **Default `'{}'` is byte-for-byte today's behaviour.** Adopting the input is
   opt-in; not passing it changes nothing.
-- **It is headroom, not an override.** The value is *added* to each tier's own
-  work budget, so the relative sizing between tiers is preserved and you cannot
-  accidentally disarm the guard for a tier whose real work cost you do not know.
-  There is deliberately no per-tier override map.
-- **Size it from your pool's p90 setup time**, not its median — the median only
-  buys you a coin flip on the tail.
+- **Partial maps are the norm.** An unlisted tier falls back to its own default,
+  so you override only the tiers you have measured and never freeze the
+  platform's other defaults into your caller.
+- **Size each value as that tier's default plus your pool's p90 setup time**,
+  not its median — the median only buys you a coin flip on the tail.
+- **These are absolute values, not headroom.** A single "add N minutes to every
+  tier" input would be the smaller surface, and it is what
+  [#340](https://github.com/dsj1984/mandrel-platform/issues/340) asked for — but
+  GitHub Actions expressions have **no arithmetic operators**, so
+  `timeout-minutes: ${{ 15 + inputs.headroom }}` does not merely misbehave, it
+  fails to parse and takes the whole workflow down with a *"workflow file
+  issue"* and zero jobs. The only inline alternative is a setup job emitting
+  computed outputs, which every tier would then have to `needs:` — adding a
+  full extra queue wait to the critical path on precisely the saturated fleets
+  this input exists to serve. The addition therefore moves to the caller, who
+  is the only party that knows its own p90 anyway.
 - **It does not apply to step-level budgets.** The fail-fast cancel step's own
   `timeout-minutes: 1` bounds a single API call inside an already-running job,
   where no queue wait is charged.
 - **Undersizing is now legible.** A tier killed at its ceiling is classified
   `timed-out` by the aggregator and the summary names which ceiling was hit —
   see [Cancelled-tier provenance](#cancelled-tier-provenance-cancelled-policy).
+  Your override values are detected as ceilings too, not just the defaults.
 
 ### Fail-fast run cancellation (`fail-fast`)
 
@@ -320,7 +343,7 @@ nothing to do with the runners at all:
 | Provenance | What happened | What to do |
 | --- | --- | --- |
 | `fail-fast` | A sibling tier genuinely failed and `fail-fast` cancelled the run. | Triage the failing tier — see [Triaging a fail-fast cancel](#triaging-a-fail-fast-cancel). The cancels are collateral. |
-| `timed-out` | The job exceeded its **own** `timeout-minutes` and GitHub killed it. Nothing hung. | **Config fault.** Raise [`timeout-headroom-minutes`](#tier-timeout-headroom-timeout-headroom-minutes) or cut that tier's work. Do **not** escalate to whoever owns the runners. |
+| `timed-out` | The job exceeded its **own** `timeout-minutes` and GitHub killed it. Nothing hung. | **Config fault.** Raise that tier's entry in [`tier-timeouts`](#caller-addressable-tier-timeouts-tier-timeouts) or cut its work. Do **not** escalate to whoever owns the runners. |
 | `never-started` | The job was cancelled having **executed no step** — a runner provisioning hook hung. No test signal was produced. | Infra fault, not a code defect. Nothing in the diff can fix it. |
 | `superseded` | A newer run exists for the same workflow and branch. | Nothing — the newer run is authoritative. |
 | `unknown` | The classification lookup failed, `gh` is unavailable, or nothing matched. | Treat as red, exactly as before this input existed. |
@@ -395,8 +418,8 @@ Semantics and caveats:
 - **A `timed-out` cancel stays red under both policies**, for the same reason
   an infra one does: the tier was killed before it finished, so it produced no
   complete signal. The class buys legibility, not leniency — the summary names
-  the tier, names the ceiling it hit, and points at `timeout-headroom-minutes`,
-  so the response is to edit a number rather than to open a runner ticket.
+  the tier, names the ceiling it hit, and points at that tier's `tier-timeouts`
+  entry, so the response is to edit a number rather than to open a runner ticket.
 - **An infra cancel stays red on purpose.** It is the most painful case — one
   hung self-hosted runner reds an innocent PR — but the tier produced no test
   signal, and a required gate that passes on a tier which never ran is not a

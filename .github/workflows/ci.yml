@@ -329,20 +329,21 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           # ci.yml has no workflow_call inputs — source the literal default.
           CANCELLED_POLICY: strict
-          # This repo's own distinct ceilings. The `security` tier is a
-          # pr-quality.yml self-call whose inner jobs run under THAT workflow's
-          # ceilings and are classified by its own aggregator, so its values are
-          # not listed here.
+          # This repo's own base budgets. ci.yml has no workflow_call inputs,
+          # so there is no caller override map to union in. The `security` tier
+          # is a pr-quality.yml self-call whose inner jobs run under THAT
+          # workflow's ceilings and are classified by its own aggregator; they
+          # are not listed here.
           #
-          # Note this is a ceiling SET, not a per-job map (the aggregator must
-          # stay self-maintaining), so it cannot scope the match to this repo's
-          # own jobs: a nested pr-quality job that happens to end at 5 or 10
+          # Note the match is by duration, not by job, so it cannot be scoped to
+          # this repo's own jobs: a nested pr-quality job ending at 5 or 10
           # minutes would also be labelled `timed-out`. That is bounded and
           # benign in both directions — a nested job killed at a ceiling this
-          # set omits (15/20/45) simply keeps its previous label, and every
+          # list omits (15/20/45) simply keeps its previous label, and every
           # class here is red either way, so the only thing at stake is which
           # word the summary prints.
-          TIER_TIMEOUT_MINUTES: '[5, 10]'
+          TIER_TIMEOUT_BASES: '[5, 10]'
+          TIER_TIMEOUT_OVERRIDES: '{}'
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
@@ -391,14 +392,22 @@ jobs:
                 --json jobs,workflowDatabaseId,headBranch,createdAt 2>/dev/null || true)"
             fi
 
-            # The distinct ceilings this workflow's jobs run under. An unset or
-            # unparseable value degrades to "no ceilings known", which only ever
-            # costs the `timed-out` label — never a misclassification, and never
-            # a pass, since every class here is red.
-            ceilings="${TIER_TIMEOUT_MINUTES:-}"
-            if [ -z "${ceilings}" ] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"${ceilings}"; then
-              ceilings='[]'
+            # The distinct ceilings in force = this workflow's base budgets ∪ the
+            # caller's override values. Either input being unset or unparseable
+            # degrades that side to empty, which only ever costs the `timed-out`
+            # label — never a misclassification, and never a pass, since every
+            # class here is red.
+            bases="${TIER_TIMEOUT_BASES:-}"
+            if [ -z "${bases}" ] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"${bases}"; then
+              bases='[]'
             fi
+            overrides="${TIER_TIMEOUT_OVERRIDES:-}"
+            if [ -z "${overrides}" ] || ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${overrides}"; then
+              overrides='{}'
+            fi
+            ceilings="$(jq -cn --argjson b "${bases}" --argjson o "${overrides}" \
+              '($b + [ $o[] ]) | map(select(type == "number" and . > 0)) | unique' \
+              2>/dev/null || echo '[]')"
 
             if [ -n "${run_json}" ]; then
               # Per-cancelled-job detail, for the human reading the report. A
@@ -531,12 +540,13 @@ jobs:
                   echo "A \`timed-out\` cancel is a CONFIG fault, not an infra one: the tier"
                   echo "named above exceeded its own \`timeout-minutes\` ceiling and GitHub"
                   echo "killed it. Nothing hung — do NOT escalate to whoever owns the"
-                  echo "runners. Raise \`timeout-headroom-minutes\` on the caller (or cut"
-                  echo "that tier's work): on a self-hosted fleet the pre-job"
+                  echo "runners. Raise that tier's entry in the \`tier-timeouts\` input"
+                  echo "(or cut its work): on a self-hosted fleet the pre-job"
                   echo "\`Set up runner\` wait is charged against the same clock, so a"
-                  echo "tier's real budget is work + queue wait. Size the headroom from"
-                  echo "your pool's p90 setup time. Like \`never-started\`, it produced no"
-                  echo "complete signal, so no policy neutralizes it."
+                  echo "tier's real budget is work + queue wait. Size the entry as the"
+                  echo "tier's default budget plus your pool's p90 setup time. Like"
+                  echo "\`never-started\`, it produced no complete signal, so no policy"
+                  echo "neutralizes it."
                 fi
               fi
             } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
