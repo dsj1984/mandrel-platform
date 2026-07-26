@@ -103,6 +103,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `shards`           | number  | `1`              | **DEPRECATED — no longer read.** Sharding is configured solely via `shard-matrix`; the shard-count denominator is derived from the matrix size (`strategy.job-total`). Declared for backwards compatibility only (passing it is harmless and changes nothing); scheduled for removal in the next breaking release. |
 | `shard-matrix`     | string  | `'[1]'`          | JSON-encoded array of shard indices driving the test matrix (unit, contract, e2e) — e.g. `'[1,2,3]'` for 3 shards. The only sharding input: each test invocation's `--shard=<n>/<total>` denominator is derived from the matrix size, so a mismatched second input cannot under- or over-run the suite. |
 | `fail-fast`        | boolean | `false`          | **Opt-in.** Cancel the entire run on the first tier-job failure, freeing runner capacity that cannot change the outcome. Default `false` is byte-for-byte today's run-to-completion behaviour. Requires `actions: write` on the caller's token. See [Fail-fast run cancellation](#fail-fast-run-cancellation-fail-fast). |
+| `cancelled-policy` | string  | `strict`         | How `ci-required` treats a cancelled tier. `strict` (default) fails on any cancelled tier — byte-for-byte today's behaviour. `provenance-aware` additionally lets a **superseded** run's cancels pass; fail-fast, infra (`never-started`) and unclassifiable cancels still fail. Both policies report each cancelled tier's inferred provenance. See [Cancelled-tier provenance](#cancelled-tier-provenance-cancelled-policy). |
 | `affected`         | boolean | `false`          | **Opt-in.** Run the diff-scoped tiers (lint, typecheck, unit, contract, e2e) affected-only — turbo `--affected` scoped to the packages the event introduced, cutting merge-queue / strict-required re-run cost. Exports `TURBO_SCM_BASE` / `TURBO_SCM_HEAD` (derived event-agnostically, Story #314) and deepens the checkout to full history. The consumer's turbo tasks must use `--affected`. Default `false` is byte-for-byte today's behaviour. See [Affected-only tier execution](#affected-only-tier-execution-affected). |
 | `affected-base`    | string  | `''`             | Optional base git ref/SHA that overrides the event-derived `TURBO_SCM_BASE` in affected mode (e.g. `'origin/main'`). Empty (default) uses the event-agnostic derivation. Ignored when `affected` is `false`. |
 | `enable-lint`      | boolean | `true`           | Set `false` to skip the lint + format-check tier.                                                                                              |
@@ -253,6 +254,62 @@ Two consequences worth stating explicitly:
 - **No new permission is required.** The culprit lookup uses `gh run view`,
   which needs only `actions: read` — already covered by the `actions: write`
   the cancel step required. Callers that already run fail-fast need no change.
+
+### Cancelled-tier provenance (`cancelled-policy`)
+
+`ci-required` counts `cancelled` as non-success — a tier stopped mid-flight
+proved nothing, so it cannot read as green. But a `cancelled` result on its own
+says nothing about **why**, and the three common causes call for three
+completely different responses:
+
+| Provenance | What happened | What to do |
+| --- | --- | --- |
+| `fail-fast` | A sibling tier genuinely failed and `fail-fast` cancelled the run. | Triage the failing tier — see [Triaging a fail-fast cancel](#triaging-a-fail-fast-cancel). The cancels are collateral. |
+| `never-started` | The job was cancelled having **executed no step** — a runner provisioning hook hung. No test signal was produced. | Infra fault, not a code defect. Nothing in the diff can fix it. |
+| `superseded` | A newer run exists for the same workflow and branch. | Nothing — the newer run is authoritative. |
+| `unknown` | The classification lookup failed, `gh` is unavailable, or nothing matched. | Treat as red, exactly as before this input existed. |
+
+There is **no cancellation-reason field to read.** Neither `gh run view --json`
+nor `GET /repos/{owner}/{repo}/actions/runs/{id}` exposes one, so the aggregator
+infers provenance from observable run state: a job with conclusion `failure`
+anywhere in the run, a cancelled job whose every step is `skipped`, and a newer
+run on the same workflow and branch. `fail-fast` is checked **first** — a job
+cancelled while still queued has also executed no step, so testing for
+`never-started` first would report a phantom infra hang on every fail-fast run.
+
+The classification is printed to the log and the job summary under **both**
+policies. `cancelled-policy` only decides whether it changes the verdict:
+
+```yaml
+jobs:
+  ci:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha> # <tag>
+    with:
+      cancelled-policy: provenance-aware
+    secrets: inherit
+```
+
+Semantics and caveats:
+
+- **Default off, unchanged behaviour.** `strict` is the default and is
+  byte-for-byte the behaviour that predates the input: every cancelled tier
+  fails the aggregate.
+- **Only `superseded` is ever neutralized**, and only when *nothing else is
+  wrong*: no job failed, no cancelled job was an infra hang, and at least one
+  tier actually passed. A run with zero successes can never be neutralized —
+  that is the same vacuous pass the all-tiers-skipped guard refuses.
+- **An infra cancel stays red on purpose.** It is the most painful case — one
+  hung self-hosted runner reds an innocent PR — but the tier produced no test
+  signal, and a required gate that passes on a tier which never ran is not a
+  gate. What this input changes is that the failure is now *legible*: the
+  summary names the hung job and states plainly that it is an infra fault, so
+  the escalation is evidenced rather than a guess.
+- **Classification can never turn red into green by failing.** Every lookup is
+  best-effort and every failure path yields `unknown`, which neutralizes
+  nothing. The worst case is exactly today's verdict.
+- **No new permission.** The lookup uses `gh run view` / `gh run list`, which
+  need only `actions: read` — already covered by the `actions: write` the
+  fail-fast cancel step requires.
 
 ### Affected-only tier execution (`affected`)
 

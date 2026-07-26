@@ -17,20 +17,34 @@
  *   1. STRUCTURE — each aggregator's `steps:` derive results from
  *      `toJSON(needs)` and contain NO hardcoded reference to any job named in
  *      its own `needs:` array (the "no hardcoded tier-name list" AC).
- *   2. PARITY — the two aggregators' `steps:` blocks are textually identical,
- *      so a fix to one cannot drift from the other.
+ *   2. PARITY — the two aggregators' `run:` scripts are byte-identical and both
+ *      declare the same `env:` keys, so a fix to one cannot drift from the
+ *      other. (Story #333 loosened this from "the whole `steps:` blocks are
+ *      identical": ci.yml has no `workflow_call` inputs, so it must source
+ *      `CANCELLED_POLICY` as a literal where pr-quality.yml sources it from
+ *      `inputs.cancelled-policy`. The shared script reads it from the
+ *      environment, which is what keeps the logic itself byte-identical.)
  *   3. SEMANTICS — the shared run script passes on `success`/`skipped` and
  *      fails on anything else, INCLUDING `cancelled` (load-bearing for #223's
  *      fail-fast design), while naming the failing jobs and their results.
  *      Executed against real bash+jq; skipped when jq is unavailable locally
- *      (CI's ubuntu runner always has it).
+ *      (CI's ubuntu runner always has it). `gh` is stubbed to fail so these
+ *      tests stay hermetic — provenance classification (Story #333) has its
+ *      own suite in scripts/check-cancelled-provenance.test.mjs.
  *
  * Run: node --test scripts/check-ci-required-aggregator.test.mjs
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  chmodSync,
+  rmSync,
+} from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -155,12 +169,59 @@ for (const { rel, needs, steps } of blocks) {
 // 2. PARITY — the two implementations are textually identical
 // ---------------------------------------------------------------------------
 
-test("pr-quality.yml and ci.yml aggregator steps are textually identical", () => {
+// Story #333 re-shaped this from "the whole `steps:` blocks are byte-identical"
+// to "the `run:` scripts are byte-identical AND both declare the same `env:`
+// keys". ci.yml has no `workflow_call` inputs, so it cannot source
+// `CANCELLED_POLICY` from `inputs.cancelled-policy` the way pr-quality.yml
+// does — but the LOGIC is what must not drift, and the script reads the policy
+// from the environment precisely so the two can share it verbatim.
+
+/** The `KEY:` names declared under a steps block's `env:` mapping. */
+function extractEnvKeys(steps) {
+  const stepLines = steps.split("\n");
+  const start = stepLines.findIndex((l) => /^\s+env:\s*$/.test(l));
+  assert.notEqual(start, -1, "`env:` block not found");
+  const envIndent = stepLines[start].match(/^(\s*)/)[1].length;
+  const keys = [];
+  for (let i = start + 1; i < stepLines.length; i++) {
+    if (/^\s*$/.test(stepLines[i])) continue;
+    if (/^\s*#/.test(stepLines[i])) continue;
+    const indent = stepLines[i].match(/^(\s*)/)[1].length;
+    if (indent <= envIndent) break;
+    const key = stepLines[i].match(/^\s+([A-Za-z_][A-Za-z0-9_]*):/);
+    if (key) keys.push(key[1]);
+  }
+  assert.ok(keys.length > 0, "`env:` block declared no keys");
+  return keys.sort();
+}
+
+test("pr-quality.yml and ci.yml aggregator run scripts are byte-identical", () => {
   assert.equal(
-    blocks[0].steps,
-    blocks[1].steps,
-    "the two `ci-required` steps blocks must not drift — apply every change to both"
+    extractRunScript(blocks[0].steps),
+    extractRunScript(blocks[1].steps),
+    "the two `ci-required` run scripts must not drift — apply every logic change to both"
   );
+});
+
+test("pr-quality.yml and ci.yml aggregators declare the same env keys", () => {
+  assert.deepEqual(
+    extractEnvKeys(blocks[0].steps),
+    extractEnvKeys(blocks[1].steps),
+    "the shared run script reads its inputs from the environment — a key present " +
+      "in only one workflow would leave the other running the same script unconfigured"
+  );
+});
+
+test("the shared aggregator script never references workflow_call inputs", () => {
+  // ci.yml has none, so an `inputs.*` reference could not be mirrored and
+  // would break the byte-identical run-script guarantee above.
+  for (const { rel, steps } of blocks) {
+    assert.doesNotMatch(
+      extractRunScript(steps),
+      /inputs\./,
+      `${rel}: the run script must read configuration from \`env:\`, not \`inputs.*\``
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -185,7 +246,21 @@ function runAggregator(needsResults, { captureSummary = false } = {}) {
     const needsJson = Object.fromEntries(
       Object.entries(needsResults).map(([k, result]) => [k, { result, outputs: {} }])
     );
-    const env = { ...process.env, NEEDS_JSON: JSON.stringify(needsJson) };
+    // Neutralize the provenance lookup (Story #333): shadow `gh` with a stub
+    // that always fails, so these tests stay hermetic and exercise the
+    // `unknown`-provenance path. Provenance classification itself is covered
+    // by scripts/check-cancelled-provenance.test.mjs.
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const ghStub = join(bin, "gh");
+    writeFileSync(ghStub, "#!/usr/bin/env bash\nexit 1\n");
+    chmodSync(ghStub, 0o755);
+
+    const env = {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      NEEDS_JSON: JSON.stringify(needsJson),
+    };
     // The step-summary write must degrade when GITHUB_STEP_SUMMARY is unset
     // (this harness, and any `act`-style local runner), so only define it when
     // a test is actually asserting on the summary body.
@@ -256,7 +331,9 @@ test("run script: partitions own-failures from collateral cancels", semantics, (
   const own = r.stderr
     .split("\n")
     .find((l) => l.includes("Failed on their own"));
-  const collateral = r.stderr.split("\n").find((l) => l.includes("Cancelled"));
+  const collateral = r.stderr
+    .split("\n")
+    .find((l) => l.includes("do not triage"));
 
   assert.ok(own, `no own-failure line in stderr:\n${r.stderr}`);
   assert.ok(collateral, `no collateral line in stderr:\n${r.stderr}`);

@@ -107,6 +107,30 @@ on:
         type: boolean
         default: false
 
+      # Cancelled-tier gate policy (Story #333). `ci-required` has always
+      # mapped EVERY `cancelled` result to the same red verdict, with no
+      # statement of cause — so an infra hang, a fail-fast collateral, and a
+      # superseded push were triaged identically. The aggregator now infers
+      # each cancelled tier's provenance and reports it under BOTH policies;
+      # this input only decides whether a provably-superseded cancel still
+      # reds the gate. `strict` (the default) is byte-for-byte today's
+      # behaviour. A `never-started` (infra) cancel is deliberately NOT
+      # neutralized under either policy — that tier produced no test signal,
+      # and a required gate that passes on a tier which never ran is the same
+      # vacuous pass the all-skipped guard below already refuses.
+      cancelled-policy:
+        description: >
+          How the ci-required aggregate treats a cancelled tier. 'strict'
+          (default) fails on any cancelled tier — identical behaviour to
+          before this input existed. 'provenance-aware' additionally
+          neutralizes a cancel whose run was superseded by a newer run on the
+          same workflow and branch; fail-fast, never-started (infra) and
+          unclassifiable cancels still fail. Both policies report the inferred
+          provenance of every cancelled tier (see docs/reusable-workflows.md).
+        required: false
+        type: string
+        default: strict
+
       # Opt-in affected-only tier execution (Story #315). When true, the
       # diff-scoped tiers (lint, typecheck, unit, contract, e2e) run turbo
       # scoped to the packages the triggering event INTRODUCED, cutting the
@@ -2152,15 +2176,47 @@ jobs:
       # rest were cancelled as collateral — read as N equally-guilty jobs and
       # triage blamed the wrong one. The results are now partitioned into jobs
       # that failed on their own and jobs that were merely `cancelled`, on both
-      # the log and the job summary. This block is mirrored byte-for-byte
-      # between pr-quality.yml and ci.yml (the PARITY test) and must therefore
-      # stay free of any `inputs.*` reference — ci.yml has no workflow_call
-      # inputs, so `inputs.fail-fast` is unavailable to it.
+      # the log and the job summary.
+      #
+      # CANCELLED PROVENANCE (Story #333): a `cancelled` result still said
+      # nothing about WHY, so an infra hang, a fail-fast collateral, and a
+      # superseded push were indistinguishable at the gate. There is no
+      # cancellation-reason field to read (neither `gh run view --json` nor
+      # `GET /actions/runs/{id}` exposes one), so provenance is INFERRED from
+      # observable run state, in this precedence order:
+      #   fail-fast     — some job in the run has conclusion `failure`, which
+      #                   explains every cancel in the run. Checked FIRST: a
+      #                   queued job cancelled before it started would
+      #                   otherwise be misread as an infra hang.
+      #   never-started — a cancelled job executed no step (empty `steps[]`, or
+      #                   every step `skipped`/null). The infra signature: a
+      #                   provisioning hook hung and the job never ran.
+      #   superseded    — a newer run exists for the same workflow and branch,
+      #                   so this run is not authoritative.
+      #   unknown       — the lookup failed, `gh` is absent, or nothing matched.
+      #
+      # The classification is REPORTED under both policies; `CANCELLED_POLICY`
+      # only decides whether a `superseded` run's cancels still red the gate.
+      # A `never-started` cancel is never neutralized: that tier produced no
+      # test signal, and passing on a tier that never ran is the same vacuous
+      # pass the all-skipped guard below refuses.
+      #
+      # This block is mirrored between pr-quality.yml and ci.yml: the `run:`
+      # script is byte-identical and both declare the same `env:` keys (the
+      # PARITY test). Only how `CANCELLED_POLICY` is SOURCED may differ —
+      # ci.yml has no workflow_call inputs — so the script must read it from
+      # the environment and never reference `inputs.*` directly.
       - name: Check all required job results
         shell: bash
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          CANCELLED_POLICY: ${{ inputs.cancelled-policy }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
         run: |
+          policy="${CANCELLED_POLICY:-strict}"
+
           failed="$(jq -r '
             to_entries
             | map(select(.value.result != "success" and .value.result != "skipped"))
@@ -2187,6 +2243,95 @@ jobs:
             | join(" ")
           ' <<<"${NEEDS_JSON}")"
 
+          # At least one job actually succeeded? Required before any cancel may
+          # be neutralized, so a wholly-cancelled run can never pass.
+          any_success="$(jq -r '
+            [ to_entries[] | select(.value.result == "success") ] | length
+          ' <<<"${NEEDS_JSON}")"
+
+          # ── Provenance classification (only when something was cancelled) ──
+          run_class="unknown"
+          detail=""
+          if [ -n "${collateral}" ]; then
+            run_json=""
+            if command -v gh >/dev/null 2>&1; then
+              run_json="$(gh run view "${RUN_ID}" --repo "${REPO}" \
+                --json jobs,workflowDatabaseId,headBranch,createdAt 2>/dev/null || true)"
+            fi
+
+            if [ -n "${run_json}" ]; then
+              # Per-cancelled-job detail, for the human reading the report.
+              detail="$(jq -r '
+                [ .jobs[]? | select(.conclusion == "cancelled") ] as $stopped
+                | ([ .jobs[]? | select(.conclusion == "failure") ] | length > 0) as $any_failed
+                | $stopped
+                | map(
+                    ((.steps // []) | map(select(.conclusion != null and .conclusion != "skipped")) | length) as $ran
+                    | "\(.name): " + (if $any_failed then "fail-fast" elif $ran == 0 then "never-started" else "stopped-mid-step" end))
+                | join("; ")
+              ' <<<"${run_json}" 2>/dev/null || true)"
+
+              any_failed="$(jq -r '[ .jobs[]? | select(.conclusion == "failure") ] | length' <<<"${run_json}" 2>/dev/null || echo 0)"
+              never_started="$(jq -r '
+                [ .jobs[]?
+                  | select(.conclusion == "cancelled")
+                  | select(((.steps // []) | map(select(.conclusion != null and .conclusion != "skipped")) | length) == 0) ]
+                | length
+              ' <<<"${run_json}" 2>/dev/null || echo 0)"
+
+              if [ "${any_failed:-0}" -gt 0 ]; then
+                run_class="fail-fast"
+              elif [ "${never_started:-0}" -gt 0 ]; then
+                run_class="never-started"
+              else
+                # Superseded only when a NEWER run exists for the same workflow
+                # and branch. Anything less certain stays `unknown` — and
+                # `unknown` never neutralizes anything.
+                wf="$(jq -r '.workflowDatabaseId // empty' <<<"${run_json}" 2>/dev/null || true)"
+                branch="$(jq -r '.headBranch // empty' <<<"${run_json}" 2>/dev/null || true)"
+                started="$(jq -r '.createdAt // empty' <<<"${run_json}" 2>/dev/null || true)"
+                if [ -n "${wf}" ] && [ -n "${branch}" ] && [ -n "${started}" ]; then
+                  siblings="$(gh run list --repo "${REPO}" --workflow "${wf}" \
+                    --branch "${branch}" --limit 30 --json databaseId,createdAt 2>/dev/null || true)"
+                  if [ -n "${siblings}" ]; then
+                    newer="$(jq -r --arg id "${RUN_ID}" --arg at "${started}" '
+                      [ .[]? | select((.databaseId | tostring) != $id) | select(.createdAt > $at) ] | length
+                    ' <<<"${siblings}" 2>/dev/null || echo 0)"
+                    if [ "${newer:-0}" -gt 0 ]; then
+                      run_class="superseded"
+                    fi
+                  fi
+                fi
+              fi
+            fi
+
+            echo "⏹️  Cancelled provenance: ${run_class} (policy: ${policy})" >&2
+            if [ -n "${detail}" ]; then
+              echo "⏹️  Per-job: ${detail}" >&2
+            fi
+          fi
+
+          # ── Provenance-aware neutralization ───────────────────────────────
+          # Only a provably-superseded run, with nothing else wrong and at
+          # least one real pass, may clear a cancelled tier.
+          if [ "${policy}" = "provenance-aware" ] \
+            && [ "${run_class}" = "superseded" ] \
+            && [ -z "${genuine}" ] \
+            && [ "${any_success:-0}" -gt 0 ]; then
+            {
+              echo "### ⏭️ ci-required neutral (superseded run)"
+              echo
+              echo "Cancelled: ${collateral}"
+              echo
+              echo "A newer run for this workflow and branch supersedes this one,"
+              echo "no job failed, and no cancelled job was an infra hang — so the"
+              echo "newer run is authoritative and these cancels do not gate."
+            } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+            echo "⏭️  Superseded run — cancelled tiers neutralized under 'provenance-aware': ${collateral}" >&2
+            echo "✅ Aggregate neutral: a newer run is authoritative."
+            exit 0
+          fi
+
           if [ -n "${failed}" ]; then
             {
               echo "### ❌ ci-required failed"
@@ -2201,6 +2346,19 @@ jobs:
               if [ -n "${collateral}" ]; then
                 echo
                 echo "**Cancelled — collateral, do not triage:** ${collateral}"
+                echo
+                echo "Provenance: \`${run_class}\` (policy \`${policy}\`)."
+                if [ -n "${detail}" ]; then
+                  echo
+                  echo "Per-job: ${detail}"
+                fi
+                if [ "${run_class}" = "never-started" ]; then
+                  echo
+                  echo "A \`never-started\` cancel is an INFRA fault: the job never ran a"
+                  echo "step, so it produced no test signal. It is not neutralized by any"
+                  echo "policy — a gate that passes on a tier which never ran is a"
+                  echo "vacuous pass."
+                fi
               fi
             } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
 
