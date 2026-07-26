@@ -470,10 +470,25 @@ test("malformed API output degrades to unknown and stays red", semantics, () => 
 // ---------------------------------------------------------------------------
 
 test("cancelled-policy is declared with a strict default", () => {
-  const source = readFileSync(join(repoRoot, WORKFLOW), "utf8");
-  assert.match(
-    source,
-    /^ {6}cancelled-policy:\n(?: {8}.*\n|\s*\n)*? {8}default: strict\s*$/m,
-    "`cancelled-policy` must default to `strict` so existing consumers are unaffected"
+  // Scan the input's own block by indentation rather than matching it with a
+  // multi-line regex: the obvious `(?: {8}.*\n|\s*\n)*?` formulation has
+  // overlapping alternatives and backtracks exponentially on a file with many
+  // newlines (CodeQL js/redos, high). A line walk has no such failure mode and
+  // reads more like the other extractors in this suite.
+  const lines = readFileSync(join(repoRoot, WORKFLOW), "utf8").split("\n");
+  const start = lines.findIndex((l) => l === "      cancelled-policy:");
+  assert.notEqual(start, -1, "`cancelled-policy:` input not declared");
+
+  const block = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*$/.test(lines[i])) continue;
+    if (lines[i].match(/^(\s*)/)[1].length <= 6) break;
+    block.push(lines[i].trim());
+  }
+
+  assert.ok(
+    block.includes("default: strict"),
+    "`cancelled-policy` must default to `strict` so existing consumers are unaffected; " +
+      `declared instead: ${JSON.stringify(block)}`
   );
 });
