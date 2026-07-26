@@ -83,7 +83,12 @@ test("globToRegExp: a regex-injection payload translates to a literal pattern", 
   // The classic catastrophic-backtracking payload. If any of it survived
   // unescaped, this pattern would carry regex semantics into the matcher.
   const re = globToRegExp("(a+)+$");
-  assert.equal(String(re), String(/^\(a\+\)\+\$$/));
+  // Compared as a STRING, not against a regex literal: writing the expected
+  // pattern as `/^\(a\+\)\+\$$/` puts a (wholly escaped, quantifier-free)
+  // regex literal in the file that CodeQL's js/redos analysis reads as a live
+  // backtracking hazard. The assertion is identical in strength — this test
+  // has always been about the produced source text.
+  assert.equal(String(re), "/^\\(a\\+\\)\\+\\$$/");
   assert.ok(re.test("(a+)+$"), "the payload matches only its literal self");
   assert.ok(!re.test("aaaaaaaa"), "the payload carries no quantifier semantics");
 });
