@@ -242,7 +242,10 @@ runs:
 
         asset="osv-scanner_${osv_os}_${osv_arch}"
         url="https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/${asset}"
-        tmp="$(mktemp -d)"
+        # Runner-scoped download dir (issue #343) — see the gitleaks-scan
+        # action for the full rationale. A bare `mktemp -d` leaks into the
+        # host-shared $TMPDIR, which nothing reaps on a persistent runner.
+        tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/osv-scanner.XXXXXX")"
         echo "Downloading pinned OSV-scanner: ${url}"
         # Retry a release-asset blip rather than fail fleet-wide. Fail-closed
         # is preserved — the SHA-256 check below still gates trust; retries

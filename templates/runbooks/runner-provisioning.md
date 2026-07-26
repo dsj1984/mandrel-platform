@@ -150,9 +150,18 @@ with the runner root's absolute path. The resulting file wires:
 
 - `ACTIONS_RUNNER_HOOK_JOB_STARTED=<RUNNER_DIR>/job-cleanup.sh` — the
   job-start hook. It reaps orphaned pnpm/node processes parented to **this**
-  runner's work tree, clears stale runner-scoped pnpm installs, and
-  age-gate-sweeps shared-`$TMPDIR` gitleaks leftovers. It never fails a job
-  (always exits 0) and never touches another runner's state.
+  runner's work tree, clears stale runner-scoped pnpm installs, and removes
+  leftover tool-download dirs from `<RUNNER_DIR>/_work/_temp`. It never fails
+  a job (always exits 0) and never touches another runner's state.
+
+  **Every path it reads is runner-scoped, and that is load-bearing** (issue
+  #343). The hook runs inside the *job's* clock, so its cost is charged to
+  `Set up runner` and counts against the job's own `timeout-minutes`. An
+  earlier version swept the host-shared OS temp root; on a host where that
+  directory had grown to ~840k entries, `Set up runner` reached 5m29s and
+  jobs were killed before their first real step — surfacing as `cancelled`
+  on unrelated diffs. If you add a sweep to this hook, root it at
+  `_work/_temp`, never at `$TMPDIR`.
 - `RUNNER_TOOL_CACHE=<RUNNER_DIR>/_work/_tool` and
   `AGENT_TOOLSDIRECTORY=<RUNNER_DIR>/_work/_tool` — runner-scoped tool cache
   (two env names, one dir; some actions read the legacy name).

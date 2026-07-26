@@ -1477,7 +1477,7 @@ jobs:
           label_present="false"
           label_source="none"
           if [ -n "${PR_NUMBER:-}" ]; then
-            gh_api_err="$(mktemp)"
+            gh_api_err="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gh-api-err.XXXXXX")"
             if labels_json="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '[.[].name]' 2>"${gh_api_err}")"; then
               label_source="live"
               if printf '%s' "${labels_json}" \
@@ -1939,7 +1939,10 @@ jobs:
           # rpds arm64-vs-x86_64 failure) is NOT read — pip rebuilds native
           # deps for THIS interpreter's arch into the isolated venv. No
           # reliance on the shared `--user` site.
-          venv_dir="$(mktemp -d)/semgrep-venv"
+          # Runner-scoped (issue #343): a bare `mktemp -d` leaks a venv-sized
+          # tree into the host-shared $TMPDIR on every run, and nothing reaps
+          # it on a persistent self-hosted runner.
+          venv_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/semgrep.XXXXXX")/semgrep-venv"
           python3 -m venv "${venv_dir}"
           # The lockfile pins cp312-only native wheels, so the hash-pinned path
           # is valid ONLY on a Linux interpreter whose ABI tag is cp312. Gating
