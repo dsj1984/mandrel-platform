@@ -36,11 +36,38 @@
  * and exit code, both count-independent, so planting volume would buy no signal
  * (and costs ~17ms/file on a dev Mac whose endpoint security scans every write).
  *
+ * INTERPRETER COVERAGE — what each assertion actually proves
+ *
+ * The fleet is macOS, where `/bin/bash` is 3.2 (Apple cannot ship a GPL3 bash).
+ * That version differs from bash 4.4+ in ways no source scan can see, so this
+ * suite is explicit about which interpreter it ran under rather than inheriting
+ * whatever `bash` PATH happens to resolve:
+ *
+ *   • `resolveBash()` prefers `/bin/bash`, falls back to PATH `bash`, and is
+ *     overridable with `RUNNER_KIT_BASH`. Its resolved banner is asserted and
+ *     printed, so a run can never claim 3.2 coverage it did not have.
+ *   • The bash-4 construct denylist (AC-8) is a SOURCE scan and proves the same
+ *     thing under any interpreter.
+ *   • Every other test is a real execution and proves its property only for
+ *     `BASH.banner`. On the macOS CI job and on a dev Mac that is genuinely
+ *     3.2; on ubuntu it is bash 5.
+ *
+ * The divergence that motivated this (Story #354 audit follow-up): under
+ * `set -u`, bash 3.2 aborts on `"${arr[@]}"` when the array is EMPTY, where
+ * bash 4.4+ expands to nothing. The checker runs under `set -u` and builds
+ * three accumulators, so an unguarded expansion would pass a bash-5-only CI and
+ * then fail with `unbound variable` on the fleet at the operator's first real
+ * invocation. `ci.yml`'s `runner-kit-bash32` job runs this suite on
+ * `macos-latest` against the system 3.2 for exactly that reason; the canary
+ * test below asserts the divergence is actually present before the
+ * empty-accumulator test claims to have exercised it.
+ *
  * Run: node --test scripts/runner-env-drift.test.mjs
+ *      RUNNER_KIT_BASH=/bin/bash node --test scripts/runner-env-drift.test.mjs
  */
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   copyFileSync,
   mkdirSync,
@@ -134,22 +161,59 @@ function makePool(spec) {
 }
 
 /**
- * Run the checker.
+ * Resolve the interpreter every execution test runs under, and record WHICH one
+ * it is. Bare `bash` from PATH is deliberately not used: it silently varies by
+ * host (3.2 on a stock Mac, 5.x on ubuntu), so a suite that inherits it cannot
+ * say what its passes prove. `/bin/bash` is preferred because the fleet's shell
+ * is the stricter one; `RUNNER_KIT_BASH` overrides for a deliberate cross-check.
+ *
+ * @returns {{ cmd: string, banner: string, major: number|null }}
+ */
+function resolveBash() {
+  const candidates = process.env.RUNNER_KIT_BASH
+    ? [process.env.RUNNER_KIT_BASH]
+    : ["/bin/bash", "bash"];
+  for (const cmd of candidates) {
+    let banner;
+    try {
+      banner = execFileSync(cmd, ["--version"], { encoding: "utf8" }).split("\n")[0].trim();
+    } catch {
+      continue;
+    }
+    const m = /version (\d+)\./.exec(banner);
+    return { cmd, banner, major: m ? Number(m[1]) : null };
+  }
+  throw new Error(
+    `no usable bash interpreter (tried ${candidates.join(", ")}) — this suite executes a shell script`,
+  );
+}
+
+const BASH = resolveBash();
+
+/** True when the resolved interpreter is the fleet's bash 3.x, not 4.4+. */
+const IS_BASH_3X = BASH.major === 3;
+
+/**
+ * Run the checker under the RESOLVED interpreter, capturing both streams.
+ *
+ * stderr is returned, not discarded: a bash-3.2 `unbound variable` abort writes
+ * there and exits non-zero, which would otherwise be indistinguishable from the
+ * checker's own deliberate exit 1 (drift) or exit 2 (usage).
  *
  * @param {string[]} args
  * @param {string} [scriptPath] — defaults to the shipped script
- * @returns {{ status: number, stdout: string }}
+ * @returns {{ status: number, stdout: string, stderr: string }}
  */
 function runChecker(args, scriptPath = SCRIPT) {
-  try {
-    const stdout = execFileSync("bash", [scriptPath, ...args], {
-      encoding: "utf8",
-      timeout: 60_000,
-    });
-    return { status: 0, stdout };
-  } catch (err) {
-    return { status: err.status ?? 1, stdout: err.stdout ?? "" };
-  }
+  const res = spawnSync(BASH.cmd, [scriptPath, ...args], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  return {
+    status: res.status ?? 1,
+    stdout: res.stdout ?? "",
+    stderr: res.stderr ?? "",
+  };
 }
 
 test("AC-1: the shipped script is executable", () => {
@@ -284,11 +348,15 @@ test("AC-7: --pool-root overrides the default", () => {
   assert.match(stdout, /runner-b/);
 });
 
-test("AC-8: the script stays runnable under macOS's system bash 3.2", () => {
-  // The fleet is macOS; `/bin/bash` there is 3.2. These three are the bash-4
-  // constructs a maintainer reaches for first when accumulating per-runner
-  // state, and each fails with a syntax error rather than a wrong answer —
-  // i.e. the operator's first real invocation is where they would find out.
+test("AC-8: the script uses no bash-4-only construct (source scan — interpreter-independent)", () => {
+  // These are the bash-4 constructs a maintainer reaches for first when
+  // accumulating per-runner state, and each fails with a SYNTAX error rather
+  // than a wrong answer — i.e. the operator's first real invocation is where
+  // they would find out. A source scan is the right shape for this class
+  // precisely because it does not depend on which bash ran the suite.
+  //
+  // It is NOT sufficient on its own: the runtime divergences below are
+  // invisible to any denylist. See the two tests that follow.
   const source = readFileSync(SCRIPT, "utf8");
   const code = source
     .split("\n")
@@ -299,6 +367,83 @@ test("AC-8: the script stays runnable under macOS's system bash 3.2", () => {
   assert.equal(/\bmapfile\b/.test(code), false, "mapfile is bash 4+");
   assert.equal(/\breadarray\b/.test(code), false, "readarray is bash 4+");
   assert.equal(/\$\{[A-Za-z_][A-Za-z0-9_]*,,\}/.test(code), false, "case-conversion expansion is bash 4+");
+});
+
+test("the suite reports which interpreter its execution tests actually prove", () => {
+  // A passing suite must never be readable as "bash 3.2 verified" when it ran
+  // under bash 5. This test does not gate on the version — ubuntu CI legitimately
+  // has only bash 5 — it gates on the resolution being KNOWN and reported.
+  assert.match(BASH.banner, /GNU bash, version \d+\./, "could not identify the interpreter");
+  assert.notEqual(BASH.major, null, "interpreter major version is unparseable");
+  console.log(
+    `    ℹ execution tests ran under: ${BASH.cmd} — ${BASH.banner}` +
+      (IS_BASH_3X
+        ? "  [fleet-equivalent bash 3.x]"
+        : "  [NOT the fleet's 3.x — 3.2-only regressions cannot surface in this run]"),
+  );
+});
+
+test("canary: the bash-3.2 empty-array divergence is real on a 3.x interpreter", (t) => {
+  // The empty-accumulator test below is only meaningful if the interpreter it
+  // runs under actually exhibits the hazard. Assert the divergence directly, so
+  // the guard can never be "passing" against a bash that would accept an
+  // unguarded expansion anyway.
+  if (!IS_BASH_3X) {
+    t.skip(`interpreter is bash ${BASH.major}.x — 4.4+ expands an empty "\${arr[@]}" to nothing by design`);
+    return;
+  }
+  const res = spawnSync(BASH.cmd, ["-c", 'set -u; arr=(); for x in "${arr[@]}"; do :; done'], {
+    encoding: "utf8",
+  });
+  assert.notEqual(res.status, 0, "expected bash 3.x to abort on an empty array under `set -u`");
+  assert.match(res.stderr, /unbound variable/);
+});
+
+test("no reachable path expands a possibly-empty accumulator under `set -u`", () => {
+  // The checker runs under `set -u` and builds three accumulators —
+  // `runner_names`, `unset_keys`, `unset_names`. Each is expanded only behind a
+  // non-empty guard today. This drives every scenario that empties one of them
+  // and asserts the script never aborts on an unbound expansion, so a later
+  // edit that drops a guard is caught rather than shipped.
+  //
+  // Under bash 3.x this is a real regression gate. Under 4.4+ it still checks
+  // exit codes and output, but the divergence itself cannot fire — which is
+  // what the macOS `runner-kit-bash32` CI job exists to cover.
+  const scenarios = [
+    {
+      what: "unset_keys and unset_names both empty (every key set on every runner)",
+      pool: makePool({ "runner-a": { keys: MANDATED }, "runner-b": { keys: MANDATED } }),
+      expect: 0,
+    },
+    {
+      what: "unset_names empty for the uniformly-set keys, non-empty for the drifting one",
+      pool: makePool({
+        "runner-a": { keys: MANDATED },
+        "runner-b": { keys: MANDATED.filter((k) => k !== HOOK) },
+      }),
+      expect: 1,
+    },
+    {
+      what: "every accumulator empty (a key set on no runner at all)",
+      pool: makePool({ "runner-a": { keys: [] }, "runner-b": { keys: [] } }),
+      expect: 0,
+    },
+    {
+      what: "runner_names empty (pool root holds no runner directories)",
+      pool: makePool({ "not-a-runner": { isRunner: false } }),
+      expect: 2,
+    },
+  ];
+
+  for (const { what, pool, expect } of scenarios) {
+    const res = runChecker(["--pool-root", pool]);
+    assert.doesNotMatch(
+      res.stderr,
+      /unbound variable/,
+      `aborted on an unguarded empty-array expansion — ${what}`,
+    );
+    assert.equal(res.status, expect, `unexpected exit for: ${what}\nstderr: ${res.stderr}`);
+  }
 });
 
 test("AC-9: the run is read-only against the pool", () => {
