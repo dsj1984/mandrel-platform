@@ -26,9 +26,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   parseArgs,
@@ -423,4 +424,66 @@ test("runCli: --help prints usage and exits 0", () => {
   const { code, stdout } = capture(["--help"]);
   assert.equal(code, 0);
   assert.match(stdout, /Usage: node scripts\/check-first-party-pin-freshness\.mjs/);
+});
+
+// ---------------------------------------------------------------------------
+// Wiring — the check must run where a bump PR can actually satisfy it
+//
+// Read as text rather than parsed YAML: this repo ships no YAML parser as a
+// dependency (the checkers themselves are dependency-free by design), and the
+// invariants below are all line-shaped.
+// ---------------------------------------------------------------------------
+
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const SCRIPT_INVOCATION = "node scripts/check-first-party-pin-freshness.mjs";
+
+/** Extract one top-level job block (2-space indented key) from a workflow. */
+function jobBlock(workflowText, jobName) {
+  const lines = workflowText.split("\n");
+  const start = lines.findIndex((l) => l === `  ${jobName}:`);
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^ {2}\S/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+test("wiring: pin-drift.yml runs the check on push to main and on the schedule", () => {
+  const wf = readFileSync(join(REPO_ROOT, ".github/workflows/pin-drift.yml"), "utf8");
+
+  assert.ok(wf.includes(SCRIPT_INVOCATION), "pin-drift.yml invokes the checker");
+  assert.match(wf, /^ {2}schedule:$/m, "the existing weekly schedule is retained");
+  assert.match(
+    wf,
+    /^ {2}push:\n {4}branches: \[main\]$/m,
+    "the workflow is triggered by push to main"
+  );
+});
+
+test("wiring: the checking job checks out full history (fetch-depth: 0)", () => {
+  const wf = readFileSync(join(REPO_ROOT, ".github/workflows/pin-drift.yml"), "utf8");
+  const block = jobBlock(wf, "first-party-pin-freshness");
+
+  assert.ok(block, "the first-party-pin-freshness job exists");
+  assert.ok(block.includes(SCRIPT_INVOCATION), "the job invokes the checker");
+  assert.match(
+    block,
+    /fetch-depth: 0/,
+    "a shallow checkout cannot resolve pinned manifests or ancestry"
+  );
+});
+
+test("wiring: the check is absent from the PR-gating ci.yml", () => {
+  // A PR that edits a composite action cannot pin its own not-yet-existing
+  // merge commit, so a PR-time gate would be unsatisfiable on exactly the
+  // changes this check exists to protect.
+  const ci = readFileSync(join(REPO_ROOT, ".github/workflows/ci.yml"), "utf8");
+  assert.ok(
+    !ci.includes("check-first-party-pin-freshness"),
+    "ci.yml must not invoke the freshness check"
+  );
 });

@@ -41,6 +41,18 @@
 # that lives in a consumer's GitHub API state rather than its checked-out
 # files.
 #
+# The second job — `first-party-pin-freshness` (Story #354) — is the INWARD
+# counterpart: it audits THIS repo's own `uses:` self-pins rather than a
+# consumer's. It runs on the schedule above AND on every push to `main`, and
+# is deliberately ABSENT from the PR-gating ci.yml: a PR that edits a
+# composite action cannot pin its own not-yet-existing merge commit, so a
+# PR-time gate would be unsatisfiable on exactly the changes it exists to
+# protect. A red `main` is instead the signal to open the follow-up bump PR —
+# the land-then-bump sequence documented in docs/reusable-workflows.md. Unlike
+# the consumer dashboards above (standing decision #10 — report, never gate,
+# because they describe remote repos this repo cannot fix), this job DOES fail
+# the run: its subject is this repo's own files, so the fix is always in hand.
+#
 # SHA-pinned third-party actions.
 name: Pin Drift Dashboard
 
@@ -48,6 +60,10 @@ on:
   # Mondays 07:00 UTC — a weekly standing sweep ahead of the work week.
   schedule:
     - cron: "0 7 * * 1"
+  # Every push to `main` — the first moment a self-pin can fall behind the
+  # action file it points at, and the moment the bump PR becomes possible.
+  push:
+    branches: [main]
   # On-demand: run the dashboard from the Actions tab.
   workflow_dispatch:
     inputs:
@@ -60,12 +76,44 @@ permissions:
   contents: read
 
 concurrency:
-  group: pin-drift-${{ github.ref }}
+  # Keyed by EVENT as well as ref: a push to `main` and the weekly schedule
+  # share `refs/heads/main`, and without the event in the key a routine push
+  # would cancel an in-flight consumer dashboard run.
+  group: pin-drift-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # This repo's OWN self-pins: does every first-party `uses:` resolve to a
+  # manifest that matches the working tree and is reachable from `main`?
+  first-party-pin-freshness:
+    name: first-party-pin-freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # fetch-depth: 0 is REQUIRED. The check resolves each pinned
+          # manifest with `git show <sha>:<path>` and tests reachability with
+          # `git merge-base --is-ancestor`; a shallow clone can answer neither
+          # and the check refuses to run rather than emit a wall of false
+          # `unreachable` findings.
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: First-party self-pin freshness
+        shell: bash
+        run: node scripts/check-first-party-pin-freshness.mjs
+
   pin-drift:
     name: pin-drift
+    # Cross-repo consumer dashboards read three private repos over the GitHub
+    # API; that belongs on the weekly sweep and on demand, not on every push.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
