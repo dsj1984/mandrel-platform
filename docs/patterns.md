@@ -15,13 +15,17 @@ the fleet.
 
 - `scripts/check-action-pins.mjs` is the **ratchet**: it walks every workflow
   and composite `action.yml`, extracts each `uses:` ref (stripping the
-  conventional `# v4.2.2` tag comment), and fails if any third-party ref is not
-  a 40-hex SHA. It runs in `ci-required`, so a non-SHA pin can never reach
-  `main`.
-- **Exemptions**: first-party self-references (`dsj1984/mandrel-platform/...`)
-  carry a release-tag shape and are governed by the portability lint's pin-lag
-  guard instead; local `./path` and `docker://` refs have no upstream tag to
-  move.
+  conventional `# v4.2.2` tag comment), and fails if any **remote** ref —
+  third-party or first-party — is not a 40-hex SHA. It runs in `ci-required`,
+  so a non-SHA pin can never reach `main`. The two owner classes are reported
+  separately because their remediation differs.
+- **Exemptions**: local `./path` refs (no upstream ref that can move) and
+  `docker://` refs (pinned by their own digest convention).
+- First-party self-references were exempt until the Story #354 audit. The
+  exemption's stated justification — that the portability lint's pin-lag guard
+  covered them — did not hold: that guard skips any ref which is not *already*
+  a 40-hex SHA, so a branch-pinned self-ref was validated by nothing. See
+  [`reusable-workflows.md` § First-party self-pin freshness](reusable-workflows.md#first-party-self-pin-freshness).
 - **"A bump is a PR"**: because pins are immutable SHAs, upgrading an action is
   never an in-place tag edit — it is a Renovate PR that changes the SHA, runs
   the full gate, and is reviewed. The pinned SHA carries a `# <version>` comment

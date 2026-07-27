@@ -906,11 +906,14 @@ The egress audit closes the *runtime* half of the supply-chain threat; a
 **static action-pin ratchet** closes the *tag-mutation* half. It is not a
 `pr-quality.yml` input — it is a gate in **mandrel-platform's own** CI
 (`ci.yml`, a `needs:` of that repo's `ci-required`): on every PR it walks every
-workflow and composite `action.yml` and **fails if any third-party `uses:` is
+workflow and composite `action.yml` and **fails if any remote `uses:` is
 pinned to anything other than a full 40-character commit SHA**. A mutable tag
 (`@v4`) can be force-moved to a malicious commit after review; the ratchet
-makes that un-mergeable. First-party `dsj1984/mandrel-platform/*` self-refs are
-exempt (they are governed by the portability lint's pin-lag guard). Because the
+makes that un-mergeable. This covers first-party `dsj1984/mandrel-platform/*`
+self-refs as well as third-party actions — they are counted and reported as
+separate classes, since re-pinning a self-ref must move every call site for
+that subpath together (the single-pin invariant). Only local `./path` and
+`docker://` refs are exempt. Because the
 shared workflows ship from this repo, **consumers inherit fully SHA-pinned
 workflows automatically** — no per-repo ticket. A consumer that wants the same
 guard on *its own* workflows copies `scripts/check-action-pins.mjs` into its
@@ -2915,11 +2918,20 @@ That gap shipped issue #352: PR #345 scoped the `gitleaks-scan` / `osv-scan`
 extraction dirs to `${RUNNER_TEMP}`, no call site was repointed, and every
 consumer on a self-hosted fleet kept leaking ~164 MB of extracted binaries per
 run into the host-shared temp root — on the latest release. Neither existing
-guard fired: `check-action-pins.mjs` exempts first-party refs from the SHA
-ratchet and only enforces that call sites *agree* (a fleet agreeing on one
-stale SHA is green), and the portability lint's Rule 3 re-runs only its own
-`${{ }}`/relative-path rules against the pinned manifest, so a behavioural lag
-is invisible to it.
+guard fired: `check-action-pins.mjs` enforces only that a self-pin is a SHA and
+that every call site *agrees* on it (a fleet agreeing on one stale SHA is
+green — and at the time it did not check the SHA shape for self-refs at all),
+and the portability lint's Rule 3 re-runs only its own `${{ }}`/relative-path
+rules against the pinned manifest, so a behavioural lag is invisible to it.
+
+> **The same audit closed a second hole.** Until Story #354's follow-up, a
+> self-reference on a *moving* ref (`…/gitleaks-scan@main`) was green on all
+> three first-party guards at once: this checker files a non-SHA ref under an
+> informational `unpinnedRefs` note that never fails, Rule 3 skips any ref that
+> is not already a 40-hex SHA, and `check-action-pins.mjs` exempted first-party
+> refs outright. `check-action-pins.mjs` now ratchets them, which is what makes
+> the freshness classes below exhaustive — every self-ref is a SHA, so every
+> self-ref is decidable.
 
 `scripts/check-first-party-pin-freshness.mjs` closes it. It resolves the
 manifest at every first-party pinned SHA and sorts each finding into one of
