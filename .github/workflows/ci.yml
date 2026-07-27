@@ -152,6 +152,57 @@ jobs:
   # binary in the gitleaks-scan composite action. Bump ACTIONLINT_VERSION and ACTIONLINT_SHA256
   # in lockstep (checksums:
   # https://github.com/rhysd/actionlint/releases/download/v<version>/actionlint_<version>_checksums.txt).
+  # The runner kit ships a shell script that runs on the fleet's macOS hosts,
+  # where `/bin/bash` is 3.2 — Apple cannot ship a GPL3 bash. Every other job
+  # here is ubuntu-latest (bash 5), and the divergences that matter are RUNTIME,
+  # not syntax: under `set -u`, bash 3.2 aborts on `"${arr[@]}"` when the array
+  # is empty, where 4.4+ expands to nothing. A source-scan denylist cannot see
+  # that class, so a regression would pass every ubuntu job and then fail with
+  # `unbound variable` on the fleet at the operator's first real invocation.
+  #
+  # macos-latest still ships the system 3.2, and GitHub-hosted macOS minutes are
+  # free for public repositories, so this is the fleet's own interpreter at no
+  # cost. Scoped to the runner-kit suite alone — it is the only shipped shell
+  # the fleet executes; everything else in `scripts/` is Node.
+  runner-kit-bash32:
+    name: Runner kit (macOS system bash 3.2)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      # Fail loudly rather than silently degrade to a duplicate ubuntu run: if
+      # a future image ships a newer /bin/bash, this job would keep passing
+      # while proving nothing about the fleet's shell.
+      - name: Assert the system bash is still 3.x
+        shell: bash
+        run: |
+          set -euo pipefail
+          banner="$(/bin/bash --version | head -1)"
+          echo "system bash: ${banner}"
+          case "$banner" in
+            *"version 3."*) ;;
+            *)
+              echo "::error::/bin/bash on this image is no longer 3.x (${banner}). This job exists to exercise the fleet's bash 3.2; re-point it at a 3.2 build or retire it deliberately."
+              exit 1
+              ;;
+          esac
+
+      # RUNNER_KIT_BASH pins the suite's interpreter explicitly — without it the
+      # suite resolves one itself and would still be correct here, but the pin
+      # is what makes this job's intent unambiguous.
+      - name: Run the runner-kit suite under bash 3.2
+        shell: bash
+        env:
+          RUNNER_KIT_BASH: /bin/bash
+        run: node --test scripts/runner-env-drift.test.mjs
+
   actionlint:
     name: Lint workflows (actionlint + shellcheck)
     runs-on: ubuntu-latest
@@ -257,6 +308,7 @@ jobs:
     needs:
       - node-scripts
       - actionlint
+      - runner-kit-bash32
       # Dogfood security tier (Story #236): the pr-quality.yml self-call. Its
       # result is the called workflow's overall result, so a gitleaks/Semgrep
       # finding fails this aggregator — the security gate is load-bearing on

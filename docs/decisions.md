@@ -581,3 +581,49 @@ now fails that PR's own `ci-required` (self-gating is the point, but it means
 workflow edits are tested by their own edit), and the self-call's SAST needs
 `.semgrep` excluded (the vendored ruleset snapshot would otherwise be scanned
 as a target).
+
+## 2026-07-27 — Exercise the runner kit's shell on `macos-latest`, not a bash-3.2 denylist
+
+**Context.** The runner kit ships `templates/runner/check-runner-env-drift.sh`
+(Story [#353](https://github.com/dsj1984/mandrel-platform/issues/353)) to a
+macOS fleet, where `/bin/bash` is 3.2 — Apple cannot ship a GPL3 bash. Every
+`ci.yml` job runs on `ubuntu-latest` (bash 5), and the suite invoked `bash` from
+PATH, so its bash-3.2 guarantee rested on a source-scan denylist of four bash-4
+constructs (`declare -A`, `mapfile`, `readarray`, `${var,,}`) plus the accident
+that a dev Mac's PATH `bash` is 3.2.
+
+That denylist can only see **syntax**. The divergences that matter are runtime:
+under `set -u`, bash 3.2 aborts on `"${arr[@]}"` when the array is empty, where
+4.4+ expands to nothing. The checker runs under `set -u` and builds three
+accumulators, so an unguarded expansion would pass every ubuntu job and then
+fail with `unbound variable` on the fleet at the operator's first real
+invocation — the worst place to find out, since the tool exists to diagnose
+fleet misconfiguration. Three shapes were on the table: pin `/bin/bash` in the
+suite and document CI as bash-5-only; build a 3.2 from source on the ubuntu
+runner; or run the suite on a macOS runner.
+
+**Decision.** Run it on `macos-latest`, whose system bash is still 3.2, as a
+`runner-kit-bash32` job wired into `ci-required`'s `needs:`. GitHub-hosted macOS
+minutes are free for public repositories, so the fleet's own interpreter costs
+nothing and needs no build step to keep pinned. Branch protection is untouched —
+the required context list stays exactly `ci-required`, and the aggregator is
+`toJSON(needs)`-driven, so adding the job to `needs:` was the only edit. The job
+is scoped to the one suite: this is the only shipped shell the fleet executes,
+and everything else under `scripts/` is Node. It asserts `/bin/bash` is still
+3.x and **fails** if a future image ships newer, rather than silently degrading
+into a duplicate ubuntu run that proves nothing.
+
+The suite additionally resolves its interpreter explicitly (`/bin/bash`, then
+PATH `bash`, overridable via `RUNNER_KIT_BASH`), reports which one every
+execution assertion actually ran under, and carries a canary asserting the
+empty-array divergence is genuinely present on a 3.x interpreter — so the
+empty-accumulator regression test can never pass vacuously against a bash that
+would accept an unguarded expansion anyway.
+
+**Consequences.** A bash-3.2 regression in the runner kit is now caught in PR
+CI instead of on the fleet. The cost is a second runner OS in the required set:
+`ci-required` now depends on macOS image availability, so a macOS outage or
+image change blocks merges — bounded by the job being a single 10-minute
+`node --test` run, and made loud rather than silent by the 3.x assertion. The
+denylist is retained: it is interpreter-independent and catches the syntax class
+on every job, including the ubuntu ones.
