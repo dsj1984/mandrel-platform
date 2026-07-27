@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.1.0...mandrel-platform-v1.2.0) (2026-07-27)
+
+
+### Added
+
+* bump the stale first-party action self-pins and add a `main`-side pin-freshness check ([#354](https://github.com/dsj1984/mandrel-platform/issues/354)) ([#357](https://github.com/dsj1984/mandrel-platform/issues/357)) ([526a28a](https://github.com/dsj1984/mandrel-platform/commit/526a28a165fde2cf7ddc3b22e0dba7e1181d8f4f))
+* runner-kit: report per-runner `.env` configuration drift across a host's runner pool ([#353](https://github.com/dsj1984/mandrel-platform/issues/353)) ([#355](https://github.com/dsj1984/mandrel-platform/issues/355)) ([db77979](https://github.com/dsj1984/mandrel-platform/commit/db77979677ced1f6479004ff426df91d7cbc6d49))
+
+
+### Fixed
+
+* **scripts:** ratchet first-party action self-pins to a 40-hex SHA (refs [#354](https://github.com/dsj1984/mandrel-platform/issues/354)) ([#358](https://github.com/dsj1984/mandrel-platform/issues/358)) ([853ed11](https://github.com/dsj1984/mandrel-platform/commit/853ed11b15ab89a994a88ef8b697122ad86eb398))
+
 ## [1.1.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.0.1...mandrel-platform-v1.1.0) (2026-07-26)
 
 
