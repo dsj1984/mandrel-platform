@@ -73,21 +73,26 @@
 # Runs on the host with no repo checkout and no Node runtime, and stays
 # compatible with macOS's system bash 3.2 — the same constraint
 # `.github/actions/gitleaks-scan/action.yml` documents for this fleet. That
-# rules out `declare -A`, `mapfile`/`readarray`, and `${var,,}`. The runner and
-# key tables below are therefore newline-delimited accumulator strings walked
-# with `IFS`, and the per-key tally is recomputed in a second pass rather than
-# memoised in a map.
+# rules out `declare -A`, `mapfile`/`readarray`, and `${var,,}`; it does NOT
+# rule out plain INDEXED arrays, which 3.2 supports and which the accumulators
+# below use. Only the per-key tally needs a second pass, because keeping a
+# key->count table is the one thing an indexed array cannot do.
+#
+# Accumulating into arrays rather than splitting a delimited string on a
+# reassigned `IFS` is deliberate and load-bearing: reassigning IFS globally is
+# flagged by the platform's own SAST ruleset (`bash.lang.security.ifs-tampering`)
+# because it silently changes the splitting behaviour of every later unquoted
+# expansion in the script. Arrays give the same grouping with no global state
+# and no quoting hazard for a runner directory whose name contains whitespace.
 
 set -u
 
-# Newline, used as the accumulator delimiter throughout. Because newline is an
-# IFS *whitespace* character, splitting collapses runs and drops leading and
-# trailing delimiters — so accumulators can be appended to unconditionally.
-NL='
-'
-IFS=$NL
-
-MANDATED_KEYS="ACTIONS_RUNNER_HOOK_JOB_STARTED${NL}RUNNER_TOOL_CACHE${NL}AGENT_TOOLSDIRECTORY${NL}LANG"
+MANDATED_KEYS=(
+  ACTIONS_RUNNER_HOOK_JOB_STARTED
+  RUNNER_TOOL_CACHE
+  AGENT_TOOLSDIRECTORY
+  LANG
+)
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 POOL_ROOT=$(dirname "$SCRIPT_DIR")
@@ -159,22 +164,17 @@ env_has_key() {
   grep -Eq "^[[:space:]]*${env_key}=" "$env_file" 2>/dev/null
 }
 
-key_total=0
-for key in $MANDATED_KEYS; do
-  key_total=$((key_total + 1))
-done
+key_total=${#MANDATED_KEYS[@]}
 
-# Enumerate runners. Pathname expansion is not subject to word splitting, so
-# the newline IFS above does not affect this loop; a glob matching nothing
-# stays literal and fails the `-d` test.
-runner_names=""
-runner_count=0
+# Enumerate runners. A glob matching nothing stays literal and fails the `-d`
+# test, so an empty pool root falls through to the exit-2 branch below.
+runner_names=()
 for candidate in "$POOL_ROOT"/*/; do
   [ -d "$candidate" ] || continue
   [ -f "${candidate}config.sh" ] || continue
-  runner_count=$((runner_count + 1))
-  runner_names="${runner_names}${NL}$(basename "$candidate")"
+  runner_names+=("$(basename "$candidate")")
 done
+runner_count=${#runner_names[@]}
 
 if [ "$runner_count" -eq 0 ]; then
   printf 'check-runner-env-drift: no runner directories under %s\n' "$POOL_ROOT" >&2
@@ -188,38 +188,35 @@ printf '  runners:   %d\n' "$runner_count"
 printf '\n'
 
 printf 'per-runner:\n'
-for name in $runner_names; do
-  unset_keys=""
-  for key in $MANDATED_KEYS; do
+for name in "${runner_names[@]}"; do
+  unset_keys=()
+  for key in "${MANDATED_KEYS[@]}"; do
     if ! env_has_key "$POOL_ROOT/$name/.env" "$key"; then
-      # Key names never contain whitespace, so a space-joined display string is
-      # unambiguous here — unlike runner names, which are printed one per line.
-      if [ -z "$unset_keys" ]; then
-        unset_keys=$key
-      else
-        unset_keys="$unset_keys $key"
-      fi
+      unset_keys+=("$key")
     fi
   done
 
-  if [ -z "$unset_keys" ]; then
+  if [ "${#unset_keys[@]}" -eq 0 ]; then
     printf '  %s: all %d mandated keys set\n' "$name" "$key_total"
   else
-    printf '  %s: unset %s\n' "$name" "$unset_keys"
+    # `${arr[*]}` joins on the first character of IFS — a space, since this
+    # script never reassigns it. Safe for key names, which carry no whitespace;
+    # runner names are printed one per line below for exactly that reason.
+    printf '  %s: unset %s\n' "$name" "${unset_keys[*]}"
   fi
 done
 printf '\n'
 
 printf 'per-key:\n'
 drift_count=0
-for key in $MANDATED_KEYS; do
+for key in "${MANDATED_KEYS[@]}"; do
   set_count=0
-  unset_names=""
-  for name in $runner_names; do
+  unset_names=()
+  for name in "${runner_names[@]}"; do
     if env_has_key "$POOL_ROOT/$name/.env" "$key"; then
       set_count=$((set_count + 1))
     else
-      unset_names="${unset_names}${NL}${name}"
+      unset_names+=("$name")
     fi
   done
 
@@ -228,9 +225,12 @@ for key in $MANDATED_KEYS; do
   elif [ "$set_count" -eq 0 ]; then
     printf '  %s: uniformly unset — set on 0 of %d runners; a uniform gap, not drift\n' "$key" "$runner_count"
   else
+    # Reached only when 0 < set_count < runner_count, so unset_names is
+    # non-empty here — one name per line, because a runner directory name may
+    # contain whitespace and a joined list would make it unactionable.
     drift_count=$((drift_count + 1))
     printf '  %s: DRIFT — set on %d of %d runners; unset on:\n' "$key" "$set_count" "$runner_count"
-    for name in $unset_names; do
+    for name in "${unset_names[@]}"; do
       printf '      %s\n' "$name"
     done
   fi
