@@ -2891,6 +2891,10 @@ this section. The contract guarantees today are:
   drifts from the canonical `uses:` pin (`❌ stale pin literal`), catching the
   class the `uses:`-only scan missed. Adopt the resolved-ref deploy summary
   (above) instead of hand-maintaining such a literal.
+- **Self-pin freshness** (Story #354) —
+  `scripts/check-first-party-pin-freshness.mjs` asserts that the platform's own
+  `uses:` self-pins resolve to the action files this repo actually ships. See
+  the subsection below.
 
 > **`v1.0` / `@v1` is deferred — not planned.** Cutting a `v1.0` release,
 > publishing a moving `@v1` major tag, and `@v1`-style major-tag pinning are a
@@ -2898,3 +2902,65 @@ this section. The contract guarantees today are:
 > decision, 2026-06-29). There is also no formal SemVer deprecation policy
 > today. Until that changes, **pin by release tag/SHA** (Renovate-bumped) as
 > above — do not expect a floating `@v1` tag to exist.
+
+### First-party self-pin freshness
+
+This repo calls its own composite actions the same way a consumer does — by
+absolute `dsj1984/mandrel-platform/<subpath>@<sha>` reference. **That pin is
+the only thing that decides which revision runs.** Fixing an action file in
+the working tree changes nothing at runtime until every call site is
+repointed.
+
+That gap shipped issue #352: PR #345 scoped the `gitleaks-scan` / `osv-scan`
+extraction dirs to `${RUNNER_TEMP}`, no call site was repointed, and every
+consumer on a self-hosted fleet kept leaking ~164 MB of extracted binaries per
+run into the host-shared temp root — on the latest release. Neither existing
+guard fired: `check-action-pins.mjs` exempts first-party refs from the SHA
+ratchet and only enforces that call sites *agree* (a fleet agreeing on one
+stale SHA is green), and the portability lint's Rule 3 re-runs only its own
+`${{ }}`/relative-path rules against the pinned manifest, so a behavioural lag
+is invisible to it.
+
+`scripts/check-first-party-pin-freshness.mjs` closes it. It resolves the
+manifest at every first-party pinned SHA and sorts each finding into one of
+two classes — kept distinct because their remedies differ:
+
+| Class | What it means | Remedy |
+| --- | --- | --- |
+| `stale` | The manifest **at the pinned SHA** differs from the working-tree manifest at that subpath. The pinned revision is what runs. | **Bump** the pin to a commit carrying the current manifest. |
+| `unreachable` | The pinned SHA is **not an ancestor** of the checked-out ref — typically a pre-squash branch commit. Content-identical today, resolvable only until GitHub garbage-collects it, after which every consumer fails at action-load time. | **Re-pin** to the squashed commit on `main`. |
+
+Run it locally against a full clone:
+
+```bash
+node scripts/check-first-party-pin-freshness.mjs
+```
+
+It needs full git history (`git show <sha>:<path>` and
+`git merge-base --is-ancestor`), so any checkout that runs it must set
+`fetch-depth: 0`. A shallow clone is refused outright rather than reported as
+a wall of false `unreachable` findings.
+
+#### Where it runs — and the land-then-bump sequence
+
+The check runs on **push to `main`** and on the **`pin-drift.yml` schedule**.
+It is deliberately **absent from the PR-gating `ci.yml`**: a PR that edits a
+composite action cannot pin its own not-yet-existing merge commit, so a
+PR-time gate would be unsatisfiable on exactly the changes it exists to
+protect.
+
+A red `main` is therefore not a broken build — it is the **signal to open the
+follow-up bump PR**:
+
+1. **Land** the action fix. `main` goes red on `first-party-pin-freshness`,
+   naming each stale call site with its file, line, subpath and SHA.
+2. **Bump** — open a follow-up PR repointing every call site to the commit
+   that just landed. All call sites for a given subpath must move **in the
+   same commit**: `check-action-pins.mjs` enforces the single-pin invariant
+   per subpath, so a partial bump trades one red check for another.
+3. **Verify** — `node scripts/check-first-party-pin-freshness.mjs` exits 0
+   locally, and `main` goes green when the bump lands.
+
+The same sequence applies after any squash-merge that leaves a pin on a
+pre-squash branch commit (the `unreachable` class), which is how
+`setup-toolchain` sat off-`main` undetected across several releases.
