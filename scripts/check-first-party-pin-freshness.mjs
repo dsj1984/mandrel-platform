@@ -11,10 +11,11 @@
  * tree therefore changes nothing at runtime until every call site is
  * repointed, and nothing in the repo detected that gap:
  *
- *   • `check-action-pins.mjs` EXEMPTS first-party refs from the SHA ratchet
- *     and enforces only the single-pin invariant — that every call site for a
- *     subpath agrees. A fleet of call sites agreeing on ONE STALE sha is
- *     perfectly green.
+ *   • `check-action-pins.mjs` enforces only the single-pin invariant — that
+ *     every call site for a subpath agrees. A fleet of call sites agreeing on
+ *     ONE STALE sha is perfectly green. (At the time it also EXEMPTED
+ *     first-party refs from the SHA ratchet entirely; that exemption was
+ *     retired by the Story #354 audit — see the `unpinnedRefs` note below.)
  *   • `check-workflow-portability.mjs` Rule 3 does read the manifest at the
  *     pinned SHA, but re-runs only its own Rules 1–2 against it (relative
  *     `uses:`, `${{ }}` in input descriptions/defaults). A BEHAVIOURAL lag —
@@ -38,6 +39,14 @@
  *                     garbage-collects it, after which every consumer fails at
  *                     action-load time. The fix is to RE-PIN to the squashed
  *                     commit on `main`.
+ *
+ * A first-party ref that is NOT a 40-hex SHA has no freshness answer at all —
+ * a branch or tag names a revision that can move after this check runs — so it
+ * is collected into `unpinnedRefs` and merely REPORTED. Enforcing the SHA
+ * shape belongs upstream of freshness, in `check-action-pins.mjs`, which
+ * ratchets first-party refs alongside third-party ones and runs in the
+ * PR-gating `ci.yml` where this check deliberately does not (see below). The
+ * note here is the backstop for a consumer that adopted only this script.
  *
  * Requires full git history — run the checkout with `fetch-depth: 0`. A
  * shallow clone cannot answer either question and is refused loudly rather

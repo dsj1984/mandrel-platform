@@ -27,13 +27,29 @@
  *     `pnpm/action-setup`.) A non-SHA ref (a tag like `v4`, a branch, a short
  *     SHA) FAILS the lint.
  *
- *   • FIRST-PARTY self-references — `dsj1984/mandrel-platform/...@<ref>` — are
- *     EXEMPT from this ratchet. They are this repo's OWN reusable workflows /
- *     composite actions, governed by the cross-repo portability lint's pin-lag
- *     guard (`check-workflow-portability.mjs`, Rule 3), and they carry a
- *     release-tag shape at publish time. The first-party owner is overridable
- *     via `--first-party-owner` for a fork. They ARE, however, subject to the
- *     single-pin invariant below.
+ *   • FIRST-PARTY self-references — `dsj1984/mandrel-platform/...@<ref>` — MUST
+ *     ALSO be a 40-char hex SHA, and are reported as their own violation class.
+ *     They were exempt until Story #354's audit: the exemption's stated
+ *     justification was that `check-workflow-portability.mjs` Rule 3 governs
+ *     them, but Rule 3's `collectInternalPins` skips any ref that is not
+ *     already a 40-hex SHA (`if (!isSha40(cls.ref)) return`), so a
+ *     branch-pinned self-reference was validated by NOTHING. The two other
+ *     first-party guards had the same hole — the single-pin invariant below
+ *     compares whatever refs it finds without requiring a SHA, and
+ *     `check-first-party-pin-freshness.mjs` files a non-SHA ref under an
+ *     informational `unpinnedRefs` note that never fails. So
+ *     `…/gitleaks-scan@main` was green on all three.
+ *
+ *     A moving self-ref is the same supply-chain risk the third-party ratchet
+ *     exists to close, with a wider blast radius: `pr-quality.yml` is inherited
+ *     by every consumer. It is also invisible to `platform-sync.mjs`, whose
+ *     rewrite regex matches `@[0-9a-fA-F]{40}` only — a branch-pinned consumer
+ *     workflow is silently skipped on every platform bump.
+ *
+ *     The land-then-bump flow is unaffected: it always pins full SHAs (see
+ *     docs/reusable-workflows.md § First-party self-pin freshness). The
+ *     first-party owner is overridable via `--first-party-owner` for a fork,
+ *     and first-party refs remain subject to the single-pin invariant below.
  *
  *   • LOCAL `./path` references and `docker://image` references are EXEMPT —
  *     a local path has no upstream tag to move, and a docker ref is pinned by
@@ -125,10 +141,18 @@ export function parseArgs(argv) {
 // ---------------------------------------------------------------------------
 
 /**
- * Scan a single file's TEXT for `uses:` step keys and evaluate each third-party
- * reference. Returns { violations: [...], scanned: <count> }. A violation is
- * `{ file, line, ref, owner, reason }`. `file` is left as passed-in (the
- * caller supplies a display path).
+ * Scan a single file's TEXT for `uses:` step keys and evaluate every REMOTE
+ * reference against the 40-hex SHA ratchet. Returns
+ * `{ violations, scanned, firstPartyViolations, firstPartyScanned }` — the two
+ * owner classes are counted and reported separately because their remediation
+ * differs (bump a vendored third-party pin vs. re-pin one of this repo's own
+ * call sites, which must move at every call site together to keep the
+ * single-pin invariant). A violation is `{ file, line, ref, owner, reason }`;
+ * `file` is left as passed-in (the caller supplies a display path).
+ *
+ * LOCAL (`./path`) and `docker://` references stay exempt: a local path has no
+ * upstream ref that can move, and a docker ref carries its own digest
+ * convention.
  *
  * Only lines whose first non-space token is `uses:` (a YAML mapping key) are
  * inspected — `uses:` appearing inside a comment or a `run:` heredoc never
@@ -138,13 +162,33 @@ export function parseArgs(argv) {
  */
 export function scanContent(content, displayFile, firstPartyOwner = DEFAULT_FIRST_PARTY_OWNER) {
   const violations = [];
+  const firstPartyViolations = [];
   let scanned = 0;
+  let firstPartyScanned = 0;
   const lines = String(content).split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const bareRef = parseUsesLine(lines[i]);
     if (bareRef === null) continue;
     const cls = classifyUses(bareRef, firstPartyOwner);
-    if (cls.kind !== "third-party") continue; // local/docker/first-party/unparseable → exempt
+
+    // First-party self-references (Story #354 audit). A bare `owner/repo@ref`
+    // carrying no subpath is ratcheted too: the hazard is the MOVING REF, and
+    // it moves whether or not the reference names a subpath.
+    if (cls.kind === "first-party") {
+      firstPartyScanned++;
+      if (!isSha40(cls.ref)) {
+        firstPartyViolations.push({
+          file: displayFile,
+          line: i + 1,
+          ref: bareRef,
+          owner: cls.owner,
+          reason: `first-party self-reference "${cls.owner}" is pinned to "${cls.ref}", not a full 40-char commit SHA`,
+        });
+      }
+      continue;
+    }
+
+    if (cls.kind !== "third-party") continue; // local/docker/unparseable → exempt
     scanned++;
     if (!isSha40(cls.ref)) {
       violations.push({
@@ -156,7 +200,7 @@ export function scanContent(content, displayFile, firstPartyOwner = DEFAULT_FIRS
       });
     }
   }
-  return { violations, scanned };
+  return { violations, scanned, firstPartyViolations, firstPartyScanned };
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +222,9 @@ export function runLint(opts) {
   const files = [...workflowFiles, ...listActionFiles(acDir)];
 
   const violations = [];
+  const firstPartyViolations = [];
   let scanned = 0;
+  let firstPartyScanned = 0;
   // Keep the raw workflow-file contents for the single-pin pass so we read
   // each file from disk once.
   const workflowRecords = [];
@@ -192,7 +238,9 @@ export function runLint(opts) {
     const display = relative(cwd, file) || file;
     const res = scanContent(content, display, opts.firstPartyOwner);
     violations.push(...res.violations);
+    firstPartyViolations.push(...res.firstPartyViolations);
     scanned += res.scanned;
+    firstPartyScanned += res.firstPartyScanned;
     if (workflowFiles.includes(file)) {
       workflowRecords.push({ file: display, content });
     }
@@ -204,9 +252,14 @@ export function runLint(opts) {
     : [];
 
   return {
-    ok: violations.length === 0 && singlePinViolations.length === 0,
+    ok:
+      violations.length === 0 &&
+      firstPartyViolations.length === 0 &&
+      singlePinViolations.length === 0,
     violations,
+    firstPartyViolations,
     scanned,
+    firstPartyScanned,
     files,
     singlePinViolations,
   };
@@ -242,6 +295,24 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
     );
   }
 
+  if (result.firstPartyViolations.length > 0) {
+    failed = true;
+    err(
+      `[action-pins] ❌ ${result.firstPartyViolations.length} first-party self-reference(s) pinned to a moving ref:`
+    );
+    for (const v of result.firstPartyViolations) {
+      err(`  • ${v.file}:${v.line} — ${v.reason}`);
+    }
+    err(
+      "[action-pins] Pin every first-party `uses:` to a full 40-char commit SHA " +
+        "too (keep the `# vX.Y.Z` tag note as a comment). A branch or tag ref " +
+        "means the revision that runs can change with no diff here — and " +
+        "`pr-quality.yml` is inherited by every consumer. It is also invisible " +
+        "to platform-sync.mjs, whose rewrite matches 40-hex SHAs only, so it " +
+        "would be skipped on every platform bump."
+    );
+  }
+
   if (result.singlePinViolations.length > 0) {
     failed = true;
     err(
@@ -263,7 +334,8 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
   if (failed) return 1;
 
   log(
-    `[action-pins] ✅ all ${result.scanned} third-party action reference(s) are SHA-pinned ` +
+    `[action-pins] ✅ all ${result.scanned} third-party and ${result.firstPartyScanned} ` +
+      `first-party action reference(s) are SHA-pinned ` +
       `(${result.files.length} file(s) scanned); first-party single-pin invariant holds.`
   );
   return 0;
