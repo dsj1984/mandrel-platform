@@ -142,6 +142,8 @@ Copy the kit from the platform payload into the runner root:
 ```bash
 cp node_modules/mandrel-platform/templates/runner/job-cleanup.sh <RUNNER_DIR>/job-cleanup.sh
 chmod +x <RUNNER_DIR>/job-cleanup.sh
+cp node_modules/mandrel-platform/templates/runner/check-runner-env-drift.sh <RUNNER_DIR>/check-runner-env-drift.sh
+chmod +x <RUNNER_DIR>/check-runner-env-drift.sh
 cp node_modules/mandrel-platform/templates/runner/.env.example <RUNNER_DIR>/.env
 ```
 
@@ -167,8 +169,48 @@ with the runner root's absolute path. The resulting file wires:
   (two env names, one dir; some actions read the legacy name).
 - `LANG=en_US.UTF-8`.
 
-The hook needs no per-runner editing: it derives `RUNNER_DIR` from its own
-location, so the same file works verbatim on every runner.
+Neither shipped script needs per-runner editing: each derives its paths from
+its own location, so the same files work verbatim on every runner.
+
+### Confirm the pool is uniform (`check-runner-env-drift.sh`)
+
+Run this **after provisioning each runner**, and again whenever two runners
+behave differently on the same job. It walks the pool and names the runners
+missing any of the four mandated keys:
+
+```bash
+cd <RUNNER_DIR>
+./check-runner-env-drift.sh                       # pool root = this dir's parent
+./check-runner-env-drift.sh --pool-root <POOL_ROOT>
+```
+
+The pool root is the directory holding one subdirectory per runner (§1); a
+child directory counts as a runner iff it contains `config.sh`. The checker is
+read-only — it never writes into a runner root and never touches a service.
+
+| Exit | Meaning | Operator response |
+|------|---------|-------------------|
+| `0` | No drift. Every mandated key is set on every runner, or unset on every runner. | None. |
+| `1` | **Drift** — a key is set on some runners but not all. | Copy `.env.example` onto each runner the report names, substitute its `<RUNNER_DIR>`, then `./svc.sh stop && ./svc.sh start` on those runners so they reload `.env`. |
+| `2` | Usage error — bad flag, or a pool root holding no runner directories. | Re-check `--pool-root`. |
+
+A key absent from **every** runner is reported as a uniform gap and does *not*
+exit non-zero, so a fleet that has deliberately not adopted a key is not a
+standing alarm.
+
+**Why this check exists at all:** `scripts/check-runner-health.mjs` monitors
+the fleet through the GitHub runners API, which reports a runner's name,
+labels and online status — it cannot see `<RUNNER_DIR>/.env`. So partial
+provisioning never surfaces as a configuration fault; it surfaces as an
+unattributable behavioural difference between two runs of the same job. In
+issue #343, 16 of 19 runners on one host carried the hook, and the resulting
+`Set up runner` spread (5m29s against 54s) took far longer to attribute than
+reading nineteen `.env` files would have.
+
+Do **not** wire this into `ACTIONS_RUNNER_HOOK_JOB_STARTED`. That hook runs
+inside the job's clock, where every read is billed to `Set up runner` and
+counts against the job's `timeout-minutes` — the exact cost model that made
+#343 a job-killer. This is an operator-run tool.
 
 ## 5. Install as a launchd service (`svc.sh`)
 
@@ -199,10 +241,12 @@ The runner loads `.env` at service start — after any `.env` change, restart:
   `svc.sh`.
 - **Kit updates.** The hook and `.env.example` are versioned in
   mandrel-platform. On a platform release that touches `templates/runner/`,
-  re-copy `job-cleanup.sh` (verbatim — it is parameterized) and diff
-  `.env.example` against the live `.env`, then `./svc.sh stop && ./svc.sh
-  start`. There is no `mandrel sync` equivalent for a runner host's
-  filesystem — this is an operator-applied step.
+  re-copy `job-cleanup.sh` and `check-runner-env-drift.sh` (both verbatim —
+  they are parameterized) and diff `.env.example` against the live `.env`,
+  then `./svc.sh stop && ./svc.sh start`. There is no `mandrel sync`
+  equivalent for a runner host's filesystem — this is an operator-applied
+  step. Re-run `./check-runner-env-drift.sh` afterwards: a kit update applied
+  to some runners and not others is exactly the drift it reports.
 - **Token/registration rotation.** Registration tokens are one-shot at
   config time; nothing persists to rotate. To move a runner between repos or
   rename it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
