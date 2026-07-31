@@ -417,6 +417,21 @@ on:
         type: string
         default: 'true'
 
+      # pnpm STORE destination. Distinct from pnpm-dest below: that is where the
+      # pnpm shim is installed (and is pre-cleaned every job), this is where the
+      # content-addressable store lives.
+      toolchain-store-dir:
+        description: >
+          Passed through to setup-toolchain's `store-dir` input. Leave empty for
+          the default, which with toolchain-cache 'false' puts the store in
+          RUNNER_TOOL_CACHE/pnpm-store so it survives the per-job pre-clean of the
+          pnpm shim dir — the reason a self-hosted "warm store" was not warm. Set
+          it only to place the store elsewhere (a faster disk, a mount shared by
+          design).
+        required: false
+        type: string
+        default: ''
+
       # pnpm shim destination for self-hosted runners.
       pnpm-dest:
         description: >
@@ -861,6 +876,7 @@ jobs:
         with:
           cache: ${{ inputs.toolchain-cache }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
+          store-dir: ${{ inputs.toolchain-store-dir }}
           trust-lockfile: ${{ inputs.trust-lockfile }}
           packages-read-token: ${{ secrets.packages-read-token }}
 

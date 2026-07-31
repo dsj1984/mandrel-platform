@@ -22,6 +22,15 @@
 # to runner.temp keeps the shim job-scoped, not under $HOME, and unaffected by
 # `git clean -ffdx` on the next run.
 #
+# With cache: 'false' the pnpm STORE defaults to RUNNER_TOOL_CACHE/pnpm-store so
+# it survives the pre-clean and the job — see the install step for why it had to
+# move, and what it cost while it did not. Pass store-dir only to override:
+#   - name: Setup toolchain
+#     uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
+#     with:
+#       cache: 'false'
+#       store-dir: '/mnt/fast/pnpm-store'
+#
 # Usage (transitional lockfile-policy exception — see docs/reusable-workflows.md):
 #   - name: Setup toolchain
 #     uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@<sha>
@@ -45,7 +54,10 @@ description: >
   Pass trust-lockfile: 'true' to append --trust-lockfile to the install step
   (default 'false' — unchanged behavior). Pass require-wrangler: 'true' to
   preflight that wrangler is installed from the consumer lockfile after the
-  install step (default 'false' — no preflight).
+  install step (default 'false' — no preflight). Pass store-dir to override
+  where pnpm keeps its store; by default, with cache 'false', it goes to
+  RUNNER_TOOL_CACHE/pnpm-store so a warm self-hosted store actually survives
+  the per-job pre-clean of the shim dir.
 
 inputs:
   cache:
@@ -97,6 +109,16 @@ inputs:
       expansion error.
     required: false
     default: ''
+  store-dir:
+    description: >
+      Where pnpm keeps its content-addressable store, passed as --store-dir on
+      the install step. Leave unset for the default, which depends on cache:
+      with cache 'false' the store goes to RUNNER_TOOL_CACHE/pnpm-store so it
+      survives the pre-clean below and the job itself; with cache 'true' it is
+      left alone, because actions/setup-node resolves the store path itself when
+      it caches. Set explicitly only to override that choice.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -128,20 +150,60 @@ runs:
         node-version-file: .nvmrc
         cache: ${{ inputs.cache == 'true' && 'pnpm' || '' }}
 
+    # The store has to be told where to live, or the pre-clean above deletes it.
+    # pnpm derives its default store from PNPM_HOME, which pnpm/action-setup sets
+    # to `dest` — so the store lands INSIDE the shim dir (the `store/v11/files/*`
+    # the pre-clean's own comment names) and is removed at the top of every job.
+    # With `cache: 'false'` that leaves a self-hosted runner with no cache at all:
+    # none from GitHub by design, none on disk in fact, so every job re-downloads
+    # the whole dependency graph. Consumer evidence: Beestera/swarm-os#1174, a
+    # ~22-minute registry outage that failed two required tiers inside
+    # `pnpm install`, and a store measured at 990 MB / 55k files that had never
+    # once survived a job.
+    #
+    # RUNNER_TOOL_CACHE is the right home: persistent per-runner on self-hosted,
+    # outside the shim dir the pre-clean owns, and on the same filesystem as the
+    # workspace, so pnpm keeps hardlinking into node_modules instead of copying.
+    #
+    # Only when caching is off. With `cache: 'true'` actions/setup-node runs
+    # `pnpm store path` itself to decide what to cache, at its own step before
+    # this one — moving the store here would leave it caching a directory the
+    # install no longer writes to.
+    #
+    # It must be the CLI flag: measured against pnpm 11.5.2, `pnpm store path`
+    # ignored both PNPM_STORE_DIR and npm_config_store_dir and moved only for
+    # --store-dir.
     - name: Install dependencies
       shell: bash
       env:
         TRUST_LOCKFILE: ${{ inputs.trust-lockfile }}
+        CACHE_ENABLED: ${{ inputs.cache }}
+        STORE_DIR_INPUT: ${{ inputs['store-dir'] }}
+        TOOL_CACHE: ${{ runner.tool_cache }}
         # Exported (defaulting to '') so a consumer whose committed .npmrc
         # authenticates a private registry via ${PACKAGES_READ_TOKEN} resolves
         # it during the frozen install. Empty for repos without a private dep —
         # nothing references it, and pnpm never sees an unset-variable error.
         PACKAGES_READ_TOKEN: ${{ inputs['packages-read-token'] }}
       run: |
-        if [ "${TRUST_LOCKFILE}" = "true" ]; then
-          pnpm install --frozen-lockfile --trust-lockfile
+        set -eu
+        store_dir="${STORE_DIR_INPUT}"
+        if [ -z "${store_dir}" ] && [ "${CACHE_ENABLED}" != "true" ] && [ -n "${TOOL_CACHE}" ]; then
+          store_dir="${TOOL_CACHE}/pnpm-store"
+        fi
+        # Positional params, not a bash array: this runs on macOS bash 3.2, where
+        # "${arr[@]}" under `set -u` errors when the array is empty.
+        if [ -n "${store_dir}" ]; then
+          set -- --store-dir "${store_dir}"
+          echo "pnpm store: ${store_dir}"
         else
-          pnpm install --frozen-lockfile
+          set --
+          echo "pnpm store: pnpm default (caching enabled, or no tool cache resolved)"
+        fi
+        if [ "${TRUST_LOCKFILE}" = "true" ]; then
+          pnpm install --frozen-lockfile --trust-lockfile "$@"
+        else
+          pnpm install --frozen-lockfile "$@"
         fi
 
     # Wrangler preflight (opt-in, Story #231). The ONE authoritative
