@@ -51,7 +51,7 @@ aggregator context, and the pin-by-tag/SHA versioning model.
 | [`deploy-cloudflare.yml`](docs/reusable-workflows.md#deploy-cloudflareyml) | Defence-in-depth Cloudflare deploy with a frozen deploy-secret allowlist. |
 | [`secret-scan-push.yml`](docs/reusable-workflows.md#secret-scan-pushyml) | Full-history gitleaks secret scan on push to the default branch. |
 | [`release-automation.yml`](docs/reusable-workflows.md#release-automationyml) | Conventional-commit release lifecycle (version bump + `CHANGELOG.md` + tag) via release-please. |
-| [`codeql.yml`](docs/reusable-workflows.md#codeqlyml) | CodeQL SAST analysis — dual-mode: runs on this repo's push/PR/schedule **and** is `workflow_call`-consumable. |
+| [`codeql.yml`](docs/reusable-workflows.md#codeqlyml) | CodeQL SAST analysis — dual-mode: runs on this repo's weekly schedule **and** is `workflow_call`-consumable (this repo's `ci.yml` calls it as a merge-blocking `code-scanning` job). |
 
 > `smoke-dispatch.yml` is a **platform-internal** cross-repo smoke trigger
 > (`push` / `workflow_dispatch`, not `workflow_call`). It appears in the

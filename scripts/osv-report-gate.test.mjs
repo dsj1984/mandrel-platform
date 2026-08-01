@@ -18,7 +18,10 @@ import {
   renderSummary,
   normalizeSource,
   rowKey,
+  rowIdentity,
   buildBaselineSet,
+  compareVersions,
+  isVersionCovered,
   OsvGateError,
 } from "../.github/actions/osv-scan/osv-report-gate.mjs";
 
@@ -536,4 +539,290 @@ test("a fully-demoted verdict set is not rendered as a clean scan", () => {
   const out = renderSummary(v).join("\n");
   assert.doesNotMatch(out, /no known advisories/);
   assert.match(out, /GHSA-r28c/);
+});
+
+// ---------------------------------------------------------------------------
+// Version-aware attribution (Story #365)
+//
+// The failure these close: the baseline identity keyed on `@version`, so
+// raising a floor on a package carrying an UNFIXABLE advisory re-reported that
+// advisory as introduced by the PR purely because the version string moved. A
+// consumer measured the same advisory demoted at one version and blocking at
+// another after a strictly-forward bump. Narrowing the key outright would have
+// removed a real guard (a bump from one vulnerable version to another must
+// keep blocking), so attribution asks the advisory whether it still covers the
+// new version instead.
+// ---------------------------------------------------------------------------
+
+// A report whose vulnerability entries carry the OSV `affected` ranges — the
+// real schema shape, which the pre-#365 fixtures above omit entirely.
+const reportWithRanges = (groups, { sourcePath = "pnpm-lock.yaml" } = {}) => ({
+  results: [
+    {
+      source: { path: sourcePath },
+      packages: groups.map((g) => ({
+        package: { name: g.name, version: g.version || "1.0.0", ecosystem: g.ecosystem || "npm" },
+        groups: [{ ids: g.ids, max_severity: g.score }],
+        vulnerabilities: g.ids.map((id) => ({
+          id,
+          ...(g.published ? { published: g.published } : {}),
+          affected: [
+            {
+              package: { name: g.name, ecosystem: g.ecosystem || "npm" },
+              ranges: [{ type: "SEMVER", events: g.events }],
+            },
+          ],
+        })),
+      })),
+    },
+  ],
+});
+
+const rangedBaseline = (groups, opts) =>
+  buildBaselineSet(collectRows(reportWithRanges(groups, opts), opts));
+
+test("compareVersions orders releases, pads, and sinks prereleases", () => {
+  assert.equal(compareVersions("1.2.3", "1.2.4"), -1);
+  assert.equal(compareVersions("1.10.0", "1.9.0"), 1);
+  assert.equal(compareVersions("2.0", "2.0.0"), 0);
+  assert.equal(compareVersions("1.0.0-rc1", "1.0.0"), -1);
+  assert.equal(compareVersions("v1.0.0", "1.0.0+build7"), 0);
+  // Unreadable input is null, never a coincidental ordering — every caller
+  // treats null as unknown and fails closed.
+  assert.equal(compareVersions("not-a-version", "1.0.0"), null);
+  assert.equal(compareVersions("?", "1.0.0"), null);
+});
+
+test("isVersionCovered answers from the advisory's own ranges", () => {
+  const rows = collectRows(
+    reportWithRanges([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.3.0",
+        events: [{ introduced: "0" }, { fixed: "8.4.31" }],
+      },
+    ]),
+  );
+  assert.equal(isVersionCovered(rows[0]), true);
+
+  const fixed = collectRows(
+    reportWithRanges([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.4.31",
+        events: [{ introduced: "0" }, { fixed: "8.4.31" }],
+      },
+    ]),
+  );
+  assert.equal(isVersionCovered(fixed[0]), false);
+});
+
+test("isVersionCovered is null — not false — when the report carries no ranges", () => {
+  // Load-bearing: null means "unknown", and unknown must never demote. The
+  // pre-#365 fixtures produce exactly this shape.
+  const rows = collectRows(reportWith([{ name: "p", ids: ["GHSA-x"], score: "7.5" }]));
+  assert.equal(isVersionCovered(rows[0]), null);
+});
+
+test("AC-1: a bump past the advisory's fixed version is not attributed to the PR", () => {
+  // The reported incident. The advisory is still on the package's row (an
+  // unfixable sibling range keeps the finding alive), but it no longer reaches
+  // the version this PR moved to — so the PR did not introduce it.
+  const head = collectRows(
+    reportWithRanges([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.4.31",
+        events: [{ introduced: "0" }, { fixed: "8.4.31" }],
+      },
+    ]),
+  );
+  const v = classify(head, {
+    failOn: "high",
+    baseline: rangedBaseline([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.3.0",
+        events: [{ introduced: "0" }, { fixed: "8.4.31" }],
+      },
+    ]),
+  });
+
+  assert.equal(v.blocking.length, 0);
+  assert.equal(v.preexisting.length, 1);
+  assert.equal(v.preexisting[0].version, "8.4.31");
+});
+
+test("AC-2: a bump from one still-vulnerable version to another still blocks", () => {
+  // The guard the narrowing must not remove. Same advisory, same package, a
+  // strictly-forward move — but the advisory still covers where it landed.
+  const head = collectRows(
+    reportWithRanges([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.4.0",
+        events: [{ introduced: "0" }, { fixed: "8.4.31" }],
+      },
+    ]),
+  );
+  const v = classify(head, {
+    failOn: "high",
+    baseline: rangedBaseline([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.3.0",
+        events: [{ introduced: "0" }, { fixed: "8.4.31" }],
+      },
+    ]),
+  });
+
+  assert.equal(v.blocking.length, 1);
+  assert.equal(v.blocking[0].version, "8.4.0");
+  assert.equal(v.preexisting.length, 0);
+});
+
+test("AC-2: an unreadable range keeps the version bump blocking", () => {
+  // Fail closed. Without a readable range the gate cannot prove the bump left
+  // the advisory behind, and an unproven claim must not open a required check.
+  const head = collectRows(
+    reportWithRanges([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.4.0",
+        events: [{ introduced: "0" }, { fixed: "not-a-version" }],
+      },
+    ]),
+  );
+  const v = classify(head, {
+    failOn: "high",
+    baseline: rangedBaseline([
+      {
+        name: "postcss",
+        ids: ["GHSA-r28c"],
+        score: "7.5",
+        version: "8.3.0",
+        events: [{ introduced: "0" }, { fixed: "not-a-version" }],
+      },
+    ]),
+  });
+  assert.equal(v.blocking.length, 1);
+  assert.equal(v.preexisting.length, 0);
+});
+
+test("AC-3: a genuinely new advisory, and one reaching a new package, still block", () => {
+  const baseline = rangedBaseline([
+    {
+      name: "postcss",
+      ids: ["GHSA-known"],
+      score: "7.5",
+      version: "8.3.0",
+      events: [{ introduced: "0" }, { fixed: "9.0.0" }],
+    },
+  ]);
+
+  // A new advisory id on the SAME package: no identity match at all.
+  const newAdvisory = classify(
+    collectRows(
+      reportWithRanges([
+        {
+          name: "postcss",
+          ids: ["GHSA-brand-new"],
+          score: "8.1",
+          version: "8.9.9",
+          events: [{ introduced: "0" }, { fixed: "8.0.0" }],
+        },
+      ]),
+    ),
+    { failOn: "high", baseline },
+  );
+  assert.equal(newAdvisory.blocking.length, 1, "a new advisory id is never pre-existing");
+  assert.equal(newAdvisory.preexisting.length, 0);
+
+  // The SAME advisory reaching a package that did not previously carry it.
+  const newPackage = classify(
+    collectRows(
+      reportWithRanges([
+        {
+          name: "another-pkg",
+          ids: ["GHSA-known"],
+          score: "7.5",
+          version: "9.9.9",
+          events: [{ introduced: "0" }, { fixed: "1.0.0" }],
+        },
+      ]),
+    ),
+    { failOn: "high", baseline },
+  );
+  assert.equal(newPackage.blocking.length, 1, "a new package is never pre-existing");
+  assert.equal(newPackage.preexisting.length, 0);
+});
+
+test("AC-4: the digest derives from rowKey, so identity and digest cannot drift", () => {
+  const rows = collectRows(
+    reportWith([
+      { name: "p1", ids: ["GHSA-b", "GHSA-a"], score: "7.5" },
+      { name: "p2", ids: ["GHSA-c"], score: "9.1" },
+    ]),
+  );
+  const { blocking } = classify(rows, { failOn: "high" });
+
+  // Recomputing the digest from rowKey alone reproduces it exactly — the two
+  // spellings that used to be maintained separately are now one.
+  const fromKeys = blocking.map(rowKey).sort();
+  assert.equal(findingsDigest(blocking), findingsDigest([...blocking].reverse()));
+  assert.equal(fromKeys.length, 2);
+
+  // An unchanged finding set does not churn the tracking issue, whatever order
+  // the scanner emitted it in.
+  const reordered = collectRows(
+    reportWith([
+      { name: "p2", ids: ["GHSA-c"], score: "9.1" },
+      { name: "p1", ids: ["GHSA-a", "GHSA-b"], score: "7.5" },
+    ]),
+  );
+  assert.equal(
+    findingsDigest(blocking),
+    findingsDigest(classify(reordered, { failOn: "high" }).blocking),
+  );
+});
+
+test("rowIdentity drops the version and never collides with rowKey", () => {
+  const [row] = collectRows(reportWith([{ name: "p", ids: ["GHSA-x"], score: "7.5" }]));
+  assert.ok(rowKey(row).includes("@1.0.0"));
+  assert.ok(!rowIdentity(row).includes("@1.0.0"));
+  assert.notEqual(rowKey(row), rowIdentity(row));
+});
+
+test("a legacy key-only baseline still demotes exact matches and blocks bumps", () => {
+  // Backwards compatibility: a caller passing a bare list of rowKey strings
+  // (the pre-#365 buildBaselineSet contract) loses only the version-aware tier,
+  // and loses it in the fail-closed direction.
+  const groups = [{ name: "postcss", ids: ["GHSA-r28c"], score: "7.5", version: "8.3.0" }];
+  const baseRows = collectRows(reportWith(groups));
+  const legacy = new Set(baseRows.map(rowKey));
+
+  const same = classify(collectRows(reportWith(groups)), { failOn: "high", baseline: legacy });
+  assert.equal(same.preexisting.length, 1);
+
+  const bumped = classify(
+    collectRows(
+      reportWith([{ name: "postcss", ids: ["GHSA-r28c"], score: "7.5", version: "8.4.31" }]),
+    ),
+    { failOn: "high", baseline: legacy },
+  );
+  assert.equal(bumped.blocking.length, 1);
 });
