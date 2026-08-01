@@ -130,6 +130,34 @@ jobs:
       - name: Lint gh CLI flag combinations
         run: node scripts/check-workflow-gh-flags.mjs
 
+      # Release-type advisory (Story #368). Merges here are SQUASH, so the
+      # pull-request title becomes the commit subject release-please reads —
+      # and `ci`/`chore`/`docs`/`test`/`build`/`style` are configured hidden in
+      # release-please-config.json, cutting no release and never reaching the
+      # CHANGELOG. That is correct for an internal edit and wrong for a change
+      # to what this repo PUBLISHES: a consumer-facing workflow input already
+      # landed under a `ci:` title, shipped to nobody, and had to be
+      # re-released later. Nothing signalled it, because everything was green.
+      #
+      # ADVISORY BY DESIGN — the step exits 0 whatever it finds and reports via
+      # a `::warning::` annotation plus the job summary. Blocking a pull request
+      # on a heuristic over a human-written title would be worse than the defect
+      # it prevents. It is a STEP in this existing job, so it registers no new
+      # status context and needs no branch-protection change.
+      #
+      # The title arrives through the ENVIRONMENT, never interpolated into the
+      # `run:` shell — a pull-request title is attacker-controlled text and
+      # `${{ }}` inside a script body is a command-injection seam.
+      #
+      # Only `pull_request` runs carry a title; a push to `main` supplies an
+      # empty PR_TITLE and the check skips.
+      - name: Warn on a consumer-facing change under a non-releasing title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/check-release-type.mjs
+
       - name: Run unit tests
         run: npm test
 
