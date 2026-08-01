@@ -1,22 +1,35 @@
 # CodeQL SAST analysis — unconditional (Story #6).
 #
-# Analyzes javascript-typescript on pull_request, push to main, and a weekly
-# schedule. NOT gated on repository.visibility — runs on both public and
-# private repos (CodeQL is available via GitHub Actions on private repos).
+# Analyzes javascript-typescript. NOT gated on repository.visibility — runs on
+# both public and private repos (CodeQL is available via GitHub Actions on
+# private repos, with Advanced Security enabled).
 #
 # Consumable as a reusable workflow (workflow_call) or as a documented
 # copy-target for consumer repos (domio/swarm-os, athportal, etc.).
+#
+# TRIGGER SHAPE (Story #366). This workflow used to ALSO trigger itself
+# directly on `push` to main and `pull_request` against main. That standalone
+# run was advisory: it was not a required status context, so the delivery
+# path's native auto-merge — which waits only on required contexts — merged
+# straight past a new high-severity alert.
+#
+# The commit-time scan now runs as a `code-scanning` job inside ci.yml, which
+# is a `needs:` of the required `ci-required` aggregator, so it BLOCKS. The
+# direct push/pull_request triggers are removed rather than kept alongside it:
+# both paths analyze the same commit under the same `category`, so keeping
+# them would run two 30-minute analyses per event and have the later SARIF
+# upload overwrite the earlier one — for a check that still gated nothing.
+# ci.yml's own `push: [main]` trigger preserves the default-branch baseline
+# that PR alert diffing needs.
+#
+# What remains here: the weekly `schedule` sweep (which ci.yml has no trigger
+# for) and the `workflow_call` contract consumers pin — the latter deliberately
+# unchanged, so no consumer is newly required to run CodeQL.
 #
 # SHA-pinned third-party actions.
 name: CodeQL
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
   schedule:
     # Weekly on Monday at 08:00 UTC
     - cron: '0 8 * * 1'
@@ -43,12 +56,21 @@ jobs:
     # consumable via `workflow_call`, and a called workflow's WORKFLOW-level
     # `concurrency` is never evaluated (its jobs run inside the CALLER's run) —
     # so consumers got no dedup and rapid pushes stacked full 30-min analyses.
-    # Job-level works for both the direct push/PR/schedule triggers here AND
-    # the workflow_call path. Rapid pushes to the same ref stack full analyses
-    # without this; superseded runs are cancelled — only the newest commit's
-    # analysis matters. Keyed by github.ref (the analyzed ref).
+    # Job-level works for both the schedule trigger here AND the workflow_call
+    # path. Rapid pushes to the same ref stack full analyses without this;
+    # superseded runs are cancelled — only the newest commit's analysis
+    # matters. Keyed by github.ref (the analyzed ref).
+    #
+    # github.workflow is in the key (Story #366) because the group is now
+    # shared across trigger paths that are NOT substitutes for each other: the
+    # weekly schedule run and ci.yml's gating `code-scanning` call both land on
+    # refs/heads/main. Keyed by ref alone, whichever started second would
+    # cancel the other — and a cancelled scan reds the required aggregator, so
+    # a cron tick could fail an unrelated push. In a called workflow
+    # github.workflow resolves to the CALLER's workflow name, which separates
+    # the two cleanly while still deduping rapid pushes within each path.
     concurrency:
-      group: codeql-${{ github.ref }}
+      group: codeql-${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
     steps:
       # Shallow clone: CodeQL analyzes the checked-out tree; it does not need

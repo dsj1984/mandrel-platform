@@ -2781,10 +2781,12 @@ until wired here.
 
 ## `codeql.yml`
 
-CodeQL SAST analysis. It runs unconditionally on `push` to `main`,
-`pull_request` against `main`, and a weekly schedule, and is **also**
-consumable as a `workflow_call` target (or as a documented copy-target for
-consumer repos).
+CodeQL SAST analysis. It runs on a weekly schedule and is consumable as a
+`workflow_call` target (or as a documented copy-target for consumer repos).
+Commit-time analysis for this repository runs through `ci.yml`'s
+`code-scanning` job, which calls this workflow — see
+[Gating: repository-local, through the aggregator](#gating-repository-local-through-the-aggregator)
+below.
 
 | Input      | Type   | Default                     | When to override                          |
 | ---------- | ------ | --------------------------- | ----------------------------------------- |
@@ -2795,6 +2797,57 @@ a consumer with GitHub Advanced Security can run this for blocking Code
 Scanning and set `enable-sast: false` on `pr-quality.yml`. It requires
 `security-events: write` permission and surfaces findings as Code Scanning
 alerts.
+
+### Gating: repository-local, through the aggregator
+
+**This gating is repository-local. It changes nothing for consumers.** No
+reusable workflow you call runs CodeQL, and `codeql.yml`'s `workflow_call`
+contract is unchanged — a consumer that does not call it gains no new job, and
+a consumer that does call it sees the same interface as before.
+
+Inside `mandrel-platform`, CodeQL used to run on `push`/`pull_request` but was
+**not** a required status context. The delivery path arms GitHub native
+auto-merge, which waits only on required contexts, so a pull request that
+introduced a new high-severity alert merged green — two ReDoS regressions
+reached `main` that way. "Landed" was not the same as "scanned".
+
+The fix routes through the **aggregator**, not through repository settings:
+
+- `ci.yml` declares a `code-scanning` job that calls `codeql.yml` — the same
+  dogfooding pattern its `security` job uses for `pr-quality.yml`.
+- The required `ci-required` aggregator lists `code-scanning` in `needs:`.
+
+So `requiredStatusChecks` is still the single entry `ci-required`: no branch
+protection is edited, and no phantom context can appear. That route is the
+correct one rather than an incidental convenience — declaring CodeQL's
+externally-visible check name in `docs/runbooks/main-protection.json` would
+fail `check-required-contexts.mjs`, which matches declared entries against job
+identifiers, while declaring the job identifier would name something GitHub
+cannot register as a context.
+
+The gate **fails toward blocking**. The aggregator passes a job that is
+`success` or `skipped` and fails everything else, `cancelled` included. The
+`code-scanning` job declares neither `if:` nor `needs:`, and a GitHub job can
+reach `skipped` only through a condition or a skipped dependency — so a scan
+that does not conclude cannot leave the aggregator green.
+`scripts/check-codeql-gating.test.mjs` pins that structurally, because the
+aggregator's `run:` block is byte-identical-mirrored with `pr-quality.yml` and
+cannot carry a job-specific special case.
+
+`codeql.yml`'s own `push`/`pull_request` triggers were removed when the
+`ci.yml` call was added: both analyze the same commit under the same
+`category`, so keeping them would run two 30-minute analyses per event and let
+the later SARIF upload overwrite the earlier one. The weekly `schedule` sweep
+stays here — `ci.yml` has no cron trigger.
+
+**Private repositories need Advanced Security.** CodeQL is free on public
+repositories; on a private one, code scanning requires GitHub Advanced
+Security, and a CodeQL job on a private repo without it fails closed on a
+`403`. `mandrel-platform` is public, which is why this gate is affordable
+here. The fleet's private consumers (`athportal`, `domio`, `swarm-os`) have
+code scanning disabled, so **the vendored Semgrep tier in `pr-quality.yml`
+remains the blocking SAST for consumers without Advanced Security** — CodeQL
+does not displace it.
 
 ---
 
