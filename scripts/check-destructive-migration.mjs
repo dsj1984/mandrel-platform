@@ -233,10 +233,15 @@ export function normalizeIndexName(raw) {
   return segments[segments.length - 1].toLowerCase();
 }
 
+// A postgres dollar-quote delimiter: `$$` or `$tag$`.
+const DOLLAR_QUOTE_RE = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/;
+
 /**
  * Blank out the spans of `text` that cannot execute — multi-line `/* … *​/`
- * block comments and single-quoted SQL string literals — preserving LENGTH so
- * offsets stay comparable with the unmasked text.
+ * block comments, single-quoted SQL string literals, and postgres
+ * dollar-quoted bodies (`$$ … $$` / `$tag$ … $tag$`, which is how a function
+ * body reaches the server as a literal) — preserving LENGTH so offsets stay
+ * comparable with the unmasked text.
  *
  * The two scans are deliberately asymmetric, and both directions fail closed:
  * the DROP scan reads text with only per-line comments stripped (detect as much
@@ -262,6 +267,18 @@ export function maskNonExecutable(text) {
       const end = close === -1 ? text.length : close + 2;
       blank(i, end);
       i = end;
+      continue;
+    }
+    if (text[i] === "$") {
+      const tag = DOLLAR_QUOTE_RE.exec(text.slice(i))?.[0];
+      if (tag) {
+        const close = text.indexOf(tag, i + tag.length);
+        const end = close === -1 ? text.length : close + tag.length;
+        blank(i, end);
+        i = end;
+        continue;
+      }
+      i++;
       continue;
     }
     if (text[i] === "'") {

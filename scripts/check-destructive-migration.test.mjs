@@ -325,6 +325,32 @@ test("maskNonExecutable blanks non-executable spans without moving anything", ()
   assert.equal((masked.match(/\n/g) ?? []).length, 1, "newlines survive");
 });
 
+test("a CREATE INDEX inside a dollar-quoted body does not excuse a drop", () => {
+  // A postgres function body reaches the server as a string literal — it does
+  // not run at migration time, so idx_a really is gone.
+  const sql = [
+    "DROP INDEX idx_a;",
+    "CREATE FUNCTION rebuild() RETURNS void AS $$",
+    "BEGIN CREATE INDEX idx_a ON t (x); END;",
+    "$$ LANGUAGE plpgsql;",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(sql), ["DROP statement"]);
+
+  const tagged = [
+    "DROP INDEX idx_a;",
+    "CREATE FUNCTION rebuild() RETURNS void AS $body$",
+    "BEGIN CREATE INDEX idx_a ON t (x); END;",
+    "$body$ LANGUAGE plpgsql;",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(tagged), ["DROP statement"]);
+});
+
+test("a `$` inside an identifier is not a dollar quote", () => {
+  // Masking from a bare `$` to the next one would swallow a real recreate.
+  const sql = ["DROP INDEX idx$a;", "CREATE INDEX idx$a ON t (x);"].join("\n");
+  assert.deepEqual(scanMigrationText(sql), []);
+});
+
 test("maskNonExecutable: an escaped '' does not close the literal early", () => {
   const masked = maskNonExecutable("x 'it''s CREATE INDEX idx_a' y");
   assert.ok(!masked.includes("CREATE"));
