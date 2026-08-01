@@ -24,6 +24,14 @@
  * the contract is asserted by shape. The run-to-run stability it buys is
  * observable only in a consumer.
  *
+ * The delivery half is asserted end-to-end rather than by shape: the suite
+ * imports the base through its published package specifier — the same
+ * resolution a consumer's `stryker.config.mjs` performs — and checks the
+ * settings that arrive. Stryker has no `extends` option (adjudicated against
+ * @stryker-mutator/core and @stryker-mutator/api 9.6.1), so the spread import
+ * is the only mechanism that delivers anything at all, and it is the only one
+ * documented.
+ *
  * Run: node --test scripts/stryker-base-config.test.mjs
  */
 
@@ -33,6 +41,14 @@ import { readFileSync } from "node:fs";
 
 const CONFIG_PATH = "config/stryker.base.json";
 const PACKAGE_PATH = "package.json";
+
+/**
+ * The specifier a consumer's `stryker.config.mjs` imports. Node resolves it
+ * through this package's own `exports` map (self-reference), so importing it
+ * here exercises the same resolution a consumer gets rather than a stand-in
+ * for it.
+ */
+const PACKAGE_SPECIFIER = "mandrel-platform/stryker.base.json";
 
 /** Stryker's own defaults, per https://stryker-mutator.io/docs/stryker-js/configuration. */
 const STRYKER_DEFAULTS = Object.freeze({
@@ -131,15 +147,110 @@ test("a Timeout is not silently absorbed into the score", () => {
   );
 });
 
-test("the config stays reachable to consumers by specifier", () => {
+test("the documented spread-import mechanism delivers the bail-free settings", async () => {
+  // This is the consumer's own resolution path, not a proxy for it: the
+  // specifier below is resolved through the published `exports` map by Node,
+  // exactly as `stryker.config.mjs` in a consuming repo resolves it. Asserting
+  // the exports-map *string* instead would pass while the file it points at
+  // carried the wrong values, or while the entry was absent from `files` — the
+  // two ways the recipe can be documented correctly and still deliver nothing.
+  const { default: base } = await import(PACKAGE_SPECIFIER, {
+    with: { type: "json" },
+  });
+
+  assert.equal(
+    base.disableBail,
+    true,
+    `Importing "${PACKAGE_SPECIFIER}" must yield "disableBail": true. A consumer ` +
+      "spreading this object into stryker.config.mjs gets whatever this " +
+      "resolves to, so a broken export or a stale published file silently " +
+      "restores bail.",
+  );
+  assert.ok(
+    base.timeoutMS > PRE_CHANGE_TIMEOUT_MS,
+    `Importing "${PACKAGE_SPECIFIER}" must also carry the raised timeout budget ` +
+      `that bail-free runs need; got timeoutMS ${base.timeoutMS}.`,
+  );
+
+  // The exports map must reach *this* file, or the assertions in the rest of
+  // this suite are guarding a config no consumer receives.
+  assert.deepEqual(
+    base,
+    readConfig(),
+    `"${PACKAGE_SPECIFIER}" must resolve to ${CONFIG_PATH} — the file every ` +
+      "other test here asserts.",
+  );
+});
+
+test("the config declares no `extends`, which Stryker does not support", () => {
+  const config = readConfig();
+
+  // Adjudicated against @stryker-mutator/core 9.6.1 and @stryker-mutator/api
+  // 9.6.1: the config reader loads exactly one config file and deep-merges CLI
+  // arguments over it — there is no extends resolution step anywhere in it —
+  // and `extends` is absent from the 45 top-level properties in the published
+  // stryker-core.json schema. A base that advertises an `extends` recipe sends
+  // consumers down a path where the settings below arrive not at all.
+  assert.equal(
+    Object.hasOwn(config, "extends"),
+    false,
+    `${CONFIG_PATH} must not declare "extends". Stryker has no such option; ` +
+      "the supported mechanism is importing this file by its package " +
+      "specifier and spreading it (see the README).",
+  );
+});
+
+test("annotations use the `_comment` suffix Stryker's validator exempts", () => {
+  const config = readConfig();
+
+  // Stryker warns "Unknown stryker config option \"<key>\"" for any top-level
+  // key that is neither in its schema nor suffixed `_comment`. A prefix-named
+  // key like `_comment_disableBail` fails that suffix check, so documenting
+  // the base costs every consumer a warning on every run.
+  const STRYKER_OPTIONS = new Set([
+    "$schema",
+    "packageManager",
+    "reporters",
+    "coverageAnalysis",
+    "ignoreStatic",
+    "cleanTempDir",
+    "disableBail",
+    "timeoutMS",
+    "timeoutFactor",
+    "dryRunTimeoutMinutes",
+    "thresholds",
+  ]);
+
+  const wouldWarn = Object.keys(config).filter(
+    (key) => !STRYKER_OPTIONS.has(key) && !key.endsWith("_comment"),
+  );
+
+  assert.deepEqual(
+    wouldWarn,
+    [],
+    `${CONFIG_PATH} keys ${JSON.stringify(wouldWarn)} are neither pinned Stryker ` +
+      'options nor suffixed "_comment", so Stryker reports each as an unknown ' +
+      "config option in every consumer run. Rename annotations to " +
+      "`<topic>_comment`.",
+  );
+});
+
+test("every pinned Stryker option is still exported to consumers", () => {
   const pkg = JSON.parse(readFileSync(PACKAGE_PATH, "utf8"));
 
-  // The shape above only protects the fleet while every consumer keeps
-  // resolving this file through the exports map rather than a copied fork.
+  // The import test above proves resolution works *here*, where Node's
+  // self-reference falls back to the local file. Publication is what carries it
+  // to a consumer, and that needs both the exports entry and the files
+  // allowlist.
   assert.equal(
     pkg.exports["./stryker.base.json"],
     `./${CONFIG_PATH}`,
     "The ./stryker.base.json export must point at the file this test asserts, " +
-      "or consumers extend a config nothing guards.",
+      "or consumers import a config nothing guards.",
+  );
+  assert.ok(
+    pkg.files.includes("config/"),
+    'The "files" allowlist must publish config/, or the export resolves to a ' +
+      "file absent from the tarball.",
   );
 });
