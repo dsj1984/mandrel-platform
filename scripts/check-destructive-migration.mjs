@@ -163,6 +163,52 @@ export function stripComments(line) {
   return out;
 }
 
+/**
+ * The whole-text, LENGTH-PRESERVING counterpart of {@link stripComments}: same
+ * comment syntaxes, blanked in place rather than sliced out, so offsets stay
+ * comparable across every scan derived from the same source text.
+ *
+ * @param {string} text
+ * @returns {string}  Same length as `text`.
+ */
+export function maskComments(text) {
+  return text
+    .split("\n")
+    .map((line) => {
+      let out = line.replace(/\/\*.*?\*\//g, (m) => " ".repeat(m.length));
+      const candidates = [out.indexOf("--"), out.indexOf("//")].filter((i) => i !== -1);
+      if (candidates.length > 0) {
+        const cut = Math.min(...candidates);
+        out = out.slice(0, cut) + " ".repeat(out.length - cut);
+      }
+      return out;
+    })
+    .join("\n");
+}
+
+// The direction markers of a bidirectional migration — goose, sql-migrate, and
+// dbmate. Each one starts a section that runs independently of its neighbours.
+const SECTION_DIRECTIVE_RE =
+  /^[ \t]*--[ \t]*(?:\+goose\s+(?:Up|Down)|\+migrate\s+(?:Up|Down)|migrate:(?:up|down))\b/gim;
+
+/**
+ * The offsets at which a bidirectional migration changes section. A recreate on
+ * the far side of one of these does not run in the same direction as the drop:
+ * a `CREATE INDEX` in the Down section cannot un-drop an index the Up section
+ * dropped. Read from the RAW text — the markers are `--` comments, so anything
+ * that has already masked comments has erased them.
+ *
+ * @param {string} text
+ * @returns {number[]}  Ascending offsets.
+ */
+export function sectionBoundaries(text) {
+  const re = new RegExp(SECTION_DIRECTIVE_RE.source, "gim");
+  const offsets = [];
+  let m;
+  while ((m = re.exec(text)) !== null) offsets.push(m.index);
+  return offsets;
+}
+
 // The destructive-signal matchers evaluated per line. `DROP <object>` is NOT
 // in this list — it is scanned over the whole file so a `DROP INDEX` can be
 // paired with a later recreate (see scanDropStatements below). Each entry names
@@ -269,6 +315,15 @@ export function maskNonExecutable(text) {
       i = end;
       continue;
     }
+    // `#` is a MySQL line comment. It is masked on THIS side only: blanking it
+    // on the drop side would let `INSERT … '#'; DROP TABLE x;` hide a real drop.
+    if (text[i] === "#") {
+      const nl = text.indexOf("\n", i);
+      const end = nl === -1 ? text.length : nl;
+      blank(i, end);
+      i = end;
+      continue;
+    }
     if (text[i] === "$") {
       const tag = DOLLAR_QUOTE_RE.exec(text.slice(i))?.[0];
       if (tag) {
@@ -324,30 +379,47 @@ export function collectCreatedIndexes(text) {
 }
 
 /**
- * Scan comment-stripped migration text for `DROP <object>` statements, pairing
- * a `DROP INDEX` with a later recreate of the same index in the same text.
+ * Scan a migration file's text for `DROP <object>` statements, pairing a
+ * `DROP INDEX` with a later recreate of the same index in the same text.
  *
- * @param {string} cleanText
+ * Three texts, all the same length so their offsets are comparable:
+ *   • `text`       — raw; the only place the section directives survive.
+ *   • `dropText`   — comments masked; what the DROP scan reads (detect as much
+ *                    as possible; multi-line block residue left in on purpose).
+ *   • `createText` — additionally non-executable spans masked; what the RECREATE
+ *                    scan reads (excuse as little as possible).
+ *
+ * @param {string} text  Raw migration text.
  * @returns {{ destructiveDrops: number, recreatedIndexes: string[] }}
  *   `destructiveDrops` counts the drops that still trip the guard;
  *   `recreatedIndexes` names the index drops excused as lossless.
  */
-export function scanDropStatements(cleanText) {
+export function scanDropStatements(text) {
+  const dropText = maskComments(text);
   // Only an executable CREATE counts as a recreate — see maskNonExecutable.
-  const created = collectCreatedIndexes(maskNonExecutable(cleanText));
+  const created = collectCreatedIndexes(maskNonExecutable(dropText));
+  // A recreate on the far side of a direction marker runs in the other
+  // direction — a Down-section CREATE cannot un-drop what Up dropped.
+  const boundaries = sectionBoundaries(text);
+  const sameSection = (dropAt, createAt) =>
+    !boundaries.some((b) => b > dropAt && b <= createAt);
   const re = new RegExp(DROP_OBJECT_SOURCE, "gi");
   let destructiveDrops = 0;
   const recreatedIndexes = [];
   let m;
-  while ((m = re.exec(cleanText)) !== null) {
+  while ((m = re.exec(dropText)) !== null) {
     if (m[1].toUpperCase() === "INDEX") {
-      const names = parseDroppedIndexNames(cleanText.slice(m.index));
+      const names = parseDroppedIndexNames(dropText.slice(m.index));
       // An unparseable name list fails closed — counted as destructive below.
       // EVERY name in the list must be recreated after the drop; one excused
       // name never excuses its neighbours.
       if (
         names &&
-        names.every((name) => created.some((c) => c.name === name && c.index > m.index))
+        names.every((name) =>
+          created.some(
+            (c) => c.name === name && c.index > m.index && sameSection(m.index, c.index)
+          )
+        )
       ) {
         recreatedIndexes.push(...names);
         continue;
@@ -366,14 +438,14 @@ export function scanDropStatements(cleanText) {
  */
 export function scanMigrationText(text) {
   const found = new Set();
-  const cleanLines = text.split("\n").map((line) => stripComments(line));
-  for (const line of cleanLines) {
+  for (const rawLine of text.split("\n")) {
+    const line = stripComments(rawLine);
     if (!line.trim()) continue;
     for (const { signal, re } of DESTRUCTIVE_PATTERNS) {
       if (re.test(line)) found.add(signal);
     }
   }
-  const { destructiveDrops } = scanDropStatements(cleanLines.join("\n"));
+  const { destructiveDrops } = scanDropStatements(text);
   if (destructiveDrops > 0) found.add("DROP statement");
   return [...found];
 }

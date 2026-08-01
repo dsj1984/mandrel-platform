@@ -1363,10 +1363,15 @@ carve-out is deliberately narrow and fails closed. It does **not** apply when:
   of the migration);
 - the recreate lives in a **different** file;
 - the dropped index name cannot be parsed;
-- the recreate cannot execute — a `CREATE INDEX` inside a comment (including a
-  multi-line `/* … */` rollback note), inside a string literal, or inside a
-  postgres dollar-quoted body (`$$ … $$`, e.g. a function definition) never
-  excuses a drop;
+- the recreate cannot execute — a `CREATE INDEX` inside a comment (`--`, `//`,
+  `#`, or a multi-line `/* … */` rollback note), inside a string literal, or
+  inside a postgres dollar-quoted body (`$$ … $$`, e.g. a function definition)
+  never excuses a drop;
+- the recreate is in a **different direction** of a bidirectional migration —
+  a `CREATE INDEX` after a `-- +goose Down` / `-- +migrate Down` /
+  `-- migrate:down` marker does not run when the Up section drops the index.
+  Each section pairs within itself, so a migration that narrows an index in
+  both directions still passes;
 - the statement drops several indexes in one comma-separated list
   (`DROP INDEX a, b;`) and **any** one of them is not recreated — every name in
   the list must be recreated, one excused name never excuses its neighbours;

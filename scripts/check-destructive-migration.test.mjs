@@ -29,12 +29,14 @@ import {
   formatStepSummary,
   globToRegExp,
   isMigrationFile,
+  maskComments,
   maskNonExecutable,
   normalizeIndexName,
   parseArgs,
   parseDroppedIndexNames,
   scanDropStatements,
   scanMigrationText,
+  sectionBoundaries,
   stripComments,
 } from "./check-destructive-migration.mjs";
 
@@ -343,6 +345,78 @@ test("a CREATE INDEX inside a dollar-quoted body does not excuse a drop", () => 
     "$body$ LANGUAGE plpgsql;",
   ].join("\n");
   assert.deepEqual(scanMigrationText(tagged), ["DROP statement"]);
+});
+
+test("a CREATE INDEX in a `#` MySQL line comment does not excuse a drop", () => {
+  const sql = ["DROP INDEX idx_a;", "# CREATE INDEX idx_a ON t (x);"].join("\n");
+  assert.deepEqual(scanMigrationText(sql), ["DROP statement"]);
+});
+
+test("a `#` on the drop side is not treated as a comment", () => {
+  // Masking `#` for the DROP scan too would let a literal containing one hide
+  // everything after it on the line.
+  assert.deepEqual(scanMigrationText("INSERT INTO t (c) VALUES ('#'); DROP TABLE users;"), [
+    "DROP statement",
+  ]);
+});
+
+test("a recreate in the Down section does not excuse a drop in the Up section", () => {
+  // goose, sql-migrate and dbmate all run one direction at a time: the Down
+  // CREATE INDEX does not run when Up drops the index.
+  const goose = [
+    "-- +goose Up",
+    "DROP INDEX idx_a;",
+    "-- +goose Down",
+    "CREATE INDEX idx_a ON t (x);",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(goose), ["DROP statement"]);
+
+  const dbmate = [
+    "-- migrate:up",
+    "DROP INDEX idx_a;",
+    "-- migrate:down",
+    "CREATE INDEX idx_a ON t (x);",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(dbmate), ["DROP statement"]);
+
+  const sqlMigrate = [
+    "-- +migrate Up",
+    "DROP INDEX idx_a;",
+    "-- +migrate Down",
+    "CREATE INDEX idx_a ON t (x);",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(sqlMigrate), ["DROP statement"]);
+});
+
+test("a bidirectional migration that narrows an index in BOTH directions passes", () => {
+  // Each section pairs within itself — the section rule must not block the
+  // legitimate case it exists to keep honest.
+  const sql = [
+    "-- +goose Up",
+    "DROP INDEX idx_a;",
+    "CREATE INDEX idx_a ON t (x) WHERE archived = 0;",
+    "-- +goose Down",
+    "DROP INDEX idx_a;",
+    "CREATE INDEX idx_a ON t (x);",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(sql), []);
+});
+
+test("sectionBoundaries finds the direction markers in the raw text", () => {
+  const sql = ["-- +goose Up", "SELECT 1;", "-- +goose Down", "SELECT 2;"].join("\n");
+  const offsets = sectionBoundaries(sql);
+  assert.equal(offsets.length, 2);
+  assert.equal(offsets[0], 0);
+  assert.equal(offsets[1], sql.indexOf("-- +goose Down"));
+  assert.deepEqual(sectionBoundaries("DROP INDEX idx_a;"), []);
+});
+
+test("maskComments preserves length and blanks the same syntaxes stripComments does", () => {
+  const text = "keep -- gone\nkeep2 // gone\na /* gone */ b";
+  const masked = maskComments(text);
+  assert.equal(masked.length, text.length);
+  assert.ok(!masked.includes("gone"));
+  assert.ok(masked.includes("keep") && masked.includes("keep2") && masked.includes("b"));
 });
 
 test("a `$` inside an identifier is not a dollar quote", () => {
