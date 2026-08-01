@@ -75,13 +75,23 @@ on:
         required: false
         type: string
         default: '.osv-allowlist.json'
+      # Same derived default as the quality workflow's identically-named input
+      # (Story #364) — the two are documented as one behaviour, so they move
+      # together. The literal 'auto' means "decide from the runner"; the
+      # decision is made at the setup-toolchain call site below, because a
+      # workflow_call `default:` may not hold a `${{ }}` expression (portability
+      # lint Rule 2) and GitHub resolves defaults before any runner context
+      # exists.
       toolchain-cache:
         description: >
-          Passed through to setup-toolchain's `cache` input. Set 'false' on
-          self-hosted runners with a warm pnpm store.
+          Passed through to setup-toolchain's `cache` input. 'auto' (the
+          default) derives the value from the runner: 'false' when the runner
+          labels name self-hosted (a warm store makes the post-job save pure
+          cost, and the save is billed against this job's timeout), 'true'
+          otherwise. Pass 'true' or 'false' to pin it explicitly.
         required: false
         type: string
-        default: 'true'
+        default: 'auto'
       pnpm-dest:
         description: >
           Passed through to setup-toolchain's `pnpm-dest` input. Leave empty
@@ -139,7 +149,11 @@ jobs:
       - name: Setup toolchain
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@71403dd6886633cc4831a8b0e621d32d832dcb32
         with:
-          cache: ${{ inputs.toolchain-cache }}
+          # Resolves the 'auto' default at the use site — see the input's note
+          # above. Explicit 'true'/'false' passes straight through (both are
+          # truthy non-empty strings in an Actions expression); 'auto' derives
+          # 'false' for a self-hosted runner and 'true' otherwise.
+          cache: ${{ inputs.toolchain-cache != 'auto' && inputs.toolchain-cache || (contains(inputs.runner, 'self-hosted') && 'false' || 'true') }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
           packages-read-token: ${{ secrets.packages-read-token }}
 
