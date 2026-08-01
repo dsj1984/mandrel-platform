@@ -147,7 +147,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@71403dd6886633cc4831a8b0e621d32d832dcb32
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@edd3a2713e0a37acf9fceda4e1436bef2d58c266
         with:
           # Resolves the 'auto' default at the use site — see the input's note
           # above. Explicit 'true'/'false' passes straight through (both are
@@ -167,7 +167,7 @@ jobs:
       # (scripts/check-osv-scan-mode.test.mjs) rather than incidental.
       - name: OSV advisory scan (scheduled, non-blocking)
         id: osv
-        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@71403dd6886633cc4831a8b0e621d32d832dcb32
+        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@0fe1a6e8f6d1ca952a67d8f962a0da9562a499cd
         with:
           osv-scanner-version: ${{ inputs.osv-scanner-version }}
           fail-on-severity: ${{ inputs.osv-fail-on-severity }}

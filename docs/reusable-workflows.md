@@ -3267,13 +3267,25 @@ rules against the pinned manifest, so a behavioural lag is invisible to it.
 > self-ref is decidable.
 
 `scripts/check-first-party-pin-freshness.mjs` closes it. It resolves the
-manifest at every first-party pinned SHA and sorts each finding into one of
-two classes — kept distinct because their remedies differ:
+**whole subpath tree** at every first-party pinned SHA and sorts each finding
+into one of two classes — kept distinct because their remedies differ:
 
 | Class | What it means | Remedy |
 | --- | --- | --- |
-| `stale` | The manifest **at the pinned SHA** differs from the working-tree manifest at that subpath. The pinned revision is what runs. | **Bump** the pin to a commit carrying the current manifest. |
+| `stale` | The action directory **at the pinned SHA** differs from the working-tree copy — any file under the subpath, not just `action.yml`. The pinned revision is what runs. | **Bump** the pin to a commit carrying the current directory. |
 | `unreachable` | The pinned SHA is **not an ancestor** of the checked-out ref — typically a pre-squash branch commit. Content-identical today, resolvable only until GitHub garbage-collects it, after which every consumer fails at action-load time. | **Re-pin** to the squashed commit on `main`. |
+
+> **Why the whole directory, not just the manifest (Story #379).** The first
+> cut compared only `action.yml`, which cannot protect a composite action whose
+> behaviour lives in a sibling script — `osv-scan` and `osv-track-issue` both
+> do. Story #365 rewrote `.github/actions/osv-scan/osv-report-gate.mjs`
+> (+189/-12) without touching `action.yml`, so the guard reported `osv-scan`
+> fresh while both call sites ran the old 689-line gate against 866 lines on
+> `main` — the fix executed at **zero** call sites. The comparison is now the
+> union of `git ls-tree -r <sha> -- <subpath>` and the tracked working-tree
+> files under it, so a sibling that **differs**, was **added**, or was
+> **removed** is all drift. Untracked and ignored files are excluded: a stray
+> build artefact inside an action directory is not something a consumer runs.
 
 Run it locally against a full clone:
 
@@ -3281,7 +3293,7 @@ Run it locally against a full clone:
 node scripts/check-first-party-pin-freshness.mjs
 ```
 
-It needs full git history (`git show <sha>:<path>` and
+It needs full git history (`git ls-tree -r <sha>`, `git show <sha>:<path>` and
 `git merge-base --is-ancestor`), so any checkout that runs it must set
 `fetch-depth: 0`. A shallow clone is refused outright rather than reported as
 a wall of false `unreachable` findings.

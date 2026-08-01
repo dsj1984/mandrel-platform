@@ -36,6 +36,7 @@ import {
   collectPinnedRefs,
   resolveManifest,
   manifestsMatch,
+  diffSubpathAtSha,
   runCheck,
   runCli,
 } from "./check-first-party-pin-freshness.mjs";
@@ -253,6 +254,140 @@ test("clean: two call sites pinning the same fresh SHA both pass", () => {
   const result = runCheck({ cwd: root, firstPartyOwner: OWNER });
   assert.equal(result.ok, true);
   assert.equal(result.scanned, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Story #379 — the comparison is the whole action DIRECTORY, not the manifest
+//
+// A composite action whose behaviour lives in a sibling script is the majority
+// of this repo's action surface (`osv-scan`, `osv-track-issue`), and a
+// manifest-only comparison is structurally unable to see a change there. That
+// blind spot shipped live: Story #365 rewrote `osv-scan/osv-report-gate.mjs`
+// (+189/-12) without touching `action.yml`, so both call sites read as fresh
+// while executing the old gate.
+// ---------------------------------------------------------------------------
+
+const SIBLING_MANIFEST = [
+  "name: demo",
+  "description: fixture composite action whose behaviour lives in a sibling script",
+  "runs:",
+  "  using: composite",
+  "  steps:",
+  "    - shell: bash",
+  "      run: node ./gate.mjs",
+  "",
+].join("\n");
+
+/**
+ * Create a repo whose action manifest NEVER changes — only the sibling
+ * `gate.mjs` does. The `before` commit therefore carries a byte-identical
+ * `action.yml` alongside a stale `gate.mjs`.
+ */
+function makeSiblingScriptRepo(label) {
+  const root = mkdtempSync(join(tmpdir(), `pinfresh-${label}-`));
+  git(root, "init", "-b", "main");
+  git(root, "config", "user.email", "fixture@example.invalid");
+  git(root, "config", "user.name", "Pin Freshness Fixture");
+  git(root, "config", "commit.gpgsign", "false");
+  git(root, "config", "core.hooksPath", join(root, ".no-hooks"));
+
+  put(root, `${SUBPATH}/action.yml`, SIBLING_MANIFEST);
+  put(root, `${SUBPATH}/gate.mjs`, "process.exit(0);\n");
+  git(root, "add", "-A");
+  git(root, "commit", "-m", "initial action");
+  const before = git(root, "rev-parse", "HEAD");
+
+  // Behaviour change, manifest untouched.
+  put(root, `${SUBPATH}/gate.mjs`, "process.exit(process.env.FAIL ? 1 : 0);\n");
+  git(root, "add", "-A");
+  git(root, "commit", "-m", "harden the gate");
+  const after = git(root, "rev-parse", "HEAD");
+
+  return { root, before, after };
+}
+
+/** `git show <sha>:<path>` without the trimming the `git` helper applies. */
+function showRaw(root, sha, relPath) {
+  return execFileSync("git", ["show", `${sha}:${relPath}`], { cwd: root, encoding: "utf8" });
+}
+
+test("stale: a sibling script that differs at the pinned SHA is stale even when action.yml is byte-identical", () => {
+  const { root, before } = makeSiblingScriptRepo("sibling-stale");
+  track(root);
+  put(root, ".github/workflows/fixture.yml", workflow(before));
+
+  // The premise, asserted rather than assumed: a manifest-only comparison
+  // would have called this pin fresh.
+  assert.equal(
+    showRaw(root, before, `${SUBPATH}/action.yml`),
+    readFileSync(join(root, SUBPATH, "action.yml"), "utf8"),
+    "premise: action.yml is byte-identical at the pinned SHA"
+  );
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.stale.length, 1);
+  assert.equal(result.unreachable.length, 0);
+  assert.match(result.stale[0].reason, /gate\.mjs/, "the report names the drifting sibling");
+
+  const { code, stderr } = capture(["--cwd", root, "--first-party-owner", OWNER]);
+  assert.equal(code, 1);
+  assert.match(stderr, /gate\.mjs/);
+});
+
+test("clean: a pin carrying the current sibling script exits 0", () => {
+  const { root, after } = makeSiblingScriptRepo("sibling-clean");
+  track(root);
+  put(root, ".github/workflows/fixture.yml", workflow(after));
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER });
+  assert.equal(result.ok, true);
+});
+
+test("stale: a file added to the action directory since the pinned SHA is stale", () => {
+  const { root, after } = makeSiblingScriptRepo("sibling-added");
+  track(root);
+  put(root, `${SUBPATH}/helper.mjs`, "export const help = () => 1;\n");
+  git(root, "add", "-A");
+  put(root, ".github/workflows/fixture.yml", workflow(after));
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER });
+
+  assert.equal(result.ok, false);
+  assert.match(result.stale[0].reason, /helper\.mjs/);
+});
+
+test("stale: a file removed from the action directory since the pinned SHA is stale", () => {
+  const { root, after } = makeSiblingScriptRepo("sibling-removed");
+  track(root);
+  git(root, "rm", "-q", `${SUBPATH}/gate.mjs`);
+  put(root, ".github/workflows/fixture.yml", workflow(after));
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER });
+
+  assert.equal(result.ok, false);
+  assert.match(result.stale[0].reason, /gate\.mjs/);
+});
+
+test("diffSubpathAtSha: a tracked file missing from disk is drift, not a silent skip", () => {
+  const path = `${SUBPATH}/gone.mjs`;
+  const fake = { lsTree: () => [path], lsFiles: () => [path], show: () => "body\n" };
+
+  const drift = diffSubpathAtSha(fake, "/no-such-root", "0".repeat(40), SUBPATH);
+
+  assert.deepEqual(drift, [{ path, kind: "unreadable" }]);
+});
+
+test("diffSubpathAtSha: a blob git cannot resolve at the pinned SHA is drift, not a pass", () => {
+  const { root } = makeSiblingScriptRepo("sibling-unresolvable");
+  track(root);
+  const path = `${SUBPATH}/gate.mjs`;
+  const fake = { lsTree: () => [path], lsFiles: () => [path], show: () => null };
+
+  const drift = diffSubpathAtSha(fake, root, "0".repeat(40), SUBPATH);
+
+  assert.deepEqual(drift, [{ path, kind: "differs" }]);
 });
 
 // ---------------------------------------------------------------------------
