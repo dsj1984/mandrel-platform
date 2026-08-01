@@ -46,14 +46,25 @@ function cacheExpression(text, file) {
   return m[1].trim();
 }
 
-/** The literal `default:` of the named workflow_call input. */
+/**
+ * The literal `default:` of the named workflow_call input.
+ *
+ * Scans lines rather than building a `new RegExp` around `name`: a
+ * dynamically-constructed regex is a SAST finding (ReDoS surface) and buys
+ * nothing here, since the block boundary is just indentation.
+ */
 function inputDefault(text, name, file) {
-  const re = new RegExp(`^ {6}${name}:\\n([\\s\\S]*?)(?=^ {6}\\S|^ {4}\\S|^\\S)`, "m");
-  const block = text.match(re);
-  assert.ok(block, `${file}: workflow_call input \`${name}\` not found`);
-  const d = block[1].match(/^\s*default:\s*(.+)$/m);
-  assert.ok(d, `${file}: input \`${name}\` has no default`);
-  return d[1].trim();
+  const lines = text.split("\n");
+  const start = lines.indexOf(`      ${name}:`);
+  assert.notEqual(start, -1, `${file}: workflow_call input \`${name}\` not found`);
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].trim() === "") continue;
+    // Dedent to the input-name level or beyond → the block ended.
+    if (lines[i].match(/^(\s*)/)[1].length <= 6) break;
+    const d = lines[i].match(/^\s*default:\s*(.+)$/);
+    if (d) return d[1].trim();
+  }
+  return assert.fail(`${file}: input \`${name}\` has no default`);
 }
 
 // ---------------------------------------------------------------------------
