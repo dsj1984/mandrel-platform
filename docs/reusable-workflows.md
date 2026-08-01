@@ -121,7 +121,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
 | `semgrep-config`   | string  | `'vendored'`     | Semgrep ruleset for the SAST sub-step. Default `'vendored'` resolves to this reusable workflow's own checked-out, platform-controlled snapshot at `.semgrep/rules.json` (see [SAST ruleset provenance](#sast-ruleset-provenance-and-update-process)) — NOT the live registry. Override with a registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.** |
 | `sast-exclude`     | string  | `''`             | Extra Semgrep `--exclude` globs, space- or comma-separated (e.g. `'dist coverage tests/fixtures'`), **appended** to the built-in `.agents` exclude. Set to drop generated code / fixtures from the SAST target set. |
-| `toolchain-cache`  | string  | `'true'`         | Passed through to `setup-toolchain`'s `cache` input. Set `'false'` on self-hosted runners with a warm pnpm store.                              |
+| `toolchain-cache`  | string  | `'auto'`         | Passed through to `setup-toolchain`'s `cache` input. **`'auto'` derives the value from `runner`**: `'false'` when the runner labels name `self-hosted`, `'true'` otherwise (unchanged hosted behaviour). A self-hosted runner already has a warm store, so the cache only adds a **post-job save** — and that save runs after every work step reports success, inside the job's own `timeout-minutes`, so a slow one is killed as a timeout and recorded as `cancelled`, which `ci-required` reads as a red gate with every step green. Pass `'true'` or `'false'` to pin it explicitly on either runner class. See [Derived `toolchain-cache` default](#derived-toolchain-cache-default). |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
 | `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
 | `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest`; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
@@ -442,6 +442,64 @@ Semantics and caveats:
 - **No new permission.** The lookup uses `gh run view` / `gh run list`, which
   need only `actions: read` — already covered by the `actions: write` the
   fail-fast cancel step requires.
+
+### Derived `toolchain-cache` default
+
+`toolchain-cache` defaults to the literal string `'auto'`, which means **decide
+from the runner**. It is passed to `setup-toolchain`'s `cache` input as:
+
+| `toolchain-cache` | `runner` names `self-hosted` | Effective `cache` |
+| ----------------- | ---------------------------- | ----------------- |
+| `'auto'` (default) | no                          | `'true'`          |
+| `'auto'` (default) | yes                         | `'false'`         |
+| `'true'`           | either                      | `'true'`          |
+| `'false'`          | either                      | `'false'`         |
+
+**Why the old `'true'` default was wrong for half the fleet.** Enabling the
+toolchain cache adds a **post-job save** of the pnpm store. On a GitHub-hosted
+runner that is the whole point — the runner is discarded, so the save is what
+makes the next run warm. On a self-hosted runner that already maintains a warm
+store, the save buys nothing and costs a large upload over the caller's own
+link. Critically, a post-job step runs **after every work step has reported
+success**, and it is billed against the same `timeout-minutes` those steps
+already spent. A slow save therefore exhausts the ceiling, GitHub kills the job,
+and it records the kill as **`cancelled` — not `failure`**. `ci-required` counts
+`cancelled` as non-success, so the caller sees a red required check on a job
+whose every step is green. One consumer hit this on two different teardown
+steps at two different ceilings, which is what makes it a default problem rather
+than a step problem.
+
+**Why the derivation is not in the `default:` field.** It cannot be. A
+`workflow_call` input `default:` may not contain a `${{ }}` expression — this
+repo's own portability lint (`scripts/check-workflow-portability.mjs`, Rule 2)
+rejects it, and GitHub resolves input defaults during interface validation,
+before any job exists and therefore before `inputs.runner` means anything. So
+the default stays a literal and the decision moves to the **use site**, the
+`Setup toolchain` step, which is the first point where the runner is known.
+
+**Detection is self-hosted-side on purpose.** The derivation asks whether the
+runner labels contain `self-hosted`, rather than allowlisting hosted prefixes
+like `ubuntu-`. A hosted caller on a larger-runner custom label therefore keeps
+today's caching untouched; only a caller that explicitly names `self-hosted`
+(directly or in a JSON label-array string such as
+`'["self-hosted","my-runner"]'`) opts into the no-save behaviour. A self-hosted
+pool whose labels omit `self-hosted` should pass `toolchain-cache: 'false'`
+explicitly.
+
+**Pinning still wins.** Any explicit `'true'` or `'false'` is passed through
+untouched on either runner class — the derivation applies only to the literal
+`'auto'`.
+
+The scheduled [`advisory-scan.yml`](#advisory-scanyml) workflow's
+identically-named input behaves identically.
+
+> **Related:** when a tier reports `cancelled` with no failing sibling, the
+> job's `Explain cancellation` step now says so in the run summary and names
+> the two live causes (this job's own ceiling, consumed by a post-job teardown
+> such as a cache save, or a run-wide cancel) instead of leaving the operator
+> to infer it from timings. Raise
+> [`tier-timeouts`](#caller-addressable-tier-timeouts-tier-timeouts) only when
+> the **work** needs the room.
 
 ### Affected-only tier execution (`affected`)
 
@@ -2423,7 +2481,7 @@ jobs:
 | `osv-fail-on-severity`  | string | `'high'`                                         | Lowest CVSS band counted as a tracked finding (`none`…`critical`).                  |
 | `osv-scanner-version`   | string | `'2.4.0'`                                        | Pinned OSV-scanner version — must match the `osv-scan` composite's checksum map.     |
 | `osv-allowlist-path`    | string | `'.osv-allowlist.json'`                          | Path to the optional allow-list (same schema as the PR tier). Suppressed findings are reported in the issue, never raised. |
-| `toolchain-cache`       | string | `'true'`                                         | Passed to `setup-toolchain`'s `cache`. `'false'` on self-hosted runners with a warm store. |
+| `toolchain-cache`       | string | `'auto'`                                         | Passed to `setup-toolchain`'s `cache`. Identical derivation to the quality workflow's input: `'auto'` resolves to `'false'` when `runner` names `self-hosted` (a warm store makes the post-job save pure cost, and it is billed against this job's timeout), `'true'` otherwise. Pin explicitly with `'true'`/`'false'`. See [Derived `toolchain-cache` default](#derived-toolchain-cache-default). |
 | `pnpm-dest`             | string | `''`                                             | Passed to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set it explicitly. |
 | `tracking-issue-title`  | string | `'OSV advisory scan — default branch findings'`  | Title used when opening a new tracking issue.                                        |
 | `tracking-issue-labels` | string | `''`                                             | Comma-separated labels applied to the tracking issue and used to scope the lookup.  |

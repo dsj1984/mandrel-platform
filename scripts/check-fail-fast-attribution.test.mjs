@@ -136,12 +136,29 @@ const jobs = extractJobs();
 //    are wired into every tier job that participates in fail-fast.
 // ---------------------------------------------------------------------------
 
-test("the collateral explainer fires only on cancellation under fail-fast", () => {
+test("the collateral explainer fires on cancellation and nothing else", () => {
+  // Story #364 widened this from `cancelled() && inputs.fail-fast` to
+  // `cancelled()`: a job killed for exceeding its own `timeout-minutes` is also
+  // recorded as `cancelled`, and with fail-fast off nothing explained it at all.
+  // `cancelled()` remains the ceiling — an `always()` gate would fire the step
+  // on the green path, and `success()`/bare truthiness would fire it on a real
+  // failure, where the tier's own logs are the evidence.
   assert.match(
     explainStep,
-    /^\s+if:\s+\$\{\{\s*cancelled\(\)\s*&&\s*inputs\.fail-fast\s*\}\}\s*$/m,
-    "`&explain-cancellation` must be gated `cancelled() && inputs.fail-fast` — " +
-      "an `always()` gate would fire it on the green path"
+    /^\s+if:\s+\$\{\{\s*cancelled\(\)\s*\}\}\s*$/m,
+    "`&explain-cancellation` must be gated `cancelled()` alone"
+  );
+  assert.doesNotMatch(
+    explainStep,
+    /^\s+if:\s+\$\{\{\s*always\(\)/m,
+    "an `always()` gate would fire the explainer on the green path"
+  );
+  // The fail-fast input still has to reach the script — it is what separates a
+  // collateral cancellation from a timeout kill.
+  assert.match(
+    explainStep,
+    /^\s+FAIL_FAST:\s+\$\{\{\s*inputs\.fail-fast\s*\}\}\s*$/m,
+    "the explainer must receive inputs.fail-fast to classify the cancellation"
   );
 });
 
@@ -288,6 +305,9 @@ function runStep(script, { ghExit = 0, ghStdout = "", env = {} } = {}) {
         RUN_ID: "30168441137",
         REPO: "Beestera/swarm-os",
         TIER_ID: "typecheck",
+        // The collateral branch is the fail-fast-on case; a case that is about
+        // the timeout branch overrides this explicitly.
+        FAIL_FAST: "true",
         ...env,
       },
     });
@@ -369,6 +389,7 @@ test("collateral side: still explains itself when gh is absent entirely", () => 
         REPO: "o/r",
         TIER_ID: "lint",
         GH_TOKEN: "stub-token",
+        FAIL_FAST: "true",
       },
     });
     assert.equal(r.status, 0, r.stderr);
@@ -377,6 +398,71 @@ test("collateral side: still explains itself when gh is absent entirely", () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Timeout provenance (Story #364) — the other half of the same step. A job
+// killed for exceeding `timeout-minutes` is recorded as `cancelled`, not
+// `failure`, and `ci-required` reads `cancelled` as a red gate. With every work
+// step green, the operator previously had only timings to go on.
+// ---------------------------------------------------------------------------
+
+test("timeout side: a cancellation with no failing sibling is not reported as collateral", () => {
+  // Lookup SUCCEEDS and returns no failing tier — evidence, not an unknown.
+  const r = runStep(explainScript, { ghExit: 0, ghStdout: "" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(
+    r.stdout,
+    /fail-fast collateral/,
+    "blaming a sibling that did not fail is the same misattribution in reverse"
+  );
+  assert.match(r.stdout, /::notice title=cancelled without a failing sibling::/);
+});
+
+test("timeout side: names the job's own ceiling and the post-job teardown that eats it", () => {
+  const r = runStep(explainScript, { ghExit: 0, ghStdout: "" });
+  assert.match(r.summary, /timeout-minutes/, "the summary must name the ceiling");
+  assert.match(
+    r.summary,
+    /cache save/,
+    "the summary must name the teardown that runs after the last work step"
+  );
+  assert.match(
+    r.summary,
+    /toolchain-cache/,
+    "the summary must point at the input that turns the save off"
+  );
+  assert.match(r.summary, /run-wide cancel/i, "the other live cause must stay named");
+});
+
+test("timeout side: an unknown lookup under fail-fast stays collateral, not a timeout claim", () => {
+  // Absence of evidence is not evidence of absence: a failed lookup must not be
+  // read as "no sibling failed", or a genuine collateral cancel gets a timeout
+  // diagnosis and the operator triages the wrong job.
+  const r = runStep(explainScript, { ghExit: 1 });
+  assert.match(r.stdout, /fail-fast collateral/);
+  assert.doesNotMatch(r.stdout, /cancelled without a failing sibling/);
+});
+
+test("timeout side: with fail-fast disabled the cancellation is never collateral", () => {
+  // fail-fast off means no sibling could have cancelled this job, whatever the
+  // lookup returns.
+  const r = runStep(explainScript, {
+    ghExit: 0,
+    ghStdout: "e2e",
+    env: { FAIL_FAST: "false" },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /fail-fast collateral/);
+  assert.match(r.summary, /fail-fast is disabled on this run/);
+});
+
+test("timeout side: stays non-fatal and emits no failure annotation", () => {
+  // Same terms as the collateral branch — an explainer that can fail a job
+  // would turn a diagnostic into a second failure mode.
+  const r = runStep(explainScript, { ghExit: 0, ghStdout: "", env: { FAIL_FAST: "false" } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /::error/);
 });
 
 test("collateral side: never claims this tier failed", () => {
