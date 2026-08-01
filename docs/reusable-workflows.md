@@ -1494,6 +1494,46 @@ a `DROP` that appears only in a comment never trips the guard. A non-migration
 source file mentioning `DROP` in a string is ignored — only the migration
 globs / `.sql` files are scanned.
 
+**The one carve-out: a recreated index (Story #367).** A `DROP INDEX <name>`
+whose index the **same migration file recreates later** (`CREATE [UNIQUE] INDEX
+<name>`) is **lossless** and does not trip the guard:
+
+```sql
+DROP INDEX idx_orders_open;
+CREATE INDEX idx_orders_open ON orders (customer_id) WHERE status = 'open';
+```
+
+Narrowing a partial index cannot be expressed any other way on SQLite, so
+before #367 this everyday, reversible migration demanded an acknowledgement
+label — the fastest way to train reviewers to wave the gate through. The
+carve-out is deliberately narrow and fails closed. It does **not** apply when:
+
+- the drop has no matching recreate;
+- the recreate appears **before** the drop (the index is still gone at the end
+  of the migration);
+- the recreate lives in a **different** file;
+- the dropped index name cannot be parsed;
+- the recreate cannot execute — a `CREATE INDEX` inside a comment (`--`, `//`,
+  `#`, or a multi-line `/* … */` rollback note), inside a string literal, or
+  inside a postgres dollar-quoted body (`$$ … $$`, e.g. a function definition)
+  never excuses a drop;
+- the recreate is in a **different direction** of a bidirectional migration —
+  a `CREATE INDEX` after a `-- +goose Down` / `-- +migrate Down` /
+  `-- migrate:down` marker does not run when the Up section drops the index.
+  Each section pairs within itself, so a migration that narrows an index in
+  both directions still passes;
+- the statement drops several indexes in one comma-separated list
+  (`DROP INDEX a, b;`) and **any** one of them is not recreated — every name in
+  the list must be recreated, one excused name never excuses its neighbours;
+- the statement drops anything other than an index — a table, column,
+  constraint, view, schema, type, or a `TRUNCATE`, each unchanged;
+- the migration uses the drizzle op `.dropIndex(…)` rather than SQL, which
+  still trips the `drizzle destructive op` signal.
+
+Index names are compared unquoted, unqualified, and case-insensitively, so
+`DROP INDEX IF EXISTS "public"."idx_x"` pairs with
+`CREATE INDEX IF NOT EXISTS idx_x …`.
+
 **The override label.** The override is an **explicit PR label**
 (`migration-guard-label`, default **`migration:destructive-ok`**). With the
 label present, the guard still reports the finding (job summary) but **does not
@@ -1931,6 +1971,30 @@ Behavioural refinements shipped with (and after) the extraction:
 | `enable-environments-isolation-audit`   | boolean | `false` | Set `true` once every environment you list has the canonical branch policy applied. |
 | `environments-to-audit`                 | string  | `''`    | Additional environment names to audit beyond `gh-environment` (comma-separated, deduplicated). Set this when `gh-environment` is empty or you want to audit an environment the deploy itself doesn't attach to. |
 | `isolation-audit-branch`                | string  | `'main'`| The single branch each audited environment must restrict deploys to. |
+
+> **Token requirement — and what happens without it (Story #367).** Reading an
+> environment's `deployment_branch_policy` requires repo **Administration:
+> read**, which is **not a grantable `GITHUB_TOKEN` workflow permission**.
+> Supply a classic PAT with `repo` scope, or a fine-grained PAT with
+> Administration: read, via `GH_TOKEN`.
+>
+> Without that permission GitHub omits the `deployment_branch_policy` field
+> from the response entirely. The audit used to read that absence as "this
+> environment has NO deployment branch policy" and fail with a security finding
+> it had never observed. Since #367 the two states are distinguished:
+>
+> | State | What the API returns | What the audit reports |
+> | --- | --- | --- |
+> | Not permitted to read | field **absent** | `UNREADABLE` — names the missing permission, asserts nothing about the policy |
+> | Genuinely unconfigured | field present, `null` | `has NO deployment branch policy` — a real finding, unchanged |
+>
+> The same split applies one level down to the named
+> `deployment-branch-policies` list: a failed read is reported as unreadable,
+> never as "ZERO named policies". Both outcomes still **exit non-zero** — an
+> audit that could not look has not earned a pass either — but the run summary
+> calls out how many findings are permission failures rather than policy
+> verdicts, so an operator fixes the token instead of chasing a
+> misconfiguration that isn't there.
 
 ### CI-green guard
 

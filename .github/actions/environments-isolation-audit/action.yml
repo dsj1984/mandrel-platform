@@ -28,9 +28,17 @@
 # The default GITHUB_TOKEN CANNOT satisfy this — `administration` is not a
 # grantable GITHUB_TOKEN workflow permission, so `contents: read` (or any
 # grantable combination) leaves `deployment_branch_policy` absent from the API
-# response and the audit false-fails "NO deployment branch policy" even when a
-# policy is set. Supply a classic PAT with `repo` scope, or a fine-grained PAT
-# with Administration: read (same-repo or cross-repo), via GH_TOKEN.
+# response. Supply a classic PAT with `repo` scope, or a fine-grained PAT with
+# Administration: read (same-repo or cross-repo), via GH_TOKEN.
+#
+# Story #367: an absent `deployment_branch_policy` KEY and a `null` one are
+# different states and the audit no longer conflates them. The key missing
+# entirely is the API's signal that the token was not permitted to read the
+# field — the audit says so, names the permission, and does NOT claim the
+# environment has no policy. A present-but-null field is a genuinely
+# unconfigured environment and remains the "NO deployment branch policy"
+# failure it always was. Both still exit non-zero: an audit that could not look
+# has not earned a pass either.
 name: Environments isolation audit
 description: >
   Audits GitHub Environments' deployment branch policies against the
@@ -80,6 +88,7 @@ runs:
         fi
 
         errors=0
+        unreadable=0
 
         for raw_env in "${ENVS[@]}"; do
           env_name="$(echo "$raw_env" | xargs)"
@@ -90,6 +99,21 @@ runs:
           env_json="$(gh api "repos/${REPO}/environments/${env_name}" 2>/dev/null || true)"
           if [ -z "$env_json" ]; then
             echo "::error::Environment '${env_name}' does not exist on ${REPO} (or the token lacks access)."
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          # An ABSENT `deployment_branch_policy` key is not evidence of an
+          # unrestricted environment — it is what the API returns when the token
+          # lacks Administration: read. Reporting "NO deployment branch policy"
+          # here asserts a conclusion the audit did not earn, so say what is
+          # actually true instead: it could not look. A key present with a
+          # `null` value IS a genuinely unconfigured environment and falls
+          # through to the failure below.
+          if [ "$(echo "$env_json" | jq -r 'has("deployment_branch_policy")')" != "true" ]; then
+            echo "::error::Environment '${env_name}': deployment branch policy UNREADABLE — the API response omits the 'deployment_branch_policy' field entirely, which is what GitHub returns when the token lacks repo Administration: read. This is NOT a finding that the environment has no policy; the audit could not look. Supply a classic PAT with 'repo' scope, or a fine-grained PAT with Administration: read, via GH_TOKEN — the default GITHUB_TOKEN cannot be granted this permission."
+            unreadable=$((unreadable + 1))
             errors=$((errors + 1))
             echo "::endgroup::"
             continue
@@ -109,7 +133,17 @@ runs:
             continue
           fi
 
-          policies_json="$(gh api "repos/${REPO}/environments/${env_name}/deployment-branch-policies" 2>/dev/null || echo '{"total_count":0,"branch_policies":[]}')"
+          # Same distinction one level down: a failed read of the named policies
+          # is not "ZERO named policies". Substituting an empty list here would
+          # report a misconfiguration the audit never observed.
+          if ! policies_json="$(gh api "repos/${REPO}/environments/${env_name}/deployment-branch-policies" 2>/dev/null)" || [ -z "$policies_json" ]; then
+            echo "::error::Environment '${env_name}': named branch policies UNREADABLE — 'repos/${REPO}/environments/${env_name}/deployment-branch-policies' could not be read, which requires repo Administration: read. This is NOT a finding that the environment has zero policies; the audit could not look. Supply a classic PAT with 'repo' scope, or a fine-grained PAT with Administration: read, via GH_TOKEN."
+            unreadable=$((unreadable + 1))
+            errors=$((errors + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
           policy_count="$(echo "$policies_json" | jq -r '.total_count // 0')"
           policy_names="$(echo "$policies_json" | jq -r '[.branch_policies[]?.name] | join(",")')"
 
@@ -146,6 +180,10 @@ runs:
           echo "✅ Environment '${env_name}' restricts deploys to '${ALLOWED_BRANCH}' only."
           echo "::endgroup::"
         done
+
+        if [ "$unreadable" -gt 0 ]; then
+          echo "::error::environments-isolation-audit: ${unreadable} of ${errors} finding(s) are NOT policy verdicts — the token could not read the branch policy at all. Grant repo Administration: read (classic PAT with 'repo' scope, or a fine-grained PAT) via GH_TOKEN and re-run before treating those environments as misconfigured."
+        fi
 
         if [ "$errors" -gt 0 ]; then
           echo "::error::environments-isolation-audit: ${errors} environment(s) failed the deployment branch-policy audit. See docs/runbooks/environments-provisioning.md#6-deployment-branch-policy for the canonical posture and remediation."

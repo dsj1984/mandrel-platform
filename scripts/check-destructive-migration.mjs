@@ -27,6 +27,18 @@
  * Comment lines (`--`, `/* … *​/`, `//`) are stripped before matching so a
  * `DROP` mentioned only in a comment does not trip the guard.
  *
+ * ONE carve-out, and only one (Story #367): a `DROP INDEX <name>` whose index
+ * the SAME migration file recreates LATER in the file (`CREATE [UNIQUE] INDEX
+ * <name>`) is **lossless** and does not trip the guard. Narrowing a partial
+ * index cannot be expressed any other way on SQLite — it is necessarily a drop
+ * followed immediately by a create — so an ordinary, reversible migration was
+ * demanding a human acknowledgement label. The carve-out is deliberately
+ * narrow and fails closed: a drop with no matching recreate, a recreate that
+ * appears BEFORE the drop (the index is still gone at the end of the
+ * migration), a recreate in a different file, an unparseable index name, and
+ * every non-INDEX drop all still block. No table, column, constraint, or
+ * TRUNCATE detection is relaxed.
+ *
  * The guard only inspects files whose path matches a migration glob (default
  * `**​/migrations/**` and `**​/drizzle/**` plus a `*.sql` tail), so an
  * unrelated source file mentioning `DROP` in a string never blocks a PR.
@@ -133,9 +145,11 @@ export function isMigrationFile(filePath, globs = DEFAULT_MIGRATION_GLOBS) {
 /**
  * Strip SQL / JS comments from a single line so a `DROP` that appears only in a
  * comment does not trip the guard. Handles `--`, `//`, and a `/* … *​/` opened
- * and closed on the same line. (Multi-line block comments are rare in migration
- * files and conservatively left in — a false positive there is acknowledgeable
- * via the override label.)
+ * and closed on the same line. A multi-line block comment's residue is left in
+ * DELIBERATELY on this side: it can only cause a false positive, which the
+ * override label acknowledges. It is `maskNonExecutable` — applied only to the
+ * text the RECREATE scan reads — that must be exact, because there the same
+ * residue would cause a false NEGATIVE.
  *
  * @param {string} line
  * @returns {string}
@@ -149,22 +163,272 @@ export function stripComments(line) {
   return out;
 }
 
-// The destructive-signal matchers. Each entry names the signal it detects so a
-// block message can tell the reviewer exactly what tripped the guard. Order is
-// most-specific-first only for readability; all are tested per line.
+/**
+ * The whole-text, LENGTH-PRESERVING counterpart of {@link stripComments}: same
+ * comment syntaxes, blanked in place rather than sliced out, so offsets stay
+ * comparable across every scan derived from the same source text.
+ *
+ * @param {string} text
+ * @returns {string}  Same length as `text`.
+ */
+export function maskComments(text) {
+  return text
+    .split("\n")
+    .map((line) => {
+      let out = line.replace(/\/\*.*?\*\//g, (m) => " ".repeat(m.length));
+      const candidates = [out.indexOf("--"), out.indexOf("//")].filter((i) => i !== -1);
+      if (candidates.length > 0) {
+        const cut = Math.min(...candidates);
+        out = out.slice(0, cut) + " ".repeat(out.length - cut);
+      }
+      return out;
+    })
+    .join("\n");
+}
+
+// The direction markers of a bidirectional migration — goose, sql-migrate, and
+// dbmate. Each one starts a section that runs independently of its neighbours.
+const SECTION_DIRECTIVE_RE =
+  /^[ \t]*--[ \t]*(?:\+goose\s+(?:Up|Down)|\+migrate\s+(?:Up|Down)|migrate:(?:up|down))\b/gim;
+
+/**
+ * The offsets at which a bidirectional migration changes section. A recreate on
+ * the far side of one of these does not run in the same direction as the drop:
+ * a `CREATE INDEX` in the Down section cannot un-drop an index the Up section
+ * dropped. Read from the RAW text — the markers are `--` comments, so anything
+ * that has already masked comments has erased them.
+ *
+ * @param {string} text
+ * @returns {number[]}  Ascending offsets.
+ */
+export function sectionBoundaries(text) {
+  const re = new RegExp(SECTION_DIRECTIVE_RE.source, "gim");
+  const offsets = [];
+  let m;
+  while ((m = re.exec(text)) !== null) offsets.push(m.index);
+  return offsets;
+}
+
+// The destructive-signal matchers evaluated per line. `DROP <object>` is NOT
+// in this list — it is scanned over the whole file so a `DROP INDEX` can be
+// paired with a later recreate (see scanDropStatements below). Each entry names
+// the signal it detects so a block message can tell the reviewer exactly what
+// tripped the guard.
 const DESTRUCTIVE_PATTERNS = [
   { signal: "ALTER TABLE … DROP", re: /\bALTER\s+TABLE\b[\s\S]*?\bDROP\b/i },
-  {
-    signal: "DROP statement",
-    // DROP TABLE/COLUMN/INDEX/SCHEMA/CONSTRAINT/VIEW/DATABASE/TYPE …
-    re: /\bDROP\s+(TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|DATABASE|TYPE|SEQUENCE|TRIGGER|FUNCTION)\b/i,
-  },
   { signal: "TRUNCATE", re: /\bTRUNCATE\b/i },
   {
     signal: "drizzle destructive op",
     re: /\.(dropTable|dropColumn|dropIndex|dropConstraint|dropForeignKey|dropPrimaryKey|dropUnique)\s*\(/,
   },
 ];
+
+// One identifier segment: bare, or quoted with "…", `…`, or […].
+const IDENT_SEGMENT_SOURCE = '(?:"[^"]+"|`[^`]+`|\\[[^\\]]+\\]|[A-Za-z_][A-Za-z0-9_$]*)';
+
+// A possibly schema-qualified identifier — every segment may be quoted
+// independently (`"public"."idx_x"`).
+const IDENT_SOURCE = `${IDENT_SEGMENT_SOURCE}(?:\\.${IDENT_SEGMENT_SOURCE})*`;
+
+// `DROP TABLE/COLUMN/INDEX/SCHEMA/CONSTRAINT/VIEW/DATABASE/TYPE …`. Scanned
+// globally so every occurrence is judged, not just the first on a line.
+const DROP_OBJECT_SOURCE =
+  "\\bDROP\\s+(TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|DATABASE|TYPE|SEQUENCE|TRIGGER|FUNCTION)\\b";
+
+// The dropped index NAMES, anchored at the `DROP` that already matched.
+// Tolerates postgres' `CONCURRENTLY` and the `IF EXISTS` guard, and captures
+// the WHOLE comma-separated list — `DROP INDEX a, b;` is valid postgres, and
+// excusing it on the strength of the first name alone would let `b` be dropped
+// with no recreate and no acknowledgement.
+const DROP_INDEX_LIST_RE = new RegExp(
+  `^DROP\\s+INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+EXISTS\\s+)?(${IDENT_SOURCE}(?:\\s*,\\s*${IDENT_SOURCE})*)`,
+  "i"
+);
+
+/**
+ * The normalized names a `DROP INDEX` statement targets, or `null` when the
+ * statement's name list cannot be parsed (which fails closed at the call site).
+ *
+ * @param {string} tail  Text starting at the matched `DROP`.
+ * @returns {string[]|null}
+ */
+export function parseDroppedIndexNames(tail) {
+  const m = DROP_INDEX_LIST_RE.exec(tail);
+  if (!m) return null;
+  // Re-match identifiers rather than splitting on "," so a quoted name that
+  // itself contains a comma stays one identifier.
+  const names = m[1].match(new RegExp(IDENT_SOURCE, "g"));
+  if (!names || names.length === 0) return null;
+  return names.map(normalizeIndexName);
+}
+
+// `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name>`.
+const CREATE_INDEX_SOURCE =
+  `\\bCREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+NOT\\s+EXISTS\\s+)?(${IDENT_SOURCE})`;
+
+/**
+ * Normalize an index identifier for comparison: unquote, drop any schema
+ * qualifier, and lowercase (SQL identifiers are case-insensitive unquoted).
+ *
+ * @param {string} raw
+ * @returns {string}
+ */
+export function normalizeIndexName(raw) {
+  const unquoted = raw.replace(/["`[\]]/g, "");
+  const segments = unquoted.split(".");
+  return segments[segments.length - 1].toLowerCase();
+}
+
+// A postgres dollar-quote delimiter: `$$` or `$tag$`.
+const DOLLAR_QUOTE_RE = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/;
+
+/**
+ * Blank out the spans of `text` that cannot execute — multi-line `/* … *​/`
+ * block comments, single-quoted SQL string literals, and postgres
+ * dollar-quoted bodies (`$$ … $$` / `$tag$ … $tag$`, which is how a function
+ * body reaches the server as a literal) — preserving LENGTH so offsets stay
+ * comparable with the unmasked text.
+ *
+ * The two scans are deliberately asymmetric, and both directions fail closed:
+ * the DROP scan reads text with only per-line comments stripped (detect as much
+ * as possible), while the RECREATE scan reads this masked text (excuse as
+ * little as possible). Without it, a `CREATE INDEX idx_a …` that never runs —
+ * commented out as a rollback note, or quoted inside an INSERT — would excuse a
+ * real `DROP INDEX idx_a`, and the index would be gone at the end of the
+ * migration with no acknowledgement. An unterminated quote masks the remainder
+ * of the file, which withdraws excuses rather than granting them.
+ *
+ * @param {string} text
+ * @returns {string}  Same length as `text`.
+ */
+export function maskNonExecutable(text) {
+  const chars = text.split("");
+  const blank = (from, to) => {
+    for (let k = from; k < to; k++) if (chars[k] !== "\n") chars[k] = " ";
+  };
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "/" && text[i + 1] === "*") {
+      const close = text.indexOf("*/", i + 2);
+      const end = close === -1 ? text.length : close + 2;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    // `#` is a MySQL line comment. It is masked on THIS side only: blanking it
+    // on the drop side would let `INSERT … '#'; DROP TABLE x;` hide a real drop.
+    if (text[i] === "#") {
+      const nl = text.indexOf("\n", i);
+      const end = nl === -1 ? text.length : nl;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    if (text[i] === "$") {
+      const tag = DOLLAR_QUOTE_RE.exec(text.slice(i))?.[0];
+      if (tag) {
+        const close = text.indexOf(tag, i + tag.length);
+        const end = close === -1 ? text.length : close + tag.length;
+        blank(i, end);
+        i = end;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (text[i] === "'") {
+      let k = i + 1;
+      while (k < text.length) {
+        // '' is an escaped quote inside a SQL string literal, not a close.
+        if (text[k] === "'" && text[k + 1] === "'") {
+          k += 2;
+          continue;
+        }
+        if (text[k] === "'") {
+          k++;
+          break;
+        }
+        k++;
+      }
+      blank(i, k);
+      i = k;
+      continue;
+    }
+    i++;
+  }
+  return chars.join("");
+}
+
+/**
+ * Every index this text (re)creates, with the offset at which the CREATE
+ * appears. Offsets are what make the pairing order-sensitive: only a create
+ * that lands AFTER the drop leaves the index in place at the end of the
+ * migration.
+ *
+ * @param {string} text  Comment-stripped migration text.
+ * @returns {Array<{name: string, index: number}>}
+ */
+export function collectCreatedIndexes(text) {
+  const re = new RegExp(CREATE_INDEX_SOURCE, "gi");
+  const created = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    created.push({ name: normalizeIndexName(m[1]), index: m.index });
+  }
+  return created;
+}
+
+/**
+ * Scan a migration file's text for `DROP <object>` statements, pairing a
+ * `DROP INDEX` with a later recreate of the same index in the same text.
+ *
+ * Three texts, all the same length so their offsets are comparable:
+ *   • `text`       — raw; the only place the section directives survive.
+ *   • `dropText`   — comments masked; what the DROP scan reads (detect as much
+ *                    as possible; multi-line block residue left in on purpose).
+ *   • `createText` — additionally non-executable spans masked; what the RECREATE
+ *                    scan reads (excuse as little as possible).
+ *
+ * @param {string} text  Raw migration text.
+ * @returns {{ destructiveDrops: number, recreatedIndexes: string[] }}
+ *   `destructiveDrops` counts the drops that still trip the guard;
+ *   `recreatedIndexes` names the index drops excused as lossless.
+ */
+export function scanDropStatements(text) {
+  const dropText = maskComments(text);
+  // Only an executable CREATE counts as a recreate — see maskNonExecutable.
+  const created = collectCreatedIndexes(maskNonExecutable(dropText));
+  // A recreate on the far side of a direction marker runs in the other
+  // direction — a Down-section CREATE cannot un-drop what Up dropped.
+  const boundaries = sectionBoundaries(text);
+  const sameSection = (dropAt, createAt) =>
+    !boundaries.some((b) => b > dropAt && b <= createAt);
+  const re = new RegExp(DROP_OBJECT_SOURCE, "gi");
+  let destructiveDrops = 0;
+  const recreatedIndexes = [];
+  let m;
+  while ((m = re.exec(dropText)) !== null) {
+    if (m[1].toUpperCase() === "INDEX") {
+      const names = parseDroppedIndexNames(dropText.slice(m.index));
+      // An unparseable name list fails closed — counted as destructive below.
+      // EVERY name in the list must be recreated after the drop; one excused
+      // name never excuses its neighbours.
+      if (
+        names &&
+        names.every((name) =>
+          created.some(
+            (c) => c.name === name && c.index > m.index && sameSection(m.index, c.index)
+          )
+        )
+      ) {
+        recreatedIndexes.push(...names);
+        continue;
+      }
+    }
+    destructiveDrops++;
+  }
+  return { destructiveDrops, recreatedIndexes };
+}
 
 /**
  * Scan a single migration file's text for destructive signals.
@@ -181,6 +445,8 @@ export function scanMigrationText(text) {
       if (re.test(line)) found.add(signal);
     }
   }
+  const { destructiveDrops } = scanDropStatements(text);
+  if (destructiveDrops > 0) found.add("DROP statement");
   return [...found];
 }
 
