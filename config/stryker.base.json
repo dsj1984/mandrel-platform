@@ -6,7 +6,11 @@
   "coverageAnalysis": "perTest",
   "ignoreStatic": true,
   "cleanTempDir": true,
-  "timeoutMS": 60000,
+  "_comment_disableBail": "Bail is OFF deliberately. Under Stryker's default bail the vitest runner can score a mutant Survived having completed zero of its covering tests, so a run reports a number nothing measured and a committed baseline becomes a floor under it. Every mutant now runs its full covering set, which lengthens the run — the three timeouts below are sized for that and must move together with this flag. Asserted by scripts/stryker-base-config.test.mjs.",
+  "disableBail": true,
+  "timeoutMS": 120000,
+  "timeoutFactor": 3,
+  "dryRunTimeoutMinutes": 15,
   "thresholds": {
     "high": 80,
     "low": 60,
