@@ -166,9 +166,26 @@ jobs:
           # normally queryable the moment it returns. The bounded retry only
           # covers propagation lag and transient 5xx — it never converts a
           # persistent failure into a pass.
+          #
+          # `--paginate` is load-bearing (Story #380). A single unpaginated
+          # request caps at one page, so a ref carrying more than `per_page`
+          # open alerts would have every alert past page 1 read as absent —
+          # a silent PASS from a step whose entire purpose is failing closed.
+          # `gh api --paginate` emits one JSON array per page, and the `jq`
+          # filter below runs per input, so every page is ranked.
+          #
+          # The read is deliberately NOT narrowed with the API's `severity`
+          # query parameter. That parameter takes a single value drawn from an
+          # enum that mixes the security-severity scale (critical|high|medium
+          # |low) with the rule-severity scale (error|warning|note), so
+          # `severity=high` would both drop `critical` — which is ABOVE the
+          # threshold — and silently return nothing if the alert is graded on
+          # the other scale. Both are fail-open. The narrowing is done in `jq`
+          # against `rule.security_severity_level`, which is the field the
+          # gate's own threshold is expressed in.
           alerts=""
           for attempt in 1 2 3 4 5 6; do
-            if alerts="$(gh api \
+            if alerts="$(gh api --paginate \
               "repos/${REPO}/code-scanning/alerts?ref=${ANALYSIS_REF}&state=open&per_page=100" \
               2>/dev/null)"; then
               break
@@ -180,6 +197,34 @@ jobs:
 
           if [ -z "${alerts}" ]; then
             echo "::error::Could not read code scanning alerts for ${ANALYSIS_REF}. The scan did not conclusively report clean, so this gate fails closed."
+            exit 1
+          fi
+
+          # An alert whose security severity is PRESENT but not on the known
+          # scale cannot be ranked, so the gate cannot prove it below the
+          # threshold — it fails closed rather than ranking it 0 and waving it
+          # through, which is how a newly introduced severity level would slip
+          # past. An ABSENT severity is a different case and deliberately not a
+          # finding: other tools publish SARIF to the same code scanning
+          # surface (this repository's gitleaks history scan does), and those
+          # alerts carry no security severity at all. Merging stderr into the
+          # capture also turns a response that is not parseable JSON into a
+          # named failure instead of a bare `set -e` abort.
+          if ! unrankable="$(jq -r '
+            def known: {"critical": 4, "high": 3, "medium": 2, "low": 1};
+            [ .[]
+              | ((.rule.security_severity_level // "") | ascii_downcase) as $sev
+              | select($sev != "" and (known[$sev] == null))
+              | "\($sev)\t\(.rule.id // "?")" ]
+            | .[]
+          ' <<<"${alerts}" 2>&1)"; then
+            echo "::error::Could not parse the code scanning alerts response for ${ANALYSIS_REF} (${unrankable}). The scan did not conclusively report clean, so this gate fails closed."
+            exit 1
+          fi
+
+          if [ -n "${unrankable}" ]; then
+            printf '%s\n' "${unrankable}" >&2
+            echo "::error::Code scanning reported alert(s) whose security severity is not one of low|medium|high|critical. The gate cannot rank them against ${THRESHOLD}, so it fails closed."
             exit 1
           fi
 
