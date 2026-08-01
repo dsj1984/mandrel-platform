@@ -480,6 +480,98 @@ test("isBoundedOverride: a bare lower bound is unbounded; a capped range is not"
   }
 });
 
+// The wildcard truth table (Story #375).
+//
+// The shipped regex enumerated only some wildcard spellings, so `x.x.x` and
+// `x.x` — the exact shape the lint exists to catch, and what npm reads as
+// plain `*` — fell through the catch-all and were reported bounded. The
+// deciding question is the MAJOR position: a wildcard there is open to every
+// future release, while a wildcard below it (`1.2.x`, `1.*`) stays inside its
+// major and is genuinely bounded. Every spelling is enumerated so the next
+// regex tweak has to keep answering all of them.
+const WILDCARD_TRUTH_TABLE = [
+  ["*", false],
+  ["x", false],
+  ["X", false],
+  ["*.*", false],
+  ["x.x", false],
+  ["X.X", false],
+  ["*.*.*", false],
+  ["x.x.x", false],
+  ["X.X.X", false],
+  ["x.*", false],
+  ["*.x.x", false],
+  ["x.2.3", false],
+  ["latest", false],
+  ["next", false],
+  ["LATEST", false],
+  ["1.x", true],
+  ["1.X", true],
+  ["1.*", true],
+  ["1.2.x", true],
+  ["1.2.*", true],
+];
+
+test("AC-1/AC-4: every wildcard spelling is judged on its major position", () => {
+  for (const [spec, expected] of WILDCARD_TRUTH_TABLE) {
+    assert.equal(
+      isBoundedOverride(spec),
+      expected,
+      `${JSON.stringify(spec)} should be bounded=${expected}`,
+    );
+  }
+});
+
+test("AC-2: a non-registry specifier expresses no upper bound", () => {
+  // Each of these re-resolves to whatever the source holds at install time —
+  // a branch head, a workspace sibling, a path — so none of them is a range
+  // the lint can call bounded.
+  for (const spec of [
+    "github:owner/repo",
+    "github:owner/repo#v1.2.3",
+    "git+https://github.com/owner/repo.git",
+    "git+ssh://git@github.com/owner/repo.git#main",
+    "git://github.com/owner/repo.git",
+    "workspace:*",
+    "workspace:^",
+    "file:../local-pkg",
+    "link:../local-pkg",
+    "https://example.com/pkg-1.2.3.tgz",
+  ]) {
+    assert.equal(
+      isBoundedOverride(spec),
+      false,
+      `${JSON.stringify(spec)} pins nothing`,
+    );
+  }
+});
+
+test("AC-2: a git specifier carrying #semver: is judged on that range", () => {
+  assert.equal(
+    isBoundedOverride("git+https://github.com/owner/repo.git#semver:^1.2.3"),
+    true,
+  );
+  assert.equal(isBoundedOverride("github:owner/repo#semver:>=1.2.3"), false);
+});
+
+test("AC-3: a range carrying an explicit upper bound stays bounded", () => {
+  for (const bounded of [
+    "1.2.3",
+    "=1.2.3",
+    "^1.2.3",
+    "~1.2.3",
+    ">=1.2.3 <2.0.0",
+    "<2.0.0",
+    "1.2.3 - 2.0.0",
+  ]) {
+    assert.equal(
+      isBoundedOverride(bounded),
+      true,
+      `${JSON.stringify(bounded)} is bounded`,
+    );
+  }
+});
+
 test("isBoundedOverride: a || union is only as bounded as its loosest arm", () => {
   assert.equal(isBoundedOverride("^1.0.0 || ^2.0.0"), true);
   assert.equal(isBoundedOverride("^1.0.0 || >=2.0.0"), false);

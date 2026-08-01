@@ -480,10 +480,17 @@ app.use("*", createHonoRateLimit({ limit: 100, windowMs: 60_000 }));
 
 ### `scripts/audit-check.mjs`
 
-CVE gate script. Runs `pnpm audit --prod` and blocks on any **unsuppressed**
-High or Critical vulnerability in the production dependency graph. This is the
-stricter athportal/swarm-os policy: all unsuppressed High/Critical are
-blocking, not just fixable ones.
+Dependency gate script with **two independent blocking conditions**. It exits
+non-zero when *either* fires — a clean CVE scan does not excuse an unbounded
+override, and vice versa:
+
+1. **CVE gate.** Runs `pnpm audit --prod` and blocks on any **unsuppressed**
+   High or Critical vulnerability in the production dependency graph. This is
+   the stricter athportal/swarm-os policy: all unsuppressed High/Critical are
+   blocking, not just fixable ones.
+2. **Unbounded-override lint.** Blocks on any dependency override written
+   without an upper bound — **independently of the CVE scan, and with zero
+   CVEs present**. It runs *first*, before `pnpm audit` is invoked at all.
 
 Known/accepted CVEs are suppressed via a **dated, self-expiring allowlist**
 (`audit-allowlist.json` in the project root). Expired entries are treated as
@@ -503,6 +510,44 @@ periodically re-evaluate accepted risk.
 Or copy the script into your repo's `scripts/` directory when you need
 local customization (and pin a semver range on `mandrel-platform` so drift
 is detected by Renovate).
+
+**Flags:**
+
+| Flag | Default | Purpose |
+| ---- | ------- | ------- |
+| `--allowlist <path>` | `audit-allowlist.json` in the invoking directory | Where to read the dated CVE allowlist from. An absent file means "no suppressions". |
+| `--package-json <path>` | `package.json` in the invoking directory | Which manifest the unbounded-override lint reads. Point it at a workspace member's manifest to lint that package instead of the root. An absent file skips the lint (the audit still runs). |
+
+**Unbounded-override lint:**
+
+An override *rewrites* a transitive dependent's declared range, so whatever is
+written there is the only thing standing between your tree and the next release
+of that package. Written open-endedly, the committed lockfile becomes the sole
+pin — and the moment anything re-resolves (a fresh install, a lockfile-less CI
+leg, a dependent's own bump) the newest release wins and can cross a major.
+Nothing else in the toolchain lints for this, so the gate names each offending
+override and its bound, then exits 1.
+
+Every override field is checked — `overrides`, `resolutions`, and
+`pnpm.overrides` — including dependent-scoped nested objects, which are
+reported by their full path (`overrides.some-dep.left-pad`).
+
+| Bound | Verdict | Why |
+| ----- | ------- | --- |
+| `1.2.3`, `=1.2.3` | ✅ bounded | Exact pin. |
+| `^1.2.3`, `~1.2.3` | ✅ bounded | Cannot cross a major on its own. |
+| `1.2.x`, `1.*` | ✅ bounded | The major is fixed; only lower positions float. |
+| `>=1.2.3 <2.0.0`, `1.2.3 - 2.0.0` | ✅ bounded | Carries an explicit upper bound. |
+| `npm:other-pkg@^1.2.3` | ✅ bounded | An alias is judged on the range it carries. |
+| `>=1.2.3`, `>1.2.3` | ❌ blocking | A bare lower bound; the next major satisfies it. |
+| `*`, `x`, `x.x`, `x.x.x`, `*.*.*` | ❌ blocking | npm reads a wildcard major as "any version". |
+| `latest`, `next` | ❌ blocking | A dist-tag pins nothing. |
+| `github:owner/repo`, `git+https://…`, `workspace:*`, `file:../pkg` | ❌ blocking | Non-registry specifiers re-resolve to whatever the source holds at install time. A git URL carrying an explicit `#semver:<range>` fragment is judged on that range instead. |
+| `^1.0.0 \|\| >=2.0.0` | ❌ blocking | A `\|\|` union is only as bounded as its loosest arm. |
+
+To fix a blocking override, give the bound an upper limit — `"^1.2.3"`,
+`"~1.2.3"`, or `">=1.2.3 <2.0.0"`. There is no allowlist for this check: the
+allowlist suppresses CVEs only.
 
 **Allowlist format (`audit-allowlist.json`):**
 

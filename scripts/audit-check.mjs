@@ -20,7 +20,9 @@
  *
  * Unbounded-override lint (Story #365):
  *   A dependency override REWRITES a transitive dependent's declared range.
- *   Written as a bare lower bound (`">=1.2.3"`, `"*"`) it is open-ended, so
+ *   Written as a bare lower bound (`">=1.2.3"`, `"*"`, `"x.x.x"`) or as a
+ *   non-registry specifier (`"github:owner/repo"`, `"workspace:*"`) it is
+ *   open-ended, so
  *   the committed lockfile becomes the only pin and any fresh resolution
  *   re-picks the newest release — which can cross a major. Nothing else in the
  *   toolchain lints for that, so this gate names each such override and its
@@ -202,19 +204,65 @@ export function partitionAllowlist(allowlist, today) {
 const OVERRIDE_FIELDS = ["overrides", "resolutions", "pnpm.overrides"];
 
 /**
+ * Specifier prefixes that are not registry semver ranges at all: a git ref, a
+ * workspace sibling, a local path, a tarball URL. Each re-resolves to whatever
+ * that source holds at install time — `github:owner/repo` tracks the default
+ * branch, `workspace:*` tracks the sibling's current version — so none of them
+ * expresses an upper bound and none can be judged bounded. Before Story #375
+ * they all fell through to the catch-all and were reported bounded.
+ */
+const NON_SEMVER_PROTOCOLS = [
+  "bitbucket:",
+  "file:",
+  "gist:",
+  "git+",
+  "git:",
+  "github:",
+  "gitlab:",
+  "http:",
+  "https:",
+  "link:",
+  "portal:",
+  "workspace:",
+];
+
+/**
+ * Is `value` a wildcard that pins nothing — `*`, a dist-tag, or a dotted
+ * wildcard such as `x.x.x`, `x.x` or `*.*.*`?
+ *
+ * The MAJOR position is the whole test, because npm reads `x.x.x` and `x.x` as
+ * exactly `*` (any version). A wildcard below the major — `1.2.x`, `1.*` —
+ * stays inside major 1 and is genuinely bounded, so only a wildcard in the
+ * first position is open-ended. Story #375: the enumerated regex this replaces
+ * listed `*`, `x` and `*.*.*` but not the dotted `x` forms, which is how the
+ * exact shape the lint exists to catch read as bounded.
+ *
+ * @param {string} value trimmed specifier
+ * @returns {boolean}
+ */
+function isWildcardSpec(value) {
+  if (/^(latest|next)$/i.test(value)) {
+    return true;
+  }
+
+  return /^[*xX]$/.test(value.split(".")[0]);
+}
+
+/**
  * Is this override specifier bounded above?
  *
  * An override REWRITES a transitive dependent's declared range, so whatever is
  * written here is the only thing standing between the tree and the next
  * release of that package. A bare lower bound (`>=1.2.3`, `>1.2.3`, `*`,
- * `latest`) leaves the committed lockfile as the sole pin: the moment anything
- * re-resolves — a fresh install, a lockfile-less CI leg, a dependent's own
- * bump — the newest release wins and can cross a major. That is how a major
- * jump silently emptied a consumer's test suite.
+ * `x.x.x`, `latest`) leaves the committed lockfile as the sole pin: the moment
+ * anything re-resolves — a fresh install, a lockfile-less CI leg, a
+ * dependent's own bump — the newest release wins and can cross a major. That
+ * is how a major jump silently emptied a consumer's test suite.
  *
  * Bounded means the specifier can never cross a major on its own: an exact
- * pin, a caret/tilde range, an `x`-style partial (`1.2.x`), or a compound
- * range carrying an explicit upper bound (`>=1.2.3 <2`).
+ * pin, a caret/tilde range, an `x`-style partial whose major is fixed
+ * (`1.2.x`), or a compound range carrying an explicit upper bound
+ * (`>=1.2.3 <2`).
  *
  * @param {string} spec
  * @returns {boolean}
@@ -236,13 +284,22 @@ export function isBoundedOverride(spec) {
     return aliasMatch ? isBoundedOverride(aliasMatch[1]) : false;
   }
 
+  // A non-registry specifier resolves outside semver entirely. Only the
+  // explicit `#semver:<range>` fragment a git URL may carry is a real range,
+  // and it is judged on its own merits exactly as an `npm:` alias is.
+  const lower = value.toLowerCase();
+  if (NON_SEMVER_PROTOCOLS.some((protocol) => lower.startsWith(protocol))) {
+    const semverFragment = /#semver:(.+)$/.exec(value);
+    return semverFragment ? isBoundedOverride(semverFragment[1]) : false;
+  }
+
   // A `||` union is only as bounded as its loosest arm.
   if (value.includes("||")) {
     return value.split("||").every((arm) => isBoundedOverride(arm));
   }
 
   // Wildcards and dist-tags pin nothing at all.
-  if (/^(\*|x|latest|next|\*\.\*(\.\*)?)$/i.test(value)) {
+  if (isWildcardSpec(value)) {
     return false;
   }
 
@@ -437,7 +494,7 @@ export function evaluateReport(report, auditExitCode, suppressed) {
  *
  * @param {string[]} argv
  * @param {string} [cwd]
- * @returns {{ allowlistPath: string }}
+ * @returns {{ allowlistPath: string; packageJsonPath: string }}
  */
 export function parseArgs(argv, cwd = process.cwd()) {
   let allowlistPath = null;
