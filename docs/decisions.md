@@ -627,3 +627,57 @@ image change blocks merges — bounded by the job being a single 10-minute
 `node --test` run, and made loud rather than silent by the 3.x assertion. The
 denylist is retained: it is interpreter-independent and catches the syntax class
 on every job, including the ubuntu ones.
+
+## 2026-08-01 — Stryker has no `extends`; the spread import is the only adoption recipe
+
+**Context.** `config/stryker.base.json` and the README shipped two mutually
+exclusive adoption recipes for the same file. The config's `_comment` told
+consumers to write `{ "extends": ["mandrel-platform/stryker.base.json"] }`; the
+README said Stryker's `extends` resolves a local JSON path but not a package
+specifier, and that the working mechanism is a `stryker.config.mjs` that imports
+the base and spreads it. A consumer following the config's own instruction gets
+`disableBail`, the raised timeouts, and the thresholds **not at all**, and
+nothing in the pipeline detects it — the platform runs no mutation suite, and
+the guard test asserted only that the `exports` map string equalled a path.
+
+**Decision.** Adjudicated against the published packages rather than either
+document, because the premise was that one of them was wrong. `@stryker-mutator/core`
+9.6.1's config reader loads exactly one config file — JSON via `JSON.parse`, JS
+via dynamic import — and deep-merges CLI arguments over it. There is no
+`extends` resolution step anywhere in it; the only `extends` handling in the
+package rewrites **tsconfig** paths inside the mutation sandbox. `extends` is
+likewise absent from the 45 top-level properties of `@stryker-mutator/api`
+9.6.1's `stryker-core.json` schema, and its options validator reports any
+non-schema key as `Unknown stryker config option`. So Stryker has no `extends`
+at **any** resolution — the README's conclusion was right and its stated reason
+was wrong, and the config's recipe was wrong outright.
+
+The `extends` recipe is therefore deleted from the config's `_comment`, which
+now points at the README's single worked example; the README's reason is
+corrected to "no `extends` option at all"; and `patterns.md` § 4 no longer
+implies every shared config is consumed through a native `extends`. The guard
+test now imports the base **through its package specifier** and asserts the
+values that arrive, which is the consumer's own resolution path rather than a
+proxy for it, and additionally fails if the config ever regrows an `extends`
+key. Annotation keys were renamed to Stryker's `_comment` **suffix** convention
+(`disableBail_comment`, not `_comment_disableBail`) — the validator's exemption
+is a suffix check, so the prefix-named key was costing every consumer an
+unknown-option warning on every run.
+
+`thresholds.break` stays at 50, re-justified rather than adjusted. It was
+chosen while bail deflated the measured score (a consumer recorded 53.5% against
+a real 72.29%), but that deflation runs one way only: a bail-free score is
+higher, so a break calibrated against a deflated number cannot fail a run it
+would previously have passed. Tightening it from here would impose a fail-closed
+number on consumers whose real scores are unknown to this repo — the same
+unmeasured-number failure the bail change exists to end. It is documented as a
+fleet floor of last resort, with the re-derived baseline named as the only
+defensible basis for a tighter local value.
+
+**Consequences.** One adoption mechanism, stated once, with a test that fails if
+the published artifact stops delivering it. Consumers who had already followed
+the config's `extends` recipe were running Stryker defaults — bail on, 5 s
+timeout, no break threshold — and adopting the corrected recipe will change
+their scores and their run times; `patterns.md` § 4a is the migration note. No
+mutation-score baseline is introduced here: this repo ships the config, runs no
+mutation suite, and its gate stays dormant.
