@@ -187,12 +187,32 @@ const IDENT_SOURCE = `${IDENT_SEGMENT_SOURCE}(?:\\.${IDENT_SEGMENT_SOURCE})*`;
 const DROP_OBJECT_SOURCE =
   "\\bDROP\\s+(TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|DATABASE|TYPE|SEQUENCE|TRIGGER|FUNCTION)\\b";
 
-// The dropped index's name, anchored at the `DROP` that already matched.
-// Tolerates postgres' `CONCURRENTLY` and the `IF EXISTS` guard.
-const DROP_INDEX_NAME_RE = new RegExp(
-  `^DROP\\s+INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+EXISTS\\s+)?(${IDENT_SOURCE})`,
+// The dropped index NAMES, anchored at the `DROP` that already matched.
+// Tolerates postgres' `CONCURRENTLY` and the `IF EXISTS` guard, and captures
+// the WHOLE comma-separated list — `DROP INDEX a, b;` is valid postgres, and
+// excusing it on the strength of the first name alone would let `b` be dropped
+// with no recreate and no acknowledgement.
+const DROP_INDEX_LIST_RE = new RegExp(
+  `^DROP\\s+INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+EXISTS\\s+)?(${IDENT_SOURCE}(?:\\s*,\\s*${IDENT_SOURCE})*)`,
   "i"
 );
+
+/**
+ * The normalized names a `DROP INDEX` statement targets, or `null` when the
+ * statement's name list cannot be parsed (which fails closed at the call site).
+ *
+ * @param {string} tail  Text starting at the matched `DROP`.
+ * @returns {string[]|null}
+ */
+export function parseDroppedIndexNames(tail) {
+  const m = DROP_INDEX_LIST_RE.exec(tail);
+  if (!m) return null;
+  // Re-match identifiers rather than splitting on "," so a quoted name that
+  // itself contains a comma stays one identifier.
+  const names = m[1].match(new RegExp(IDENT_SOURCE, "g"));
+  if (!names || names.length === 0) return null;
+  return names.map(normalizeIndexName);
+}
 
 // `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name>`.
 const CREATE_INDEX_SOURCE =
@@ -247,14 +267,16 @@ export function scanDropStatements(cleanText) {
   let m;
   while ((m = re.exec(cleanText)) !== null) {
     if (m[1].toUpperCase() === "INDEX") {
-      const nameMatch = DROP_INDEX_NAME_RE.exec(cleanText.slice(m.index));
-      // An unparseable name fails closed — it is counted as destructive below.
-      if (nameMatch) {
-        const name = normalizeIndexName(nameMatch[1]);
-        if (created.some((c) => c.name === name && c.index > m.index)) {
-          recreatedIndexes.push(name);
-          continue;
-        }
+      const names = parseDroppedIndexNames(cleanText.slice(m.index));
+      // An unparseable name list fails closed — counted as destructive below.
+      // EVERY name in the list must be recreated after the drop; one excused
+      // name never excuses its neighbours.
+      if (
+        names &&
+        names.every((name) => created.some((c) => c.name === name && c.index > m.index))
+      ) {
+        recreatedIndexes.push(...names);
+        continue;
       }
     }
     destructiveDrops++;

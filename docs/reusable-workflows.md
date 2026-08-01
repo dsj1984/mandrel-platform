@@ -1363,6 +1363,9 @@ carve-out is deliberately narrow and fails closed. It does **not** apply when:
   of the migration);
 - the recreate lives in a **different** file;
 - the dropped index name cannot be parsed;
+- the statement drops several indexes in one comma-separated list
+  (`DROP INDEX a, b;`) and **any** one of them is not recreated — every name in
+  the list must be recreated, one excused name never excuses its neighbours;
 - the statement drops anything other than an index — a table, column,
   constraint, view, schema, type, or a `TRUNCATE`, each unchanged;
 - the migration uses the drizzle op `.dropIndex(…)` rather than SQL, which

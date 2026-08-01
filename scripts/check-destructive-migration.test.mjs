@@ -31,6 +31,7 @@ import {
   isMigrationFile,
   normalizeIndexName,
   parseArgs,
+  parseDroppedIndexNames,
   scanDropStatements,
   scanMigrationText,
   stripComments,
@@ -246,6 +247,39 @@ test("dropping a table, a column, a constraint, or truncating is untouched by th
   assert.deepEqual(scanMigrationText(`table.dropIndex('idx_x');${recreate}`), [
     "drizzle destructive op",
   ]);
+});
+
+test("a comma-separated drop list is excused only when EVERY name is recreated", () => {
+  // `DROP INDEX a, b;` is valid postgres. Pairing on the first name alone would
+  // let idx_b be dropped with no recreate and no acknowledgement.
+  const partial = ["DROP INDEX idx_a, idx_b;", "CREATE INDEX idx_a ON t (x);"].join("\n");
+  assert.deepEqual(scanMigrationText(partial), ["DROP statement"]);
+
+  const reversed = ["DROP INDEX idx_b, idx_a;", "CREATE INDEX idx_a ON t (x);"].join("\n");
+  assert.deepEqual(scanMigrationText(reversed), ["DROP statement"]);
+
+  const whole = [
+    "DROP INDEX IF EXISTS idx_a, idx_b;",
+    "CREATE INDEX idx_a ON t (x);",
+    "CREATE INDEX idx_b ON t (y);",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(whole), []);
+});
+
+test("parseDroppedIndexNames reads the whole list, or nothing", () => {
+  assert.deepEqual(parseDroppedIndexNames("DROP INDEX idx_a"), ["idx_a"]);
+  assert.deepEqual(parseDroppedIndexNames("DROP INDEX CONCURRENTLY idx_a , idx_b;"), [
+    "idx_a",
+    "idx_b",
+  ]);
+  assert.deepEqual(parseDroppedIndexNames('DROP INDEX IF EXISTS "public"."idx_a", idx_b'), [
+    "idx_a",
+    "idx_b",
+  ]);
+  // MySQL's `DROP INDEX i ON t` — the table is not part of the name list.
+  assert.deepEqual(parseDroppedIndexNames("DROP INDEX idx_a ON orders"), ["idx_a"]);
+  assert.equal(parseDroppedIndexNames("DROP INDEX ;"), null);
+  assert.equal(parseDroppedIndexNames("DROP TABLE users"), null);
 });
 
 test("scanDropStatements reports which index drops were excused", () => {
