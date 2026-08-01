@@ -22,12 +22,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { stepByName, runScript } from "./lib/yaml-step.mjs";
 import {
+  EXIT,
   parseArgs,
   parseTitleType,
   loadReleaseTypes,
@@ -435,7 +437,7 @@ test("AC-6: end to end, a real mismatch exits 0 and reports rather than failing"
       "--title",
       "ci: add a workflow input",
     ]);
-    assert.equal(code, 0, "an advisory check never blocks the pull request");
+    assert.equal(code, EXIT.mismatch, "a finding is reported as its own exit code");
     assert.match(err, /⚠️/);
     assert.match(err, /`ci`/);
     assert.match(err, /pr-quality\.yml \[reusable workflow\]/);
@@ -497,13 +499,109 @@ test("AC-3: end to end, an internal-only diff under `ci:` reports nothing", () =
 });
 
 test("AC-6: a push run with no pull-request title skips instead of guessing", () => {
-  assert.equal(cli(["--title", ""]).code, 0);
+  assert.equal(cli(["--title", ""]).code, EXIT.skipped);
   assert.match(cli(["--title", ""]).out, /skipped/);
 });
 
-test("an unknown flag is the one usage error that exits non-zero", () => {
-  assert.equal(cli(["--nope"]).code, 1);
+test("an unknown flag is the usage error that means the check did not run", () => {
+  assert.equal(cli(["--nope"]).code, EXIT.usage);
   assert.equal(parseArgs(["--title", "feat: x"]).title, "feat: x");
+});
+
+// ---------------------------------------------------------------------------
+// AC-5 (Story #377) — three outcomes, three exit codes, still not blocking
+// ---------------------------------------------------------------------------
+
+test("AC-5: ok, mismatch and skipped are three distinguishable exit codes", () => {
+  // The whole point: a caller can tell the three apart without parsing log
+  // text. Exiting 0 uniformly let this capability go permanently inert — a
+  // check that skips forever looked exactly like one that kept finding
+  // nothing.
+  assert.deepEqual(
+    [EXIT.ok, EXIT.usage, EXIT.mismatch, EXIT.skipped],
+    [0, 1, 2, 3],
+    "the exit codes are a published contract; changing one is a breaking change"
+  );
+  assert.equal(new Set(Object.values(EXIT)).size, 4, "no two outcomes share a code");
+});
+
+test("AC-5: each outcome returns its own code end to end", () => {
+  const mismatch = fixtureRepo({
+    ".github/workflows/pr-quality.yml": `${REUSABLE_WORKFLOW}\n# edited\n`,
+  });
+  try {
+    const range = ["--cwd", mismatch.root, "--base", mismatch.base, "--head", mismatch.head];
+
+    assert.equal(cli([...range, "--title", "ci: add a workflow input"]).code, EXIT.mismatch);
+    assert.equal(cli([...range, "--title", "feat: add a workflow input"]).code, EXIT.ok);
+    // An unresolvable range is the shallow-clone degradation: a skip, and now
+    // a skip that says so.
+    assert.equal(
+      cli(["--cwd", mismatch.root, "--title", "ci: add a workflow input"]).code,
+      EXIT.skipped
+    );
+  } finally {
+    mismatch.cleanup();
+  }
+});
+
+/**
+ * Execute the ci.yml step's real `run:` body against a stub `node` that exits
+ * `stubCode`, and return what the STEP exited with.
+ *
+ * Asserting the tolerance by regex would prove only that some text is present.
+ * The claim under test — "a mismatch cannot fail the build, a broken check
+ * still can" — is a property of the shell branch, so the shell branch is what
+ * runs here. `bash -eo pipefail` mirrors GitHub's default `run:` shell, which
+ * is the part most likely to break a naive `|| code=$?`.
+ */
+function runCiStep(stubCode) {
+  const step = stepByName(read(".github/workflows/ci.yml"), "non-releasing title");
+  const body = runScript(step);
+
+  const dir = mkdtempSync(join(tmpdir(), "release-type-step-"));
+  try {
+    const stub = join(dir, "node");
+    writeFileSync(stub, `#!/bin/sh\nexit ${stubCode}\n`);
+    chmodSync(stub, 0o755);
+    const script = join(dir, "step.sh");
+    writeFileSync(script, body);
+
+    const opts = {
+      cwd: dir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { PATH: `${dir}${delimiter}${process.env.PATH}` },
+    };
+    try {
+      return { code: 0, output: execFileSync("bash", ["-eo", "pipefail", script], opts) };
+    } catch (e) {
+      return { code: e.status ?? 1, output: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("AC-5: the ci.yml step tolerates every advisory outcome and names which one it got", () => {
+  for (const [stubCode, label] of [
+    [EXIT.ok, /outcome: ok/],
+    [EXIT.mismatch, /outcome: mismatch/],
+    [EXIT.skipped, /outcome: skipped/],
+  ]) {
+    const { code, output } = runCiStep(stubCode);
+    assert.equal(code, 0, `exit ${stubCode} must not fail the step or the required aggregator`);
+    assert.match(output, label);
+  }
+});
+
+test("AC-5: a check that could not run still fails the step", () => {
+  // The other half, and the reason the tolerance is a `case` rather than a
+  // `|| true`: a usage error means the check never ran, which must not read as
+  // a check that ran and found nothing.
+  const { code, output } = runCiStep(EXIT.usage);
+  assert.equal(code, EXIT.usage);
+  assert.match(output, /the check itself failed/);
 });
 
 // ---------------------------------------------------------------------------
@@ -537,7 +635,23 @@ function jobBlock(body, jobId) {
 test("AC-5: the check runs as a step in the existing node-scripts job", () => {
   const ci = read(".github/workflows/ci.yml");
   const block = jobBlock(ci, "node-scripts");
-  assert.match(block, /run: node scripts\/check-release-type\.mjs/);
+  assert.match(runScript(stepByName(block, "non-releasing title")), /node scripts\/check-release-type\.mjs/);
+});
+
+test("AC-4 (#377): the node-scripts job checks out full history", () => {
+  // `changedFiles` resolves the diff with `git diff base...head`, which needs
+  // the merge base in the local object store. A shallow clone makes that range
+  // unresolvable, the check degrades to `skipped`, and it stays green forever
+  // while classifying nothing — so the depth this check depends on is pinned
+  // here rather than left to a comment. The pin-lag guard in
+  // check-workflow-portability.mjs depends on the same full history.
+  const checkout = stepByName(jobBlock(read(".github/workflows/ci.yml"), "node-scripts"), "Checkout");
+
+  assert.match(
+    checkout,
+    /^\s+fetch-depth: 0\s*$/m,
+    "the node-scripts checkout must fetch full history"
+  );
 });
 
 test("AC-5: the step is given the pull-request title and diff range it needs", () => {

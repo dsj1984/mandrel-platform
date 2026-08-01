@@ -27,60 +27,10 @@ import { readFileSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { stepByName, runScript } from "./lib/yaml-step.mjs";
+
 const ACTION = ".github/actions/setup-toolchain/action.yml";
 const WORKFLOW = ".github/workflows/pr-quality.yml";
-
-// Minimal indentation-based extraction (dependency-free, mirrors
-// check-osv-scan-mode.test.mjs / check-affected-mode.test.mjs).
-// ---------------------------------------------------------------------------
-
-function stepByName(text, name) {
-  const lines = text.split("\n");
-  const nameIdx = lines.findIndex((l) => /^\s+(- )?name:\s/.test(l) && l.includes(name));
-  assert.notEqual(nameIdx, -1, `step "${name}" not found`);
-  let start = -1;
-  for (let i = nameIdx; i >= 0; i--) {
-    if (/^\s*-\s/.test(lines[i])) {
-      start = i;
-      break;
-    }
-  }
-  assert.notEqual(start, -1, `opening bullet for step "${name}" not found`);
-  const bulletIndent = lines[start].match(/^(\s*)/)[1].length;
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
-    if (/^\s*$/.test(lines[i])) continue;
-    const indent = lines[i].match(/^(\s*)/)[1].length;
-    if (indent < bulletIndent) {
-      end = i;
-      break;
-    }
-    if (indent === bulletIndent && /^\s*-\s/.test(lines[i])) {
-      end = i;
-      break;
-    }
-  }
-  return lines.slice(start, end).join("\n");
-}
-
-/** The dedented body of a step's `run: |` block scalar. */
-function runScript(stepBlock) {
-  const lines = stepBlock.split("\n");
-  const start = lines.findIndex((l) => /^\s+run:\s*\|\s*$/.test(l));
-  assert.notEqual(start, -1, "`run: |` block not found");
-  const runIndent = lines[start].match(/^(\s*)/)[1].length;
-  const body = [];
-  for (let i = start + 1; i < lines.length; i++) {
-    if (/^\s*$/.test(lines[i])) {
-      body.push("");
-      continue;
-    }
-    const indent = lines[i].match(/^(\s*)/)[1].length;
-    if (indent <= runIndent) break;
-    body.push(lines[i].slice(runIndent + 2));
-  }
-  return body.join("\n");
-}
 
 const actionText = readFileSync(ACTION, "utf8");
 const installScript = runScript(stepByName(actionText, "Install dependencies"));
