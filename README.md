@@ -177,13 +177,19 @@ export default config;
 
 #### `stryker.base.json`
 
-Shared Stryker mutation-testing defaults (pnpm package manager,
-`perTest` coverage analysis, HTML + clear-text + progress reporters,
-`ignoreStatic`, a 60 s timeout, and high/low/break thresholds). Stryker's
-`extends` resolves a **local JSON path**, not an npm-package specifier, so
-the working mechanism is a `stryker.config.mjs` (or `.js` when
-`"type": "module"`) module that imports the base JSON and spreads it, then
-pins the test runner and mutate set:
+Shared Stryker mutation-testing defaults: pnpm package manager, `perTest`
+coverage analysis, HTML + clear-text + progress reporters, `ignoreStatic`,
+`disableBail: true`, the timeout budget a bail-free run needs
+(`timeoutMS: 120000` — 120 s — plus `timeoutFactor: 3` and
+`dryRunTimeoutMinutes: 15`), and high/low/break thresholds.
+
+Stryker has **no `extends` option at all** — its config reader loads exactly
+one config file and merges CLI arguments over it, and `extends` is not among
+the top-level properties its schema accepts, so a config that declares one is
+reported as an unknown option and otherwise ignored. The working mechanism is
+therefore a `stryker.config.mjs` (or `.js` when `"type": "module"`) module
+that imports the base JSON **by package specifier** and spreads it, then pins
+the test runner and mutate set:
 
 ```js
 // stryker.config.mjs — import the base and spread it
@@ -196,6 +202,12 @@ export default {
   mutate: ["src/**/*.ts", "!src/**/*.test.ts"],
 };
 ```
+
+Adopting the base is not a drop-in bump: `disableBail: true` changes what the
+mutation score *means*, so any baseline captured under bail has to be
+re-derived, and the base's `break: 50` is a fleet floor of last resort rather
+than a calibrated target. Both are covered in
+[Adopting the bail-free Stryker base](docs/patterns.md#4a-adopting-the-bail-free-stryker-base).
 
 #### `commitlint.base.mjs`
 

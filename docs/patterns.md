@@ -96,9 +96,15 @@ of copying a file that then drifts:
 - The `files` allowlist (`config/`, `default.json`, `scripts/`, `templates/`)
   bounds what is published, and `publishConfig.provenance` signs the release.
 
-Extending by specifier means a platform release propagates the new baseline to
-every consumer through a single Renovate version bump — closing the loop with
-the drift-control pattern above.
+The **specifier** is the invariant here, not the word `extends`. Where the tool
+has a native `extends` that resolves through Node module resolution — tsconfig,
+Biome, commitlint — the consumer writes the specifier there. Where it has none —
+Knip, secretlint, and **Stryker**, whose config reader loads exactly one file and
+has no `extends` option at all — the consumer imports the same specifier in a JS
+config module and spreads it. Either way the resolution goes through the
+`exports` map, so a platform release propagates the new baseline to every
+consumer through a single Renovate version bump — closing the loop with the
+drift-control pattern above.
 
 ### 4a. Adopting the bail-free Stryker base
 
@@ -118,6 +124,13 @@ consequences for a consumer picking up this baseline:
   `disableBail: true` in `stryker.config.json` can remove that key; the shared
   base now carries it, and the local copy is redundant rather than harmful. A
   consumer that never added one needs no action beyond the version bump.
+- **Set your own `thresholds.break` once the baseline is re-derived.** The base
+  ships `break: 50` and leaves it there. It cannot be tightened from the
+  platform side without imposing a fail-closed number on consumers whose real
+  scores are unknown here — the same unmeasured-number failure the bail change
+  exists to end — so treat it as a floor of last resort, not a target. The
+  re-derived score is the only defensible basis for a tighter local value, and
+  `thresholds` is consumer-tunable precisely so that value lives in your repo.
 
 Because every mutant now runs its full covering set, runs get longer. The base
 raises `timeoutMS`, `timeoutFactor`, and `dryRunTimeoutMinutes` together with
