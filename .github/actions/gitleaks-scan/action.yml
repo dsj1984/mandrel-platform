@@ -103,7 +103,10 @@ inputs:
       suppression narrows exactly one finding and leaves every other rule
       blocking; a config that replaces the ruleset outright is rejected unless
       allow-default-rule-replacement is 'true'. Empty (default) runs gitleaks
-      with its built-in ruleset, byte-for-byte as before.
+      with its built-in ruleset, byte-for-byte as before — except that a
+      repo-root .gitleaks.toml, which gitleaks would otherwise auto-discover
+      and apply unvalidated, is adopted as if it had been passed here so the
+      same useDefault guard applies to it.
     required: false
     default: ''
   allow-default-rule-replacement:
@@ -230,6 +233,22 @@ runs:
           exit 1
         fi
 
+        # Root-config auto-discovery is a bypass, not a feature (Story #378).
+        # gitleaks reads a repo-root .gitleaks.toml on its own whenever
+        # --config is absent, so before this branch a config that REPLACES the
+        # default ruleset reached the scan with the useDefault guard below
+        # never running — the silent tier-wide opt-out that guard exists to
+        # prevent, arrived at by committing a file rather than by passing an
+        # input. Adopt the file explicitly instead, so a discovered config
+        # takes exactly the same validated path a caller-supplied config-path
+        # does. A repo with no .gitleaks.toml is unaffected.
+        DISCOVERED_ROOT_CONFIG=0
+        if [ -z "$CONFIG_PATH" ] && [ -f ".gitleaks.toml" ]; then
+          CONFIG_PATH=".gitleaks.toml"
+          DISCOVERED_ROOT_CONFIG=1
+          echo "Found a repo-root .gitleaks.toml — adopting it as config-path so it is validated, not auto-discovered."
+        fi
+
         # Caller-supplied allowlist config (Story #365). A required check needs
         # an escape that is not disabling it: this is the reviewable seam for a
         # known false positive. The useDefault guard is the whole point — an
@@ -258,6 +277,9 @@ runs:
             echo "::error::  [extend]"
             echo "::error::  useDefault = true"
             echo "::error::so an allowlist entry suppresses one finding and leaves every other rule blocking. Set allow-default-rule-replacement: 'true' only for a config that deliberately ships a complete rule set."
+            if [ "$DISCOVERED_ROOT_CONFIG" -eq 1 ]; then
+              echo "::error::This config was auto-discovered at the repo root, not passed via config-path — gitleaks would otherwise have applied it unvalidated."
+            fi
             exit 1
           fi
           echo "Using caller-supplied gitleaks config: ${CONFIG_PATH}"

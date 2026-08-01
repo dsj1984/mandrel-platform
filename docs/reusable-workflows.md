@@ -121,6 +121,8 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
 | `semgrep-config`   | string  | `'vendored'`     | Semgrep ruleset for the SAST sub-step. Default `'vendored'` resolves to this reusable workflow's own checked-out, platform-controlled snapshot at `.semgrep/rules.json` (see [SAST ruleset provenance](#sast-ruleset-provenance-and-update-process)) — NOT the live registry. Override with a registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.** |
 | `sast-exclude`     | string  | `''`             | Extra Semgrep `--exclude` globs, space- or comma-separated (e.g. `'dist coverage tests/fixtures'`), **appended** to the built-in `.agents` exclude. Set to drop generated code / fixtures from the SAST target set. |
+| `secret-scan-config-path` | string | `''`      | Path to a gitleaks TOML config for the secret scan, forwarded to the `gitleaks-scan` composite's `config-path`. The supported way to suppress a known false positive **without** turning the tier off. Empty (default) is today's behaviour exactly. See [Secret-scan allowlist](#secret-scan-allowlist-secret-scan-config-path). |
+| `secret-scan-allow-default-rule-replacement` | string | `'false'` | Set `'true'` only for a `secret-scan-config-path` that deliberately ships a complete rule set instead of extending the default one. Default `'false'` keeps the `[extend] useDefault = true` guard that stops an allowlist becoming a tier-wide opt-out. |
 | `toolchain-cache`  | string  | `'auto'`         | Passed through to `setup-toolchain`'s `cache` input. **`'auto'` derives the value from `runner`**: `'false'` when the runner labels name `self-hosted`, `'true'` otherwise (unchanged hosted behaviour). A self-hosted runner already has a warm store, so the cache only adds a **post-job save** — and that save runs after every work step reports success, inside the job's own `timeout-minutes`, so a slow one is killed as a timeout and recorded as `cancelled`, which `ci-required` reads as a red gate with every step green. Pass `'true'` or `'false'` to pin it explicitly on either runner class. See [Derived `toolchain-cache` default](#derived-toolchain-cache-default). |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
 | `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
@@ -615,7 +617,7 @@ no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
   platform (darwin/linux × arm64/x64), verifying it before execution. Bumping
   the gitleaks release is a single edit inside that composite — there is no
   per-workflow version input or checksum copy. For suppressing a known false
-  positive, see [Secret-scan allowlist](#secret-scan-allowlist-config-path)
+  positive, see [Secret-scan allowlist](#secret-scan-allowlist-secret-scan-config-path)
   below — a required check needs an escape that is not turning it off.
 - **SAST** — pinned Semgrep, scoped via `--baseline-commit` to the same shared
   derivation, so only findings **introduced** by the event block: the
@@ -638,7 +640,7 @@ no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
 > `on: merge_group` in your caller and adding the reusable workflow's
 > `ci-required` context to the queue's required checks is sufficient.
 
-#### Secret-scan allowlist (`config-path`)
+#### Secret-scan allowlist (`secret-scan-config-path`)
 
 **The failure this fixes.** The secret scan exposed no seam for suppressing a
 known false positive. Ordinary prose that happened to match the generic-secret
@@ -646,14 +648,16 @@ heuristic blocked a docs-only PR, and the only ways out were rewording the
 source or turning the whole tier off — a required check whose sole escape is
 disabling it teaches the fleet to route around the security tier.
 
-The `gitleaks-scan` composite action accepts a caller-supplied gitleaks TOML
-config, passed straight through as `--config`:
+**Set it on the reusable workflow.** A gitleaks TOML config path passed to
+`pr-quality` is forwarded to the `gitleaks-scan` composite's `config-path`,
+which reaches gitleaks as `--config`:
 
 ```yaml
-- name: Secret scan (pinned gitleaks, blocking)
-  uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
-  with:
-    config-path: .gitleaks.toml
+jobs:
+  quality:
+    uses: dsj1984/mandrel-platform/.github/workflows/pr-quality.yml@<sha>
+    with:
+      secret-scan-config-path: .gitleaks.toml
 ```
 
 ```toml
@@ -666,17 +670,48 @@ description = "Prose in the runbook that matches the generic-secret rule"
 paths = ['''docs/reusable-workflows\.md''']
 ```
 
+A workflow of your own that calls the composite action directly — rather than
+going through `pr-quality` — passes the same value under the composite's own
+input name:
+
+```yaml
+- name: Secret scan (pinned gitleaks, blocking)
+  uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
+  with:
+    config-path: .gitleaks.toml
+```
+
 **The config must extend the default ruleset.** A gitleaks config that omits
 `[extend] useDefault = true` *replaces* the rules rather than adding to them —
-which would make `config-path` a supported way to delete every rule and still
+which would make the allowlist a supported way to delete every rule and still
 report green. The step rejects such a config by name and does not run the scan.
 A repo that genuinely ships its own complete rule set opts in explicitly with
-`allow-default-rule-replacement: 'true'`.
+`secret-scan-allow-default-rule-replacement: 'true'` (composite:
+`allow-default-rule-replacement`).
+
+**A repo-root `.gitleaks.toml` is validated, not auto-discovered.** gitleaks
+reads a root `.gitleaks.toml` by itself whenever `--config` is absent, so
+before Story #378 there was a second way into the scan that skipped the check
+above entirely: a rule-replacing config could arrive by committing a file
+rather than by setting an input. The step now adopts a root `.gitleaks.toml` as
+though it had been passed as `config-path`, so it takes the same `useDefault`
+validation. A root config that already extends the default ruleset is
+unaffected; one that replaces it is rejected by name, with the
+`…allow-default-rule-replacement` opt-in as the deliberate escape.
 
 Both inputs default to off (`''` / `'false'`), so a caller that passes neither
-gets the previous behaviour byte-for-byte. Suppressing one finding leaves every
-other rule blocking, and the tier stays blocking throughout — the allowlist is
-reviewable in the diff, which `non-blocking: 'true'` never was.
+gets the previous behaviour byte-for-byte — which matters more than usual here,
+because a `workflow_call` interface is resolved at compile time for every
+consumer whether or not they set the input. Suppressing one finding leaves
+every other rule blocking, and the tier stays blocking throughout — the
+allowlist is reviewable in the diff, which `non-blocking: 'true'` never was.
+
+> **Which revision of the composite runs.** `pr-quality` calls `gitleaks-scan`
+> by pinned SHA, and the pin — not the working tree — decides the behaviour a
+> consumer gets. A caller-side input only takes effect once the pin carries a
+> composite revision that declares the matching input. See
+> [First-party self-pin freshness](#first-party-self-pin-freshness) for the
+> land-then-bump sequence and the guard that reports a lagging pin.
 
 Toggle matrix:
 

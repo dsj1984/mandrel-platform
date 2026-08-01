@@ -408,6 +408,51 @@ on:
         type: string
         default: ''
 
+      # Secret-scan allowlist passthrough (Story #378). The gitleaks-scan
+      # composite has accepted a caller-supplied TOML config since Story #365,
+      # and the docs told consumers to use it — but this workflow exposed no
+      # input, so a reusable-workflow consumer's only exit from a false
+      # positive was `enable-security: false`. A required check whose sole
+      # escape is turning it off teaches the fleet to route around the tier.
+      #
+      # Both are `type: string`, not boolean, because both are forwarded
+      # verbatim to the composite's own string inputs — and the defaults are
+      # the composite's own defaults ('' / 'false'), so a caller that passes
+      # neither gets today's behaviour byte-for-byte. That matters more here
+      # than on most inputs: a `workflow_call` interface is resolved at
+      # compile time for EVERY consumer, whether or not they set the input.
+      #
+      # The defaults are literals, never expressions: the portability lint
+      # (scripts/check-workflow-portability.mjs, Rule 2) prohibits `${{ }}` in
+      # a workflow_call input `default:`, and GitHub resolves defaults during
+      # interface validation before any context exists.
+      secret-scan-config-path:
+        description: >
+          Path (relative to the consumer repo root) to a gitleaks TOML config
+          for the PR-diff secret scan, forwarded to the gitleaks-scan
+          composite's `config-path`. This is the supported way to suppress a
+          known false positive — ordinary prose matching the generic-secret
+          heuristic — without disabling the security tier or rewording the
+          source. The config MUST extend the default ruleset
+          ([extend] useDefault = true) unless
+          secret-scan-allow-default-rule-replacement is 'true'. Empty
+          (default) is today's behaviour exactly.
+        required: false
+        type: string
+        default: ''
+
+      secret-scan-allow-default-rule-replacement:
+        description: >
+          Escape hatch for a secret-scan-config-path that deliberately does
+          NOT extend the default gitleaks ruleset (a repo shipping its own
+          complete rule set), forwarded to the gitleaks-scan composite's
+          `allow-default-rule-replacement`. Default 'false' — the useDefault
+          guard is what keeps an allowlist from quietly becoming a tier-wide
+          opt-out.
+        required: false
+        type: string
+        default: 'false'
+
       # Cache toggle for the setup-toolchain composite action (Story #364).
       #
       # The default is the LITERAL string 'auto', not 'true'. 'true' was only
@@ -1788,6 +1833,10 @@ jobs:
           mode: ${{ steps.range.outputs.mode == 'range' && 'git' || 'dir' }}
           log-opts: ${{ steps.range.outputs.range }}
           verbose: 'true'
+          # Caller-supplied allowlist passthrough (Story #378). Defaults are
+          # the composite's own ('' / 'false'), so an unset input is a no-op.
+          config-path: ${{ inputs.secret-scan-config-path }}
+          allow-default-rule-replacement: ${{ inputs.secret-scan-allow-default-rule-replacement }}
 
       # M7: fetch THIS reusable workflow's hash-pinned Semgrep lockfile at the
       # exact resolved SHA the caller pinned (`job_workflow_sha`), so the SAST

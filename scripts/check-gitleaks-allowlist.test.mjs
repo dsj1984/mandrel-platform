@@ -29,9 +29,28 @@ import path from "node:path";
 import { stepByName, runScript } from "./lib/yaml-step.mjs";
 
 const ACTION = ".github/actions/gitleaks-scan/action.yml";
+const WORKFLOW = ".github/workflows/pr-quality.yml";
 
 const actionText = readFileSync(ACTION, "utf8");
+const workflowText = readFileSync(WORKFLOW, "utf8");
 const scanScript = runScript(stepByName(actionText, "Run gitleaks scan"));
+
+/**
+ * The definition block of a single `workflow_call` input, keyed by name: every
+ * line indented under the `      <name>:` key. Asserts rather than returning a
+ * sentinel, so a renamed input fails at the point of extraction instead of
+ * silently passing an empty block to every downstream matcher.
+ */
+function workflowInput(name) {
+  const lines = workflowText.split("\n");
+  const start = lines.indexOf(`      ${name}:`);
+  assert.notEqual(start, -1, `workflow_call input "${name}" is not declared`);
+  const body = [];
+  for (let i = start + 1; i < lines.length && /^ {8,}\S/.test(lines[i]); i++) {
+    body.push(lines[i]);
+  }
+  return body.join("\n");
+}
 
 /**
  * Run the extracted scan body against a stub gitleaks that echoes its argv and
@@ -199,6 +218,79 @@ test("a config-path that does not exist is a hard error, not a silently-skipped 
   assert.equal(status, 1);
   assert.match(output, /does not exist in the checkout/);
   assert.doesNotMatch(output, /GITLEAKS_ARGV/);
+});
+
+test("AC-3: a repo-root .gitleaks.toml is validated instead of silently auto-discovered", () => {
+  // gitleaks reads a repo-root .gitleaks.toml on its own whenever --config is
+  // absent. Left alone, that is a second, UNVALIDATED way into the scan — the
+  // useDefault guard never runs. The file is adopted as config-path instead.
+  const { status, output } = runScan({
+    files: { ".gitleaks.toml": EXTENDING_CONFIG },
+  });
+  assert.equal(status, 0);
+  assert.match(output, /--config \.gitleaks\.toml/);
+});
+
+test("AC-3: a rule-replacing repo-root .gitleaks.toml is rejected, naming config-path", () => {
+  // The bypass this closes. Auto-discovery would have applied this config —
+  // which deletes every default rule — and reported green.
+  const { status, output } = runScan({
+    files: { ".gitleaks.toml": '[[rules]]\nid = "only-mine"\n' },
+  });
+  assert.equal(status, 1);
+  assert.match(output, /must extend the default ruleset/);
+  assert.match(output, /config-path/);
+  assert.doesNotMatch(output, /GITLEAKS_ARGV/, "gitleaks must not run on a rejected config");
+});
+
+test("AC-3: an explicit config-path still wins over a repo-root .gitleaks.toml", () => {
+  const { status, output } = runScan({
+    files: { ".gitleaks.toml": EXTENDING_CONFIG, "custom.toml": EXTENDING_CONFIG },
+    CONFIG_PATH: "custom.toml",
+  });
+  assert.equal(status, 0);
+  assert.match(output, /--config custom\.toml/);
+  assert.doesNotMatch(output, /--config \.gitleaks\.toml/);
+});
+
+test("AC-3: a deliberate rule-replacing root config still opts in explicitly", () => {
+  const { status, output } = runScan({
+    files: { ".gitleaks.toml": '[[rules]]\nid = "only-mine"\n' },
+    ALLOW_RULE_REPLACEMENT: "true",
+  });
+  assert.equal(status, 0);
+  assert.match(output, /--config \.gitleaks\.toml/);
+});
+
+test("AC-1: pr-quality.yml declares both allowlist inputs with unchanged-behaviour defaults", () => {
+  // pr-quality.yml is compile-time resolved for every consumer, so a caller
+  // that passes neither input must get byte-identical behaviour: '' and
+  // 'false' are exactly the composite's own defaults.
+  const configPath = workflowInput("secret-scan-config-path");
+  assert.match(configPath, /^ {8}type: string$/m);
+  assert.match(configPath, /^ {8}default: ''$/m);
+
+  const allowReplacement = workflowInput("secret-scan-allow-default-rule-replacement");
+  assert.match(allowReplacement, /^ {8}type: string$/m);
+  assert.match(allowReplacement, /^ {8}default: 'false'$/m);
+
+  // Cross-repo portability contract (scripts/check-workflow-portability.mjs):
+  // no `${{ }}` in a workflow_call input description or default — GitHub
+  // resolves those during interface validation, before any context exists.
+  assert.doesNotMatch(configPath, /\$\{\{/);
+  assert.doesNotMatch(allowReplacement, /\$\{\{/);
+});
+
+test("AC-2: both caller inputs reach the gitleaks composite's own inputs", () => {
+  // The whole point of the Story: an input a consumer can set has to arrive at
+  // the composite, or the documented escape from a false positive is
+  // unreachable and `enable-security: false` stays the only exit.
+  const step = stepByName(workflowText, "Secret scan (pinned gitleaks, blocking)");
+  assert.match(step, /^\s+config-path: \$\{\{ inputs\.secret-scan-config-path \}\}$/m);
+  assert.match(
+    step,
+    /^\s+allow-default-rule-replacement: \$\{\{ inputs\.secret-scan-allow-default-rule-replacement \}\}$/m,
+  );
 });
 
 test("the action declares both inputs with the non-breaking empty/false defaults", () => {
