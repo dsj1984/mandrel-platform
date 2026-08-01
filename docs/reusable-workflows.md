@@ -2788,9 +2788,34 @@ Commit-time analysis for this repository runs through `ci.yml`'s
 [Gating: repository-local, through the aggregator](#gating-repository-local-through-the-aggregator)
 below.
 
-| Input      | Type   | Default                     | When to override                          |
-| ---------- | ------ | --------------------------- | ----------------------------------------- |
-| `language` | string | `'javascript-typescript'`   | Set to analyze a different CodeQL language. |
+| Input                    | Type   | Default                   | When to override                                                                                                                      |
+| ------------------------ | ------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `language`               | string | `'javascript-typescript'` | Set to analyze a different CodeQL language.                                                                                            |
+| `fail-on-alert-severity` | string | `''` (off)                | Set to `low`/`medium`/`high`/`critical` to **fail this job** when the analyzed ref has open alerts at or above that security severity. |
+
+`fail-on-alert-severity` exists because `github/codeql-action/analyze` uploads
+its SARIF and exits `0` **whatever it found** — a scan that just introduced a
+critical alert is a *successful* job. GitHub reds a separate **Code scanning
+results** check run for that, but a check run is not a job: no aggregator can
+`needs:` it, and nothing waits on it unless it is registered as a required
+status context. Gating a merge on this job alone therefore gates on *the scan
+ran*, not on *the scan came back clean*. Passing a threshold makes the job
+itself fail, which propagates through `needs:` with no new status context.
+
+It is **opt-in and defaults to off**, so existing callers and the weekly
+schedule run keep the historical upload-and-report behaviour. Two properties
+worth knowing before you enable it:
+
+- **It reads every open alert on the analyzed ref**, not a diff against the
+  base. Against a clean default branch those are exactly the alerts the pull
+  request introduced; against a dirty one it errs toward blocking — it can
+  demand the tree be cleaned, but never lets a new alert through.
+- **An inconclusive read fails.** A non-200 from the alerts API (Advanced
+  Security disabled, a missing token scope, a transient 5xx) means the gate
+  could not prove the ref clean, so it retries briefly and then fails closed.
+
+`security-events: write` already covers the read, so enabling it grants no new
+scope.
 
 CodeQL is the **GHAS alternative** to `pr-quality.yml`'s Semgrep SAST sub-step:
 a consumer with GitHub Advanced Security can run this for blocking Code
@@ -2814,7 +2839,9 @@ reached `main` that way. "Landed" was not the same as "scanned".
 The fix routes through the **aggregator**, not through repository settings:
 
 - `ci.yml` declares a `code-scanning` job that calls `codeql.yml` — the same
-  dogfooding pattern its `security` job uses for `pr-quality.yml`.
+  dogfooding pattern its `security` job uses for `pr-quality.yml` — passing
+  `fail-on-alert-severity: high` so a concluded-but-dirty scan fails the job
+  rather than merely reporting.
 - The required `ci-required` aggregator lists `code-scanning` in `needs:`.
 
 So `requiredStatusChecks` is still the single entry `ci-required`: no branch

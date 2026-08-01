@@ -23,7 +23,11 @@
  * actually rests on:
  *
  *   1. WIRING — ci.yml has a `code-scanning` job that calls codeql.yml, and
- *      `ci-required` lists it in `needs:`.
+ *      `ci-required` lists it in `needs:`. It also passes a
+ *      `fail-on-alert-severity` threshold: `codeql-action/analyze` exits 0
+ *      whatever it finds, so without one the gate would only assert that the
+ *      scan RAN. The alert signal GitHub itself reds is a check run, which no
+ *      aggregator can `needs:`.
  *   2. FAIL TOWARD BLOCKING — that job declares neither `if:` nor `needs:`.
  *      The aggregator passes a job whose result is `success` or `skipped`; a
  *      GitHub job can only reach `skipped` through an `if:` condition or a
@@ -148,6 +152,52 @@ test("the required aggregator depends on the code-scanning job", () => {
     needs.includes(SCAN_JOB),
     `\`${AGGREGATOR}\` must list \`${SCAN_JOB}\` in \`needs:\` — that single ` +
       `line is the whole gate. Found: ${needs.join(", ") || "(none)"}`
+  );
+});
+
+test("the code-scanning job fails on a high-severity alert, not merely on a crash", () => {
+  const block = extractJobBlock(read(CI), SCAN_JOB);
+  // `github/codeql-action/analyze` uploads its SARIF and exits 0 whatever it
+  // found — a scan that just introduced a critical alert is a SUCCESSFUL job.
+  // Without a threshold this gate would assert "the scan ran", not "the scan
+  // came back clean", and the alert signal GitHub does red is a CHECK RUN,
+  // which no aggregator can `needs:`.
+  const m = block.match(/^ {6}fail-on-alert-severity:\s*(\S+)\s*$/m);
+  assert.ok(
+    m,
+    `\`${SCAN_JOB}\` must pass \`fail-on-alert-severity\` — otherwise a pull ` +
+      "request that introduces a high-severity alert still reaches a green " +
+      "aggregator, which is the exact regression this gate exists to stop"
+  );
+  assert.ok(
+    ["high", "critical"].includes(m[1]),
+    `\`fail-on-alert-severity\` must be \`high\` or \`critical\` (got \`${m[1]}\`)`
+  );
+});
+
+test("codeql.yml implements the alert gate and fails closed on an unreadable API", () => {
+  const codeql = read(CODEQL);
+  assert.match(
+    codeql,
+    /^ {6}fail-on-alert-severity:$/m,
+    "codeql.yml must declare the `fail-on-alert-severity` workflow_call input"
+  );
+  assert.match(
+    codeql,
+    /^ {8}default:\s*''\s*$/m,
+    "`fail-on-alert-severity` must default to empty — the gate is opt-in, so " +
+      "an existing caller and the schedule run keep upload-and-report behaviour"
+  );
+  assert.match(
+    codeql,
+    /code-scanning\/alerts\?ref=/,
+    "the gate must read the code scanning alerts published for the analyzed ref"
+  );
+  assert.match(
+    codeql,
+    /did not conclusively report clean, so this gate fails closed/,
+    "an unreadable alerts API must fail the job — passing on an inconclusive " +
+      "read is the same vacuous green the gate removes"
   );
 });
 

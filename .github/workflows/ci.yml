@@ -318,6 +318,17 @@ jobs:
   #   2. No branch-protection edit is required here, and nothing outside this
   #      repository has to be reconfigured.
   #
+  # A CONCLUDED SCAN IS NOT A CLEAN SCAN. `codeql-action/analyze` uploads its
+  # SARIF and exits 0 whatever it found, so depending on this job alone would
+  # gate on "the scan ran", not on "the scan came back clean" — and the alert
+  # signal GitHub does red is a CHECK RUN, which no aggregator can `needs:`.
+  # `fail-on-alert-severity: high` makes codeql.yml fail the JOB on an open
+  # high/critical alert on the analyzed ref, which is what reaches the
+  # aggregator. The input is opt-in and defaults to empty, so passing it here
+  # changes nothing for any other caller. `high` matches the severity band the
+  # two ReDoS regressions landed at; the query pack and what CodeQL scans are
+  # untouched.
+  #
   # FAIL TOWARD BLOCKING. The aggregator passes a job that is `success` or
   # `skipped` and fails everything else, INCLUDING `cancelled`. This job
   # therefore carries NO `if:` condition and NO `needs:` — with neither, a
@@ -336,6 +347,8 @@ jobs:
   # them. See docs/reusable-workflows.md § codeql.yml.
   code-scanning:
     uses: ./.github/workflows/codeql.yml
+    with:
+      fail-on-alert-severity: high
     permissions:
       contents: read
       # codeql.yml's analyze job uploads SARIF as Code Scanning alerts and
