@@ -24,11 +24,14 @@ import { test } from "node:test";
 import {
   DEFAULT_MIGRATION_GLOBS,
   DEFAULT_OVERRIDE_LABEL,
+  collectCreatedIndexes,
   detectDestructiveMigrations,
   formatStepSummary,
   globToRegExp,
   isMigrationFile,
+  normalizeIndexName,
   parseArgs,
+  scanDropStatements,
   scanMigrationText,
   stripComments,
 } from "./check-destructive-migration.mjs";
@@ -158,6 +161,115 @@ test("scanMigrationText: a DROP only in a comment does NOT trip the guard", () =
 test("scanMigrationText: de-duplicates repeated signals", () => {
   const signals = scanMigrationText("DROP TABLE a;\nDROP TABLE b;");
   assert.deepEqual(signals, ["DROP statement"]);
+});
+
+// ── the recreated-index carve-out (Story #367) ─────────────────────────────
+//
+// Narrowing a partial index on SQLite is necessarily DROP-then-CREATE. Before
+// #367 that lossless, everyday migration tripped a human-in-the-loop gate and
+// needed an acknowledgement label, which is how operators learn to wave the
+// check through. The carve-out is one shape and one shape only; the tests below
+// pin both halves — what it excuses, and everything it must still stop.
+
+test("a DROP INDEX recreated later in the same migration is lossless", () => {
+  const sql = [
+    "DROP INDEX idx_orders_open;",
+    "CREATE INDEX idx_orders_open ON orders (customer_id) WHERE status = 'open';",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(sql), []);
+});
+
+test("the recreate is matched on the index name, not merely on some CREATE INDEX", () => {
+  const sql = ["DROP INDEX idx_orders_open;", "CREATE INDEX idx_orders_closed ON orders (id);"].join(
+    "\n"
+  );
+  assert.deepEqual(scanMigrationText(sql), ["DROP statement"]);
+});
+
+test("a DROP INDEX with no recreate still trips the guard", () => {
+  assert.deepEqual(scanMigrationText("DROP INDEX idx_users_email;"), ["DROP statement"]);
+});
+
+test("a recreate BEFORE the drop is not a recreate — the index is gone at the end", () => {
+  const sql = ["CREATE INDEX idx_orders_open ON orders (id);", "DROP INDEX idx_orders_open;"].join(
+    "\n"
+  );
+  assert.deepEqual(scanMigrationText(sql), ["DROP statement"]);
+});
+
+test("the carve-out tolerates IF EXISTS / IF NOT EXISTS, UNIQUE, quoting and schema qualifiers", () => {
+  const sql = [
+    'DROP INDEX IF EXISTS "public"."idx_orders_open";',
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_open ON orders (id) WHERE archived = 0;",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(sql), []);
+});
+
+test("a recreate in a DIFFERENT file does not excuse the drop", () => {
+  const files = {
+    "db/migrations/0012_drop_idx.sql": "DROP INDEX idx_orders_open;",
+    "db/migrations/0013_add_idx.sql": "CREATE INDEX idx_orders_open ON orders (id);",
+  };
+  const res = detectDestructiveMigrations({
+    changedFiles: Object.keys(files),
+    readFile: fakeReader(files),
+  });
+  assert.equal(res.destructive, true);
+  assert.equal(res.findings.length, 1);
+  assert.equal(res.findings[0].file, "db/migrations/0012_drop_idx.sql");
+});
+
+test("only the INDEX drop is excused — a table drop in the same file still blocks", () => {
+  const sql = [
+    "DROP INDEX idx_orders_open;",
+    "CREATE INDEX idx_orders_open ON orders (id);",
+    "DROP TABLE legacy_orders;",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(sql), ["DROP statement"]);
+});
+
+test("dropping a table, a column, a constraint, or truncating is untouched by the carve-out", () => {
+  // Each of these pairs the destructive statement with a CREATE INDEX that
+  // recreates an index name, proving the pairing cannot leak past DROP INDEX.
+  const recreate = "\nDROP INDEX idx_x;\nCREATE INDEX idx_x ON t (a);";
+  assert.deepEqual(scanMigrationText(`DROP TABLE users;${recreate}`), ["DROP statement"]);
+  assert.deepEqual(scanMigrationText(`DROP COLUMN email;${recreate}`), ["DROP statement"]);
+  assert.deepEqual(scanMigrationText(`ALTER TABLE users DROP CONSTRAINT fk_org;${recreate}`), [
+    "ALTER TABLE … DROP",
+    "DROP statement",
+  ]);
+  assert.deepEqual(scanMigrationText(`ALTER TABLE users DROP COLUMN legacy_id;${recreate}`), [
+    "ALTER TABLE … DROP",
+    "DROP statement",
+  ]);
+  assert.deepEqual(scanMigrationText(`TRUNCATE audit_log;${recreate}`), ["TRUNCATE"]);
+  assert.deepEqual(scanMigrationText(`table.dropIndex('idx_x');${recreate}`), [
+    "drizzle destructive op",
+  ]);
+});
+
+test("scanDropStatements reports which index drops were excused", () => {
+  const res = scanDropStatements(
+    "DROP INDEX idx_a;\nCREATE INDEX idx_a ON t (x);\nDROP TABLE t2;"
+  );
+  assert.equal(res.destructiveDrops, 1);
+  assert.deepEqual(res.recreatedIndexes, ["idx_a"]);
+});
+
+test("normalizeIndexName unquotes, de-qualifies and lowercases", () => {
+  assert.equal(normalizeIndexName('"public"."IDX_A"'), "idx_a");
+  assert.equal(normalizeIndexName("public.IDX_A"), "idx_a");
+  assert.equal(normalizeIndexName("`idx_a`"), "idx_a");
+  assert.equal(normalizeIndexName("[idx_a]"), "idx_a");
+});
+
+test("collectCreatedIndexes records every create with its offset", () => {
+  const created = collectCreatedIndexes("CREATE INDEX a ON t (x);\nCREATE UNIQUE INDEX b ON t (y);");
+  assert.deepEqual(
+    created.map((c) => c.name),
+    ["a", "b"]
+  );
+  assert.ok(created[1].index > created[0].index);
 });
 
 // ── detectDestructiveMigrations: end-to-end over a changed set ─────────────
@@ -335,6 +447,45 @@ test("CLI: comment-only DROP does not trip the guard (exit 0)", () => {
     });
     assert.equal(res.code, 0);
     assert.ok(res.stdout.includes("No destructive migration detected"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI: a narrowed partial index passes with NO acknowledgement label (exit 0)", () => {
+  // The end-to-end shape of the false positive #367 removes: on SQLite this is
+  // the only way to narrow a partial index, and it was demanding a label.
+  const root = mkdtempSync(join(tmpdir(), "destmig-"));
+  try {
+    mkdirSync(join(root, "db", "migrations"), { recursive: true });
+    writeFileSync(
+      join(root, "db", "migrations", "0012_narrow_idx.sql"),
+      "DROP INDEX idx_orders_open;\n" +
+        "CREATE INDEX idx_orders_open ON orders (customer_id) WHERE status = 'open';\n"
+    );
+    const res = runCli(["--changed-files", "-", "--repo-root", root], {
+      input: "db/migrations/0012_narrow_idx.sql\n",
+    });
+    assert.equal(res.code, 0);
+    assert.ok(res.stdout.includes("No destructive migration detected"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI: dropping an index WITHOUT recreating it still blocks (exit 1)", () => {
+  const root = mkdtempSync(join(tmpdir(), "destmig-"));
+  try {
+    mkdirSync(join(root, "db", "migrations"), { recursive: true });
+    writeFileSync(
+      join(root, "db", "migrations", "0013_drop_idx.sql"),
+      "DROP INDEX idx_orders_open;\n"
+    );
+    const res = runCli(["--changed-files", "-", "--repo-root", root], {
+      input: "db/migrations/0013_drop_idx.sql\n",
+    });
+    assert.equal(res.code, 1);
+    assert.ok(res.stderr.includes("DROP statement"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

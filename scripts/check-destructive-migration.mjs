@@ -27,6 +27,18 @@
  * Comment lines (`--`, `/* … *​/`, `//`) are stripped before matching so a
  * `DROP` mentioned only in a comment does not trip the guard.
  *
+ * ONE carve-out, and only one (Story #367): a `DROP INDEX <name>` whose index
+ * the SAME migration file recreates LATER in the file (`CREATE [UNIQUE] INDEX
+ * <name>`) is **lossless** and does not trip the guard. Narrowing a partial
+ * index cannot be expressed any other way on SQLite — it is necessarily a drop
+ * followed immediately by a create — so an ordinary, reversible migration was
+ * demanding a human acknowledgement label. The carve-out is deliberately
+ * narrow and fails closed: a drop with no matching recreate, a recreate that
+ * appears BEFORE the drop (the index is still gone at the end of the
+ * migration), a recreate in a different file, an unparseable index name, and
+ * every non-INDEX drop all still block. No table, column, constraint, or
+ * TRUNCATE detection is relaxed.
+ *
  * The guard only inspects files whose path matches a migration glob (default
  * `**​/migrations/**` and `**​/drizzle/**` plus a `*.sql` tail), so an
  * unrelated source file mentioning `DROP` in a string never blocks a PR.
@@ -149,22 +161,106 @@ export function stripComments(line) {
   return out;
 }
 
-// The destructive-signal matchers. Each entry names the signal it detects so a
-// block message can tell the reviewer exactly what tripped the guard. Order is
-// most-specific-first only for readability; all are tested per line.
+// The destructive-signal matchers evaluated per line. `DROP <object>` is NOT
+// in this list — it is scanned over the whole file so a `DROP INDEX` can be
+// paired with a later recreate (see scanDropStatements below). Each entry names
+// the signal it detects so a block message can tell the reviewer exactly what
+// tripped the guard.
 const DESTRUCTIVE_PATTERNS = [
   { signal: "ALTER TABLE … DROP", re: /\bALTER\s+TABLE\b[\s\S]*?\bDROP\b/i },
-  {
-    signal: "DROP statement",
-    // DROP TABLE/COLUMN/INDEX/SCHEMA/CONSTRAINT/VIEW/DATABASE/TYPE …
-    re: /\bDROP\s+(TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|DATABASE|TYPE|SEQUENCE|TRIGGER|FUNCTION)\b/i,
-  },
   { signal: "TRUNCATE", re: /\bTRUNCATE\b/i },
   {
     signal: "drizzle destructive op",
     re: /\.(dropTable|dropColumn|dropIndex|dropConstraint|dropForeignKey|dropPrimaryKey|dropUnique)\s*\(/,
   },
 ];
+
+// One identifier segment: bare, or quoted with "…", `…`, or […].
+const IDENT_SEGMENT_SOURCE = '(?:"[^"]+"|`[^`]+`|\\[[^\\]]+\\]|[A-Za-z_][A-Za-z0-9_$]*)';
+
+// A possibly schema-qualified identifier — every segment may be quoted
+// independently (`"public"."idx_x"`).
+const IDENT_SOURCE = `${IDENT_SEGMENT_SOURCE}(?:\\.${IDENT_SEGMENT_SOURCE})*`;
+
+// `DROP TABLE/COLUMN/INDEX/SCHEMA/CONSTRAINT/VIEW/DATABASE/TYPE …`. Scanned
+// globally so every occurrence is judged, not just the first on a line.
+const DROP_OBJECT_SOURCE =
+  "\\bDROP\\s+(TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|DATABASE|TYPE|SEQUENCE|TRIGGER|FUNCTION)\\b";
+
+// The dropped index's name, anchored at the `DROP` that already matched.
+// Tolerates postgres' `CONCURRENTLY` and the `IF EXISTS` guard.
+const DROP_INDEX_NAME_RE = new RegExp(
+  `^DROP\\s+INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+EXISTS\\s+)?(${IDENT_SOURCE})`,
+  "i"
+);
+
+// `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name>`.
+const CREATE_INDEX_SOURCE =
+  `\\bCREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+NOT\\s+EXISTS\\s+)?(${IDENT_SOURCE})`;
+
+/**
+ * Normalize an index identifier for comparison: unquote, drop any schema
+ * qualifier, and lowercase (SQL identifiers are case-insensitive unquoted).
+ *
+ * @param {string} raw
+ * @returns {string}
+ */
+export function normalizeIndexName(raw) {
+  const unquoted = raw.replace(/["`[\]]/g, "");
+  const segments = unquoted.split(".");
+  return segments[segments.length - 1].toLowerCase();
+}
+
+/**
+ * Every index this text (re)creates, with the offset at which the CREATE
+ * appears. Offsets are what make the pairing order-sensitive: only a create
+ * that lands AFTER the drop leaves the index in place at the end of the
+ * migration.
+ *
+ * @param {string} text  Comment-stripped migration text.
+ * @returns {Array<{name: string, index: number}>}
+ */
+export function collectCreatedIndexes(text) {
+  const re = new RegExp(CREATE_INDEX_SOURCE, "gi");
+  const created = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    created.push({ name: normalizeIndexName(m[1]), index: m.index });
+  }
+  return created;
+}
+
+/**
+ * Scan comment-stripped migration text for `DROP <object>` statements, pairing
+ * a `DROP INDEX` with a later recreate of the same index in the same text.
+ *
+ * @param {string} cleanText
+ * @returns {{ destructiveDrops: number, recreatedIndexes: string[] }}
+ *   `destructiveDrops` counts the drops that still trip the guard;
+ *   `recreatedIndexes` names the index drops excused as lossless.
+ */
+export function scanDropStatements(cleanText) {
+  const created = collectCreatedIndexes(cleanText);
+  const re = new RegExp(DROP_OBJECT_SOURCE, "gi");
+  let destructiveDrops = 0;
+  const recreatedIndexes = [];
+  let m;
+  while ((m = re.exec(cleanText)) !== null) {
+    if (m[1].toUpperCase() === "INDEX") {
+      const nameMatch = DROP_INDEX_NAME_RE.exec(cleanText.slice(m.index));
+      // An unparseable name fails closed — it is counted as destructive below.
+      if (nameMatch) {
+        const name = normalizeIndexName(nameMatch[1]);
+        if (created.some((c) => c.name === name && c.index > m.index)) {
+          recreatedIndexes.push(name);
+          continue;
+        }
+      }
+    }
+    destructiveDrops++;
+  }
+  return { destructiveDrops, recreatedIndexes };
+}
 
 /**
  * Scan a single migration file's text for destructive signals.
@@ -174,13 +270,15 @@ const DESTRUCTIVE_PATTERNS = [
  */
 export function scanMigrationText(text) {
   const found = new Set();
-  for (const rawLine of text.split("\n")) {
-    const line = stripComments(rawLine);
+  const cleanLines = text.split("\n").map((line) => stripComments(line));
+  for (const line of cleanLines) {
     if (!line.trim()) continue;
     for (const { signal, re } of DESTRUCTIVE_PATTERNS) {
       if (re.test(line)) found.add(signal);
     }
   }
+  const { destructiveDrops } = scanDropStatements(cleanLines.join("\n"));
+  if (destructiveDrops > 0) found.add("DROP statement");
   return [...found];
 }
 
