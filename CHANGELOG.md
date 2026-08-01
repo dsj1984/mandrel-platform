@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.3.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.2.0...mandrel-platform-v1.3.0) (2026-08-01)
+
+
+### Added
+
+* bump the stale first-party pins and widen the freshness guard from the manifest to the whole action directory ([#379](https://github.com/dsj1984/mandrel-platform/issues/379)) ([#386](https://github.com/dsj1984/mandrel-platform/issues/386)) ([431aca5](https://github.com/dsj1984/mandrel-platform/commit/431aca5f93fbad603f2c8b4f24fdff0d43c22b07))
+* **setup-toolchain:** keep the pnpm store out of the shim dir the pre-clean deletes ([#361](https://github.com/dsj1984/mandrel-platform/issues/361)) ([edd3a27](https://github.com/dsj1984/mandrel-platform/commit/edd3a2713e0a37acf9fceda4e1436bef2d58c266))
+* thread the gitleaks allowlist inputs through pr-quality.yml so consumers can escape a false positive ([#378](https://github.com/dsj1984/mandrel-platform/issues/378)) ([#383](https://github.com/dsj1984/mandrel-platform/issues/383)) ([9d09c4d](https://github.com/dsj1984/mandrel-platform/commit/9d09c4ddb441510d3626c55f6c28808f303cb65a))
+* warn when a consumer-facing change carries a non-releasing title (refs [#368](https://github.com/dsj1984/mandrel-platform/issues/368)) ([#373](https://github.com/dsj1984/mandrel-platform/issues/373)) ([720b8ba](https://github.com/dsj1984/mandrel-platform/commit/720b8bae9ec333d18e1eef44498b23e403d2df34))
+
+
+### Fixed
+
+* close the CodeQL alert gate's unpaginated and unrankable-severity fail-opens (refs [#380](https://github.com/dsj1984/mandrel-platform/issues/380)) ([#384](https://github.com/dsj1984/mandrel-platform/issues/384)) ([1965351](https://github.com/dsj1984/mandrel-platform/commit/196535163eae3b780a88e6216e1af138551ae79d))
+* close the operator-prefixed and wildcard-lower override fail-opens ([#387](https://github.com/dsj1984/mandrel-platform/issues/387)) ([74e0b41](https://github.com/dsj1984/mandrel-platform/commit/74e0b416595d4886b1e1a689a77794b094283204))
+* correct the Stryker adoption recipe to the only mechanism Stryker supports (refs [#376](https://github.com/dsj1984/mandrel-platform/issues/376)) ([#385](https://github.com/dsj1984/mandrel-platform/issues/385)) ([066d673](https://github.com/dsj1984/mandrel-platform/commit/066d6738e8e0d234a9f22da02850f65d13fcd935))
+* fix the isBoundedOverride false negative on dotted wildcards and document the override lint in the README ([#375](https://github.com/dsj1984/mandrel-platform/issues/375)) ([#382](https://github.com/dsj1984/mandrel-platform/issues/382)) ([db4d76f](https://github.com/dsj1984/mandrel-platform/commit/db4d76f9c50da5b5c6f8e40644ad23fe0a3af1f3))
+* make CodeQL block a merge by gating the required aggregator on it, instead of leaving it advisory ([#366](https://github.com/dsj1984/mandrel-platform/issues/366)) ([#372](https://github.com/dsj1984/mandrel-platform/issues/372)) ([336a47d](https://github.com/dsj1984/mandrel-platform/commit/336a47da2dd51ead21679c1b8a902f0df469573f))
+* stop defaulting the toolchain cache on for self-hosted callers, where the post-job save hangs into the job's own timeout ([#364](https://github.com/dsj1984/mandrel-platform/issues/364)) ([#370](https://github.com/dsj1984/mandrel-platform/issues/370)) ([f668c72](https://github.com/dsj1984/mandrel-platform/commit/f668c72c03171357508a153348ff7c578ac0a66c))
+* stop the migration guard stopping on a recreated index and stop the isolation audit asserting a policy it cannot read ([#367](https://github.com/dsj1984/mandrel-platform/issues/367)) ([#374](https://github.com/dsj1984/mandrel-platform/issues/374)) ([6cdb0a9](https://github.com/dsj1984/mandrel-platform/commit/6cdb0a90aeeb648c36fd48f0bfa3cf1c758a5a17))
+* stop the supply-chain tiers blocking on a safer version, an unbounded override, and ordinary prose ([#365](https://github.com/dsj1984/mandrel-platform/issues/365)) ([#371](https://github.com/dsj1984/mandrel-platform/issues/371)) ([0fe1a6e](https://github.com/dsj1984/mandrel-platform/commit/0fe1a6e8f6d1ca952a67d8f962a0da9562a499cd))
+* **stryker:** disable bail in the shared base so a score reflects tests that ran (refs [#363](https://github.com/dsj1984/mandrel-platform/issues/363)) ([#369](https://github.com/dsj1984/mandrel-platform/issues/369)) ([c7332c7](https://github.com/dsj1984/mandrel-platform/commit/c7332c7e1e6de49b7ba1b6d6cb367160096495fd))
+
+
+### Changed
+
+* extract the duplicated YAML step-extractor to a shared module and make the release-type check assert what it depends on ([#377](https://github.com/dsj1984/mandrel-platform/issues/377)) ([#381](https://github.com/dsj1984/mandrel-platform/issues/381)) ([e008d70](https://github.com/dsj1984/mandrel-platform/commit/e008d702277635661563ba00b802e210ac94e997))
+
 ## [1.2.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.1.0...mandrel-platform-v1.2.0) (2026-07-27)
 
 
