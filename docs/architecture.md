@@ -39,7 +39,8 @@ artifact, and its own repo dog-foods every one of them:
   scheduled runner-fleet health with offline alerting via
   `check-runner-health.mjs`). Each ships with a `node:test` sibling
   (`*.test.mjs`). `platform-sync.mjs` / `platform-repair.mjs` drive the fleet
-  convergence loop.
+  convergence loop. One script is deliberately **advisory** rather than
+  fail-closed: `check-release-type.mjs` (see _Release-type advisory_ below).
 - **Operator runbook templates** (`templates/runbooks/`) plus starter workflows
   (`templates/workflows/`) — copy-in operator procedures (deploy promotion,
   post-deploy smoke, incident response, backup/restore, environment
@@ -58,6 +59,33 @@ release, let Renovate raise bump PRs into each consumer after a hold window,
 and run standing checks (`check-pin-drift.mjs`, `platform-sync.mjs`) that
 surface any consumer that has drifted off the current release or split its pin
 across two SHAs.
+
+### Release-type advisory
+
+That loop has an upstream precondition: **a change only reaches a consumer if
+it cuts a release.** Merges here are squash, so the pull-request title becomes
+the commit subject release-please reads, and the types marked `hidden: true` in
+`release-please-config.json` (`ci`, `chore`, `docs`, `test`, `build`, `style`)
+produce no release and no CHANGELOG entry. For an internal edit that is
+correct. For a change to the published surface it means the change exists on
+`main` and nowhere a consumer can reach it — which is how a consumer-facing
+reusable-workflow input once landed under a `ci:` title and had to be
+re-released later, with every check green at the time.
+
+`check-release-type.mjs` reports that pair, and only that pair: a diff touching
+the published surface (a `workflow_call` workflow, anything under
+`.github/actions/`, or a path inside the npm `files` allowlist minus the
+`*.test.mjs` siblings) under a title whose type cannot release. Both halves are
+read from configuration — the type split from `release-please-config.json`, the
+published paths from `package.json` — so neither is duplicated in the check.
+A `!` breaking marker always counts as releasable.
+
+It is **advisory**: it runs as a step in the existing `node-scripts` job,
+registers no status context, and always exits 0, reporting through a
+`::warning::` annotation and the job summary. Blocking a pull request on a
+heuristic over a human-written title would be worse than the defect it
+prevents; a hidden-type title over a wholly internal diff stays silent, so the
+warning stays worth reading.
 
 ## Tech Stack
 
