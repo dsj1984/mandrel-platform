@@ -40,69 +40,23 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 
+import { stepByName, runScript } from "./lib/yaml-step.mjs";
+
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW = ".github/workflows/pr-quality.yml";
 const content = readFileSync(join(repoRoot, WORKFLOW), "utf8");
 
 // ---------------------------------------------------------------------------
-// Minimal indentation-based extraction (dependency-free, mirrors
-// check-ci-required-aggregator.test.mjs). A step spans from its `- ` bullet to
-// the next sibling bullet at the same indent (or a dedent below it).
+// Local extraction helper. Step-block and `run:` extraction are shared via
+// scripts/lib/yaml-step.mjs; only the `if:` reader is specific to this suite,
+// which is the only one asserting on step gating.
 // ---------------------------------------------------------------------------
-
-function stepByName(text, name) {
-  const lines = text.split("\n");
-  const nameIdx = lines.findIndex((l) => /^\s+(- )?name:\s/.test(l) && l.includes(name));
-  assert.notEqual(nameIdx, -1, `step "${name}" not found`);
-  let start = -1;
-  for (let i = nameIdx; i >= 0; i--) {
-    if (/^\s*-\s/.test(lines[i])) {
-      start = i;
-      break;
-    }
-  }
-  assert.notEqual(start, -1, `opening bullet for step "${name}" not found`);
-  const bulletIndent = lines[start].match(/^(\s*)/)[1].length;
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
-    if (/^\s*$/.test(lines[i])) continue;
-    const indent = lines[i].match(/^(\s*)/)[1].length;
-    if (indent < bulletIndent) {
-      end = i;
-      break;
-    }
-    if (indent === bulletIndent && /^\s*-\s/.test(lines[i])) {
-      end = i;
-      break;
-    }
-  }
-  return lines.slice(start, end).join("\n");
-}
 
 /** The (first) `if:` expression on a step block, trimmed. */
 function ifCondition(stepBlock) {
   const m = stepBlock.match(/^\s+if:\s*(.+?)\s*$/m);
   assert.ok(m, "step has no `if:` condition");
   return m[1].trim();
-}
-
-/** The dedented body of the step's `run: |` block scalar. */
-function runScript(stepBlock) {
-  const lines = stepBlock.split("\n");
-  const start = lines.findIndex((l) => /^\s+run:\s*\|\s*$/.test(l));
-  assert.notEqual(start, -1, "`run: |` block not found");
-  const runIndent = lines[start].match(/^(\s*)/)[1].length;
-  const body = [];
-  for (let i = start + 1; i < lines.length; i++) {
-    if (/^\s*$/.test(lines[i])) {
-      body.push("");
-      continue;
-    }
-    const indent = lines[i].match(/^(\s*)/)[1].length;
-    if (indent <= runIndent) break;
-    body.push(lines[i].slice(runIndent + 2));
-  }
-  return body.join("\n");
 }
 
 // ---------------------------------------------------------------------------
