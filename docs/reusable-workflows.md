@@ -709,9 +709,13 @@ allowlist is reviewable in the diff, which `non-blocking: 'true'` never was.
 > **Which revision of the composite runs.** `pr-quality` calls `gitleaks-scan`
 > by pinned SHA, and the pin — not the working tree — decides the behaviour a
 > consumer gets. A caller-side input only takes effect once the pin carries a
-> composite revision that declares the matching input. See
-> [First-party self-pin freshness](#first-party-self-pin-freshness) for the
-> land-then-bump sequence and the guard that reports a lagging pin.
+> composite revision that declares the matching input. **As of this writing the
+> pin predates the composite's `config-path` input**, so setting
+> `secret-scan-config-path` on today's release is inert: the run emits an
+> `Unexpected input(s)` warning and scans with the built-in ruleset. It becomes
+> live when the land-then-bump follow-up repoints every `gitleaks-scan` call
+> site. See [First-party self-pin freshness](#first-party-self-pin-freshness)
+> for that sequence and the guard that reports a lagging pin.
 
 Toggle matrix:
 

@@ -243,7 +243,11 @@ test("AC-3: a rule-replacing repo-root .gitleaks.toml is rejected, naming config
   assert.doesNotMatch(output, /GITLEAKS_ARGV/, "gitleaks must not run on a rejected config");
 });
 
-test("AC-3: an explicit config-path still wins over a repo-root .gitleaks.toml", () => {
+// Not AC-3 evidence: this passes with the discovery branch reverted, because
+// nothing ever routed a root file when config-path was set. It is a regression
+// guard for one plausible mis-write of that branch — omitting its `[ -z
+// "$CONFIG_PATH" ]` condition — and should not be read as proving AC-3.
+test("an explicit config-path still wins over a repo-root .gitleaks.toml", () => {
   const { status, output } = runScan({
     files: { ".gitleaks.toml": EXTENDING_CONFIG, "custom.toml": EXTENDING_CONFIG },
     CONFIG_PATH: "custom.toml",
