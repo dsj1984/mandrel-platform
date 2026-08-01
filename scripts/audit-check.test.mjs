@@ -597,6 +597,98 @@ test("AC-3: a wildcard LOWER end still counts as bounded when the range caps it"
   }
 });
 
+// Residual fail-opens left open by the dotted-wildcard fix. Both classes reach
+// the catch-all `return true` and so read as bounded while pinning nothing.
+//
+// Class 1 — an operator in front of the wildcard. The wildcard test is gated on
+// a single BARE token, so any leading range operator defeats it: `^x.x.x` is
+// `^` applied to "any version", which is still any version.
+const OPERATOR_PREFIXED_WILDCARDS = [
+  ["^x.x.x", false],
+  ["^x.x", false],
+  ["^x", false],
+  ["^*", false],
+  ["~*", false],
+  ["~x.x.x", false],
+  ["=x.x.x", false],
+  ["=*", false],
+  ["=X.X", false],
+  ["^latest", false],
+  // The same operators over a real version are untouched — this is the
+  // near-miss the fix must not break.
+  ["^1.2.3", true],
+  ["~1.2.3", true],
+  ["=1.2.3", true],
+  ["^1.x", true],
+  ["~1.2.x", true],
+];
+
+test("operator-prefixed wildcards are unbounded, real versions unaffected", () => {
+  for (const [spec, expected] of OPERATOR_PREFIXED_WILDCARDS) {
+    assert.equal(
+      isBoundedOverride(spec),
+      expected,
+      `${JSON.stringify(spec)} should be bounded=${expected}`,
+    );
+  }
+});
+
+test("a compound whose every term is a wildcard or bare lower bound is unbounded", () => {
+  // Class 2 — a wildcard lower with no upper bound anywhere. `x.x >=1.0.0`
+  // reads as a range only because it is spelled like one; both terms are open
+  // above, so the resolved set is still "every future release".
+  for (const unbounded of [
+    "x.x >=1.0.0",
+    "x.x.x >=1.0.0",
+    "* >=1.0.0",
+    "x.x >1.0.0",
+    ">=1.0.0 x.x",
+    "x.x - x.x",
+    "x.x.x - *",
+    "* - x",
+    "1.0.0 - x.x.x",
+  ]) {
+    assert.equal(
+      isBoundedOverride(unbounded),
+      false,
+      `${JSON.stringify(unbounded)} carries no upper bound`,
+    );
+  }
+});
+
+test("a malformed hyphen range carrying a comparator still fails closed", () => {
+  // A real hyphen range takes plain versions on both sides. Reading the
+  // right-hand side of `>=1.0.0 - 2.0.0` as the cap answers a range npm never
+  // agreed to parse, and turns a spec that failed closed into one that passes
+  // — the exact fail-open direction this lint exists to prevent.
+  for (const unbounded of [">=1.0.0 - 2.0.0", ">=1.0.0 - ^2.0.0", ">1.0.0 - 2.0.0"]) {
+    assert.equal(
+      isBoundedOverride(unbounded),
+      false,
+      `${JSON.stringify(unbounded)} is not a hyphen range and must fail closed`,
+    );
+  }
+});
+
+test("a real upper bound still closes a range with a wildcard lower", () => {
+  // The regression guard for the trap the dotted-wildcard fix already hit once:
+  // testing the wildcard against the whole specifier called these unbounded.
+  // An upper bound is an upper bound regardless of how loose the lower end is.
+  for (const bounded of [
+    "x.x <2.0.0",
+    "x.x.x - 2.0.0",
+    "* <=2.0.0",
+    "x.x >=1.0.0 <2.0.0",
+    "^x.x.x - 2.0.0",
+  ]) {
+    assert.equal(
+      isBoundedOverride(bounded),
+      true,
+      `${JSON.stringify(bounded)} carries a real upper bound`,
+    );
+  }
+});
+
 test("isBoundedOverride: a || union is only as bounded as its loosest arm", () => {
   assert.equal(isBoundedOverride("^1.0.0 || ^2.0.0"), true);
   assert.equal(isBoundedOverride("^1.0.0 || >=2.0.0"), false);

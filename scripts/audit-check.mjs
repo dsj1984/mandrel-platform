@@ -258,6 +258,39 @@ function isWildcardSpec(value) {
 }
 
 /**
+ * Strip a leading range operator from a single bare token.
+ *
+ * `isWildcardSpec` reads the major position, which a leading operator shifts
+ * out of view: `^x.x.x` splits to `^x`, matches nothing, and reads as a real
+ * version. An operator applied to "any version" is still any version, so the
+ * operator has to come off before the major position can be judged.
+ *
+ * @param {string} term single bare token
+ * @returns {string}
+ */
+function stripRangeOperator(term) {
+  return term.replace(/^(?:[<>]=?|[\^~=])+/, "");
+}
+
+/**
+ * Does this single bare token carry a real upper bound?
+ *
+ * A wildcard pins nothing, and a bare lower bound (`>=1.0.0`) is open above by
+ * construction. Anything else — an exact pin, a caret/tilde range, an `x`-style
+ * partial with a fixed major, an explicit `<` cap — closes the range.
+ *
+ * @param {string} term single bare token
+ * @returns {boolean}
+ */
+function termCarriesUpperBound(term) {
+  if (isWildcardSpec(stripRangeOperator(term))) {
+    return false;
+  }
+
+  return !/^>=?/.test(term);
+}
+
+/**
  * Is this override specifier bounded above?
  *
  * An override REWRITES a transitive dependent's declared range, so whatever is
@@ -307,14 +340,39 @@ export function isBoundedOverride(spec) {
     return value.split("||").every((arm) => isBoundedOverride(arm));
   }
 
-  // Wildcards and dist-tags pin nothing at all.
-  if (isWildcardSpec(value)) {
+  // Wildcards and dist-tags pin nothing at all — including behind a leading
+  // range operator, which shifts the major position out of view.
+  if (isWildcardSpec(stripRangeOperator(value))) {
     return false;
   }
 
-  // An explicit upper bound anywhere in a compound range closes it.
+  // A hyphen range is bounded by its right-hand side alone: `x.x.x - 2.0.0`
+  // caps at 2.0.0 however loose its lower end is, and `x.x - x.x` caps at
+  // nothing however much it is spelled like a range.
+  //
+  // A real hyphen range takes plain versions on both sides. A comparator on
+  // either end (`>=1.0.0 - 2.0.0`) is malformed, so reading its right-hand
+  // side as the cap would answer a range npm never agreed to parse — that one
+  // is left to the compound logic below, which keeps failing closed on it.
+  const hyphenRange = /^(.+?)\s+-\s+(.+)$/.exec(value);
+  if (hyphenRange) {
+    const lowerEnd = hyphenRange[1].trim();
+    const upperEnd = hyphenRange[2].trim();
+    if (!/^[<>]/.test(lowerEnd) && !/^[<>]/.test(upperEnd)) {
+      return termCarriesUpperBound(upperEnd);
+    }
+  }
+
+  // An explicit upper bound anywhere in a space-separated compound closes it.
   if (/[<]/.test(value)) {
     return true;
+  }
+
+  // Otherwise a compound is only as bounded as its terms: when every one of
+  // them is a wildcard or a bare lower bound, nothing caps the range and the
+  // range-like spelling is the only thing suggesting otherwise.
+  if (/\s/.test(value) && !value.split(/\s+/).some(termCarriesUpperBound)) {
+    return false;
   }
 
   // A bare lower bound is the unbounded shape this check exists to name.
