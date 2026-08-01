@@ -139,11 +139,22 @@ jobs:
       # landed under a `ci:` title, shipped to nobody, and had to be
       # re-released later. Nothing signalled it, because everything was green.
       #
-      # ADVISORY BY DESIGN — the step exits 0 whatever it finds and reports via
-      # a `::warning::` annotation plus the job summary. Blocking a pull request
-      # on a heuristic over a human-written title would be worse than the defect
-      # it prevents. It is a STEP in this existing job, so it registers no new
-      # status context and needs no branch-protection change.
+      # ADVISORY BY DESIGN — blocking a pull request on a heuristic over a
+      # human-written title would be worse than the defect it prevents, so a
+      # finding reports via a `::warning::` annotation plus the job summary and
+      # this step still passes. It is a STEP in this existing job, so it
+      # registers no new status context and needs no branch-protection change.
+      #
+      # ADVISORY IS NOT SILENT (Story #377). The check used to exit 0 on every
+      # outcome, which made `ok`, `mismatch` and `skipped` indistinguishable —
+      # and a check that degrades to a permanent skip (shallow clone, no
+      # changelog-sections) is inert with nothing to notice. It now exits
+      # 0=ok / 2=mismatch / 3=skipped, and the TOLERANCE lives here, in the
+      # wiring, rather than being baked into the exit code. Anything else —
+      # exit 1, a usage error — means the check did not run and still fails the
+      # step, because a check that did not run must not read as one that found
+      # nothing. scripts/check-release-type.test.mjs executes this very `run:`
+      # body against a stubbed `node` to prove both halves.
       #
       # The title arrives through the ENVIRONMENT, never interpolated into the
       # `run:` shell — a pull-request title is attacker-controlled text and
@@ -156,7 +167,18 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: node scripts/check-release-type.mjs
+        run: |
+          code=0
+          node scripts/check-release-type.mjs || code=$?
+          case "$code" in
+            0) echo "[release-type] outcome: ok" ;;
+            2) echo "[release-type] outcome: mismatch — advisory, not blocking" ;;
+            3) echo "[release-type] outcome: skipped — advisory, not blocking" ;;
+            *)
+              echo "[release-type] the check itself failed (exit $code)" >&2
+              exit "$code"
+              ;;
+          esac
 
       - name: Run unit tests
         run: npm test

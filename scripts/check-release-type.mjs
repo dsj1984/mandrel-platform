@@ -38,10 +38,21 @@
  * The classification is a heuristic over a human-written title. Blocking a
  * pull request on it would be worse than the defect it prevents: an
  * unappealable stop on a judgement call teaches people to route around the
- * gate. So this exits 0 on a mismatch and reports through a `::warning::`
- * annotation and the job summary. It runs as a STEP in the existing
- * `node-scripts` job — no new job, therefore no new status context and no
- * branch-protection change.
+ * gate. So a mismatch reports through a `::warning::` annotation and the job
+ * summary, and the CI step deliberately TOLERATES the mismatch exit code. It
+ * runs as a STEP in the existing `node-scripts` job — no new job, therefore no
+ * new status context and no branch-protection change.
+ *
+ * ## Advisory is not the same as silent (Story #377)
+ *
+ * Advisory used to mean "exit 0 whatever happened", which collapsed three very
+ * different outcomes into one indistinguishable signal. `skipped` in
+ * particular is the dangerous one: a shallow clone, a missing pull-request
+ * title, or a release config that stops declaring `changelog-sections` all
+ * degrade this check to a skip, and a check that skips on every run forever is
+ * inert with nothing to notice. The three outcomes now carry three exit codes
+ * (see {@link EXIT}) so the caller can tell them apart; keeping the pull
+ * request unblocked is the CI step's job, not the exit code's.
  *
  * ## Where the type set comes from
  *
@@ -88,9 +99,8 @@
  *   BASE_SHA   pull_request.base.sha
  *   HEAD_SHA   pull_request.head.sha
  *
- * Exit codes:
- *   0 — always, except a usage error. This check reports; it never blocks.
- *   1 — an unknown flag or a missing flag value.
+ * Exit codes: see {@link EXIT}. Only a usage error (1) is a fault in the check
+ * itself; 2 and 3 are findings, and the CI step tolerates them by name.
  */
 
 import { readFileSync, appendFileSync } from "node:fs";
@@ -99,6 +109,26 @@ import { resolve, join } from "node:path";
 
 import { parseFlags } from "./lib/args.mjs";
 import { walkYaml, isReusableWorkflow } from "./check-workflow-portability.mjs";
+
+/**
+ * The outcome of a run, as a POSIX exit code.
+ *
+ * `mismatch` and `skipped` are non-zero so a caller can DISTINGUISH them —
+ * from each other and from a clean run — without parsing log text. That does
+ * not make either one blocking: the ci.yml step maps 0/2/3 onto a passing step
+ * and only propagates anything else, which is asserted directly by
+ * check-release-type.test.mjs so the tolerance cannot be dropped by accident.
+ *
+ * `usage` is the one genuinely broken state — a flag this check does not
+ * understand means it did not run, and a check that did not run must not
+ * report as one that found nothing.
+ */
+export const EXIT = Object.freeze({
+  ok: 0,
+  usage: 1,
+  mismatch: 2,
+  skipped: 3,
+});
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -448,7 +478,8 @@ export function renderReport(result) {
       "type. Landing this as-is publishes the change to `main` and to no consumer. " +
       "Retitle to a releasing type (e.g. `feat:` / `fix:`) if consumers need it, or " +
       "keep the title and confirm the change is genuinely internal.",
-    "[release-type] Advisory — this check never fails the pull request.",
+    `[release-type] Advisory — this reports exit ${EXIT.mismatch}, which the CI step ` +
+      "tolerates by name. The pull request is never failed.",
   ];
 
   // GitHub renders `%0A` as a newline inside a single-line workflow command.
@@ -496,13 +527,13 @@ function writeSummary(body) {
 }
 
 /**
- * Run the check and return a POSIX exit code. `log` / `err` are injectable so
- * the sibling node:test suite captures output without touching the real
- * streams.
+ * Run the check and return a POSIX exit code from {@link EXIT}. `log` / `err`
+ * are injectable so the sibling node:test suite captures output without
+ * touching the real streams.
  *
  * @param {string[]} argv
  * @param {{log?: Function, err?: Function}} [io]
- * @returns {number}
+ * @returns {number} One of {@link EXIT}.
  */
 export function runCli(argv, { log = console.log, err = console.error } = {}) {
   let opts;
@@ -511,11 +542,11 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
   } catch (e) {
     err(`[release-type] ❌ ${e.message}`);
     err(USAGE);
-    return 1;
+    return EXIT.usage;
   }
   if (opts.help) {
     log(USAGE);
-    return 0;
+    return EXIT.ok;
   }
 
   const root = resolve(opts.cwd);
@@ -533,7 +564,7 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
 
   if (result.status === "skipped") {
     log(`[release-type] ⏭️  skipped — ${result.reason}.`);
-    return 0;
+    return EXIT.skipped;
   }
 
   if (result.status === "ok") {
@@ -541,7 +572,7 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
       `[release-type] ✅ title type ${result.type === null ? "(unparseable)" : `\`${result.type}\``} ` +
         `— ${result.detail}; ${result.surfaces.length} consumer-facing path(s) touched.`
     );
-    return 0;
+    return EXIT.ok;
   }
 
   const report = renderReport(result);
@@ -549,7 +580,7 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
   log(report.annotation);
   writeSummary(report.summary);
 
-  return 0;
+  return EXIT.mismatch;
 }
 
 // Only run when executed directly, not when imported by the test suite.
