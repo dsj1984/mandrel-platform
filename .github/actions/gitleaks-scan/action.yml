@@ -241,8 +241,19 @@ runs:
             echo "::error::gitleaks config-path '${CONFIG_PATH}' does not exist in the checkout."
             exit 1
           fi
-          if [ "$ALLOW_RULE_REPLACEMENT" != "true" ] &&
-             ! grep -Eq '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true' "$CONFIG_PATH"; then
+          # The key MUST be read inside the [extend] table. A bare grep would
+          # accept `useDefault = true` sitting under [[rules]] — where gitleaks
+          # ignores it — which is precisely the silent tier-wide opt-out this
+          # guard exists to prevent. awk keeps that scoping bash-3.2-safe.
+          extends_default=0
+          if awk '
+            /^[[:space:]]*\[/ { in_extend = ($0 ~ /^[[:space:]]*\[extend\][[:space:]]*$/); next }
+            in_extend && /^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true[[:space:]]*$/ { found = 1 }
+            END { exit found ? 0 : 1 }
+          ' "$CONFIG_PATH"; then
+            extends_default=1
+          fi
+          if [ "$ALLOW_RULE_REPLACEMENT" != "true" ] && [ "$extends_default" -ne 1 ]; then
             echo "::error::gitleaks config '${CONFIG_PATH}' must extend the default ruleset. Add:"
             echo "::error::  [extend]"
             echo "::error::  useDefault = true"

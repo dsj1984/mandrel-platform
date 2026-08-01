@@ -202,6 +202,38 @@ test("AC-8: a config that replaces the default ruleset is rejected", () => {
   assert.doesNotMatch(output, /GITLEAKS_ARGV/, "gitleaks must not run on a rejected config");
 });
 
+test("AC-8: useDefault must sit in [extend], not merely appear in the file", () => {
+  // The guard's one remaining bypass if it were a bare grep: gitleaks reads
+  // useDefault only from the [extend] table, so the same line under [[rules]]
+  // is inert — a rule-replacing config that reads as if it extended.
+  const { status, output } = runScan({
+    files: {
+      ".gitleaks.toml": ["[[rules]]", 'id = "only-mine"', "useDefault = true"].join("\n"),
+    },
+    CONFIG_PATH: ".gitleaks.toml",
+  });
+  assert.equal(status, 1);
+  assert.match(output, /must extend the default ruleset/);
+  assert.doesNotMatch(output, /GITLEAKS_ARGV/, "gitleaks must not run on a rejected config");
+});
+
+test("AC-7: [extend] is still honoured when other tables follow it", () => {
+  const { status, output } = runScan({
+    files: {
+      ".gitleaks.toml": [
+        "[extend]",
+        "useDefault = true",
+        "",
+        "[[allowlists]]",
+        'description = "prose"',
+      ].join("\n"),
+    },
+    CONFIG_PATH: ".gitleaks.toml",
+  });
+  assert.equal(status, 0);
+  assert.match(output, /--config \.gitleaks\.toml/);
+});
+
 test("a deliberate full rule-set replacement is possible, but only explicitly", () => {
   const { status, output } = runScan({
     files: { ".gitleaks.toml": '[[rules]]\nid = "only-mine"\n' },

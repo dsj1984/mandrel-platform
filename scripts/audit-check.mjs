@@ -487,6 +487,57 @@ export function loadAllowlist(allowlistPath) {
 }
 
 /**
+ * Gate a package.json on unbounded dependency overrides. Returns the process
+ * exit code (0 clean, 1 blocking) and prints what is wrong and how to fix it.
+ *
+ * Split out of `runCli` so BOTH outcomes are executable in a test: the clean
+ * path returns here without ever reaching `pnpm audit`, which needs a real
+ * lockfile and a network. A missing package.json is not this gate's business —
+ * the audit is what proves the graph.
+ *
+ * @param {string} packageJsonPath
+ * @returns {number}
+ */
+export function lintOverrides(packageJsonPath) {
+  if (!existsSync(packageJsonPath)) {
+    return 0;
+  }
+
+  /** @type {unknown} */
+  let pkgJson;
+  try {
+    pkgJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+  } catch (err) {
+    console.error(
+      `[audit-check] ERROR: could not parse ${packageJsonPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return 1;
+  }
+
+  const unbounded = findUnboundedOverrides(pkgJson);
+  if (unbounded.length === 0) {
+    return 0;
+  }
+
+  console.error(
+    `[audit-check] ${unbounded.length} unbounded dependency override(s) in ${packageJsonPath}:`,
+  );
+  for (const finding of unbounded) {
+    console.error(
+      `  - ${finding.field}.${finding.package}: "${finding.bound}" has no upper bound`,
+    );
+  }
+  console.error(
+    "\n[audit-check] An override rewrites a dependent's range, so a bare lower bound leaves " +
+      "the lockfile as the only pin and lets a fresh resolution cross a major. Give each " +
+      'bound an upper limit — "^1.2.3", "~1.2.3", or ">=1.2.3 <2.0.0". Exit 1.',
+  );
+  return 1;
+}
+
+/**
  * Run `pnpm audit --prod --json`, returning the raw stdout and exit code.
  * pnpm audit exits non-zero when vulnerabilities are found; we want the JSON
  * regardless of the exit code.
@@ -518,39 +569,10 @@ export function runCli(argv) {
   //
   // Runs BEFORE the audit: an unbounded override is a standing invitation for
   // the next resolution to cross a major, and nothing else in the toolchain
-  // looks for one. A missing or unparseable package.json is not this gate's
-  // business — the audit below is what proves the graph.
-  if (existsSync(packageJsonPath)) {
-    /** @type {unknown} */
-    let pkgJson = null;
-    try {
-      pkgJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
-    } catch (err) {
-      console.error(
-        `[audit-check] ERROR: could not parse ${packageJsonPath}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return 1;
-    }
-
-    const unbounded = findUnboundedOverrides(pkgJson);
-    if (unbounded.length > 0) {
-      console.error(
-        `[audit-check] ${unbounded.length} unbounded dependency override(s) in ${packageJsonPath}:`,
-      );
-      for (const finding of unbounded) {
-        console.error(
-          `  - ${finding.field}.${finding.package}: "${finding.bound}" has no upper bound`,
-        );
-      }
-      console.error(
-        "\n[audit-check] An override rewrites a dependent's range, so a bare lower bound leaves " +
-          "the lockfile as the only pin and lets a fresh resolution cross a major. Give each " +
-          'bound an upper limit — "^1.2.3", "~1.2.3", or ">=1.2.3 <2.0.0". Exit 1.',
-      );
-      return 1;
-    }
+  // looks for one.
+  const overrideExit = lintOverrides(packageJsonPath);
+  if (overrideExit !== 0) {
+    return overrideExit;
   }
 
   // --- Load & validate the allowlist ---------------------------------------

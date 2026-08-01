@@ -45,6 +45,7 @@ import {
   runCli,
   isBoundedOverride,
   findUnboundedOverrides,
+  lintOverrides,
 } from "./audit-check.mjs";
 
 const TODAY = "2026-07-02";
@@ -560,25 +561,47 @@ test("AC-5: runCli fails on an unbounded override before pnpm ever runs", () => 
   }
 });
 
-test("AC-6: runCli does not fail on a bounded override", () => {
+test("AC-6: the override gate passes a bounded override, reaching the audit", () => {
+  // Executes the clean path rather than asserting around it. lintOverrides is
+  // the gate runCli delegates to, split out precisely so a PASS is provable
+  // without `pnpm audit` (which needs a real lockfile and a network).
   const dir = mkdtempSync(join(tmpdir(), "audit-check-bounded-"));
   try {
     const packageJsonPath = join(dir, "package.json");
     writeFileSync(
       packageJsonPath,
-      JSON.stringify({ name: "fixture", pnpm: { overrides: { "left-pad": "^1.3.0" } } }),
+      JSON.stringify({
+        name: "fixture",
+        overrides: { a: "^1.3.0", b: ">=1.0.0 <2.0.0" },
+        pnpm: { overrides: { "left-pad": "~1.3.0" } },
+      }),
     );
-    // The override gate is what is under test; the audit that follows needs a
-    // real pnpm and is covered by evaluateReport's unit cases instead. Proving
-    // the gate did NOT fire means proving runCli got past it.
-    const findings = findUnboundedOverrides(
-      JSON.parse(readFileSync(packageJsonPath, "utf8")),
-    );
-    assert.deepEqual(findings, []);
-    assert.deepEqual(parseArgs(["--package-json", packageJsonPath]).packageJsonPath, packageJsonPath);
+    assert.equal(lintOverrides(packageJsonPath), 0);
+    assert.equal(parseArgs(["--package-json", packageJsonPath]).packageJsonPath, packageJsonPath);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("AC-5: the override gate blocks an unbounded override", () => {
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-lint-"));
+  try {
+    const packageJsonPath = join(dir, "package.json");
+    writeFileSync(packageJsonPath, JSON.stringify({ overrides: { "left-pad": ">=1.3.0" } }));
+    assert.equal(lintOverrides(packageJsonPath), 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the override gate is a no-op when there is no package.json to read", () => {
+  assert.equal(lintOverrides(join(tmpdir(), "audit-check-absent-xyz", "package.json")), 0);
+});
+
+test("this repo's own package.json passes the override gate", () => {
+  // The lint ships enabled by default; a false positive here would red the
+  // platform's own required check on every PR.
+  assert.deepEqual(findUnboundedOverrides(JSON.parse(readFileSync("package.json", "utf8"))), []);
 });
 
 test("runCli: an unparseable package.json is a hard error, not a skipped check", () => {
