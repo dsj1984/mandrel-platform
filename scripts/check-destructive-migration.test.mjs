@@ -29,6 +29,7 @@ import {
   formatStepSummary,
   globToRegExp,
   isMigrationFile,
+  maskNonExecutable,
   normalizeIndexName,
   parseArgs,
   parseDroppedIndexNames,
@@ -280,6 +281,54 @@ test("parseDroppedIndexNames reads the whole list, or nothing", () => {
   assert.deepEqual(parseDroppedIndexNames("DROP INDEX idx_a ON orders"), ["idx_a"]);
   assert.equal(parseDroppedIndexNames("DROP INDEX ;"), null);
   assert.equal(parseDroppedIndexNames("DROP TABLE users"), null);
+});
+
+test("a CREATE INDEX that never executes does not excuse a real drop", () => {
+  // Both of these leave the index gone at the end of the migration. Only an
+  // executable CREATE counts as a recreate.
+  const inBlockComment = [
+    "DROP INDEX idx_a;",
+    "/* rollback:",
+    "CREATE INDEX idx_a ON t (x);",
+    "*/",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(inBlockComment), ["DROP statement"]);
+
+  const inStringLiteral = [
+    "DROP INDEX idx_a;",
+    "INSERT INTO audit (msg) VALUES ('CREATE INDEX idx_a ON t (x)');",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(inStringLiteral), ["DROP statement"]);
+
+  const inLineComment = ["DROP INDEX idx_a;", "-- CREATE INDEX idx_a ON t (x);"].join("\n");
+  assert.deepEqual(scanMigrationText(inLineComment), ["DROP statement"]);
+});
+
+test("masking preserves offsets so a real recreate after a masked span still pairs", () => {
+  const sql = [
+    "DROP INDEX idx_a;",
+    "/* the index below replaces it */",
+    "INSERT INTO audit (msg) VALUES ('dropping idx_a');",
+    "CREATE INDEX idx_a ON t (x) WHERE archived = 0;",
+  ].join("\n");
+  assert.deepEqual(scanMigrationText(sql), []);
+});
+
+test("maskNonExecutable blanks non-executable spans without moving anything", () => {
+  const text = "a /* b\nc */ d 'e f' g";
+  const masked = maskNonExecutable(text);
+  assert.equal(masked.length, text.length);
+  assert.equal(masked.indexOf("d"), text.indexOf("d"), "offsets must be preserved");
+  assert.ok(!masked.includes("b") && !masked.includes("c"), "block comment blanked");
+  assert.ok(!masked.includes("e") && !masked.includes("f"), "string literal blanked");
+  assert.ok(masked.includes("a") && masked.includes("g"), "executable text survives");
+  assert.equal((masked.match(/\n/g) ?? []).length, 1, "newlines survive");
+});
+
+test("maskNonExecutable: an escaped '' does not close the literal early", () => {
+  const masked = maskNonExecutable("x 'it''s CREATE INDEX idx_a' y");
+  assert.ok(!masked.includes("CREATE"));
+  assert.ok(masked.includes("x") && masked.includes("y"));
 });
 
 test("scanDropStatements reports which index drops were excused", () => {

@@ -145,9 +145,11 @@ export function isMigrationFile(filePath, globs = DEFAULT_MIGRATION_GLOBS) {
 /**
  * Strip SQL / JS comments from a single line so a `DROP` that appears only in a
  * comment does not trip the guard. Handles `--`, `//`, and a `/* … *​/` opened
- * and closed on the same line. (Multi-line block comments are rare in migration
- * files and conservatively left in — a false positive there is acknowledgeable
- * via the override label.)
+ * and closed on the same line. A multi-line block comment's residue is left in
+ * DELIBERATELY on this side: it can only cause a false positive, which the
+ * override label acknowledges. It is `maskNonExecutable` — applied only to the
+ * text the RECREATE scan reads — that must be exact, because there the same
+ * residue would cause a false NEGATIVE.
  *
  * @param {string} line
  * @returns {string}
@@ -232,6 +234,60 @@ export function normalizeIndexName(raw) {
 }
 
 /**
+ * Blank out the spans of `text` that cannot execute — multi-line `/* … *​/`
+ * block comments and single-quoted SQL string literals — preserving LENGTH so
+ * offsets stay comparable with the unmasked text.
+ *
+ * The two scans are deliberately asymmetric, and both directions fail closed:
+ * the DROP scan reads text with only per-line comments stripped (detect as much
+ * as possible), while the RECREATE scan reads this masked text (excuse as
+ * little as possible). Without it, a `CREATE INDEX idx_a …` that never runs —
+ * commented out as a rollback note, or quoted inside an INSERT — would excuse a
+ * real `DROP INDEX idx_a`, and the index would be gone at the end of the
+ * migration with no acknowledgement. An unterminated quote masks the remainder
+ * of the file, which withdraws excuses rather than granting them.
+ *
+ * @param {string} text
+ * @returns {string}  Same length as `text`.
+ */
+export function maskNonExecutable(text) {
+  const chars = text.split("");
+  const blank = (from, to) => {
+    for (let k = from; k < to; k++) if (chars[k] !== "\n") chars[k] = " ";
+  };
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "/" && text[i + 1] === "*") {
+      const close = text.indexOf("*/", i + 2);
+      const end = close === -1 ? text.length : close + 2;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    if (text[i] === "'") {
+      let k = i + 1;
+      while (k < text.length) {
+        // '' is an escaped quote inside a SQL string literal, not a close.
+        if (text[k] === "'" && text[k + 1] === "'") {
+          k += 2;
+          continue;
+        }
+        if (text[k] === "'") {
+          k++;
+          break;
+        }
+        k++;
+      }
+      blank(i, k);
+      i = k;
+      continue;
+    }
+    i++;
+  }
+  return chars.join("");
+}
+
+/**
  * Every index this text (re)creates, with the offset at which the CREATE
  * appears. Offsets are what make the pairing order-sensitive: only a create
  * that lands AFTER the drop leaves the index in place at the end of the
@@ -260,7 +316,8 @@ export function collectCreatedIndexes(text) {
  *   `recreatedIndexes` names the index drops excused as lossless.
  */
 export function scanDropStatements(cleanText) {
-  const created = collectCreatedIndexes(cleanText);
+  // Only an executable CREATE counts as a recreate — see maskNonExecutable.
+  const created = collectCreatedIndexes(maskNonExecutable(cleanText));
   const re = new RegExp(DROP_OBJECT_SOURCE, "gi");
   let destructiveDrops = 0;
   const recreatedIndexes = [];

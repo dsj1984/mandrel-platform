@@ -1363,6 +1363,9 @@ carve-out is deliberately narrow and fails closed. It does **not** apply when:
   of the migration);
 - the recreate lives in a **different** file;
 - the dropped index name cannot be parsed;
+- the recreate cannot execute — a `CREATE INDEX` inside a comment (including a
+  multi-line `/* … */` rollback note) or inside a string literal never excuses a
+  drop;
 - the statement drops several indexes in one comma-separated list
   (`DROP INDEX a, b;`) and **any** one of them is not recreated — every name in
   the list must be recreated, one excused name never excuses its neighbours;
