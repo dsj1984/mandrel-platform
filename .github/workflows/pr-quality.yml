@@ -956,7 +956,7 @@ jobs:
       # through the first arm correctly.
       - &setup-toolchain
         name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@71403dd6886633cc4831a8b0e621d32d832dcb32
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@edd3a2713e0a37acf9fceda4e1436bef2d58c266
         with:
           cache: ${{ inputs.toolchain-cache != 'auto' && inputs.toolchain-cache || (contains(inputs.runner, 'self-hosted') && 'false' || 'true') }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -1826,7 +1826,7 @@ jobs:
       # first SHA whose tree contains it. Bump to the next release SHA in the
       # post-release pin-bump follow-up.
       - name: Secret scan (pinned gitleaks, blocking)
-        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@71403dd6886633cc4831a8b0e621d32d832dcb32
+        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@9d09c4ddb441510d3626c55f6c28808f303cb65a
         with:
           # 'range' mode from the resolver maps to a range-scoped git-history
           # scan; the no-ranged-base fallback stays a full working-tree scan.
@@ -2317,7 +2317,7 @@ jobs:
       # reusable workflow references a first-party composite by absolute
       # owner/repo/path@<sha> form only — never a relative ./ path.
       - name: OSV advisory scan (pinned binary)
-        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@71403dd6886633cc4831a8b0e621d32d832dcb32
+        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@0fe1a6e8f6d1ca952a67d8f962a0da9562a499cd
         with:
           osv-scanner-version: ${{ inputs.osv-scanner-version }}
           fail-on-severity: ${{ inputs.osv-fail-on-severity }}
