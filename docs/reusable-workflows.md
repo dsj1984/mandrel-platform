@@ -556,7 +556,9 @@ no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
   version + per-platform SHA-256 checksum map and selects the binary asset per
   platform (darwin/linux × arm64/x64), verifying it before execution. Bumping
   the gitleaks release is a single edit inside that composite — there is no
-  per-workflow version input or checksum copy.
+  per-workflow version input or checksum copy. For suppressing a known false
+  positive, see [Secret-scan allowlist](#secret-scan-allowlist-config-path)
+  below — a required check needs an escape that is not turning it off.
 - **SAST** — pinned Semgrep, scoped via `--baseline-commit` to the same shared
   derivation, so only findings **introduced** by the event block: the
   merge-base of `base..head` on `pull_request`, `merge_group.base_sha` on
@@ -577,6 +579,46 @@ no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
 > before it entered the queue. No caller change is needed — declaring
 > `on: merge_group` in your caller and adding the reusable workflow's
 > `ci-required` context to the queue's required checks is sufficient.
+
+#### Secret-scan allowlist (`config-path`)
+
+**The failure this fixes.** The secret scan exposed no seam for suppressing a
+known false positive. Ordinary prose that happened to match the generic-secret
+heuristic blocked a docs-only PR, and the only ways out were rewording the
+source or turning the whole tier off — a required check whose sole escape is
+disabling it teaches the fleet to route around the security tier.
+
+The `gitleaks-scan` composite action accepts a caller-supplied gitleaks TOML
+config, passed straight through as `--config`:
+
+```yaml
+- name: Secret scan (pinned gitleaks, blocking)
+  uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
+  with:
+    config-path: .gitleaks.toml
+```
+
+```toml
+# .gitleaks.toml — extends the default ruleset, narrows exactly one finding.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Prose in the runbook that matches the generic-secret rule"
+paths = ['''docs/reusable-workflows\.md''']
+```
+
+**The config must extend the default ruleset.** A gitleaks config that omits
+`[extend] useDefault = true` *replaces* the rules rather than adding to them —
+which would make `config-path` a supported way to delete every rule and still
+report green. The step rejects such a config by name and does not run the scan.
+A repo that genuinely ships its own complete rule set opts in explicitly with
+`allow-default-rule-replacement: 'true'`.
+
+Both inputs default to off (`''` / `'false'`), so a caller that passes neither
+gets the previous behaviour byte-for-byte. Suppressing one finding leaves every
+other rule blocking, and the tier stays blocking throughout — the allowlist is
+reviewable in the diff, which `non-blocking: 'true'` never was.
 
 Toggle matrix:
 
@@ -1031,11 +1073,34 @@ subtracts:
 | Present in **both** the head scan and the merge-base scan | **Pre-existing** — reported in the job summary, does **not** block |
 | Present in the **head scan only** | **PR-introduced** — blocks exactly as before |
 
-Baseline identity includes the **version**, so bumping an advisory-bearing
-dependency to *another still-vulnerable version* is a head-only finding and
-correctly blocks. Using a second scan rather than parsing lockfiles keeps the
-comparison correct for **every ecosystem** OSV-scanner supports — a
-per-ecosystem parser would silently under-block on any format it did not know.
+Using a second scan rather than parsing lockfiles keeps the comparison correct
+for **every ecosystem** OSV-scanner supports — a per-ecosystem parser would
+silently under-block on any format it did not know.
+
+**Attribution follows the advisory, not the version string.** Baseline identity
+carries the version, so a finding whose version moved is not an exact match.
+That alone used to re-attribute an untouched advisory to whichever PR raised
+the floor: bumping a package that carries an **unfixable** advisory re-reported
+that advisory as PR-introduced purely because the version string changed, and
+consumers measured the same advisory demoted at one version and blocking at the
+next after a strictly-forward bump. So a version-moved finding is resolved
+against the advisory's own OSV `affected` ranges:
+
+| Same advisory + package + source as the baseline, at another version | Verdict |
+| --- | --- |
+| The advisory **no longer covers** the new version | **Pre-existing** — a strictly-forward move out of range is not an introduction |
+| The advisory **still covers** the new version | **Blocks** — one vulnerable version to another is a real finding |
+| The report carries **no readable range data** | **Blocks** — unknown is never a demotion |
+
+The version stays in the identity; what changed is that the gate now *asks* the
+advisory whether the new version is still in scope rather than inferring an
+introduction from a moved string. A brand-new advisory id, or a known advisory
+reaching a package that did not previously carry it, matches no baseline
+identity at all and blocks unconditionally.
+
+The **finding digest** that drives the scheduled tracking-issue upsert derives
+from that same identity function rather than re-spelling it, so the two can
+never drift apart and an unchanged finding set never churns the issue.
 
 **It costs nothing on a clean tree.** The baseline scan runs *only* when the
 head scan produced at least one blocking finding. A green PR pays exactly what
@@ -1187,6 +1252,33 @@ warning, and blocking findings apart at a glance:
 > unchanged. It also does not change the default `osv-fail-on-severity` or
 > `enable-osv-scan` values; suppression narrows what blocks within whatever
 > band a consumer has already configured.
+
+#### Unbounded dependency overrides (`scripts/audit-check.mjs`)
+
+The CVE gate also lints the `overrides` / `resolutions` / `pnpm.overrides`
+blocks of `package.json` and **fails on any override expressed as an unbounded
+lower bound**, naming the package and the bound.
+
+An override *rewrites* a transitive dependent's declared range, so whatever is
+written there is the only thing between the tree and the next release of that
+package. Written as `">=1.2.3"` (or `"*"`, or a dist-tag) it is open-ended: the
+committed lockfile becomes the sole pin, and the moment anything re-resolves —
+a fresh install, a lockfile-less CI leg, a dependent's own bump — the newest
+release wins and can cross a **major**. That is how a major jump silently
+emptied a consumer's test suite. Two consumers derived this rule independently
+after the fact, and both then found further already-escaped overrides; nothing
+in the toolchain looked for one.
+
+| Override value | Verdict |
+| --- | --- |
+| `"^1.2.3"`, `"~1.2.3"`, `"1.2.x"`, `"1.2.3"`, `">=1.2.3 <2.0.0"` | Passes — cannot cross a major on its own |
+| `">=1.2.3"`, `"> 1.2.3"`, `"*"`, `"latest"`, `""` | **Fails** — no upper bound |
+| `"^1.0.0 \|\| >=2.0.0"` | **Fails** — a union is only as bounded as its loosest arm |
+
+A dependent-scoped nested override is checked too and reported by its full
+path (`overrides.some-dep.left-pad`). The check runs **before** `pnpm audit`,
+so it costs nothing and reports even when the audit itself cannot run. Point it
+at a non-default manifest with `--package-json <path>`.
 
 ### Wrangler-baseline check (`enable-wrangler-baseline-check`)
 

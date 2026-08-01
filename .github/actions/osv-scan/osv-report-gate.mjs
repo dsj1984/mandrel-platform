@@ -104,16 +104,167 @@ export function normalizeSource(source, scanRoot = "") {
  * Deliberately includes `@version`: a PR that bumps an advisory-bearing
  * dependency to ANOTHER still-vulnerable version produces a key absent from
  * the baseline, and therefore correctly blocks rather than inheriting the
- * pre-existing demotion.
+ * pre-existing demotion. That guard is NOT relaxed — see `rowIdentity` for the
+ * version-free companion and `classify` for how the two combine.
  */
 export function rowKey(row) {
   const ids = [...(row?.ids || [])].sort().join("+");
   return `${ids}|${row?.ecosystem ?? ""}:${row?.name ?? ""}@${row?.version ?? ""}|${row?.source ?? ""}`;
 }
 
-/** Build the lookup a `classify({ baseline })` call consumes from baseline rows. */
+/**
+ * Version-free identity: advisory ids + package + source (Story #365).
+ *
+ * A strictly-forward bump moves `rowKey` even when the advisory, the package
+ * and the source are untouched, so the exact key alone re-attributes an
+ * untouched advisory to whichever PR raised the floor. This companion answers
+ * "is this the SAME finding, at a different version?" — the exact key still
+ * answers "is this byte-for-byte the finding the baseline carried?".
+ *
+ * The two never collide: `rowKey` carries an `@version` segment this does not.
+ * That is what lets a single Set hold both (see `buildBaselineSet`) without a
+ * second lookup structure, and keeps a legacy key-only baseline safe: it
+ * simply never matches here and the finding stays blocking (fail closed).
+ */
+export function rowIdentity(row) {
+  const ids = [...(row?.ids || [])].sort().join("+");
+  return `${ids}|${row?.ecosystem ?? ""}:${row?.name ?? ""}|${row?.source ?? ""}`;
+}
+
+/**
+ * Build the lookup a `classify({ baseline })` call consumes from baseline rows.
+ *
+ * Carries BOTH identities so `classify` can distinguish "identical finding"
+ * from "same advisory on the same package at another version" without a second
+ * argument. The two key shapes are disjoint by construction.
+ */
 export function buildBaselineSet(rows) {
-  return new Set((rows || []).map(rowKey));
+  const set = new Set();
+  for (const row of rows || []) {
+    set.add(rowKey(row));
+    set.add(rowIdentity(row));
+  }
+  return set;
+}
+
+/**
+ * Compare two dotted version strings, newest-last (`-1` / `0` / `1`), or null
+ * when either side is not comparable.
+ *
+ * Deliberately small: this exists only to evaluate OSV `affected.ranges`
+ * events, where both sides come from the same advisory record and the same
+ * ecosystem. A shape it cannot read yields null, which every caller treats as
+ * "unknown" and therefore fails closed.
+ */
+export function compareVersions(a, b) {
+  const split = (v) => {
+    if (typeof v !== "string") return null;
+    const trimmed = v.trim().replace(/^[v=]/, "");
+    if (trimmed === "" || trimmed === "?") return null;
+    const [core, pre = null] = trimmed.split("+")[0].split("-", 2);
+    const parts = core.split(".");
+    if (parts.some((p) => !/^\d+$/.test(p))) return null;
+    return { parts: parts.map(Number), pre };
+  };
+
+  const left = split(a);
+  const right = split(b);
+  if (!left || !right) return null;
+
+  const len = Math.max(left.parts.length, right.parts.length);
+  for (let i = 0; i < len; i++) {
+    const l = left.parts[i] ?? 0;
+    const r = right.parts[i] ?? 0;
+    if (l !== r) return l < r ? -1 : 1;
+  }
+
+  // A prerelease sorts BELOW the release it leads to (1.0.0-rc1 < 1.0.0).
+  if (left.pre === right.pre) return 0;
+  if (left.pre === null) return 1;
+  if (right.pre === null) return -1;
+  return left.pre < right.pre ? -1 : 1;
+}
+
+/** Does one OSV `affected` range cover `version`? Null when unreadable. */
+function rangeCovers(range, version) {
+  const events = Array.isArray(range?.events) ? range.events : [];
+  if (events.length === 0) return null;
+
+  let introduced = null;
+  let sawUsableEvent = false;
+
+  for (const event of events) {
+    if (typeof event?.introduced === "string") {
+      introduced = event.introduced === "0" ? "0.0.0" : event.introduced;
+      sawUsableEvent = true;
+      continue;
+    }
+    const upper = typeof event?.fixed === "string" ? event.fixed : null;
+    const lastAffected = typeof event?.last_affected === "string" ? event.last_affected : null;
+    if (upper === null && lastAffected === null) continue;
+    sawUsableEvent = true;
+    if (introduced === null) continue;
+
+    const fromLower = compareVersions(version, introduced);
+    if (fromLower === null) return null;
+    if (fromLower >= 0) {
+      if (upper !== null) {
+        const toUpper = compareVersions(version, upper);
+        if (toUpper === null) return null;
+        if (toUpper < 0) return true;
+      } else {
+        const toUpper = compareVersions(version, lastAffected);
+        if (toUpper === null) return null;
+        if (toUpper <= 0) return true;
+      }
+    }
+    introduced = null;
+  }
+
+  if (!sawUsableEvent) return null;
+  // An unterminated `introduced` runs to infinity — everything at or above it
+  // is still affected.
+  if (introduced !== null) {
+    const fromLower = compareVersions(version, introduced);
+    if (fromLower === null) return null;
+    if (fromLower >= 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Is this finding's version still covered by the advisory that produced it?
+ *
+ * Returns true (still vulnerable), false (the advisory no longer reaches this
+ * version), or **null when the report carries no readable `affected` data** —
+ * and null is load-bearing. Every caller treats unknown as "still covered", so
+ * a report shape without version ranges keeps the pre-Story-#365 blocking
+ * behaviour rather than opening the gate on an unproven claim.
+ */
+export function isVersionCovered(row) {
+  const entries = (row?.affected || []).filter((entry) => {
+    const name = entry?.package?.name;
+    if (typeof name === "string" && name !== row.name) return false;
+    const ecosystem = entry?.package?.ecosystem;
+    if (typeof ecosystem === "string" && row.ecosystem && ecosystem !== row.ecosystem) return false;
+    return true;
+  });
+  if (entries.length === 0) return null;
+
+  let readable = false;
+  for (const entry of entries) {
+    if (Array.isArray(entry?.versions) && entry.versions.length > 0) {
+      readable = true;
+      if (entry.versions.some((v) => String(v) === String(row.version))) return true;
+    }
+    for (const range of entry?.ranges || []) {
+      const covered = rangeCovers(range, row.version);
+      if (covered === null) return null;
+      readable = true;
+      if (covered) return true;
+    }
+  }
+  return readable ? false : null;
 }
 
 /**
@@ -161,12 +312,18 @@ export function collectRows(report, { scanRoot = "" } = {}) {
       const version = pkg.package?.version || "?";
       const ecosystem = pkg.package?.ecosystem || "";
 
-      // Group rows carry the severity but not the publish date; the date lives
-      // on the per-vulnerability entries the group's ids reference.
+      // Group rows carry the severity but not the publish date or the version
+      // ranges; both live on the per-vulnerability entries the group's ids
+      // reference. `affected` is what lets the diff-aware gate ask whether a
+      // bumped version is still covered by the advisory (Story #365).
       const publishedById = new Map();
+      const affectedById = new Map();
       for (const v of pkg.vulnerabilities || []) {
-        if (v?.id && typeof v.published === "string") publishedById.set(v.id, v.published);
+        if (!v?.id) continue;
+        if (typeof v.published === "string") publishedById.set(v.id, v.published);
+        if (Array.isArray(v.affected)) affectedById.set(v.id, v.affected);
       }
+      const affectedFor = (ids) => (ids || []).flatMap((id) => affectedById.get(id) || []);
 
       for (const group of pkg.groups || []) {
         const score = Number.parseFloat(group.max_severity ?? "");
@@ -180,6 +337,7 @@ export function collectRows(report, { scanRoot = "" } = {}) {
           score,
           ids,
           published: earliestPublished(ids, publishedById),
+          affected: affectedFor(ids),
         });
       }
       if ((pkg.groups || []).length === 0) {
@@ -193,6 +351,7 @@ export function collectRows(report, { scanRoot = "" } = {}) {
             score: NaN,
             ids: [v.id || "(unknown)"],
             published: typeof v.published === "string" ? v.published : null,
+            affected: Array.isArray(v.affected) ? v.affected : [],
           });
         }
       }
@@ -359,9 +518,24 @@ export function classify(
       continue;
     }
 
-    if (baselineSet && baselineSet.has(rowKey(r))) {
-      preexisting.push(r);
-      continue;
+    // Attribution follows the advisory and the package, not the version string
+    // (Story #365). An identical finding is pre-existing outright. A finding
+    // whose advisory + package + source the baseline already carried, only at
+    // another version, is pre-existing ONLY when the advisory demonstrably no
+    // longer covers the new version — a strictly-forward move out of the
+    // advisory's range is not something the PR introduced. When the new version
+    // is still covered, or the report carries no readable range data, it keeps
+    // blocking: bumping from one vulnerable version to another is a real
+    // finding, and an unproven claim must never open the gate.
+    if (baselineSet) {
+      if (baselineSet.has(rowKey(r))) {
+        preexisting.push(r);
+        continue;
+      }
+      if (baselineSet.has(rowIdentity(r)) && isVersionCovered(r) === false) {
+        preexisting.push(r);
+        continue;
+      }
     }
     if (withinGraceWindow(r, midnight, graceWindow)) {
       grace.push(r);
@@ -517,11 +691,14 @@ export function renderSummary(verdictSet, { heading = "OSV advisory scan" } = {}
  * so it must depend on the finding identity (advisory ids + package + version
  * + source) and NOT on ordering, scan timestamps, or the below-gate rows —
  * otherwise an unchanged advisory set would rewrite the issue body daily.
+ *
+ * It derives from `rowKey` rather than re-spelling that format inline (Story
+ * #365). The two were byte-identical strings maintained in two places: any
+ * future move of the finding identity would have silently churned the tracking
+ * issue for every consumer until someone noticed the copy had drifted.
  */
 export function findingsDigest(blocking) {
-  const keys = blocking
-    .map((r) => `${[...r.ids].sort().join("+")}|${r.ecosystem}:${r.name}@${r.version}|${r.source}`)
-    .sort();
+  const keys = blocking.map(rowKey).sort();
   // FNV-1a — a short, dependency-free, stable hash; this is a change-detector,
   // not a security primitive.
   let hash = 0x811c9dc5;

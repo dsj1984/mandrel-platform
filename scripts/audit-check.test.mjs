@@ -30,7 +30,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -43,6 +43,9 @@ import {
   parseArgs,
   loadAllowlist,
   runCli,
+  isBoundedOverride,
+  findUnboundedOverrides,
+  lintOverrides,
 } from "./audit-check.mjs";
 
 const TODAY = "2026-07-02";
@@ -455,4 +458,173 @@ test("loadAllowlist: non-array throws", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Unbounded dependency overrides (Story #365)
+//
+// The failure these close: nothing lints for an unbounded override. Written as
+// a bare lower bound it rewrites a dependent's range open-endedly, leaving the
+// committed lockfile as the only pin — so any fresh resolution re-picks the
+// newest release and can cross a major. Two consumers derived this rule
+// independently after a major jump silently emptied a test suite, and both
+// then found further already-escaped overrides.
+// ---------------------------------------------------------------------------
+
+test("isBoundedOverride: a bare lower bound is unbounded; a capped range is not", () => {
+  for (const unbounded of [">=1.2.3", "> 1.2.3", ">=0", "*", "x", "latest", "", "   "]) {
+    assert.equal(isBoundedOverride(unbounded), false, `${JSON.stringify(unbounded)} is unbounded`);
+  }
+  for (const bounded of ["1.2.3", "^1.2.3", "~1.2.3", "1.2.x", ">=1.2.3 <2.0.0", "<2.0.0"]) {
+    assert.equal(isBoundedOverride(bounded), true, `${JSON.stringify(bounded)} is bounded`);
+  }
+});
+
+test("isBoundedOverride: a || union is only as bounded as its loosest arm", () => {
+  assert.equal(isBoundedOverride("^1.0.0 || ^2.0.0"), true);
+  assert.equal(isBoundedOverride("^1.0.0 || >=2.0.0"), false);
+});
+
+test("isBoundedOverride: an npm: alias is judged on the range it carries", () => {
+  assert.equal(isBoundedOverride("npm:other-pkg@^1.2.3"), true);
+  assert.equal(isBoundedOverride("npm:@scope/other@^1.2.3"), true);
+  assert.equal(isBoundedOverride("npm:other-pkg@>=1.2.3"), false);
+  // An alias with no range at all pins nothing.
+  assert.equal(isBoundedOverride("npm:other-pkg"), false);
+});
+
+test("AC-5: findUnboundedOverrides names the package and the bound", () => {
+  const findings = findUnboundedOverrides({
+    pnpm: { overrides: { "left-pad": ">=1.3.0", semver: "^7.5.2" } },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].package, "left-pad");
+  assert.equal(findings[0].bound, ">=1.3.0");
+  assert.equal(findings[0].field, "pnpm.overrides");
+});
+
+test("AC-5: every override field is checked, npm and pnpm and yarn alike", () => {
+  const findings = findUnboundedOverrides({
+    overrides: { a: ">=1.0.0" },
+    resolutions: { b: "*" },
+    pnpm: { overrides: { c: ">2" } },
+  });
+  assert.deepEqual(
+    findings.map((f) => `${f.field}.${f.package}`).sort(),
+    ["overrides.a", "pnpm.overrides.c", "resolutions.b"],
+  );
+});
+
+test("AC-5: a nested (dependent-scoped) override is named by its full path", () => {
+  const findings = findUnboundedOverrides({
+    overrides: { "some-dep": { "left-pad": ">=1.3.0" } },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].package, "some-dep.left-pad");
+  assert.equal(findings[0].bound, ">=1.3.0");
+});
+
+test("AC-6: an override that pins a bounded range passes", () => {
+  assert.deepEqual(
+    findUnboundedOverrides({
+      overrides: { a: "^1.2.3", b: "~2.0.0", c: "3.1.4", d: ">=1.0.0 <2.0.0" },
+      pnpm: { overrides: { e: "1.2.x" } },
+    }),
+    [],
+  );
+});
+
+test("findUnboundedOverrides: a package.json with no overrides at all is clean", () => {
+  assert.deepEqual(findUnboundedOverrides({ name: "x", dependencies: { a: ">=1.0.0" } }), []);
+  assert.deepEqual(findUnboundedOverrides(null), []);
+  assert.deepEqual(findUnboundedOverrides("not-an-object"), []);
+});
+
+test("AC-5: runCli fails on an unbounded override before pnpm ever runs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-override-"));
+  try {
+    const packageJsonPath = join(dir, "package.json");
+    writeFileSync(
+      packageJsonPath,
+      JSON.stringify({ name: "fixture", pnpm: { overrides: { "left-pad": ">=1.3.0" } } }),
+    );
+    // An absent allowlist keeps this case about the override and nothing else.
+    const exit = runCli([
+      "--package-json",
+      packageJsonPath,
+      "--allowlist",
+      join(dir, "no-such-allowlist.json"),
+    ]);
+    assert.equal(exit, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AC-6: the override gate passes a bounded override, reaching the audit", () => {
+  // Executes the clean path rather than asserting around it. lintOverrides is
+  // the gate runCli delegates to, split out precisely so a PASS is provable
+  // without `pnpm audit` (which needs a real lockfile and a network).
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-bounded-"));
+  try {
+    const packageJsonPath = join(dir, "package.json");
+    writeFileSync(
+      packageJsonPath,
+      JSON.stringify({
+        name: "fixture",
+        overrides: { a: "^1.3.0", b: ">=1.0.0 <2.0.0" },
+        pnpm: { overrides: { "left-pad": "~1.3.0" } },
+      }),
+    );
+    assert.equal(lintOverrides(packageJsonPath), 0);
+    assert.equal(parseArgs(["--package-json", packageJsonPath]).packageJsonPath, packageJsonPath);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AC-5: the override gate blocks an unbounded override", () => {
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-lint-"));
+  try {
+    const packageJsonPath = join(dir, "package.json");
+    writeFileSync(packageJsonPath, JSON.stringify({ overrides: { "left-pad": ">=1.3.0" } }));
+    assert.equal(lintOverrides(packageJsonPath), 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the override gate is a no-op when there is no package.json to read", () => {
+  assert.equal(lintOverrides(join(tmpdir(), "audit-check-absent-xyz", "package.json")), 0);
+});
+
+test("this repo's own package.json passes the override gate", () => {
+  // The lint ships enabled by default; a false positive here would red the
+  // platform's own required check on every PR.
+  assert.deepEqual(findUnboundedOverrides(JSON.parse(readFileSync("package.json", "utf8"))), []);
+});
+
+test("runCli: an unparseable package.json is a hard error, not a skipped check", () => {
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-badpkg-"));
+  try {
+    const packageJsonPath = join(dir, "package.json");
+    writeFileSync(packageJsonPath, "{ not json");
+    assert.equal(
+      runCli([
+        "--package-json",
+        packageJsonPath,
+        "--allowlist",
+        join(dir, "no-such-allowlist.json"),
+      ]),
+      1,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseArgs defaults the package.json path alongside the allowlist path", () => {
+  const { allowlistPath, packageJsonPath } = parseArgs([], "/tmp/proj");
+  assert.equal(allowlistPath, "/tmp/proj/audit-allowlist.json");
+  assert.equal(packageJsonPath, "/tmp/proj/package.json");
 });
