@@ -408,14 +408,44 @@ on:
         type: string
         default: ''
 
-      # Cache toggle for the setup-toolchain composite action.
+      # Cache toggle for the setup-toolchain composite action (Story #364).
+      #
+      # The default is the LITERAL string 'auto', not 'true'. 'true' was only
+      # ever correct for GitHub-hosted callers: on a self-hosted runner that
+      # already maintains a warm pnpm store, enabling the cache adds a post-job
+      # SAVE of that store over the caller's link. That save runs AFTER every
+      # work step has reported success, inside the job's own `timeout-minutes`,
+      # so a slow save is killed as a timeout — and GitHub records a timeout
+      # kill as `cancelled`, which `ci-required` maps to a red gate while every
+      # work step shows green. One consumer hit this on two different teardown
+      # steps at two different ceilings.
+      #
+      # The default CANNOT be an expression: this repo's portability lint
+      # (scripts/check-workflow-portability.mjs, Rule 2) prohibits `${{ }}` in a
+      # workflow_call input `default:`, and GitHub would not evaluate one there
+      # anyway — it resolves defaults during interface validation, before any
+      # runner context exists. So the literal 'auto' means "decide from the
+      # runner" and the decision is made where the value is USED (the
+      # setup-toolchain call site below), which is the only place `inputs.runner`
+      # is resolvable.
+      #
+      # Derivation, applied only when the value is still 'auto': runner labels
+      # naming `self-hosted` → 'false' (no post-job save); anything else →
+      # 'true' (unchanged hosted behaviour). Detection is deliberately
+      # self-hosted-side rather than a hosted-prefix allowlist, so a hosted
+      # caller on a larger-runner custom label keeps today's caching. A caller
+      # that passes 'true' or 'false' explicitly gets exactly that, on either
+      # runner class.
       toolchain-cache:
         description: >
-          Passed through to setup-toolchain's `cache` input. Set to 'false' on
-          self-hosted runners that maintain their own warm pnpm store.
+          Passed through to setup-toolchain's `cache` input. 'auto' (the
+          default) derives the value from the runner: 'false' when the runner
+          labels name self-hosted (a warm store makes the post-job save pure
+          cost, and the save is billed against this job's timeout), 'true'
+          otherwise. Pass 'true' or 'false' to pin it explicitly.
         required: false
         type: string
-        default: 'true'
+        default: 'auto'
 
       # pnpm STORE destination. Distinct from pnpm-dest below: that is where the
       # pnpm shim is installed (and is pre-cleaned every job), this is where the
@@ -870,11 +900,20 @@ jobs:
             echo "TURBO_SCM_* not exported; turbo --affected uses its own default base/head."
           fi
 
+      # The `cache` value resolves the 'auto' default here, at the USE site —
+      # the workflow_call `default:` cannot hold an expression (portability lint
+      # Rule 2 / GitHub interface validation), and `inputs.runner` is only
+      # resolvable once a job exists. Read as a two-level ternary:
+      #   explicit value ('true'/'false') → pass it through untouched;
+      #   'auto' → 'false' when the runner labels name self-hosted, else 'true'.
+      # Both `'true'` and `'false'` are non-empty strings and therefore truthy
+      # in Actions expressions, so the `&&`/`||` ternary carries either value
+      # through the first arm correctly.
       - &setup-toolchain
         name: Setup toolchain
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@71403dd6886633cc4831a8b0e621d32d832dcb32
         with:
-          cache: ${{ inputs.toolchain-cache }}
+          cache: ${{ inputs.toolchain-cache != 'auto' && inputs.toolchain-cache || (contains(inputs.runner, 'self-hosted') && 'false' || 'true') }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
           store-dir: ${{ inputs.toolchain-store-dir }}
           trust-lockfile: ${{ inputs.trust-lockfile }}
@@ -947,9 +986,20 @@ jobs:
       # own artifact uploads need. Anchored (`&explain-cancellation`) and
       # aliased IMMEDIATELY BEFORE `*cancel-on-failure` in every tier job, so
       # the cancel step remains the last step of every job.
+      #
+      # TIMEOUT PROVENANCE (Story #364). The gate is `cancelled()` alone, not
+      # `cancelled() && inputs.fail-fast`: a job killed for exceeding its own
+      # `timeout-minutes` is ALSO recorded as `cancelled`, and that is the case
+      # the operator has the least evidence for — every work step shows green
+      # and only the wall clock says otherwise. When no sibling tier failed,
+      # this cancellation is not fail-fast collateral, so the step says which
+      # remaining causes are live (this job's own ceiling — commonly consumed by
+      # a post-job teardown such as a cache save, which runs after the last work
+      # step reports success — or a run-wide cancel) instead of leaving the
+      # operator to infer it from timings.
       - &explain-cancellation
-        name: Explain fail-fast cancellation (collateral)
-        if: ${{ cancelled() && inputs.fail-fast }}
+        name: Explain cancellation (collateral or timeout)
+        if: ${{ cancelled() }}
         shell: bash
         timeout-minutes: 1
         env:
@@ -957,28 +1007,73 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
           TIER_ID: ${{ github.job }}
+          FAIL_FAST: ${{ inputs.fail-fast }}
         run: |
           set -uo pipefail
+          FAIL_FAST="${FAIL_FAST:-false}"
+
+          # `lookup_ok` is tracked SEPARATELY from `culprit` because the two
+          # empty-string cases mean opposite things: a lookup that succeeded and
+          # found no failing sibling is evidence (this is not collateral), while
+          # a lookup that failed or never ran is the absence of evidence. Folding
+          # them together would report a timeout diagnosis on a run where a
+          # sibling did fail and the API simply did not answer.
           culprit=""
+          lookup_ok=0
           if command -v gh >/dev/null 2>&1; then
-            culprit="$(gh run view "${RUN_ID}" --repo "${REPO}" --json jobs \
+            if culprit="$(gh run view "${RUN_ID}" --repo "${REPO}" --json jobs \
               --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")' \
-              2>/dev/null || true)"
+              2>/dev/null)"; then
+              lookup_ok=1
+            else
+              culprit=""
+            fi
           fi
-          if [ -n "${culprit}" ]; then
-            detail="the failing tier is: ${culprit}"
+
+          if [ "${FAIL_FAST}" = "true" ] && { [ -n "${culprit}" ] || [ "${lookup_ok}" -eq 0 ]; }; then
+            if [ -n "${culprit}" ]; then
+              detail="the failing tier is: ${culprit}"
+            else
+              detail="the failing tier could not be resolved from the Actions API — open the run summary and look for the 'fail-fast triggered by' annotation"
+            fi
+            echo "::notice title=fail-fast collateral::Tier '${TIER_ID}' was CANCELLED by fail-fast, not by its own failure — ${detail}."
+            {
+              echo "### ⏹️ Cancelled as fail-fast collateral"
+              echo
+              echo "Tier \`${TIER_ID}\` did **not** fail. It was cancelled because a sibling"
+              echo "tier failed and \`fail-fast: true\` cancelled run \`${RUN_ID}\`."
+              echo
+              echo "- ${detail}"
+              echo "- Do not triage this job — triage the failing tier above."
+            } >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if [ "${FAIL_FAST}" = "true" ]; then
+            unresolved="- fail-fast is enabled but no sibling tier reports \`failure\` — if one failed moments ago, triage that tier and ignore this job."
           else
-            detail="the failing tier could not be resolved from the Actions API — open the run summary and look for the 'fail-fast triggered by' annotation"
+            unresolved="- fail-fast is disabled on this run, so this job was not cancelled as collateral for a sibling tier."
           fi
-          echo "::notice title=fail-fast collateral::Tier '${TIER_ID}' was CANCELLED by fail-fast, not by its own failure — ${detail}."
+          echo "::notice title=cancelled without a failing sibling::Tier '${TIER_ID}' was CANCELLED and no sibling tier failed — suspect this job's own timeout-minutes (a post-job teardown such as a cache save is billed against it) or a run-wide cancel."
           {
-            echo "### ⏹️ Cancelled as fail-fast collateral"
+            echo "### ⏹️ Cancelled — no failing sibling tier"
             echo
-            echo "Tier \`${TIER_ID}\` did **not** fail. It was cancelled because a sibling"
-            echo "tier failed and \`fail-fast: true\` cancelled run \`${RUN_ID}\`."
+            echo "Tier \`${TIER_ID}\` reports \`cancelled\` in run \`${RUN_ID}\`, and no sibling"
+            echo "tier reports \`failure\`. \`ci-required\` counts \`cancelled\` as non-success,"
+            echo "so this still shows as a red gate — but it is not a work-step failure."
             echo
-            echo "- ${detail}"
-            echo "- Do not triage this job — triage the failing tier above."
+            echo "${unresolved}"
+            echo "- **This job's own \`timeout-minutes\`.** GitHub records a timeout kill as"
+            echo "  \`cancelled\`, not \`failure\`, and the ceiling covers the pre-job runner"
+            echo "  setup and every POST-job teardown — including a cache save, which starts"
+            echo "  only after the last work step has already reported success. A tier whose"
+            echo "  steps are all green but whose job is \`cancelled\` is this case. On a"
+            echo "  self-hosted runner with a warm store, set \`toolchain-cache: 'false'\`"
+            echo "  (or leave it at the derived \`'auto'\` default, which does that for you)"
+            echo "  so no store save is attempted; raise \`tier-timeouts\` only if the WORK"
+            echo "  itself needs the room."
+            echo "- **A run-wide cancel.** A superseded push or an operator cancel stops every"
+            echo "  tier the same way. Check whether a newer run exists for this ref."
           } >>"${GITHUB_STEP_SUMMARY}"
           exit 0
 

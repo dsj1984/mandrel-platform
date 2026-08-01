@@ -1,22 +1,35 @@
 # CodeQL SAST analysis — unconditional (Story #6).
 #
-# Analyzes javascript-typescript on pull_request, push to main, and a weekly
-# schedule. NOT gated on repository.visibility — runs on both public and
-# private repos (CodeQL is available via GitHub Actions on private repos).
+# Analyzes javascript-typescript. NOT gated on repository.visibility — runs on
+# both public and private repos (CodeQL is available via GitHub Actions on
+# private repos, with Advanced Security enabled).
 #
 # Consumable as a reusable workflow (workflow_call) or as a documented
 # copy-target for consumer repos (domio/swarm-os, athportal, etc.).
+#
+# TRIGGER SHAPE (Story #366). This workflow used to ALSO trigger itself
+# directly on `push` to main and `pull_request` against main. That standalone
+# run was advisory: it was not a required status context, so the delivery
+# path's native auto-merge — which waits only on required contexts — merged
+# straight past a new high-severity alert.
+#
+# The commit-time scan now runs as a `code-scanning` job inside ci.yml, which
+# is a `needs:` of the required `ci-required` aggregator, so it BLOCKS. The
+# direct push/pull_request triggers are removed rather than kept alongside it:
+# both paths analyze the same commit under the same `category`, so keeping
+# them would run two 30-minute analyses per event and have the later SARIF
+# upload overwrite the earlier one — for a check that still gated nothing.
+# ci.yml's own `push: [main]` trigger preserves the default-branch baseline
+# that PR alert diffing needs.
+#
+# What remains here: the weekly `schedule` sweep (which ci.yml has no trigger
+# for) and the `workflow_call` contract consumers pin — the latter deliberately
+# unchanged, so no consumer is newly required to run CodeQL.
 #
 # SHA-pinned third-party actions.
 name: CodeQL
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
   schedule:
     # Weekly on Monday at 08:00 UTC
     - cron: '0 8 * * 1'
@@ -27,6 +40,16 @@ on:
         required: false
         type: string
         default: 'javascript-typescript'
+      fail-on-alert-severity:
+        description: >-
+          Security severity at or above which open alerts on the analyzed ref
+          FAIL this job: low, medium, high, or critical. Empty (the default)
+          keeps the historical upload-and-report behaviour, so existing callers
+          are unaffected. Set it when the calling workflow gates a merge on
+          this job.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -43,12 +66,21 @@ jobs:
     # consumable via `workflow_call`, and a called workflow's WORKFLOW-level
     # `concurrency` is never evaluated (its jobs run inside the CALLER's run) —
     # so consumers got no dedup and rapid pushes stacked full 30-min analyses.
-    # Job-level works for both the direct push/PR/schedule triggers here AND
-    # the workflow_call path. Rapid pushes to the same ref stack full analyses
-    # without this; superseded runs are cancelled — only the newest commit's
-    # analysis matters. Keyed by github.ref (the analyzed ref).
+    # Job-level works for both the schedule trigger here AND the workflow_call
+    # path. Rapid pushes to the same ref stack full analyses without this;
+    # superseded runs are cancelled — only the newest commit's analysis
+    # matters. Keyed by github.ref (the analyzed ref).
+    #
+    # github.workflow is in the key (Story #366) because the group is now
+    # shared across trigger paths that are NOT substitutes for each other: the
+    # weekly schedule run and ci.yml's gating `code-scanning` call both land on
+    # refs/heads/main. Keyed by ref alone, whichever started second would
+    # cancel the other — and a cancelled scan reds the required aggregator, so
+    # a cron tick could fail an unrelated push. In a called workflow
+    # github.workflow resolves to the CALLER's workflow name, which separates
+    # the two cleanly while still deduping rapid pushes within each path.
     concurrency:
-      group: codeql-${{ github.ref }}
+      group: codeql-${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
     steps:
       # Shallow clone: CodeQL analyzes the checked-out tree; it does not need
@@ -69,3 +101,115 @@ jobs:
         uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
         with:
           category: '/language:${{ inputs.language || ''javascript-typescript'' }}'
+
+      # ── Alert gate (Story #366) ───────────────────────────────────────────
+      #
+      # `analyze` uploads SARIF and exits 0 no matter WHAT it found: a scan
+      # that just introduced a critical alert is a SUCCESSFUL job. GitHub reds
+      # a separate "Code scanning results" CHECK RUN for that — but a check run
+      # is not a job, so no aggregator can `needs:` it, and nothing waits on it
+      # unless it is registered as a required status context. A caller that
+      # gates a merge on this job alone therefore gates on "the scan ran", not
+      # on "the scan came back clean".
+      #
+      # This step closes that gap by reading the alerts the analysis just
+      # published for the analyzed ref and failing the JOB — which propagates
+      # through `needs:` to the caller's aggregator with no new status context.
+      #
+      # OPT-IN, so no consumer is affected: the input defaults to empty, and on
+      # the schedule trigger the `inputs` context is empty too, which the same
+      # condition skips.
+      #
+      # NEWNESS. The gate reads every OPEN alert on the analyzed ref, not a
+      # diff against the base. Against a clean default branch — the state this
+      # gate is adopted from and preserves — those are exactly the alerts the
+      # pull request introduced. Against a dirty one it errs toward blocking,
+      # which is the intended direction: it can demand the tree be cleaned, but
+      # never let a new alert through.
+      #
+      # INCONCLUSIVE READS FAIL. A non-200 from the alerts API (Advanced
+      # Security disabled on a private repo, a missing token scope, a transient
+      # 5xx) means the gate could not prove the ref clean. Passing there would
+      # be exactly the vacuous green this step exists to remove, so it retries
+      # briefly and then fails closed.
+      #
+      # `security-events: write` already covers the read, so a caller grants no
+      # new scope to enable this.
+      - name: Fail on alerts at or above the gating severity
+        if: inputs.fail-on-alert-severity != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ANALYSIS_REF: ${{ github.ref }}
+          THRESHOLD: ${{ inputs.fail-on-alert-severity }}
+        run: |
+          set -euo pipefail
+
+          severity_rank() {
+            case "$1" in
+              critical) echo 4 ;;
+              high)     echo 3 ;;
+              medium)   echo 2 ;;
+              low)      echo 1 ;;
+              *)        echo 0 ;;
+            esac
+          }
+
+          min_rank="$(severity_rank "${THRESHOLD}")"
+          if [ "${min_rank}" -eq 0 ]; then
+            echo "::error::fail-on-alert-severity must be one of low|medium|high|critical (got '${THRESHOLD}')."
+            exit 1
+          fi
+
+          # `analyze` runs with wait-for-processing enabled, so the alerts are
+          # normally queryable the moment it returns. The bounded retry only
+          # covers propagation lag and transient 5xx — it never converts a
+          # persistent failure into a pass.
+          alerts=""
+          for attempt in 1 2 3 4 5 6; do
+            if alerts="$(gh api \
+              "repos/${REPO}/code-scanning/alerts?ref=${ANALYSIS_REF}&state=open&per_page=100" \
+              2>/dev/null)"; then
+              break
+            fi
+            alerts=""
+            echo "Code scanning alerts not readable yet (attempt ${attempt}/6); retrying in 10s." >&2
+            sleep 10
+          done
+
+          if [ -z "${alerts}" ]; then
+            echo "::error::Could not read code scanning alerts for ${ANALYSIS_REF}. The scan did not conclusively report clean, so this gate fails closed."
+            exit 1
+          fi
+
+          blocking="$(jq -r --argjson min "${min_rank}" '
+            def rank: {"critical": 4, "high": 3, "medium": 2, "low": 1};
+            [ .[]
+              | ((.rule.security_severity_level // "") | ascii_downcase) as $sev
+              | select((rank[$sev] // 0) >= $min)
+              | "\($sev)\t\(.rule.id // "?")\t"
+                + "\(.most_recent_instance.location.path // "?"):"
+                + "\(.most_recent_instance.location.start_line // 0)\t"
+                + "\(.html_url // "")" ]
+            | .[]
+          ' <<<"${alerts}")"
+
+          if [ -n "${blocking}" ]; then
+            count="$(printf '%s\n' "${blocking}" | wc -l | tr -d ' ')"
+            {
+              echo "### ❌ Code scanning gate failed"
+              echo
+              echo "${count} open alert(s) at or above \`${THRESHOLD}\` on \`${ANALYSIS_REF}\`."
+              echo "Fix or dismiss them — this job gates the merge."
+              echo
+              echo '```'
+              printf '%s\n' "${blocking}"
+              echo '```'
+            } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+            printf '%s\n' "${blocking}" >&2
+            echo "::error::${count} open code scanning alert(s) at or above ${THRESHOLD} on ${ANALYSIS_REF}."
+            exit 1
+          fi
+
+          echo "✅ No open code scanning alerts at or above ${THRESHOLD} on ${ANALYSIS_REF}."

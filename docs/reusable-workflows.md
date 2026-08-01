@@ -121,7 +121,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
 | `semgrep-config`   | string  | `'vendored'`     | Semgrep ruleset for the SAST sub-step. Default `'vendored'` resolves to this reusable workflow's own checked-out, platform-controlled snapshot at `.semgrep/rules.json` (see [SAST ruleset provenance](#sast-ruleset-provenance-and-update-process)) — NOT the live registry. Override with a registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.** |
 | `sast-exclude`     | string  | `''`             | Extra Semgrep `--exclude` globs, space- or comma-separated (e.g. `'dist coverage tests/fixtures'`), **appended** to the built-in `.agents` exclude. Set to drop generated code / fixtures from the SAST target set. |
-| `toolchain-cache`  | string  | `'true'`         | Passed through to `setup-toolchain`'s `cache` input. Set `'false'` on self-hosted runners with a warm pnpm store.                              |
+| `toolchain-cache`  | string  | `'auto'`         | Passed through to `setup-toolchain`'s `cache` input. **`'auto'` derives the value from `runner`**: `'false'` when the runner labels name `self-hosted`, `'true'` otherwise (unchanged hosted behaviour). A self-hosted runner already has a warm store, so the cache only adds a **post-job save** — and that save runs after every work step reports success, inside the job's own `timeout-minutes`, so a slow one is killed as a timeout and recorded as `cancelled`, which `ci-required` reads as a red gate with every step green. Pass `'true'` or `'false'` to pin it explicitly on either runner class. See [Derived `toolchain-cache` default](#derived-toolchain-cache-default). |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
 | `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
 | `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest`; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
@@ -443,6 +443,64 @@ Semantics and caveats:
   need only `actions: read` — already covered by the `actions: write` the
   fail-fast cancel step requires.
 
+### Derived `toolchain-cache` default
+
+`toolchain-cache` defaults to the literal string `'auto'`, which means **decide
+from the runner**. It is passed to `setup-toolchain`'s `cache` input as:
+
+| `toolchain-cache` | `runner` names `self-hosted` | Effective `cache` |
+| ----------------- | ---------------------------- | ----------------- |
+| `'auto'` (default) | no                          | `'true'`          |
+| `'auto'` (default) | yes                         | `'false'`         |
+| `'true'`           | either                      | `'true'`          |
+| `'false'`          | either                      | `'false'`         |
+
+**Why the old `'true'` default was wrong for half the fleet.** Enabling the
+toolchain cache adds a **post-job save** of the pnpm store. On a GitHub-hosted
+runner that is the whole point — the runner is discarded, so the save is what
+makes the next run warm. On a self-hosted runner that already maintains a warm
+store, the save buys nothing and costs a large upload over the caller's own
+link. Critically, a post-job step runs **after every work step has reported
+success**, and it is billed against the same `timeout-minutes` those steps
+already spent. A slow save therefore exhausts the ceiling, GitHub kills the job,
+and it records the kill as **`cancelled` — not `failure`**. `ci-required` counts
+`cancelled` as non-success, so the caller sees a red required check on a job
+whose every step is green. One consumer hit this on two different teardown
+steps at two different ceilings, which is what makes it a default problem rather
+than a step problem.
+
+**Why the derivation is not in the `default:` field.** It cannot be. A
+`workflow_call` input `default:` may not contain a `${{ }}` expression — this
+repo's own portability lint (`scripts/check-workflow-portability.mjs`, Rule 2)
+rejects it, and GitHub resolves input defaults during interface validation,
+before any job exists and therefore before `inputs.runner` means anything. So
+the default stays a literal and the decision moves to the **use site**, the
+`Setup toolchain` step, which is the first point where the runner is known.
+
+**Detection is self-hosted-side on purpose.** The derivation asks whether the
+runner labels contain `self-hosted`, rather than allowlisting hosted prefixes
+like `ubuntu-`. A hosted caller on a larger-runner custom label therefore keeps
+today's caching untouched; only a caller that explicitly names `self-hosted`
+(directly or in a JSON label-array string such as
+`'["self-hosted","my-runner"]'`) opts into the no-save behaviour. A self-hosted
+pool whose labels omit `self-hosted` should pass `toolchain-cache: 'false'`
+explicitly.
+
+**Pinning still wins.** Any explicit `'true'` or `'false'` is passed through
+untouched on either runner class — the derivation applies only to the literal
+`'auto'`.
+
+The scheduled [`advisory-scan.yml`](#advisory-scanyml) workflow's
+identically-named input behaves identically.
+
+> **Related:** when a tier reports `cancelled` with no failing sibling, the
+> job's `Explain cancellation` step now says so in the run summary and names
+> the two live causes (this job's own ceiling, consumed by a post-job teardown
+> such as a cache save, or a run-wide cancel) instead of leaving the operator
+> to infer it from timings. Raise
+> [`tier-timeouts`](#caller-addressable-tier-timeouts-tier-timeouts) only when
+> the **work** needs the room.
+
 ### Affected-only tier execution (`affected`)
 
 By default every diff-scoped tier (lint, typecheck, unit, contract, e2e) runs
@@ -556,7 +614,9 @@ no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
   version + per-platform SHA-256 checksum map and selects the binary asset per
   platform (darwin/linux × arm64/x64), verifying it before execution. Bumping
   the gitleaks release is a single edit inside that composite — there is no
-  per-workflow version input or checksum copy.
+  per-workflow version input or checksum copy. For suppressing a known false
+  positive, see [Secret-scan allowlist](#secret-scan-allowlist-config-path)
+  below — a required check needs an escape that is not turning it off.
 - **SAST** — pinned Semgrep, scoped via `--baseline-commit` to the same shared
   derivation, so only findings **introduced** by the event block: the
   merge-base of `base..head` on `pull_request`, `merge_group.base_sha` on
@@ -577,6 +637,46 @@ no SARIF / Code Scanning upload is required, so the gate is load-bearing on a
 > before it entered the queue. No caller change is needed — declaring
 > `on: merge_group` in your caller and adding the reusable workflow's
 > `ci-required` context to the queue's required checks is sufficient.
+
+#### Secret-scan allowlist (`config-path`)
+
+**The failure this fixes.** The secret scan exposed no seam for suppressing a
+known false positive. Ordinary prose that happened to match the generic-secret
+heuristic blocked a docs-only PR, and the only ways out were rewording the
+source or turning the whole tier off — a required check whose sole escape is
+disabling it teaches the fleet to route around the security tier.
+
+The `gitleaks-scan` composite action accepts a caller-supplied gitleaks TOML
+config, passed straight through as `--config`:
+
+```yaml
+- name: Secret scan (pinned gitleaks, blocking)
+  uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
+  with:
+    config-path: .gitleaks.toml
+```
+
+```toml
+# .gitleaks.toml — extends the default ruleset, narrows exactly one finding.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Prose in the runbook that matches the generic-secret rule"
+paths = ['''docs/reusable-workflows\.md''']
+```
+
+**The config must extend the default ruleset.** A gitleaks config that omits
+`[extend] useDefault = true` *replaces* the rules rather than adding to them —
+which would make `config-path` a supported way to delete every rule and still
+report green. The step rejects such a config by name and does not run the scan.
+A repo that genuinely ships its own complete rule set opts in explicitly with
+`allow-default-rule-replacement: 'true'`.
+
+Both inputs default to off (`''` / `'false'`), so a caller that passes neither
+gets the previous behaviour byte-for-byte. Suppressing one finding leaves every
+other rule blocking, and the tier stays blocking throughout — the allowlist is
+reviewable in the diff, which `non-blocking: 'true'` never was.
 
 Toggle matrix:
 
@@ -1031,11 +1131,34 @@ subtracts:
 | Present in **both** the head scan and the merge-base scan | **Pre-existing** — reported in the job summary, does **not** block |
 | Present in the **head scan only** | **PR-introduced** — blocks exactly as before |
 
-Baseline identity includes the **version**, so bumping an advisory-bearing
-dependency to *another still-vulnerable version* is a head-only finding and
-correctly blocks. Using a second scan rather than parsing lockfiles keeps the
-comparison correct for **every ecosystem** OSV-scanner supports — a
-per-ecosystem parser would silently under-block on any format it did not know.
+Using a second scan rather than parsing lockfiles keeps the comparison correct
+for **every ecosystem** OSV-scanner supports — a per-ecosystem parser would
+silently under-block on any format it did not know.
+
+**Attribution follows the advisory, not the version string.** Baseline identity
+carries the version, so a finding whose version moved is not an exact match.
+That alone used to re-attribute an untouched advisory to whichever PR raised
+the floor: bumping a package that carries an **unfixable** advisory re-reported
+that advisory as PR-introduced purely because the version string changed, and
+consumers measured the same advisory demoted at one version and blocking at the
+next after a strictly-forward bump. So a version-moved finding is resolved
+against the advisory's own OSV `affected` ranges:
+
+| Same advisory + package + source as the baseline, at another version | Verdict |
+| --- | --- |
+| The advisory **no longer covers** the new version | **Pre-existing** — a strictly-forward move out of range is not an introduction |
+| The advisory **still covers** the new version | **Blocks** — one vulnerable version to another is a real finding |
+| The report carries **no readable range data** | **Blocks** — unknown is never a demotion |
+
+The version stays in the identity; what changed is that the gate now *asks* the
+advisory whether the new version is still in scope rather than inferring an
+introduction from a moved string. A brand-new advisory id, or a known advisory
+reaching a package that did not previously carry it, matches no baseline
+identity at all and blocks unconditionally.
+
+The **finding digest** that drives the scheduled tracking-issue upsert derives
+from that same identity function rather than re-spelling it, so the two can
+never drift apart and an unchanged finding set never churns the issue.
 
 **It costs nothing on a clean tree.** The baseline scan runs *only* when the
 head scan produced at least one blocking finding. A green PR pays exactly what
@@ -1187,6 +1310,33 @@ warning, and blocking findings apart at a glance:
 > unchanged. It also does not change the default `osv-fail-on-severity` or
 > `enable-osv-scan` values; suppression narrows what blocks within whatever
 > band a consumer has already configured.
+
+#### Unbounded dependency overrides (`scripts/audit-check.mjs`)
+
+The CVE gate also lints the `overrides` / `resolutions` / `pnpm.overrides`
+blocks of `package.json` and **fails on any override expressed as an unbounded
+lower bound**, naming the package and the bound.
+
+An override *rewrites* a transitive dependent's declared range, so whatever is
+written there is the only thing between the tree and the next release of that
+package. Written as `">=1.2.3"` (or `"*"`, or a dist-tag) it is open-ended: the
+committed lockfile becomes the sole pin, and the moment anything re-resolves —
+a fresh install, a lockfile-less CI leg, a dependent's own bump — the newest
+release wins and can cross a **major**. That is how a major jump silently
+emptied a consumer's test suite. Two consumers derived this rule independently
+after the fact, and both then found further already-escaped overrides; nothing
+in the toolchain looked for one.
+
+| Override value | Verdict |
+| --- | --- |
+| `"^1.2.3"`, `"~1.2.3"`, `"1.2.x"`, `"1.2.3"`, `">=1.2.3 <2.0.0"` | Passes — cannot cross a major on its own |
+| `">=1.2.3"`, `"> 1.2.3"`, `"*"`, `"latest"`, `""` | **Fails** — no upper bound |
+| `"^1.0.0 \|\| >=2.0.0"` | **Fails** — a union is only as bounded as its loosest arm |
+
+A dependent-scoped nested override is checked too and reported by its full
+path (`overrides.some-dep.left-pad`). The check runs **before** `pnpm audit`,
+so it costs nothing and reports even when the audit itself cannot run. Point it
+at a non-default manifest with `--package-json <path>`.
 
 ### Wrangler-baseline check (`enable-wrangler-baseline-check`)
 
@@ -2395,7 +2545,7 @@ jobs:
 | `osv-fail-on-severity`  | string | `'high'`                                         | Lowest CVSS band counted as a tracked finding (`none`…`critical`).                  |
 | `osv-scanner-version`   | string | `'2.4.0'`                                        | Pinned OSV-scanner version — must match the `osv-scan` composite's checksum map.     |
 | `osv-allowlist-path`    | string | `'.osv-allowlist.json'`                          | Path to the optional allow-list (same schema as the PR tier). Suppressed findings are reported in the issue, never raised. |
-| `toolchain-cache`       | string | `'true'`                                         | Passed to `setup-toolchain`'s `cache`. `'false'` on self-hosted runners with a warm store. |
+| `toolchain-cache`       | string | `'auto'`                                         | Passed to `setup-toolchain`'s `cache`. Identical derivation to the quality workflow's input: `'auto'` resolves to `'false'` when `runner` names `self-hosted` (a warm store makes the post-job save pure cost, and it is billed against this job's timeout), `'true'` otherwise. Pin explicitly with `'true'`/`'false'`. See [Derived `toolchain-cache` default](#derived-toolchain-cache-default). |
 | `pnpm-dest`             | string | `''`                                             | Passed to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set it explicitly. |
 | `tracking-issue-title`  | string | `'OSV advisory scan — default branch findings'`  | Title used when opening a new tracking issue.                                        |
 | `tracking-issue-labels` | string | `''`                                             | Comma-separated labels applied to the tracking issue and used to scope the lookup.  |
@@ -2845,20 +2995,100 @@ until wired here.
 
 ## `codeql.yml`
 
-CodeQL SAST analysis. It runs unconditionally on `push` to `main`,
-`pull_request` against `main`, and a weekly schedule, and is **also**
-consumable as a `workflow_call` target (or as a documented copy-target for
-consumer repos).
+CodeQL SAST analysis. It runs on a weekly schedule and is consumable as a
+`workflow_call` target (or as a documented copy-target for consumer repos).
+Commit-time analysis for this repository runs through `ci.yml`'s
+`code-scanning` job, which calls this workflow — see
+[Gating: repository-local, through the aggregator](#gating-repository-local-through-the-aggregator)
+below.
 
-| Input      | Type   | Default                     | When to override                          |
-| ---------- | ------ | --------------------------- | ----------------------------------------- |
-| `language` | string | `'javascript-typescript'`   | Set to analyze a different CodeQL language. |
+| Input                    | Type   | Default                   | When to override                                                                                                                      |
+| ------------------------ | ------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `language`               | string | `'javascript-typescript'` | Set to analyze a different CodeQL language.                                                                                            |
+| `fail-on-alert-severity` | string | `''` (off)                | Set to `low`/`medium`/`high`/`critical` to **fail this job** when the analyzed ref has open alerts at or above that security severity. |
+
+`fail-on-alert-severity` exists because `github/codeql-action/analyze` uploads
+its SARIF and exits `0` **whatever it found** — a scan that just introduced a
+critical alert is a *successful* job. GitHub reds a separate **Code scanning
+results** check run for that, but a check run is not a job: no aggregator can
+`needs:` it, and nothing waits on it unless it is registered as a required
+status context. Gating a merge on this job alone therefore gates on *the scan
+ran*, not on *the scan came back clean*. Passing a threshold makes the job
+itself fail, which propagates through `needs:` with no new status context.
+
+It is **opt-in and defaults to off**, so existing callers and the weekly
+schedule run keep the historical upload-and-report behaviour. Two properties
+worth knowing before you enable it:
+
+- **It reads every open alert on the analyzed ref**, not a diff against the
+  base. Against a clean default branch those are exactly the alerts the pull
+  request introduced; against a dirty one it errs toward blocking — it can
+  demand the tree be cleaned, but never lets a new alert through.
+- **An inconclusive read fails.** A non-200 from the alerts API (Advanced
+  Security disabled, a missing token scope, a transient 5xx) means the gate
+  could not prove the ref clean, so it retries briefly and then fails closed.
+
+`security-events: write` already covers the read, so enabling it grants no new
+scope.
 
 CodeQL is the **GHAS alternative** to `pr-quality.yml`'s Semgrep SAST sub-step:
 a consumer with GitHub Advanced Security can run this for blocking Code
 Scanning and set `enable-sast: false` on `pr-quality.yml`. It requires
 `security-events: write` permission and surfaces findings as Code Scanning
 alerts.
+
+### Gating: repository-local, through the aggregator
+
+**This gating is repository-local. It changes nothing for consumers.** No
+reusable workflow you call runs CodeQL, and `codeql.yml`'s `workflow_call`
+contract is unchanged — a consumer that does not call it gains no new job, and
+a consumer that does call it sees the same interface as before.
+
+Inside `mandrel-platform`, CodeQL used to run on `push`/`pull_request` but was
+**not** a required status context. The delivery path arms GitHub native
+auto-merge, which waits only on required contexts, so a pull request that
+introduced a new high-severity alert merged green — two ReDoS regressions
+reached `main` that way. "Landed" was not the same as "scanned".
+
+The fix routes through the **aggregator**, not through repository settings:
+
+- `ci.yml` declares a `code-scanning` job that calls `codeql.yml` — the same
+  dogfooding pattern its `security` job uses for `pr-quality.yml` — passing
+  `fail-on-alert-severity: high` so a concluded-but-dirty scan fails the job
+  rather than merely reporting.
+- The required `ci-required` aggregator lists `code-scanning` in `needs:`.
+
+So `requiredStatusChecks` is still the single entry `ci-required`: no branch
+protection is edited, and no phantom context can appear. That route is the
+correct one rather than an incidental convenience — declaring CodeQL's
+externally-visible check name in `docs/runbooks/main-protection.json` would
+fail `check-required-contexts.mjs`, which matches declared entries against job
+identifiers, while declaring the job identifier would name something GitHub
+cannot register as a context.
+
+The gate **fails toward blocking**. The aggregator passes a job that is
+`success` or `skipped` and fails everything else, `cancelled` included. The
+`code-scanning` job declares neither `if:` nor `needs:`, and a GitHub job can
+reach `skipped` only through a condition or a skipped dependency — so a scan
+that does not conclude cannot leave the aggregator green.
+`scripts/check-codeql-gating.test.mjs` pins that structurally, because the
+aggregator's `run:` block is byte-identical-mirrored with `pr-quality.yml` and
+cannot carry a job-specific special case.
+
+`codeql.yml`'s own `push`/`pull_request` triggers were removed when the
+`ci.yml` call was added: both analyze the same commit under the same
+`category`, so keeping them would run two 30-minute analyses per event and let
+the later SARIF upload overwrite the earlier one. The weekly `schedule` sweep
+stays here — `ci.yml` has no cron trigger.
+
+**Private repositories need Advanced Security.** CodeQL is free on public
+repositories; on a private one, code scanning requires GitHub Advanced
+Security, and a CodeQL job on a private repo without it fails closed on a
+`403`. `mandrel-platform` is public, which is why this gate is affordable
+here. The fleet's private consumers (`athportal`, `domio`, `swarm-os`) have
+code scanning disabled, so **the vendored Semgrep tier in `pr-quality.yml`
+remains the blocking SAST for consumers without Advanced Security** — CodeQL
+does not displace it.
 
 ---
 

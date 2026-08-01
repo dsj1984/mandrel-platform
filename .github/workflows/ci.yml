@@ -130,6 +130,34 @@ jobs:
       - name: Lint gh CLI flag combinations
         run: node scripts/check-workflow-gh-flags.mjs
 
+      # Release-type advisory (Story #368). Merges here are SQUASH, so the
+      # pull-request title becomes the commit subject release-please reads —
+      # and `ci`/`chore`/`docs`/`test`/`build`/`style` are configured hidden in
+      # release-please-config.json, cutting no release and never reaching the
+      # CHANGELOG. That is correct for an internal edit and wrong for a change
+      # to what this repo PUBLISHES: a consumer-facing workflow input already
+      # landed under a `ci:` title, shipped to nobody, and had to be
+      # re-released later. Nothing signalled it, because everything was green.
+      #
+      # ADVISORY BY DESIGN — the step exits 0 whatever it finds and reports via
+      # a `::warning::` annotation plus the job summary. Blocking a pull request
+      # on a heuristic over a human-written title would be worse than the defect
+      # it prevents. It is a STEP in this existing job, so it registers no new
+      # status context and needs no branch-protection change.
+      #
+      # The title arrives through the ENVIRONMENT, never interpolated into the
+      # `run:` shell — a pull-request title is attacker-controlled text and
+      # `${{ }}` inside a script body is a command-injection seam.
+      #
+      # Only `pull_request` runs carry a title; a push to `main` supplies an
+      # empty PR_TITLE and the check skips.
+      - name: Warn on a consumer-facing change under a non-releasing title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/check-release-type.mjs
+
       - name: Run unit tests
         run: npm test
 
@@ -295,6 +323,71 @@ jobs:
       # with startup_failure before any job runs — not just the unused job.
       pull-requests: read
 
+  # ── Code scanning tier (dogfood self-call of codeql.yml, Story #366) ──────
+  #
+  # CodeQL ran on this repo's own pull requests long before this job existed,
+  # but it was never a REQUIRED status context — and the delivery path arms
+  # GitHub native auto-merge, which waits only on required contexts. A pull
+  # request introducing a new high-severity alert therefore merged green
+  # (two ReDoS regressions reached main exactly that way): landed was not the
+  # same as scanned.
+  #
+  # The fix routes through the AGGREGATOR, not through repository settings.
+  # `ci-required` is this repo's one required context, so making the scan a
+  # `needs:` of it makes the scan load-bearing without registering a new
+  # context. That matters for two reasons:
+  #
+  #   1. docs/runbooks/main-protection.json lists only the aggregator by
+  #      design, and check-required-contexts.mjs matches declared entries
+  #      against JOB IDENTIFIERS. Declaring CodeQL's externally-visible check
+  #      name ("CodeQL / CodeQL Analysis") would fail that lint, while
+  #      declaring the job id would name something that is not registrable as
+  #      a context. The aggregator route needs neither.
+  #   2. No branch-protection edit is required here, and nothing outside this
+  #      repository has to be reconfigured.
+  #
+  # A CONCLUDED SCAN IS NOT A CLEAN SCAN. `codeql-action/analyze` uploads its
+  # SARIF and exits 0 whatever it found, so depending on this job alone would
+  # gate on "the scan ran", not on "the scan came back clean" — and the alert
+  # signal GitHub does red is a CHECK RUN, which no aggregator can `needs:`.
+  # `fail-on-alert-severity: high` makes codeql.yml fail the JOB on an open
+  # high/critical alert on the analyzed ref, which is what reaches the
+  # aggregator. The input is opt-in and defaults to empty, so passing it here
+  # changes nothing for any other caller. `high` matches the severity band the
+  # two ReDoS regressions landed at; the query pack and what CodeQL scans are
+  # untouched.
+  #
+  # FAIL TOWARD BLOCKING. The aggregator passes a job that is `success` or
+  # `skipped` and fails everything else, INCLUDING `cancelled`. This job
+  # therefore carries NO `if:` condition and NO `needs:` — with neither, a
+  # GitHub job cannot reach the `skipped` conclusion, so the only ways it can
+  # resolve are `success` (green) and failure/cancellation (red). A scan that
+  # does not conclude cannot leave the aggregator green.
+  # scripts/check-codeql-gating.test.mjs asserts that structurally, because
+  # the aggregator's own `run:` block is byte-identical-mirrored with
+  # pr-quality.yml and cannot carry a job-specific special case.
+  #
+  # Scope: repository-local. codeql.yml's `workflow_call` contract is
+  # untouched and no reusable workflow a consumer calls gains a CodeQL job —
+  # the fleet's private repos (athportal, domio, swarm-os) have code scanning
+  # disabled, where a CodeQL job would fail closed on a 403. The vendored
+  # Semgrep tier in the `security` job above remains the blocking SAST for
+  # them. See docs/reusable-workflows.md § codeql.yml.
+  code-scanning:
+    uses: ./.github/workflows/codeql.yml
+    with:
+      fail-on-alert-severity: high
+    permissions:
+      contents: read
+      # codeql.yml's analyze job uploads SARIF as Code Scanning alerts and
+      # reads the run's own Actions metadata. A called workflow's declared
+      # permissions are validated against the caller's grant at dispatch
+      # time, so both scopes must be granted here or the entire call fails
+      # with startup_failure before any job runs (the Story #292 lesson from
+      # the `security` job above).
+      security-events: write
+      actions: read
+
   # ── Aggregator: single required branch-protection context ─────────────────
   #
   # Mirrors the ci-required pattern from pr-quality.yml: a single stable
@@ -314,6 +407,11 @@ jobs:
       # finding fails this aggregator — the security gate is load-bearing on
       # the platform's own PRs through the existing required context.
       - security
+      # Dogfood code-scanning tier (Story #366): the codeql.yml self-call.
+      # Listing it here is the ENTIRE gating change — it turns CodeQL from an
+      # advisory check nothing waited on into a blocker of the one required
+      # context, with no branch-protection edit and no new context.
+      - code-scanning
     steps:
       # Self-maintaining aggregator: results are derived from `toJSON(needs)`,
       # so the `needs:` array above is the single source of truth — adding a
