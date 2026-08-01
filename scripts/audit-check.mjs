@@ -237,10 +237,19 @@ const NON_SEMVER_PROTOCOLS = [
  * listed `*`, `x` and `*.*.*` but not the dotted `x` forms, which is how the
  * exact shape the lint exists to catch read as bounded.
  *
+ * Deliberately answers for a SINGLE bare token only. A compound range spells
+ * its own upper bound out (`x.x <2.0.0`, `x.x.x - 2.0.0`) and is judged on
+ * that by the caller; reading the first dot-segment of the whole string would
+ * call such a range unbounded purely on its lower end.
+ *
  * @param {string} value trimmed specifier
  * @returns {boolean}
  */
 function isWildcardSpec(value) {
+  if (/\s/.test(value)) {
+    return false;
+  }
+
   if (/^(latest|next)$/i.test(value)) {
     return true;
   }

@@ -502,9 +502,11 @@ const WILDCARD_TRUTH_TABLE = [
   ["x.*", false],
   ["*.x.x", false],
   ["x.2.3", false],
+  ["*.x", false],
   ["latest", false],
   ["next", false],
   ["LATEST", false],
+  ["NEXT", false],
   ["1.x", true],
   ["1.X", true],
   ["1.*", true],
@@ -563,6 +565,29 @@ test("AC-3: a range carrying an explicit upper bound stays bounded", () => {
     ">=1.2.3 <2.0.0",
     "<2.0.0",
     "1.2.3 - 2.0.0",
+  ]) {
+    assert.equal(
+      isBoundedOverride(bounded),
+      true,
+      `${JSON.stringify(bounded)} is bounded`,
+    );
+  }
+});
+
+test("AC-3: a wildcard LOWER end still counts as bounded when the range caps it", () => {
+  // The wildcard test asks about the major position, so it may only be applied
+  // to a single bare token. Applied to a compound range it read the first
+  // dot-segment of the whole string and called `x.x <2.0.0` unbounded — a
+  // range that plainly carries an upper bound — while the equivalent
+  // `* <2.0.0` passed, because its first segment is `* <2`. That
+  // self-inconsistency is the tell: it was an artifact of check ordering.
+  for (const bounded of [
+    "x.x <2.0.0",
+    "x.x.x <2.0.0",
+    "* <2.0.0",
+    "x.x.x - 2.0.0",
+    "x - 2.0.0",
+    "* - 2.0.0",
   ]) {
     assert.equal(
       isBoundedOverride(bounded),
