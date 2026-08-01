@@ -36,6 +36,12 @@
 #       report-format: sarif
 #       report-path: gitleaks.sarif
 #
+# Usage (blocking scan with a caller-supplied allowlist — Story #365):
+#   - name: Secret scan (pinned gitleaks, blocking)
+#     uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@<sha>
+#     with:
+#       config-path: .gitleaks.toml   # must carry [extend] useDefault = true
+#
 # Cross-repo portability contract (scripts/check-workflow-portability.mjs):
 # no `${{ }}` expressions in input descriptions/defaults; reusable workflows
 # reference this action by absolute `owner/repo/path@<sha>` form only.
@@ -87,6 +93,27 @@ inputs:
       Required when report-format is set.
     required: false
     default: ''
+  config-path:
+    description: >
+      Optional path (relative to the workspace) to a caller-supplied gitleaks
+      TOML config, passed as --config. This is the supported way to suppress a
+      known false positive — ordinary prose matching the generic-secret
+      heuristic — without disabling the tier or rewording the source. The
+      config MUST extend the default ruleset ([extend] useDefault = true) so a
+      suppression narrows exactly one finding and leaves every other rule
+      blocking; a config that replaces the ruleset outright is rejected unless
+      allow-default-rule-replacement is 'true'. Empty (default) runs gitleaks
+      with its built-in ruleset, byte-for-byte as before.
+    required: false
+    default: ''
+  allow-default-rule-replacement:
+    description: >
+      Escape hatch for a config-path that deliberately does NOT extend the
+      default ruleset (a repo shipping its own complete rule set). Default
+      'false' — the useDefault guard is what keeps an allowlist from quietly
+      becoming a tier-wide opt-out.
+    required: false
+    default: 'false'
   non-blocking:
     description: >
       When 'true', a leak finding (or scan error) never fails this step —
@@ -189,6 +216,8 @@ runs:
         REPORT_FORMAT: ${{ inputs.report-format }}
         REPORT_PATH: ${{ inputs.report-path }}
         NON_BLOCKING: ${{ inputs.non-blocking }}
+        CONFIG_PATH: ${{ inputs.config-path }}
+        ALLOW_RULE_REPLACEMENT: ${{ inputs.allow-default-rule-replacement }}
       run: |
         set -euo pipefail
 
@@ -201,7 +230,32 @@ runs:
           exit 1
         fi
 
+        # Caller-supplied allowlist config (Story #365). A required check needs
+        # an escape that is not disabling it: this is the reviewable seam for a
+        # known false positive. The useDefault guard is the whole point — an
+        # allowlist that also replaces the ruleset would turn one suppression
+        # into a silent tier-wide opt-out, which is exactly what this input
+        # exists to avoid.
+        if [ -n "$CONFIG_PATH" ]; then
+          if [ ! -f "$CONFIG_PATH" ]; then
+            echo "::error::gitleaks config-path '${CONFIG_PATH}' does not exist in the checkout."
+            exit 1
+          fi
+          if [ "$ALLOW_RULE_REPLACEMENT" != "true" ] &&
+             ! grep -Eq '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true' "$CONFIG_PATH"; then
+            echo "::error::gitleaks config '${CONFIG_PATH}' must extend the default ruleset. Add:"
+            echo "::error::  [extend]"
+            echo "::error::  useDefault = true"
+            echo "::error::so an allowlist entry suppresses one finding and leaves every other rule blocking. Set allow-default-rule-replacement: 'true' only for a config that deliberately ships a complete rule set."
+            exit 1
+          fi
+          echo "Using caller-supplied gitleaks config: ${CONFIG_PATH}"
+        fi
+
         args=( "--redact=${REDACT}" --no-banner )
+        if [ -n "$CONFIG_PATH" ]; then
+          args=( "${args[@]}" --config "$CONFIG_PATH" )
+        fi
         if [ "$VERBOSE" = "true" ]; then
           args=( "${args[@]}" --verbose )
         fi

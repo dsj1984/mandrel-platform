@@ -18,16 +18,26 @@
  *   an uninterpretable report means the gate cannot prove the graph is
  *   clean, so it must fail closed rather than wave the build through.
  *
+ * Unbounded-override lint (Story #365):
+ *   A dependency override REWRITES a transitive dependent's declared range.
+ *   Written as a bare lower bound (`">=1.2.3"`, `"*"`) it is open-ended, so
+ *   the committed lockfile becomes the only pin and any fresh resolution
+ *   re-picks the newest release — which can cross a major. Nothing else in the
+ *   toolchain lints for that, so this gate names each such override and its
+ *   bound before it runs the audit.
+ *
  * Usage:
  *   node scripts/audit-check.mjs
  *   node scripts/audit-check.mjs --allowlist path/to/allowlist.json
+ *   node scripts/audit-check.mjs --package-json path/to/package.json
  *
  * Exit codes:
  *   0 — no blocking vulnerabilities (all High/Critical suppressed with
- *       valid, non-expired allowlist entries, or none found)
+ *       valid, non-expired allowlist entries, or none found) and every
+ *       dependency override carries an upper bound
  *   1 — one or more unsuppressed High/Critical CVEs, expired allowlist
- *       entries were encountered, or the audit report was uninterpretable
- *       while pnpm audit exited non-zero
+ *       entries were encountered, an override was unbounded, or the audit
+ *       report was uninterpretable while pnpm audit exited non-zero
  *
  * Allowlist format (JSON):
  *   [
@@ -184,6 +194,129 @@ export function partitionAllowlist(allowlist, today) {
 }
 
 /**
+ * Fields a package.json can express dependency overrides through. All three
+ * are checked, because a repo that has migrated package managers routinely
+ * carries more than one and an unbounded bound is equally open-ended in any
+ * of them.
+ */
+const OVERRIDE_FIELDS = ["overrides", "resolutions", "pnpm.overrides"];
+
+/**
+ * Is this override specifier bounded above?
+ *
+ * An override REWRITES a transitive dependent's declared range, so whatever is
+ * written here is the only thing standing between the tree and the next
+ * release of that package. A bare lower bound (`>=1.2.3`, `>1.2.3`, `*`,
+ * `latest`) leaves the committed lockfile as the sole pin: the moment anything
+ * re-resolves — a fresh install, a lockfile-less CI leg, a dependent's own
+ * bump — the newest release wins and can cross a major. That is how a major
+ * jump silently emptied a consumer's test suite.
+ *
+ * Bounded means the specifier can never cross a major on its own: an exact
+ * pin, a caret/tilde range, an `x`-style partial (`1.2.x`), or a compound
+ * range carrying an explicit upper bound (`>=1.2.3 <2`).
+ *
+ * @param {string} spec
+ * @returns {boolean}
+ */
+export function isBoundedOverride(spec) {
+  if (typeof spec !== "string") {
+    return false;
+  }
+
+  const value = spec.trim();
+  if (value === "") {
+    return false;
+  }
+
+  // `npm:other-pkg@<range>` and `pkg@<range>` alias forms are judged on the
+  // range they carry, not on the alias target.
+  if (value.startsWith("npm:")) {
+    const aliasMatch = /^npm:(?:@[^/]+\/)?[^@\s]+@(.+)$/.exec(value);
+    return aliasMatch ? isBoundedOverride(aliasMatch[1]) : false;
+  }
+
+  // A `||` union is only as bounded as its loosest arm.
+  if (value.includes("||")) {
+    return value.split("||").every((arm) => isBoundedOverride(arm));
+  }
+
+  // Wildcards and dist-tags pin nothing at all.
+  if (/^(\*|x|latest|next|\*\.\*(\.\*)?)$/i.test(value)) {
+    return false;
+  }
+
+  // An explicit upper bound anywhere in a compound range closes it.
+  if (/[<]/.test(value)) {
+    return true;
+  }
+
+  // A bare lower bound is the unbounded shape this check exists to name.
+  if (/^[>]=?/.test(value)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Report every override in `pkgJson` expressed as an unbounded lower bound.
+ *
+ * Pure and package-manager agnostic: the caller supplies the parsed
+ * package.json, so this is unit-testable without a fixture tree.
+ *
+ * @param {unknown} pkgJson parsed package.json
+ * @returns {Array<{ field: string; package: string; bound: string }>}
+ */
+export function findUnboundedOverrides(pkgJson) {
+  /** @type {Array<{ field: string; package: string; bound: string }>} */
+  const findings = [];
+
+  if (pkgJson === null || typeof pkgJson !== "object") {
+    return findings;
+  }
+
+  for (const field of OVERRIDE_FIELDS) {
+    /** @type {unknown} */
+    let node = pkgJson;
+    for (const segment of field.split(".")) {
+      node =
+        node !== null && typeof node === "object"
+          ? /** @type {Record<string, unknown>} */ (node)[segment]
+          : undefined;
+    }
+
+    if (node === null || typeof node !== "object" || Array.isArray(node)) {
+      continue;
+    }
+
+    for (const [name, spec] of Object.entries(
+      /** @type {Record<string, unknown>} */ (node),
+    )) {
+      // A nested override object scopes a bound to one dependent; recurse so a
+      // nested unbounded bound is named too, keyed by its full path.
+      if (spec !== null && typeof spec === "object" && !Array.isArray(spec)) {
+        for (const nested of findUnboundedOverrides({ overrides: spec })) {
+          findings.push({
+            field,
+            package: `${name}.${nested.package}`,
+            bound: nested.bound,
+          });
+        }
+        continue;
+      }
+
+      const bound = typeof spec === "string" ? spec : String(spec);
+      if (!isBoundedOverride(bound)) {
+        findings.push({ field, package: name, bound });
+      }
+    }
+  }
+
+  return findings;
+}
+
+/**
  * True when `report` has the recognizable pnpm-audit shape: an object with
  * an `advisories` object. This is the discriminator the fail-closed contract
  * hangs on — a parsed-but-unrecognizable report (e.g. an error envelope) is
@@ -308,10 +441,14 @@ export function evaluateReport(report, auditExitCode, suppressed) {
  */
 export function parseArgs(argv, cwd = process.cwd()) {
   let allowlistPath = null;
+  let packageJsonPath = null;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--allowlist" && argv[i + 1]) {
       allowlistPath = resolve(cwd, argv[i + 1]);
+      i++;
+    } else if (argv[i] === "--package-json" && argv[i + 1]) {
+      packageJsonPath = resolve(cwd, argv[i + 1]);
       i++;
     }
   }
@@ -319,8 +456,11 @@ export function parseArgs(argv, cwd = process.cwd()) {
   if (allowlistPath === null) {
     allowlistPath = resolve(cwd, "audit-allowlist.json");
   }
+  if (packageJsonPath === null) {
+    packageJsonPath = resolve(cwd, "package.json");
+  }
 
-  return { allowlistPath };
+  return { allowlistPath, packageJsonPath };
 }
 
 /**
@@ -372,7 +512,46 @@ function runPnpmAudit() {
  * @returns {number}
  */
 export function runCli(argv) {
-  const { allowlistPath } = parseArgs(argv);
+  const { allowlistPath, packageJsonPath } = parseArgs(argv);
+
+  // --- Lint dependency overrides -------------------------------------------
+  //
+  // Runs BEFORE the audit: an unbounded override is a standing invitation for
+  // the next resolution to cross a major, and nothing else in the toolchain
+  // looks for one. A missing or unparseable package.json is not this gate's
+  // business — the audit below is what proves the graph.
+  if (existsSync(packageJsonPath)) {
+    /** @type {unknown} */
+    let pkgJson = null;
+    try {
+      pkgJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    } catch (err) {
+      console.error(
+        `[audit-check] ERROR: could not parse ${packageJsonPath}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return 1;
+    }
+
+    const unbounded = findUnboundedOverrides(pkgJson);
+    if (unbounded.length > 0) {
+      console.error(
+        `[audit-check] ${unbounded.length} unbounded dependency override(s) in ${packageJsonPath}:`,
+      );
+      for (const finding of unbounded) {
+        console.error(
+          `  - ${finding.field}.${finding.package}: "${finding.bound}" has no upper bound`,
+        );
+      }
+      console.error(
+        "\n[audit-check] An override rewrites a dependent's range, so a bare lower bound leaves " +
+          "the lockfile as the only pin and lets a fresh resolution cross a major. Give each " +
+          'bound an upper limit — "^1.2.3", "~1.2.3", or ">=1.2.3 <2.0.0". Exit 1.',
+      );
+      return 1;
+    }
+  }
 
   // --- Load & validate the allowlist ---------------------------------------
 
