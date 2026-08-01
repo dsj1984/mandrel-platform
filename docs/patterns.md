@@ -100,6 +100,32 @@ Extending by specifier means a platform release propagates the new baseline to
 every consumer through a single Renovate version bump — closing the loop with
 the drift-control pattern above.
 
+### 4a. Adopting the bail-free Stryker base
+
+`stryker.base.json` sets `disableBail: true`. Under Stryker's default bail the
+vitest runner can mark a mutant Survived having **completed zero of its covering
+tests**, so the run reports a mutation score that no test actually produced —
+wrong in the direction that hides surviving mutants, not merely noisy. Two
+consequences for a consumer picking up this baseline:
+
+- **Re-derive any committed baseline captured before this change.** A baseline
+  taken under bail is a floor under an unmeasured number, and carrying it
+  forward keeps that floor in place. Delete the recorded score/threshold, run
+  the suite once on the new base, and commit the result as the new baseline.
+  Expect it to move — a consumer measured 53.5% under bail against a real
+  72.29%.
+- **Drop any local bail override.** A repo that worked around this with its own
+  `disableBail: true` in `stryker.config.json` can remove that key; the shared
+  base now carries it, and the local copy is redundant rather than harmful. A
+  consumer that never added one needs no action beyond the version bump.
+
+Because every mutant now runs its full covering set, runs get longer. The base
+raises `timeoutMS`, `timeoutFactor`, and `dryRunTimeoutMinutes` together with
+the flag so an overrun **fails loudly** instead of preserving the prior result
+and exiting clean. Consumers tightening any of the three locally reintroduce
+that silent-overrun mask; `scripts/stryker-base-config.test.mjs` guards the
+platform-side shape.
+
 ## 5. Drift control as the platform's control loop
 
 Patterns 1–4 compose into one operating loop: pin immutably (1), enforce with
