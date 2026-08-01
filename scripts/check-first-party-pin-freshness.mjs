@@ -26,13 +26,26 @@
  * consumer on a self-hosted fleet kept leaking ~164 MB per run into the
  * host-shared temp root on the latest release.
  *
+ * ## Why the comparison is the DIRECTORY, not the manifest (Story #379)
+ *
+ * The first cut of this checker compared only `action.yml`, which is
+ * structurally unable to protect a composite action whose behaviour lives in a
+ * sibling script — the majority of this repo's action surface. Story #365
+ * rewrote `.github/actions/osv-scan/osv-report-gate.mjs` (+189/-12) without
+ * touching `action.yml`, so this guard reported `osv-scan` fresh while both
+ * call sites ran a 689-line gate against 866 lines on `main`. The comparison
+ * is therefore the whole subpath tree — every file `git ls-tree -r <sha> --
+ * <subpath>` names, plus every tracked working-tree file under it, so an added
+ * or removed sibling is drift too.
+ *
  * This checker closes it by classifying every first-party SHA pin into one of
  * two failure classes — deliberately kept distinct, because their remedies
  * differ:
  *
- *   • `stale`       — the manifest AT THE PINNED SHA differs from the
- *                     working-tree manifest at the same subpath. The fix is to
- *                     BUMP the pin to a commit carrying the current manifest.
+ *   • `stale`       — the SUBPATH TREE at the pinned SHA differs from the
+ *                     working-tree copy — any file under it, not just the
+ *                     manifest. The fix is to BUMP the pin to a commit
+ *                     carrying the current tree.
  *   • `unreachable` — the pinned SHA is not an ancestor of the checked-out
  *                     ref. Typically a pre-squash branch commit: content-
  *                     identical to `main` today, resolvable only until GitHub
@@ -279,7 +292,106 @@ export function createGit(repoRoot) {
         return null;
       }
     },
+    /**
+     * Repo-relative paths of every blob a subpath covers AT `sha`. A directory
+     * subpath yields its whole tree; a file subpath yields just itself. `-z`
+     * so a path with a space or a quote survives intact.
+     */
+    lsTree(sha, subpath) {
+      try {
+        return run(["ls-tree", "-r", "--name-only", "-z", sha, "--", subpath])
+          .split("\0")
+          .filter(Boolean);
+      } catch {
+        return [];
+      }
+    },
+    /**
+     * Repo-relative paths of every TRACKED working-tree file under a subpath.
+     * Tracked, not on-disk: an ignored build artefact or a stray `.DS_Store`
+     * inside an action directory is not something a consumer ever runs.
+     */
+    lsFiles(subpath) {
+      try {
+        return run(["ls-files", "-z", "--", subpath]).split("\0").filter(Boolean);
+      } catch {
+        return [];
+      }
+    },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Subpath tree comparison
+// ---------------------------------------------------------------------------
+
+/** How each drift kind reads in the report. */
+const DRIFT_PHRASE = {
+  differs: "differs from the working-tree copy",
+  added: "is absent at the pinned SHA (added since)",
+  removed: "is gone from the working tree (removed since)",
+  unreadable: "is tracked but unreadable in the working tree",
+};
+
+/**
+ * Compare every file a `uses:` subpath covers at `sha` against the working
+ * tree, and return one record per drifting path (empty when the tree matches).
+ *
+ * The union of both sides is walked, so a sibling script ADDED or REMOVED
+ * since the pinned revision is drift just as much as one whose bytes changed —
+ * all three change what the pinned revision actually executes.
+ *
+ * @param {{lsTree: Function, lsFiles: Function, show: Function}} git
+ * @param {string} repoRoot
+ * @param {string} sha
+ * @param {string} subpath
+ * @returns {Array<{path: string, kind: "differs" | "added" | "removed" | "unreadable"}>}
+ */
+export function diffSubpathAtSha(git, repoRoot, sha, subpath) {
+  const pinned = new Set(git.lsTree(sha, subpath));
+  const working = new Set(git.lsFiles(subpath));
+  const drift = [];
+
+  for (const path of [...new Set([...pinned, ...working])].sort()) {
+    if (!working.has(path)) {
+      drift.push({ path, kind: "removed" });
+      continue;
+    }
+    if (!pinned.has(path)) {
+      drift.push({ path, kind: "added" });
+      continue;
+    }
+    let workingBody;
+    try {
+      workingBody = readFileSync(join(repoRoot, path), "utf8");
+    } catch {
+      drift.push({ path, kind: "unreadable" });
+      continue;
+    }
+    const pinnedBody = git.show(sha, path);
+    if (pinnedBody === null || !manifestsMatch(pinnedBody, workingBody)) {
+      drift.push({ path, kind: "differs" });
+    }
+  }
+
+  return drift;
+}
+
+/**
+ * Render a drift list as the one-line `reason` a finding carries. Action
+ * directories hold a handful of files, so every drifting path is named rather
+ * than summarised — the operator needs to know WHICH file is inert.
+ *
+ * @param {string} subpath
+ * @param {ReturnType<typeof diffSubpathAtSha>} drift
+ * @returns {string}
+ */
+export function describeDrift(subpath, drift) {
+  const detail = drift.map((d) => `${d.path} ${DRIFT_PHRASE[d.kind]}`).join("; ");
+  return (
+    `${drift.length} file(s) under ${subpath} lag the pinned SHA — the pinned ` +
+    `revision is what actually runs: ${detail}`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +455,18 @@ export function runCheck(opts = {}, git = createGit(resolve(opts.cwd || process.
   const unpinnedRefs = [];
   let scanned = 0;
 
+  // Every call site for a subpath must move together, so the same
+  // (sha, subpath) pair is compared repeatedly — `setup-toolchain` alone has
+  // five. Resolve each tree once.
+  const driftCache = new Map();
+  const driftFor = (sha, subpath) => {
+    const key = `${sha}:${subpath}`;
+    if (!driftCache.has(key)) {
+      driftCache.set(key, diffSubpathAtSha(git, repoRoot, sha, subpath));
+    }
+    return driftCache.get(key);
+  };
+
   for (const file of files) {
     let content;
     try {
@@ -379,8 +503,7 @@ export function runCheck(opts = {}, git = createGit(resolve(opts.cwd || process.
         continue;
       }
 
-      const pinnedBody = git.show(pin.sha, manifest.path);
-      if (pinnedBody === null) {
+      if (git.show(pin.sha, manifest.path) === null) {
         stale.push({
           ...pin,
           reason: `${manifest.path} does not exist at the pinned SHA — the pin predates the manifest`,
@@ -388,19 +511,12 @@ export function runCheck(opts = {}, git = createGit(resolve(opts.cwd || process.
         continue;
       }
 
-      let workingBody;
-      try {
-        workingBody = readFileSync(join(repoRoot, manifest.path), "utf8");
-      } catch {
-        stale.push({ ...pin, reason: `cannot read the working-tree ${manifest.path}` });
-        continue;
-      }
-
-      if (!manifestsMatch(pinnedBody, workingBody)) {
+      const drift = driftFor(pin.sha, pin.subpath);
+      if (drift.length > 0) {
         stale.push({
           ...pin,
           manifest: manifest.path,
-          reason: `the manifest at the pinned SHA differs from the working-tree ${manifest.path} — the pinned revision is what actually runs`,
+          reason: describeDrift(pin.subpath, drift),
         });
       }
     }
@@ -485,13 +601,13 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
   if (result.stale.length > 0) {
     err(
       `[pin-freshness] ❌ ${result.stale.length} stale first-party pin(s) — ` +
-        `the pinned manifest lags the working tree:`
+        `the pinned revision lags the working tree:`
     );
     for (const f of result.stale) err(formatFinding(f, "stale"));
     err(
       "[pin-freshness] Bump each pin to a commit on the default branch whose " +
-        "manifest matches the working-tree copy. Every call site for a given " +
-        "subpath must move together (check-action-pins.mjs enforces the " +
+        "action directory matches the working-tree copy. Every call site for a " +
+        "given subpath must move together (check-action-pins.mjs enforces the " +
         "single-pin invariant per subpath)."
     );
   }
@@ -516,9 +632,9 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
   }
 
   log(
-    `[pin-freshness] ✅ all ${result.scanned} first-party pin(s) resolve to a manifest ` +
-      `matching the working tree and reachable from ${opts.ref} (${result.headSha.slice(0, 7)}); ` +
-      `${result.files.length} file(s) scanned.`
+    `[pin-freshness] ✅ all ${result.scanned} first-party pin(s) resolve to an action ` +
+      `directory matching the working tree and reachable from ${opts.ref} ` +
+      `(${result.headSha.slice(0, 7)}); ${result.files.length} file(s) scanned.`
   );
   return 0;
 }
