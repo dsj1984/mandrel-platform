@@ -26,8 +26,8 @@ import { buildGlobFilter } from './filters.js';
 import { promptStashDecision, promptYesNo } from './prompts.js';
 import { executePrune } from './prune.js';
 import {
+  renderCandidateList,
   renderDeferredLine,
-  renderDryRun,
   renderExecutionLine,
   renderExecutionSummary,
   renderPruneLine,
@@ -41,8 +41,9 @@ import {
 const TAG = '[git-cleanup]';
 
 /* node:coverage ignore next */
-function emitDryRunHuman(plan, baseBranch) {
-  for (const line of renderDryRun(plan, { baseBranch })) Logger.info(line);
+function emitCandidateList(plan, opts, baseBranch) {
+  for (const l of renderCandidateList({ plan, opts, baseBranch }))
+    Logger.info(l);
 }
 
 /* node:coverage ignore next */
@@ -291,7 +292,7 @@ export async function runBranchPhase(opts, cwd, baseBranch) {
     filter,
     includeRemoteOnly: true,
   });
-  emitDryRunHuman(plan, baseBranch);
+  emitCandidateList(plan, opts, baseBranch);
   const action = decideBranchPhase({ plan, opts, cwd });
   if (action.kind === 'prompt-then-execute') {
     const go = await promptYesNo(action.promptMessage);
@@ -375,7 +376,11 @@ export async function executeStashPhase(action) {
   );
 }
 
-/* node:coverage ignore next */
+// Story #4922 — the `node:coverage ignore next` directive that used to sit
+// here is gone. It was never justified: `runStashPhase` is drivable end to
+// end (planStashes degrades to an empty list outside a repo, and the
+// decide/execute pair below is pure given an allowlist), so the directive
+// only hid a sequencer nothing exercised.
 export async function runStashPhase(opts, cwd) {
   Logger.info(`${TAG} ── phase: stashes ──`);
   const { stashes } = planStashes({ cwd });

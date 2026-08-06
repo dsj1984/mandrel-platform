@@ -18,10 +18,6 @@ is merged to `main`. The live v2 path is **Story scope only**:
   after the PR opens and before auto-merge. Findings post to the PR;
   critical findings block close (`agent::blocked`).
 
-Legacy `scope: epic` / Epic-branch review procedure (including
-`epic-audit-prepare.js` / `epic-audit-recheck.js`) was removed with the
-v2 Story-only cutover.
-
 **Invariant — Story-scope review runs outside the maker's LLM context.**
 The Story-scope review executes inside the `single-story-close.js` close
 subprocess, **not** in the delivering child's (maker agent's) LLM context.
@@ -45,28 +41,21 @@ The caller passes the following arguments (`/deliver` passes
 
 | Argument    | Type                                  | Required | Meaning                                                                                          |
 | ----------- | ------------------------------------- | -------- | ------------------------------------------------------------------------------------------------ |
-| `scope`     | `"story"` \| `"epic"`                 | yes      | Live path is `"story"`. `"epic"` remains only for legacy cumulative adapters.                    |
-| `ticketId`  | integer                               | yes      | GitHub issue number of the Story (when `scope === 'story'`) or cumulative ticket (legacy `scope === 'epic'`). |
-| `baseRef`   | string (git ref)                      | yes      | The diff base. Story scope: `main` (or `project.baseBranch`). Legacy cumulative scope: caller-provided base. |
-| `headRef`   | string (git ref)                      | yes      | The branch tip under review. Story scope: `story-<storyId>`. Legacy cumulative scope: caller-provided head. |
+| `scope`     | `"story"`                             | yes      | The live delivery path.                                                                          |
+| `ticketId`  | integer                               | yes      | GitHub issue number of the Story.                                                                |
+| `baseRef`   | string (git ref)                      | yes      | The diff base — `main` (or `project.baseBranch`).                                                |
+| `headRef`   | string (git ref)                      | yes      | The branch tip under review — `story-<storyId>`.                                                 |
 | `depth`     | `"light"` \| `"standard"` \| `"deep"` | no       | Risk-derived review thoroughness lever. Absent → `standard`. See **Review depth** below.         |
 
-All scope-dependent behavior in this helper branches off the first four
-arguments. Do not hard-code branch names or ticket types — read them from
-the argument envelope.
+Do not hard-code branch names or ticket types — read them from the argument
+envelope.
 
 ### Review depth (`depth`)
 
-`depth` is the thoroughness lever introduced by Story #3876, made a live
-consumed signal end to end by Story #3937, and re-based on an observable signal
-by Story #4542. `runCodeReview` derives it from the diff it already enumerates,
-via [`review-depth.js`](../../scripts/lib/orchestration/review-depth.js): the
-changed files' intersection with the `sensitivePaths` classes registered in
-`audit-rules.json` gives the level, their count gives the width, and
-`resolveDepth` folds the two (a sensitive path OR a wide diff → `deep`; neither,
-on a small diff → `light`; an unenumerable diff → `standard`). It takes no
-planner-authored input and reads no checkpoint. `runCodeReview` forwards `depth`
-to every provider's `runReview` input.
+`depth` is the thoroughness lever: `runCodeReview` derives it from the diff via
+[`review-depth.js`](../../scripts/lib/orchestration/review-depth.js) — an
+observable signal that takes no planner-authored input — and forwards it to
+every provider's `runReview` input.
 
 It is an **input-only** signal: it changes *how thorough* the review is, never
 the findings envelope (`{ status, severity, posted, report, halted,
@@ -109,7 +98,7 @@ The caller invokes the in-process code-review pipeline
 (`runCodeReview` in `.agents/scripts/lib/orchestration/code-review.js`)
 with the resolved `{ scope, ticketId, baseRef, headRef, depth }` envelope
 (`depth` defaults to `standard` when the caller omits it). The
-pluggable `ReviewProvider` adapter chain (Epic #2815) runs against the
+pluggable `ReviewProvider` adapter chain runs against the
 diff `baseRef..headRef`, with the LLM-backed providers honoring `depth`
 (see **Review depth** above), and posts a structured summary to `[TICKET_ID]`.
 The pipeline will:
@@ -119,7 +108,7 @@ The pipeline will:
 - Run a focused lint check on the change set.
 - Post a structured summary report to the `[TICKET_ID]` issue.
 
-### Step 1a — Story-scope local-lens pass (`scope: story` only, Epic #4405)
+### Step 1a — Story-scope local-lens pass (`scope: story` only)
 
 When `scope === 'story'`, the shared review spine
 [`runStoryReviewCore`](../../scripts/lib/orchestration/story-close/phases/review-core.js)
@@ -184,7 +173,7 @@ The diff under review is `baseRef..headRef`
 (`main..story-<storyId>`, or the configured base branch to the Story
 branch). The Story-scope local-lens pass (Step 1a) has already covered the
 local-tier concerns. Lens findings and pillar findings share the single
-`verification-results` comment this pass posts (Story #4411). The
+`verification-results` comment this pass posts. The
 integration view here focuses on cross-cutting ripple within the Story and
 contract drift against the base branch. Look for:
 
@@ -268,10 +257,9 @@ prior baseline before merging.
 ## Step 4 — Produce Findings Report
 
 Findings are **persisted as a `verification-results` structured comment on
-the `[TICKET_ID]` issue** by `runCodeReview` (the unified findings contract of
-Story #4411; this single comment carries the
-Epic-close lens findings). The target ticket is the Story when
-`scope === 'story'` and the Epic when `scope === 'epic'`. The comment
+the `[TICKET_ID]` issue** by `runCodeReview` (the unified findings contract —
+this single comment carries the Story-scope lens findings). The target
+ticket is the Story. The comment
 is idempotent — re-runs replace the prior one — and its body includes
 severity-tier counts plus the full findings list so downstream workflows
 (notably the retro helper) can summarise blockers/high findings without
@@ -301,7 +289,7 @@ For every finding, provide:
   fix worked. Keep it tight (≤ 5 sentences); the sub-agent will read the
   surrounding code itself.
 
-### The `## Fixed on-branch` section (Story #4399)
+### The `## Fixed on-branch` section
 
 Findings that Step 4.5 remediated on `[HEAD_REF]` MUST be rendered under a
 dedicated **`## Fixed on-branch`** heading, **not** in the severity groups
@@ -334,7 +322,7 @@ the executor: it decides, per finding, between a focused fix on
 `[HEAD_REF]` and leaving the finding on the `verification-results`
 structured comment for the operator.
 
-### Resolve the remediation threshold (Story #4399)
+### Resolve the remediation threshold
 
 Read `delivery.codeReview.autoFixSeverity` from the resolved `.agentrc.json`
 (default **`medium`**; the resolver in

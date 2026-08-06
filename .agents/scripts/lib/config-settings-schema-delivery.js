@@ -160,10 +160,19 @@ const SIGNALS_SCHEMA = {
  * behind-the-base PR up to date before giving the branch up as unwinnable,
  * rather than waiting out the budget behind a base it could have merged.
  * All keys default in the consumer when omitted (30s / 300s / 3600s / 3).
+ *
+ * `mode` selects the close-time merge posture (Story #4698). Default `sync`
+ * keeps the in-close foreground wait unchanged. `async` caps the per-invocation
+ * wait to a short probe window (~60s: catches instant merges and instantly-red
+ * required checks) and then returns the resumable `pending` terminal, so a
+ * slow-CI consumer no longer burns ~5 minutes of the host tool slot on a merge
+ * that lands after the wait would have expired anyway — the worker launches the
+ * `pending` envelope's `nextCommand` in the background instead.
  */
 const MERGE_WATCH_SCHEMA = {
   type: 'object',
   properties: {
+    mode: { type: 'string', enum: ['sync', 'async'] },
     intervalSeconds: { type: 'integer', minimum: 1 },
     maxWaitSeconds: { type: 'integer', minimum: 1 },
     maxBudgetSeconds: { type: 'integer', minimum: 1 },
@@ -205,12 +214,17 @@ const ROUTING_SCHEMA = {
 // the merge/CI watch poll loop; `autoMerge` selects the merge posture.
 // Retired: `earlyPr` (Epic early-PR warmup) and `requireChecks` (no
 // AutomergePredicate reader on v2).
+// Story #4890 added `attachWindowMs`: how long the watch keeps re-resolving an
+// EMPTY required-check set before it stops waiting for one. This block is
+// `additionalProperties: false`, so the knob is inert unless it lands here AND
+// in the `.agents/schemas/agentrc.schema.json` mirror.
 const CI_WATCH_SCHEMA = {
   type: 'object',
   properties: {
     pollIntervalMs: { type: 'integer', minimum: 1 },
     maxPolls: { type: 'integer', minimum: 1 },
     maxResumes: { type: 'integer', minimum: 0 },
+    attachWindowMs: { type: 'integer', minimum: 1 },
   },
   additionalProperties: false,
 };
@@ -281,6 +295,26 @@ const ACCEPTANCE_EVAL_SCHEMA = {
 };
 
 /**
+ * `delivery.review` — close-scope review tuning (Story #4699). `lensDiffFloor`
+ * is the changed-line floor below which the Story-scope local-lens pass skips
+ * lens materialization for a diff with zero sensitive-path hits (default 40
+ * via `lib/audit-suite/lens-diff-floor.js`; `0` disables the skip). The
+ * maker-blind code-review pass and all hard gates are untouched by the floor.
+ */
+const REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    lensDiffFloor: {
+      type: 'integer',
+      minimum: 0,
+      description:
+        'Changed-line floor for the close-scope lens walk (Story #4699). A diff strictly below this many changed lines (additions + deletions) with zero sensitive-path hits skips lens materialization and records the skip in the findings-yield ledger. Default 40; 0 disables the skip. Hard gates and the maker-blind code-review pass are unaffected.',
+    },
+  },
+  additionalProperties: false,
+};
+
+/**
  * `delivery.feedbackLoop` — opt-out toggles consumed by the Epic finalize
  * listener's auto-file graduators (`lib/feedback-loop/*-graduator.js`, read
  * via `graduator-core.js#makeIsAutoFileEnabled`). All default to `true`
@@ -293,12 +327,20 @@ const ACCEPTANCE_EVAL_SCHEMA = {
  * issues via the graduator pre-parsed-findings seam, and the rendered retro
  * sections list the filed issue numbers instead of paste-ready `gh` command
  * stanzas; set it to `false` to fall back to the command stanzas.
+ *
+ * `frictionWindowDays` (Story #4850) bounds the run-scope friction recurrence
+ * window by row age. The window deliberately spans every surviving signal
+ * stream rather than the triggering run's own Stories — that is what lets a
+ * once-per-Story systemic defect reach the ≥ 2 actionable threshold — which
+ * left it unbounded in time, so a defect fixed weeks ago kept re-routing. An
+ * integer ≥ 1; unset means 30 days.
  */
 const FEEDBACK_LOOP_SCHEMA = {
   type: 'object',
   properties: {
     auditResultsAutoFile: { type: 'boolean' },
     retroProposals: { type: 'boolean' },
+    frictionWindowDays: { type: 'integer', minimum: 1 },
   },
   additionalProperties: false,
 };
@@ -323,18 +365,94 @@ const AUDIT_TO_STORIES_SCHEMA = {
   additionalProperties: false,
 };
 
+/**
+ * `delivery.tempRetention` — auto-purge of spent temp artifacts (Story #4794).
+ *
+ * `enabled` defaults to `true`: reclaiming a landed Story's gate transcripts
+ * and evidence is the behaviour, and the knob exists to turn it off. `classes`
+ * lets an operator keep one family while purging the rest; `staleDays` is the
+ * age floor for the families no Story id can be recovered from (audit reports,
+ * abandoned `plan-<slug>/` dirs).
+ */
+const TEMP_RETENTION_SCHEMA = {
+  type: 'object',
+  description:
+    'Story #4794. Auto-purge of spent temp artifacts once their Story lands. ' +
+    'Classification is an allowlist: only the declared classes below are ever ' +
+    'deleted, so operator scratch files under tempRoot are reported with their ' +
+    'size and left alone. signals.ndjson is never purged by any path.',
+  properties: {
+    enabled: {
+      type: 'boolean',
+      description:
+        "Master switch. Default true — reclaiming a landed Story's gate " +
+        'transcripts and validation evidence is the behaviour, and this knob ' +
+        'turns it off. When false every purge path is a reported no-op.',
+    },
+    staleDays: {
+      type: 'integer',
+      minimum: 1,
+      description:
+        'Age floor (days, default 7) for the families no Story id can be ' +
+        'recovered from — roster-level audit reports and abandoned ' +
+        'plan-<slug>/ dirs. Story-keyed artifacts do not wait for it: they are ' +
+        'purged as soon as their merge is confirmed.',
+    },
+    classes: {
+      type: 'object',
+      description:
+        'Per-class opt-out. Each defaults to true; set one false to keep that ' +
+        'family while the rest are purged.',
+      properties: {
+        orchestrationLogs: {
+          type: 'boolean',
+          description:
+            '<tempRoot>/orchestration/*.log — close gate transcripts and ' +
+            'terse-result detail dumps.',
+        },
+        validationEvidence: {
+          type: 'boolean',
+          description:
+            'Per-Story validation-evidence.json, lifecycle.ndjson, and ' +
+            'manifest.md under the standalone and per-run story trees.',
+        },
+        auditResults: {
+          type: 'boolean',
+          description: '<tempRoot>/audits/ — audit lens reports.',
+        },
+        planDirs: {
+          type: 'boolean',
+          description:
+            '<tempRoot>/plan-<slug>/ — abandoned plan authoring dirs. ' +
+            'Age-floored only; the current run is always excluded.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  additionalProperties: false,
+};
+
 export const DELIVERY_SCHEMA = {
   type: 'object',
   properties: {
     execution: EXECUTION_SCHEMA,
     lease: LEASE_SCHEMA,
     docsFreshness: DOCS_FRESHNESS_SCHEMA,
+    tempRetention: TEMP_RETENTION_SCHEMA,
     deliverRunner: DELIVER_RUNNER_SCHEMA,
     worktreeIsolation: WORKTREE_ISOLATION_SCHEMA,
     signals: SIGNALS_SCHEMA,
+    // `quality.gates.crap.incrementalCoverage` (Story #4981) is declared in
+    // `config/gates/crap.schema.js` and reaches AJV validation through this
+    // property — QUALITY_SCHEMA → GATES_SCHEMA → CRAP_GATE. No separate
+    // declaration lives here; this is the composition point that makes the
+    // gate-level schema authoritative for the top-level `.agentrc.json`
+    // surface this module validates.
     quality: QUALITY_SCHEMA,
     mergeWatch: MERGE_WATCH_SCHEMA,
     codeReview: CODE_REVIEW_SCHEMA,
+    review: REVIEW_SCHEMA,
     refactorStage: REFACTOR_STAGE_SCHEMA,
     acceptanceEval: ACCEPTANCE_EVAL_SCHEMA,
     feedbackLoop: FEEDBACK_LOOP_SCHEMA,

@@ -39,16 +39,15 @@
  * Robustness contract (mirrors `lib/observability/signals-writer.js`):
  *   - **Best-effort writes.** A failed append is a missing metric, not a
  *     failed plan phase — fs errors are swallowed after a `Logger.warn`.
- *   - **No buffering.** Each append opens, writes one line, closes.
+ *   - **No buffering / rotation.** The append tail (open → append one line →
+ *     rotate at the byte cap → close) is owned by the shared
+ *     `lib/observability/metrics-ledger.js` module (Story #4712); every
+ *     appender here routes through it. The close-domain findings-yield
+ *     entry point (Story #4699) lives there too, so the story-close review
+ *     spine never imports this plan-domain module.
  *   - **Malformed-line tolerance on read.** The reader skips unparseable
  *     lines (counting them) instead of throwing, so a torn write can never
  *     wedge the analyzer.
- *   - **Rotation.** When an append would push the ledger past
- *     `MAX_LEDGER_BYTES`, the current file is renamed to
- *     `plan-metrics.json.1` (replacing any prior rollover) and the append
- *     starts a fresh ledger, so a long-lived Epic cannot grow the file
- *     unboundedly. Readers only consume the active generation — the
- *     rollover exists for manual archaeology.
  *
  * `plan-metrics.json` is intentionally NOT in
  * `lib/plan-phase-cleanup.js#PHASE_TEMP_BASENAMES`: the ledger must survive
@@ -57,68 +56,16 @@
  */
 
 import fs from 'node:fs/promises';
-import path from 'node:path';
 
-import {
-  anchorTempRoot,
-  runArtifactPath,
-  tempRootFrom,
-} from '../config/temp-paths.js';
 import { Logger } from '../Logger.js';
-
-export const PLAN_METRICS_BASENAME = 'plan-metrics.json';
-export const PLAN_METRICS_SCHEMA_VERSION = 1;
+import {
+  appendLedgerRecord,
+  PLAN_METRICS_SCHEMA_VERSION,
+  planMetricsPath,
+} from '../observability/metrics-ledger.js';
 
 /** Record kind for a logged critic skip decision (Epic #4474 PR6). */
 export const PLAN_METRICS_KIND_CRITIC_SKIP = 'critic-skip';
-
-/**
- * Rotation threshold. At ~200 bytes per record this is ~5000 invocations —
- * far beyond any real plan run, so rotation only fires on pathological
- * accumulation.
- */
-export const MAX_LEDGER_BYTES = 1024 * 1024;
-
-/**
- * Resolve the ledger path for an Epic (or the standalone stream when
- * `epicId` is `null` — the `story-plan.js` / Epic-less healthcheck case).
- *
- * @param {number|null} epicId
- * @param {object} [config] Resolved config (threads `project.paths.tempRoot`).
- * @returns {string}
- */
-export function planMetricsPath(epicId, config) {
-  if (epicId === null || epicId === undefined) {
-    return path.join(
-      anchorTempRoot(tempRootFrom(config)),
-      'standalone',
-      PLAN_METRICS_BASENAME,
-    );
-  }
-  return runArtifactPath(epicId, PLAN_METRICS_BASENAME, config);
-}
-
-/**
- * Rotate the ledger when appending `incomingBytes` would exceed
- * `maxBytes`. Single-generation rollover: `plan-metrics.json` →
- * `plan-metrics.json.1` (any prior `.1` is replaced).
- *
- * @param {string} filePath
- * @param {number} incomingBytes
- * @param {number} [maxBytes]
- * @returns {Promise<boolean>} true when a rotation happened.
- */
-async function rotateIfNeeded(filePath, incomingBytes, maxBytes) {
-  let size = 0;
-  try {
-    size = (await fs.stat(filePath)).size;
-  } catch {
-    return false; // No existing ledger — nothing to rotate.
-  }
-  if (size + incomingBytes <= maxBytes) return false;
-  await fs.rename(filePath, `${filePath}.1`);
-  return true;
-}
 
 /**
  * Append one invocation record to the ledger. Best-effort: returns `false`
@@ -165,15 +112,11 @@ export async function appendPlanMetric(entry, config, opts = {}) {
             ) || 0,
       ok: entry.ok === true,
     };
-    const filePath = planMetricsPath(epicId, config);
-    const line = `${JSON.stringify(record)}\n`;
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await rotateIfNeeded(
-      filePath,
-      Buffer.byteLength(line),
-      opts.maxBytes ?? MAX_LEDGER_BYTES,
-    );
-    await fs.appendFile(filePath, line, 'utf8');
+    await appendLedgerRecord(record, {
+      epicId,
+      config,
+      maxBytes: opts.maxBytes,
+    });
     return true;
   } catch (err) {
     Logger.warn(
@@ -198,9 +141,10 @@ export async function appendPlanMetric(entry, config, opts = {}) {
  *   epicId?: number|null,
  * }} entry
  * @param {object} [config]
+ * @param {{ maxBytes?: number }} [opts] Test seam for the rotation threshold.
  * @returns {Promise<boolean>} true when the line was written.
  */
-export async function appendCriticSkip(entry, config) {
+export async function appendCriticSkip(entry, config, opts = {}) {
   try {
     if (!entry || typeof entry !== 'object') {
       throw new TypeError('appendCriticSkip requires an entry object');
@@ -223,11 +167,11 @@ export async function appendCriticSkip(entry, config) {
       epicId,
       at: new Date().toISOString(),
     };
-    const filePath = planMetricsPath(epicId, config);
-    const line = `${JSON.stringify(record)}\n`;
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await rotateIfNeeded(filePath, Buffer.byteLength(line), MAX_LEDGER_BYTES);
-    await fs.appendFile(filePath, line, 'utf8');
+    await appendLedgerRecord(record, {
+      epicId,
+      config,
+      maxBytes: opts.maxBytes,
+    });
     return true;
   } catch (err) {
     Logger.warn(
@@ -348,14 +292,13 @@ export async function readPlanMetrics(epicId, config) {
  */
 /**
  * Timestamp a ledger record is ordered by: `startedAt` for invocation
- * records, `at` for critic-skip records.
+ * records, `at` for kinded records (critic-skip, findings-yield).
  *
  * @param {object} entry
  * @returns {string|null}
  */
 function recordTimestamp(entry) {
-  const stamp =
-    entry?.kind === PLAN_METRICS_KIND_CRITIC_SKIP ? entry.at : entry.startedAt;
+  const stamp = typeof entry?.kind === 'string' ? entry.at : entry?.startedAt;
   return typeof stamp === 'string' ? stamp : null;
 }
 
@@ -388,6 +331,12 @@ export function summarizePlanMetrics(ledger, opts = {}) {
         criticSkipsByCritic[e.critic] =
           (criticSkipsByCritic[e.critic] ?? 0) + 1;
       }
+      continue;
+    }
+    if (typeof e.kind === 'string') {
+      // Any other kinded record (e.g. `findings-yield`, Story #4699) is not
+      // an invocation — readers key on `kind`, never on absent fields, so it
+      // must not inflate the invocation/failure tallies.
       continue;
     }
     invocationEntries.push(e);

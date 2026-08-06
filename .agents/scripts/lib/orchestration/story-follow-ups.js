@@ -9,11 +9,15 @@
  * @module lib/orchestration/story-follow-ups
  */
 
+import { signalsFile } from '../config/temp-paths.js';
 import { graduateRetroProposals } from '../feedback-loop/retro-proposals-graduator.js';
 import { DEFAULT_FRAMEWORK_REPO } from '../github/framework-repo.js';
 import { Logger } from '../Logger.js';
 import { normalizeGatheredSignal } from '../observability/runtime-friction.js';
-import { forEachLine } from '../observability/signals-writer.js';
+import {
+  forEachLine,
+  forEachSignalStreamLine,
+} from '../observability/signals-writer.js';
 import {
   composeRoutedProposals,
   deriveUnresolvedBlockedEvents,
@@ -21,6 +25,33 @@ import {
 import { upsertStructuredComment } from './ticketing.js';
 
 export const FOLLOW_UPS_COMMENT_TYPE = 'follow-ups';
+
+/** Milliseconds in one day — the unit `frictionWindowDays` is expressed in. */
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/** Window bound applied when `frictionWindowDays` is unset. */
+const DEFAULT_FRICTION_WINDOW_DAYS = 30;
+
+/**
+ * How many days back the run-scope recurrence window reaches (Story #4850).
+ *
+ * Defaults to 30 rather than to "unbounded": the widened cross-run window
+ * exists to let a once-per-Story defect reach the ≥ 2 threshold, and 30 days is
+ * long enough for that while short enough that a defect fixed last month stops
+ * re-routing. An absent, non-integer, or sub-1 value takes the default — the
+ * runtime AJV in `config-settings-schema-delivery.js` rejects those at load, so
+ * reaching this fallback means the config never went through the validator.
+ *
+ * @param {object} [config]
+ * @returns {number}
+ */
+function resolveFrictionWindowDays(config) {
+  const raw = config?.delivery?.feedbackLoop?.frictionWindowDays;
+  const days = Number(raw);
+  return Number.isInteger(days) && days >= 1
+    ? days
+    : DEFAULT_FRICTION_WINDOW_DAYS;
+}
 
 /**
  * @param {object} [config]
@@ -83,8 +114,55 @@ export async function gatherStoryFrictionSignals(storyId, config) {
 }
 
 /**
- * Gather friction signals across every Story in a run, for the run-scoped
- * roll-up.
+ * Identity of one physical signal row, for de-duplication.
+ *
+ * `eventId` is minted by every producer (`diagnose-friction.js` and
+ * `runtime-friction.js` both `crypto.randomUUID()` it), so it is the primary
+ * key. A row predating the field falls back to its physical `file:line`,
+ * which is equally stable — the same row read through two passes over the
+ * same tree yields the same coordinates.
+ *
+ * @param {unknown} parsed
+ * @param {string} file
+ * @param {number} lineNumber
+ * @returns {string}
+ */
+function signalIdentity(parsed, file, lineNumber) {
+  const eventId =
+    parsed !== null &&
+    typeof parsed === 'object' &&
+    typeof (/** @type {Record<string, unknown>} */ (parsed).eventId) ===
+      'string'
+      ? /** @type {string} */ (
+          /** @type {Record<string, unknown>} */ (parsed).eventId
+        ).trim()
+      : '';
+  return eventId.length > 0 ? `event:${eventId}` : `row:${file}:${lineNumber}`;
+}
+
+/**
+ * Gather friction signals for the run-scoped roll-up, over the **whole
+ * surviving recurrence window** rather than the run's own Stories
+ * (Story #4824).
+ *
+ * The recurrence threshold in `retro-proposals.js` is ≥ 2 occurrences, and
+ * the window it was measured over was one run's Story ids. A defect that
+ * fires exactly **once per Story** — which is what a systemic framework
+ * defect looks like — therefore scored 1 on every Story and was discarded as
+ * a singleton, forever. Eighteen consecutive Stories filed nothing.
+ *
+ * So the gather reduces over every `signals.ndjson` still present under the
+ * configured temp root: `<tempRoot>/standalone/stories/story-<sid>/` and
+ * `<tempRoot>/run-<eid>/stories/story-<sid>/`. Temp-tree auto-purge
+ * shortening that window is acceptable — a short window under-counts, and
+ * therefore fails toward *not* filing, which is the safe direction.
+ *
+ * The run's own Stories are still gathered explicitly first. The discovery
+ * walk resolves through the identical path helpers, so it is provably a
+ * superset; the explicit pass makes "never fewer signals than before" a
+ * property of the code rather than of an argument about path resolution.
+ * {@link signalIdentity} de-duplicates the overlap, so one event can never be
+ * counted twice and inflate a singleton into a fabricated recurrence.
  *
  * Homed beside {@link gatherStoryFrictionSignals} on purpose: the two used to
  * be independent copies of the same loop in two modules, and they drifted in
@@ -94,18 +172,85 @@ export async function gatherStoryFrictionSignals(storyId, config) {
  * Unusable ids are skipped rather than throwing — a roll-up must not fail the
  * epilogue over one malformed entry.
  *
- * @param {Array<number|string>} storyIds
+ * **Bounded by age, not by run (Story #4850).** Widening the window to the
+ * whole surviving temp tree also made it unbounded in *time*: a defect fixed
+ * weeks ago kept its occurrences on disk and kept re-routing forever, burying
+ * a genuine new regression underneath a historical ledger. Rows older than
+ * `delivery.feedbackLoop.frictionWindowDays` (default 30) are excluded, as are
+ * rows carrying no `ts` a `Date` can read — excluding an undateable row is the
+ * direction that fails toward under-counting, and under-counting fails toward
+ * not filing. Both exclusions are **counted and reported**, so a caller can
+ * tell a bounded window from an unbounded one without reading prose.
+ *
+ * A recovery marker is written after the incident it cancels, so a marker can
+ * never fall outside a window its incident is inside — the netting cannot be
+ * broken by the age floor.
+ *
+ * @param {Array<number|string>} storyIds The run's own Stories.
  * @param {object} [config]
- * @returns {Promise<Array<{ category: string, source: 'framework'|'consumer', storyId: number, details: object }>>}
+ * @param {{ now?: number }} [clock] Injected epoch-ms seam so a test can pin
+ *   the window without touching the system clock.
+ * @returns {Promise<{
+ *   signals: Array<{ category: string, source: 'framework'|'consumer', storyId: number, ts: string|null, details: object }>,
+ *   window: { days: number, cutoff: string, excludedStale: number, excludedUnparseable: number },
+ * }>}
  */
-export async function gatherRunFrictionSignals(storyIds, config) {
+export async function gatherRunFrictionSignals(
+  storyIds,
+  config,
+  { now = Date.now() } = {},
+) {
+  const days = resolveFrictionWindowDays(config);
+  const cutoffMs = now - days * MS_PER_DAY;
   const signals = [];
+  const seen = new Set();
+  let excludedStale = 0;
+  let excludedUnparseable = 0;
+  const take = (parsed, fallbackStoryId, identity) => {
+    if (seen.has(identity)) return;
+    seen.add(identity);
+    const signal = normalizeGatheredSignal(parsed, fallbackStoryId);
+    if (!signal) return;
+    const ms = signal.ts === null ? Number.NaN : Date.parse(signal.ts);
+    if (!Number.isFinite(ms)) {
+      excludedUnparseable += 1;
+      return;
+    }
+    if (ms < cutoffMs) {
+      excludedStale += 1;
+      return;
+    }
+    signals.push(signal);
+  };
+
   for (const raw of Array.isArray(storyIds) ? storyIds : []) {
     const sid = Number(raw);
     if (!Number.isInteger(sid) || sid <= 0) continue;
-    signals.push(...(await gatherStoryFrictionSignals(sid, config)));
+    const file = signalsFile(null, sid, config);
+    await forEachLine(
+      null,
+      sid,
+      (parsed, lineNumber) =>
+        take(parsed, sid, signalIdentity(parsed, file, lineNumber)),
+      config,
+    );
   }
-  return signals;
+
+  await forEachSignalStreamLine(
+    (parsed, { storyId, file, lineNumber }) =>
+      take(parsed, storyId, signalIdentity(parsed, file, lineNumber)),
+    config,
+  );
+
+  return {
+    signals,
+    window: {
+      days,
+      cutoff: new Date(cutoffMs).toISOString(),
+      excludedStale,
+      excludedUnparseable,
+    },
+  };
 }
 
 /**
@@ -152,13 +297,336 @@ function renderEmptyRollupLines(storyCount) {
 }
 
 /**
+ * Skip reasons that are a deliberate outcome rather than a broken loop. A
+ * roll-up whose every proposal was skipped for one of these filed nothing
+ * *on purpose*; anything else is the loop failing quietly.
+ */
+const BENIGN_SKIP_REASONS = new Set([
+  'already-filed',
+  'toggle-disabled',
+  'cross-repo-deferred',
+  'cap-reached',
+  'no-actionable-proposals',
+]);
+
+/**
+ * Summarize a category corpus for the "name what you saw" lines. Pure.
+ *
+ * @param {Array<{ category?: string }>} signals
+ * @returns {Array<{ category: string, occurrences: number }>}
+ */
+export function summarizeSignalCategories(signals) {
+  const counts = new Map();
+  for (const sig of Array.isArray(signals) ? signals : []) {
+    if (sig === null || typeof sig !== 'object') continue;
+    const category =
+      typeof sig.category === 'string' ? sig.category.trim() : '';
+    if (category.length === 0) continue;
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([category, occurrences]) => ({ category, occurrences }))
+    .sort((a, b) => a.category.localeCompare(b.category));
+}
+
+/**
+ * Classify what a roll-up's own numbers say about it — the reporting-layer
+ * assertion Story #4828 adds. Pure, so the run epilogue's step result and the
+ * rendered comment cannot disagree about whether a roll-up succeeded.
+ *
+ * Two suspect shapes, both of which previously rendered as success:
+ *
+ *   - `zeroProposals` — signals were gathered and **nothing** came out, not
+ *     even a below-threshold row. That is the third instance of the failure
+ *     mode Story #4578 fixed for the zero-signal case and Story #4824 for the
+ *     all-discarded case: an all-empty routed result is silence, and a routing
+ *     regression is exactly what it looks like.
+ *   - `unfiledProposals` — proposals cleared the threshold and none were
+ *     filed for a reason that is not a deliberate one. This is what actually
+ *     happened in Story #4828: `gh issue create` rejected every call over an
+ *     absent label, the error landed in a bucket nobody rendered, and the
+ *     roll-up reported `filed: 0`.
+ *
+ * @param {object} args
+ * @param {number} args.signalCount
+ * @param {number} args.proposalCount   framework + consumer
+ * @param {number} args.discardedCount
+ * @param {number} args.filedCount
+ * @param {string[]} [args.filingErrors]
+ * @param {Array<{ reason?: string }>} [args.filingSkipped]
+ * @returns {{ zeroProposals: boolean, unfiledProposals: boolean, blockingSkipReasons: string[] }}
+ */
+export function assessRollupOutcome({
+  signalCount,
+  proposalCount,
+  discardedCount,
+  filedCount,
+  filingErrors = [],
+  filingSkipped = [],
+}) {
+  const blockingSkipReasons = [
+    ...new Set(
+      (Array.isArray(filingSkipped) ? filingSkipped : [])
+        .map((entry) => (typeof entry?.reason === 'string' ? entry.reason : ''))
+        .filter((reason) => reason && !BENIGN_SKIP_REASONS.has(reason)),
+    ),
+  ].sort();
+  const errors = Array.isArray(filingErrors) ? filingErrors : [];
+  return {
+    zeroProposals:
+      signalCount > 0 && proposalCount === 0 && discardedCount === 0,
+    unfiledProposals:
+      proposalCount > 0 &&
+      filedCount === 0 &&
+      (errors.length > 0 || blockingSkipReasons.length > 0),
+    blockingSkipReasons,
+  };
+}
+
+/**
+ * Render the "N signals in, zero proposals out" warning (Story #4828).
+ *
+ * @param {number} signalCount
+ * @param {Array<{ category: string, occurrences: number }>} categories
+ * @returns {string[]}
+ */
+function renderZeroProposalLines(signalCount, categories) {
+  const named =
+    categories.length > 0
+      ? categories.map((c) => `\`${c.category}\` ×${c.occurrences}`).join(', ')
+      : '_none — every gathered signal carried an unusable category_';
+  return [
+    `> ⚠️ **${signalCount} friction signals gathered, 0 proposals produced — a routing outcome, not a clean run.**`,
+    `> Categories seen: ${named}.`,
+    '> Nothing cleared the actionable threshold AND nothing was recorded below',
+    '> it, so every signal was netted out as recovered or dropped in routing.',
+    '> A regression in routing renders byte-identically to this, which is why',
+    '> the roll-up states it rather than rendering silence.',
+  ];
+}
+
+/**
+ * Render the "proposals cleared the threshold but none were filed" warning
+ * (Story #4828).
+ *
+ * @param {number} proposalCount
+ * @param {string[]} filingErrors
+ * @param {string[]} blockingSkipReasons
+ * @returns {string[]}
+ */
+function renderUnfiledProposalLines(
+  proposalCount,
+  filingErrors,
+  blockingSkipReasons,
+) {
+  const lines = [
+    `> ⚠️ **${proposalCount} actionable proposal(s) reached the filer and none were filed.**`,
+    '> Auto-file is on, so this is the feedback loop failing, not declining.',
+  ];
+  if (blockingSkipReasons.length > 0) {
+    lines.push(`> Skipped: ${blockingSkipReasons.join(', ')}.`);
+  }
+  for (const error of filingErrors) {
+    lines.push(`> ${error}`);
+  }
+  return lines;
+}
+
+/**
+ * Render one discarded (below-threshold) roll-up row (Story #4824).
+ *
+ * The pre-#4824 row was `` `category` ×N `` and nothing else. That is exactly
+ * how a defect firing once per Story stayed invisible for eighteen
+ * consecutive Stories: an operator reading "×1" cannot tell a one-off from a
+ * systemic defect whose window was too narrow to see it recur. The row now
+ * names the emitting tools, the bucket fingerprint, and the number of
+ * distinct Stories it spans — the cross-run count the widened recurrence
+ * window produces.
+ *
+ * Every added field is optional so a caller passing a hand-built proposals
+ * object (or an older persisted one) still renders.
+ *
+ * @param {{ category: string, occurrences: number, tools?: string[], fingerprint?: string, storyCount?: number }} item
+ * @returns {string}
+ */
+function renderDiscardedItem(item) {
+  const parts = [`\`${item.category}\` ×${item.occurrences}`];
+  if (Number.isInteger(item.storyCount) && item.storyCount > 0) {
+    const plural = item.storyCount === 1 ? 'Story' : 'Stories';
+    parts.push(`across ${item.storyCount} ${plural}`);
+  }
+  if (Array.isArray(item.tools) && item.tools.length > 0) {
+    parts.push(`via ${item.tools.map((t) => `\`${t}\``).join(', ')}`);
+  }
+  if (typeof item.fingerprint === 'string' && item.fingerprint.length > 0) {
+    parts.push(`fingerprint \`${item.fingerprint}\``);
+  }
+  return parts.join(' — ');
+}
+
+/**
+ * Normalize the two loosely-typed inputs into the four buckets every section
+ * renderer reads. Absorbs the optional-chain / nullish-coalesce cluster that
+ * otherwise all lands on `buildFollowUpsCommentBody` (Story #4926).
+ *
+ * @param {object|null|undefined} proposals
+ * @param {object|null|undefined} graduated
+ * @returns {{ filed: object[], framework: object[], consumer: object[],
+ *   discarded: object[], filingErrors: string[] }}
+ */
+function normalizeRollupBuckets(proposals, graduated) {
+  const asArray = (value) => (Array.isArray(value) ? value : []);
+  return {
+    filed: asArray(graduated?.filed),
+    framework: asArray(proposals?.framework),
+    consumer: asArray(proposals?.consumer),
+    discarded: asArray(proposals?.discarded),
+    filingErrors: asArray(graduated?.errors),
+  };
+}
+
+/**
+ * Render the "**Filed**" section, or nothing when no proposal was filed.
+ *
+ * @param {object[]} filed
+ * @returns {string[]}
+ */
+function renderFiledSection(filed) {
+  if (filed.length === 0) return [];
+  return [
+    '**Filed**',
+    ...filed.map(
+      (item) =>
+        `- ${item.source}: ${item.title}${item.url ? ` — ${item.url}` : ''}`,
+    ),
+    '',
+  ];
+}
+
+/**
+ * Render the "**Actionable (not auto-filed)**" fallback — the command stanzas
+ * an operator runs by hand when auto-filing produced nothing.
+ *
+ * @param {object[]} actionable framework + consumer, in that order
+ * @param {object[]} filed
+ * @returns {string[]}
+ */
+function renderActionableSection(actionable, filed) {
+  if (actionable.length === 0 || filed.length > 0) return [];
+  const lines = ['**Actionable (not auto-filed)**'];
+  for (const item of actionable) {
+    lines.push(`- ${item.source}: ${item.title}`, '', '```bash', item.command);
+    lines.push('```');
+  }
+  lines.push('');
+  return lines;
+}
+
+/**
+ * Render the "**Below threshold (not filed)**" section.
+ *
+ * @param {object[]} discarded
+ * @returns {string[]}
+ */
+function renderDiscardedSection(discarded) {
+  if (discarded.length === 0) return [];
+  return [
+    '**Below threshold (not filed)**',
+    ...discarded.map(
+      (item) => `- ${item.source}: ${renderDiscardedItem(item)}`,
+    ),
+    '',
+  ];
+}
+
+/**
+ * Render the all-empty branch. Story #4828 — "no proposals" has two readings,
+ * and only one of them is a quiet run. Signals gathered but nothing routed is
+ * the third instance of the silence Stories #4578 and #4824 each fixed once.
+ *
+ * @param {{ empty: boolean, outcome: {zeroProposals: boolean},
+ *   signalCount: number, categories: object[], storyCount: number }} args
+ * @returns {string[]}
+ */
+function renderEmptySection({
+  empty,
+  outcome,
+  signalCount,
+  categories,
+  storyCount,
+}) {
+  if (!empty) return [];
+  return [
+    ...(outcome.zeroProposals
+      ? renderZeroProposalLines(signalCount, categories)
+      : renderEmptyRollupLines(storyCount)),
+    '',
+  ];
+}
+
+/**
+ * Build the machine-readable twin of the rendered prose. Every suspect flag
+ * above has a field here so a caller never has to regex the body.
+ *
+ * @param {object} args
+ * @returns {object}
+ */
+function buildRollupPayload({
+  storyId,
+  storyCount,
+  signalCount,
+  categories,
+  buckets,
+  empty,
+  outcome,
+}) {
+  const { filed, framework, consumer, discarded, filingErrors } = buckets;
+  return {
+    storyId,
+    storyCount,
+    // Story #4828 — the corpus the roll-up actually read. Without it a
+    // reader cannot tell "0 proposals because nothing recurred" from
+    // "0 proposals because routing broke".
+    signalCount,
+    categories,
+    framework: framework.map((i) => i.category),
+    consumer: consumer.map((i) => i.category),
+    // Story #4824 — the machine-readable twin of the row above. A bare
+    // category list could not distinguish a genuine one-off from a
+    // recurrence the window was too narrow to see, so the count, the
+    // cross-Story span, and the shape fingerprint ride along.
+    discarded: discarded.map((i) => ({
+      category: i.category,
+      occurrences: i.occurrences,
+      storyCount: i.storyCount ?? null,
+      fingerprint: i.fingerprint ?? null,
+    })),
+    filed: filed.map((i) => ({ category: i.category, url: i.url ?? null })),
+    // Story #4578 — an empty roll-up over N>1 Stories is a claim worth
+    // flagging, not a success. Machine-readable twin of the warning
+    // prose so a caller need not regex the body.
+    emptyRollupSuspect: storyCount > 1 && empty && signalCount === 0,
+    // Story #4828 — the two remaining shapes that used to render as
+    // success. Machine-readable twins of the warning prose above.
+    zeroProposalSuspect: outcome.zeroProposals,
+    unfiledProposalSuspect: outcome.unfiledProposals,
+    filingErrors,
+  };
+}
+
+/**
  * @param {{
  *   storyId: number,
  *   proposals: object,
  *   graduated: object,
  *   storyCount?: number,
+ *   signalCount?: number,
+ *   categories?: Array<{ category: string, occurrences: number }>,
  * }} args - `storyCount` (default 1) is how many Stories the roll-up spans;
  *   it decides whether an empty result reads as quiet or as a flagged claim.
+ *   `signalCount` / `categories` (Story #4828) are what the roll-up actually
+ *   gathered, so a zero-proposal or zero-filed outcome can name its own
+ *   corpus instead of rendering as a clean run.
  * @returns {string}
  */
 export function buildFollowUpsCommentBody({
@@ -166,76 +634,60 @@ export function buildFollowUpsCommentBody({
   proposals,
   graduated,
   storyCount = 1,
+  signalCount = 0,
+  categories = [],
 }) {
-  const filed = Array.isArray(graduated?.filed) ? graduated.filed : [];
-  const framework = proposals?.framework ?? [];
-  const consumer = proposals?.consumer ?? [];
-  const discarded = proposals?.discarded ?? [];
+  const buckets = normalizeRollupBuckets(proposals, graduated);
+  const { filed, framework, consumer, discarded } = buckets;
+  const actionable = [...framework, ...consumer];
+  const empty =
+    filed.length === 0 && actionable.length === 0 && discarded.length === 0;
+  const outcome = assessRollupOutcome({
+    signalCount,
+    proposalCount: actionable.length,
+    discardedCount: discarded.length,
+    filedCount: filed.length,
+    filingErrors: graduated?.errors,
+    filingSkipped: graduated?.skipped,
+  });
   const lines = [
     '### follow-ups',
     '',
     `Actionable follow-ups captured from Story #${storyId} after merge.`,
     '',
+    ...(outcome.unfiledProposals
+      ? [
+          ...renderUnfiledProposalLines(
+            actionable.length,
+            buckets.filingErrors,
+            outcome.blockingSkipReasons,
+          ),
+          '',
+        ]
+      : []),
+    ...renderFiledSection(filed),
+    ...renderActionableSection(actionable, filed),
+    ...renderDiscardedSection(discarded),
+    ...renderEmptySection({
+      empty,
+      outcome,
+      signalCount,
+      categories,
+      storyCount,
+    }),
+    '```json',
   ];
-  if (filed.length > 0) {
-    lines.push('**Filed**');
-    for (const item of filed) {
-      lines.push(
-        `- ${item.source}: ${item.title}${item.url ? ` — ${item.url}` : ''}`,
-      );
-    }
-    lines.push('');
-  }
-  if (framework.length + consumer.length > 0 && filed.length === 0) {
-    lines.push('**Actionable (not auto-filed)**');
-    for (const item of [...framework, ...consumer]) {
-      lines.push(`- ${item.source}: ${item.title}`);
-      lines.push('');
-      lines.push('```bash');
-      lines.push(item.command);
-      lines.push('```');
-    }
-    lines.push('');
-  }
-  if (discarded.length > 0) {
-    lines.push('**Single-occurrence (not filed)**');
-    for (const item of discarded) {
-      lines.push(`- ${item.source}: \`${item.category}\` ×${item.occurrences}`);
-    }
-    lines.push('');
-  }
-  if (
-    filed.length === 0 &&
-    framework.length === 0 &&
-    consumer.length === 0 &&
-    discarded.length === 0
-  ) {
-    lines.push(...renderEmptyRollupLines(storyCount));
-    lines.push('');
-  }
-  lines.push('```json');
   lines.push(
     JSON.stringify(
-      {
+      buildRollupPayload({
         storyId,
         storyCount,
-        framework: framework.map((i) => i.category),
-        consumer: consumer.map((i) => i.category),
-        discarded: discarded.map((i) => i.category),
-        filed: filed.map((i) => ({
-          category: i.category,
-          url: i.url ?? null,
-        })),
-        // Story #4578 — an empty roll-up over N>1 Stories is a claim worth
-        // flagging, not a success. Machine-readable twin of the warning
-        // prose so a caller need not regex the body.
-        emptyRollupSuspect:
-          storyCount > 1 &&
-          filed.length === 0 &&
-          framework.length === 0 &&
-          consumer.length === 0 &&
-          discarded.length === 0,
-      },
+        signalCount,
+        categories,
+        buckets,
+        empty,
+        outcome,
+      }),
       null,
       2,
     ),
@@ -308,6 +760,8 @@ export async function captureStoryFollowUps({
       storyId: sid,
       proposals,
       graduated,
+      signalCount: signals.length,
+      categories: summarizeSignalCategories(signals),
     });
     await upsertStructuredComment(provider, sid, FOLLOW_UPS_COMMENT_TYPE, body);
     progress?.(

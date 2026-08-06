@@ -28,11 +28,20 @@ const tasks = [
     args: ['biome', 'ci', '.'],
   },
   {
+    // `docs/**/*.md` sat outside these globs until PR #4970's follow-up,
+    // so `npm run lint` reported "0 error(s)" while the close-time
+    // code-review lens — which lints the whole changed surface, not just
+    // what this driver globs — raised pre-existing `docs/` violations
+    // against whichever Story happened to touch the file. Keep `docs/`
+    // here so the two surfaces agree. `docs/CHANGELOG.md` is linted too;
+    // the generator-owned rules it can never satisfy are exempted by a
+    // `markdownlint-disable-file` directive in its own header.
     name: 'markdownlint',
     cmd: 'npx',
     args: [
       'markdownlint-cli2',
       '.agents/**/*.md',
+      'docs/**/*.md',
       '*.md',
       '!node_modules/**',
       '!.worktrees/**',
@@ -78,6 +87,17 @@ const tasks = [
     name: 'label-vocabulary',
     cmd: 'node',
     args: ['.agents/scripts/lint-label-vocabulary.js'],
+  },
+  {
+    // GitHub Actions job-timeout gate (Story #4936). Enumerates every
+    // `jobs.<id>` key across `.github/workflows/*.yml` and fails when one
+    // sets no `timeout-minutes` (inheriting GitHub's 360-minute default) or
+    // sets one above the ceiling. A deadlocked Windows job burned 44 minutes
+    // of a runner and withheld the failing required check's logs for the
+    // whole time; nothing but this check would have caught the gap.
+    name: 'workflow-timeouts',
+    cmd: 'node',
+    args: ['.agents/scripts/check-workflow-timeouts.js'],
   },
   {
     // Architecture cycle ratchet (Story #3991). Detects directed import

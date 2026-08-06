@@ -324,8 +324,21 @@
         "riskHeuristics": {
           "$ref": "#/$defs/listOrExtenderOfStrings"
         },
-        "codebaseSnapshot": {
-          "$ref": "#/$defs/codebaseSnapshot"
+        "complexityGate": {
+          "type": "object",
+          "description": "Shape-derived ceremony-lite complexity routing. A lite claim is validated against the authored Story shape at persist and re-derived from the Story body at dispatch; conservative (full on any doubt). Never relaxes the Story-ticket / PR-to-main / repo-gates / security-baseline non-negotiables.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Master switch. When false, lite routing is disabled everywhere: persist refuses lite claims and dispatch always takes the sub-agent path. Default true."
+            },
+            "maxArtifacts": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Enumerated-artifact threshold reported by the plan-context complexity signals. An input signal for the planner verdict — carries no routing authority. Default 1."
+            }
+          },
+          "additionalProperties": false
         },
         "failOnSharedEditors": {
           "type": "boolean",
@@ -376,34 +389,6 @@
       },
       "additionalProperties": false
     },
-    "codebaseSnapshot": {
-      "type": "object",
-      "properties": {
-        "tier": {
-          "type": "string",
-          "enum": ["skinny", "medium"]
-        },
-        "include": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "exclude": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "recentCommitWindow": {
-          "type": "integer",
-          "minimum": 1
-        }
-      },
-      "additionalProperties": false
-    },
     "execution": {
       "type": "object",
       "properties": {
@@ -421,6 +406,45 @@
         "ttlMs": {
           "type": "integer",
           "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "tempRetention": {
+      "type": "object",
+      "description": "Story #4794. Auto-purge of spent temp artifacts once their Story lands. Classification is an allowlist: only the declared classes below are ever deleted, so operator scratch files under tempRoot are reported with their size and left alone. signals.ndjson is never purged by any path.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Master switch. Default true — reclaiming a landed Story's gate transcripts and validation evidence is the behaviour, and this knob turns it off. When false every purge path is a reported no-op."
+        },
+        "staleDays": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Age floor (days, default 7) for the families no Story id can be recovered from — roster-level audit reports and abandoned plan-<slug>/ dirs. Story-keyed artifacts do not wait for it: they are purged as soon as their merge is confirmed."
+        },
+        "classes": {
+          "type": "object",
+          "description": "Per-class opt-out. Each defaults to true; set one false to keep that family while the rest are purged.",
+          "properties": {
+            "orchestrationLogs": {
+              "type": "boolean",
+              "description": "<tempRoot>/orchestration/*.log — close gate transcripts and terse-result detail dumps."
+            },
+            "validationEvidence": {
+              "type": "boolean",
+              "description": "Per-Story validation-evidence.json, lifecycle.ndjson, and manifest.md under the standalone and per-run story trees."
+            },
+            "auditResults": {
+              "type": "boolean",
+              "description": "<tempRoot>/audits/ — audit lens reports."
+            },
+            "planDirs": {
+              "type": "boolean",
+              "description": "<tempRoot>/plan-<slug>/ — abandoned plan authoring dirs. Age-floored only; the current run is always excluded."
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -758,6 +782,12 @@
         "requireCoverage": {
           "type": "boolean"
         },
+        "minMethodResolutionRate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Fail-closed floor on the per-method coverage JOIN (Story #4775): the fraction of methods that must resolve a coverage entry, counted only over files that HAVE one, before `update-crap-baseline.js` will persist. A broken join is silent by construction — unresolved methods are simply absent — so the updater refuses rather than writing a thin baseline and logging it as success. Not enforced below 25 joinable methods, where a diff-scoped run's rate is noise. Default 0.75; a healthy repo resolves ~98%."
+        },
         "friction": {
           "type": "object",
           "properties": {
@@ -790,6 +820,20 @@
             "minLength": 1
           },
           "description": "Minimatch glob patterns matched against the canonicalised repo-relative path of each discovered file. Files matching any pattern are excluded from CRAP discovery before scoring. Orthogonal to `components` (grouping) — a file excluded here never appears in any component bucket. Absent or empty preserves the existing IGNORED_DIRS-only behaviour (Story #3217)."
+        },
+        "incrementalCoverage": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "baseRef": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false,
+          "description": "Story #4981 — opt-in incremental coverage-capture + CRAP-join scoping. Default (key absent) preserves today's full-repo behaviour byte-for-byte. When `enabled: true`, `coverage-capture.js` scopes `npm run test:coverage` to the files changed against `baseRef` (default: the gate's own `--ref` / `main`), and the CRAP join treats a method in a file the diff did not touch as resolved by its committed baseline row instead of requiring fresh coverage for it."
         }
       },
       "additionalProperties": false
@@ -822,6 +866,16 @@
         "targetDirs": {
           "$ref": "#/$defs/listOrExtenderOfStrings",
           "description": "Directories whose JS sources the maintainability gate scores. Mandrel ships a `src/`-centric default; projects whose executable code lives elsewhere (e.g. this repo's `.agents/scripts/` plus `tests/`) override here. The framework default is intentionally not auto-discovered, so an override is the explicit, auditable signal."
+        },
+        "refreshTag": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/safeString"
+            },
+            {
+              "minLength": 1
+            }
+          ]
         },
         "refreshTimeoutMs": {
           "type": "integer",
@@ -1150,8 +1204,14 @@
     },
     "mergeWatch": {
       "type": "object",
-      "description": "Knobs consumed by the close-and-land merge wait (Story #4543; defaults in `lib/orchestration/merge-poll.js`). `intervalSeconds` is the poll cadence between `gh pr view` probes after the arm. `maxWaitSeconds` bounds ONE invocation of the merge wait and its expiry returns a resumable `pending` terminal with no label mutation; `maxBudgetSeconds` bounds the CUMULATIVE wait across resumes (anchored at the PR's createdAt, so a resume does not restart the clock) and exhausting it is the genuine give-up that classifies and blocks. `updateAttempts` caps the bounded update of a behind-the-base PR.",
+      "description": "Knobs consumed by the close-and-land merge wait (Story #4543; defaults in `lib/orchestration/merge-poll.js`). `mode` (Story #4698) selects the close-time merge posture. `intervalSeconds` is the poll cadence between `gh pr view` probes after the arm. `maxWaitSeconds` bounds ONE invocation of the merge wait and its expiry returns a resumable `pending` terminal with no label mutation; `maxBudgetSeconds` bounds the CUMULATIVE wait across resumes (anchored at the PR's createdAt, so a resume does not restart the clock) and exhausting it is the genuine give-up that classifies and blocks. `updateAttempts` caps the bounded update of a behind-the-base PR.",
       "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["sync", "async"],
+          "default": "sync",
+          "description": "Close-time merge-wait posture (Story #4698). `sync` (default) keeps the in-close foreground merge wait unchanged. `async` caps the per-invocation wait to a short ~60s probe window — long enough to catch an instant merge and, via the head-anchored required-check predicate, an instantly-red required check — then returns the resumable `pending` terminal (exit 3) with a `nextCommand`. Opt in when slow CI makes the foreground wait routinely expire: the worker launches `nextCommand` in the background instead of burning the host tool slot polling. `maxBudgetSeconds` (the cumulative give-up) is unchanged."
+        },
         "intervalSeconds": {
           "type": "integer",
           "minimum": 1,
@@ -1175,6 +1235,19 @@
           "minimum": 0,
           "default": 3,
           "description": "Maximum times the merge wait will bring a behind-the-base PR up to date before giving up on the branch. Default 3. Set 0 to disable the update."
+        }
+      },
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object",
+      "description": "Close-scope review tuning (Story #4699). Governs the Story-scope local-lens pass that runs inside the close subprocess; the maker-blind code-review pass and all hard gates are unaffected.",
+      "properties": {
+        "lensDiffFloor": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 40,
+          "description": "Changed-line floor for the close-scope lens walk (Story #4699). A diff strictly below this many changed lines (additions + deletions) with zero sensitive-path hits skips lens materialization and records the skip in the findings-yield ledger. Default 40; 0 disables the skip."
         }
       },
       "additionalProperties": false
@@ -1273,6 +1346,9 @@
         "docsFreshness": {
           "$ref": "#/$defs/docsFreshness"
         },
+        "tempRetention": {
+          "$ref": "#/$defs/tempRetention"
+        },
         "deliverRunner": {
           "$ref": "#/$defs/deliverRunner"
         },
@@ -1291,6 +1367,9 @@
         "codeReview": {
           "$ref": "#/$defs/codeReview"
         },
+        "review": {
+          "$ref": "#/$defs/review"
+        },
         "refactorStage": {
           "$ref": "#/$defs/refactorStage"
         },
@@ -1302,7 +1381,7 @@
           "properties": {
             "watch": {
               "type": "object",
-              "description": "Story #4356 (Epic #4355). Poll-loop tuning for the merge/CI watch. pollIntervalMs is the cadence between check probes; maxPolls caps total probes before the watcher gives up; maxResumes caps how many times the watcher may resume after a transient stall.",
+              "description": "Story #4356 (Epic #4355). Poll-loop tuning for the merge/CI watch. pollIntervalMs is the cadence between check probes; maxPolls caps total probes before the watcher gives up; maxResumes caps how many times the watcher may resume after a transient stall; attachWindowMs bounds the wait for a required context to attach at all.",
               "properties": {
                 "pollIntervalMs": {
                   "type": "integer",
@@ -1315,6 +1394,11 @@
                 "maxResumes": {
                   "type": "integer",
                   "minimum": 0
+                },
+                "attachWindowMs": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Story #4890. How long (ms) the watch keeps re-resolving an EMPTY `gh pr checks --required` set before it stops waiting for a required context to attach. A ruleset attaches its contexts asynchronously and the arrival latency is set by the slowest one, so a required context that is an aggregator job gated on every other tier is the last to appear — measured at 16m52s on this repository. Default 1200000 (20 minutes). Raise it for a repository whose contexts arrive later still; exhausting the window is never reported as a red check (the watch exits 2, not-yet-started)."
                 }
               },
               "additionalProperties": false
@@ -1365,6 +1449,12 @@
               "type": "boolean",
               "default": true,
               "description": "When true (default), the retro auto-files its actionable routed proposals as meta::<framework-gap|consumer-improvement> + friction::<category> issues via the graduator pre-parsed-findings seam, and the rendered retro sections list the filed issue numbers instead of paste-ready gh command stanzas. Set to false to fall back to the command stanzas."
+            },
+            "frictionWindowDays": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 30,
+              "description": "How many days back the run-scope friction recurrence window reaches (Story #4850). The window spans every surviving per-Story signal stream rather than the triggering run's own Stories, so that a defect firing once per Story can reach the actionable threshold; this bounds it by age so a defect fixed weeks ago stops re-routing. Rows older than the bound — and rows carrying no readable timestamp — are excluded and counted on the roll-up step result. Default 30."
             }
           },
           "additionalProperties": false

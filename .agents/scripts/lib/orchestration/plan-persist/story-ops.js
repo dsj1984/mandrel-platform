@@ -17,12 +17,17 @@
 
 import { createHash } from 'node:crypto';
 import { applyBlockedByDependencies } from '../../../providers/github/blocked-by-add.js';
+import { carryProvenanceFooters } from '../../findings/route-finding.js';
 import { Logger } from '../../Logger.js';
 import { AGENT_LABELS, TYPE_LABELS } from '../../label-constants.js';
 import {
   parse as parseStoryBody,
   serialize as serializeStoryBody,
 } from '../../story-body/story-body.js';
+import {
+  concurrentMap,
+  FANOUT_CONCURRENCY,
+} from '../../util/concurrent-map.js';
 import { assertSpecWithinBudget } from '../spec-spill.js';
 import { assertAcceptancePartition } from '../split-policy-validator.js';
 import {
@@ -30,11 +35,89 @@ import {
   normalizeSupersedes,
 } from './supersede-ops.js';
 
-// Story #4540 removed PLAN_RUN_LABEL_PREFIX / normalizePlanRunId /
-// planRunLabel from here. They minted an opaque random-hex label per N>1
-// plan that nothing ever deleted, and their only external consumer was the
-// (now deleted) `--run` resolver. Sibling order survives in the
-// `blocked by #N` body footers this module already writes.
+/**
+ * Label prefix grouping the Stories one plan-persist run authored.
+ *
+ * Reintroduced (Story #4692) after Story #4540 retired it: #4540 was right
+ * that batch identity is the wrong axis for *ordering delivery across runs*
+ * (`/deliver` takes ids and resolves the graph from live state — that stays),
+ * but it is the correct axis for *grouping the Stories one plan run created*
+ * so a cohort is filterable and traceable in the GitHub UI. The label is
+ * metadata only; nothing in persist or delivery reads it as a
+ * delivery-resolution input.
+ */
+export const PLAN_RUN_LABEL_PREFIX = 'plan-run::';
+
+/** Stable color for the cohort grouping label (`ensureLabels`). */
+const PLAN_RUN_LABEL_COLOR = '#C5DEF5';
+
+/**
+ * Stable color for the `route::lite` ceremony-route hint (Story #4707;
+ * hint-only since Story #4722 — `/deliver` re-derives the route from the
+ * Story body's shape).
+ */
+const LITE_ROUTE_LABEL_COLOR = '#D4C5F9';
+
+/** Length of the derived plan-run id (hex chars). */
+const PLAN_RUN_ID_LENGTH = 8;
+
+/**
+ * Normalize a caller-supplied plan-run token. Kept shared so human-readable
+ * ids map to one canonical label shape.
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function normalizePlanRunId(id) {
+  const token = String(id ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^plan-run::/, '')
+    .replace(/[^a-z0-9._-]+/g, '-');
+  if (!token) {
+    throw new Error('plan-run id requires a non-empty planRunId');
+  }
+  return token;
+}
+
+/**
+ * Build a `plan-run::<id>` label from an explicit id.
+ *
+ * Unlike the pre-#4540 shape, this never mints a random token — a random id
+ * would split a resumed persist's cohort across two labels. Derive the id
+ * from the authored artifacts via {@link derivePlanRunId} instead.
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function planRunLabel(id) {
+  return `${PLAN_RUN_LABEL_PREFIX}${normalizePlanRunId(id)}`;
+}
+
+/**
+ * Derive the deterministic plan-run id for a cohort of assembled Stories.
+ *
+ * Hashes the **sorted** set of per-Story plan fingerprints (the same
+ * content identities the resumable-create contract adopts on), so the id is
+ * a pure function of the authored artifacts: the same `stories.json` yields
+ * the same `plan-run::<id>` on every run — a persist resumed after a
+ * mid-run failure applies the identical label to the newly-created
+ * remainder that the already-created (adopted) Stories carry — while a
+ * different plan derives a different label. Sorting makes the id
+ * independent of creation order.
+ *
+ * @param {string[]} fingerprints Per-Story plan fingerprints.
+ * @returns {string} Hex id, {@link PLAN_RUN_ID_LENGTH} chars.
+ */
+export function derivePlanRunId(fingerprints) {
+  const sorted = (Array.isArray(fingerprints) ? fingerprints : [])
+    .map(String)
+    .sort();
+  return createHash('sha256')
+    .update(sorted.join(' '))
+    .digest('hex')
+    .slice(0, PLAN_RUN_ID_LENGTH);
+}
 
 /**
  * Marker prefix for the per-Story plan fingerprint appended to every
@@ -113,13 +196,19 @@ function planFingerprintMarker(fingerprint) {
 /**
  * Labels the authoring pass is never allowed to set. The `agent::*` axis is
  * the runtime's lifecycle state (persist owns the terminal `agent::ready`
- * flip itself), `type::*` is fixed to `type::story` by the v2 hierarchy, and
- * `persona::*` is a retired axis.
+ * flip itself), `type::*` is fixed to `type::story` by the v2 hierarchy,
+ * `persona::*` is a retired axis, `plan-run::*` is the runtime-derived
+ * cohort grouping axis (Story #4692), and `route::*` is the runtime-derived
+ * ceremony-route axis (Story #4707) — a hand-authored entry on either
+ * derived axis would compete with the deterministic label persist applies
+ * itself.
  */
 const FORBIDDEN_LABEL_PREFIXES = Object.freeze([
   'agent::',
   'type::',
   'persona::',
+  PLAN_RUN_LABEL_PREFIX,
+  'route::',
 ]);
 
 /** GitHub's own label-name ceiling. */
@@ -308,7 +397,18 @@ function assembleOnePlanStory(ticket, opts) {
   });
   // Body first: the fingerprint is an identity over the *assembled* content,
   // so it cannot be computed until that content exists.
-  const body = serializeStoryBody({ ...folded, depends_on });
+  const serialized = serializeStoryBody({ ...folded, depends_on });
+  // Carry audit dedup provenance out of the seed this plan was authored from
+  // (Story #4877). The audit sweep's Single-plan path stamps the
+  // `audit-fingerprints` / `audit-semantic-keys` footers into the seed it hands
+  // `/plan`; without this the persisted Story carries no provenance and the
+  // next sweep re-files work it already planned. Mechanical on purpose — the
+  // authoring agent is not asked to notice HTML comments in a one-pager. A
+  // non-audit seed carries no footers, so this is a no-op there.
+  const { body } = carryProvenanceFooters({
+    from: opts.provenanceSource ?? '',
+    into: serialized,
+  });
   const fingerprint = planStoryFingerprint({ slug, title, body });
   return {
     story: {
@@ -608,6 +708,64 @@ async function mirrorNativeDependencyEdges({ provider, stories, idBySlug }) {
 }
 
 /**
+ * Ensure a runtime-derived persist label (`plan-run::<id>` cohort grouping,
+ * `route::lite` route marker) exists before it is applied — GitHub's
+ * create-issue path does not auto-create unknown labels on every provider
+ * route, and an opaque derived label never exists yet.
+ *
+ * **Non-fatal by design**, matching the native-blocked_by mirroring posture:
+ * neither label is load-bearing for correctness (grouping is cosmetic, and
+ * the route label is a human-visible hint only — `/deliver` re-derives the
+ * route from the Story body's shape, Story #4722), so it is never a reason
+ * to fail persist. On an ensure
+ * failure (throw, or the label reported `missing` by the post-loop
+ * reconcile) the create loop proceeds **without** the label — applying an
+ * unensured label could fail the issue create itself, and the Stories matter
+ * more than their metadata. A provider that exposes no `ensureLabels` (test
+ * fakes, minimal providers) is assumed to accept arbitrary labels on create.
+ *
+ * @param {object} args
+ * @param {object} args.provider
+ * @param {string} args.label
+ * @param {string} args.color
+ * @param {string} args.description
+ * @param {string} args.role Human-readable role for the degrade warning.
+ * @returns {Promise<boolean>} Whether the create loop should apply the label.
+ */
+async function ensurePersistLabel({
+  provider,
+  label,
+  color,
+  description,
+  role,
+}) {
+  if (typeof provider?.ensureLabels !== 'function') {
+    return true;
+  }
+  try {
+    const result = await provider.ensureLabels([
+      { name: label, color, description },
+    ]);
+    if (Array.isArray(result?.missing) && result.missing.includes(label)) {
+      Logger.warn(
+        `[plan-persist] ${role} label "${label}" could not be verified ` +
+          'on the remote — creating the Stories without it. Add the label ' +
+          'by hand if you want it.',
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    Logger.warn(
+      `[plan-persist] ${role} label ensure failed (${err.message}) — ` +
+        'creating the Stories without it. Add the label by hand if you ' +
+        'want it.',
+    );
+    return false;
+  }
+}
+
+/**
  * Create Story issues via `provider.createIssue`, resumably.
  *
  * **Stories are born without `agent::ready`** (Story #4541). They used to
@@ -631,24 +789,51 @@ async function mirrorNativeDependencyEdges({ provider, stories, idBySlug }) {
  * is named in a warning. Adoption never rewrites a body, so keying it on
  * anything weaker than content would silently ship a stale one.
  *
- * Story #4540 retired the `plan-run::<id>` label this used to apply when
- * N>1. Batch identity was the wrong axis to encode: it could not express an
- * edge to a Story planned in a different run, and ordering already lives in
- * the `blocked by #N` footers written below — which `/deliver`'s resolver
- * reads directly, alongside native GitHub edges, from live state.
+ * **Every created Story carries the cohort's `plan-run::<id>` grouping
+ * label** (Story #4692, metadata only). The id is deterministic over the
+ * authored artifacts ({@link derivePlanRunId}), so a resumed persist derives
+ * the identical label its adopted Stories already carry from their original
+ * create — no relabel call is needed on the resume path, and the cohort is
+ * never split across two labels. The label is ensured to exist before the
+ * first POST, **non-fatally**: grouping is cosmetic and never fails the run
+ * (see `ensureCohortLabel`). `/deliver` never reads it — delivery stays
+ * ids-only over live state (Story #4540's actual point).
+ *
+ * **The create loop stays serial and dependency-ordered** — deliberately, and
+ * unlike every other per-Story loop on this path (Story #4952). It is not an
+ * independent fan-out: `renderStoryBodyForCreate(story, idBySlug)` resolves a
+ * Story's `depends_on` slugs to the real issue ids its siblings were just
+ * minted with, and `idBySlug` is filled *in loop order* by the POSTs
+ * themselves. Running it concurrently would render `#undefined` dependency
+ * refs for any Story whose dependency had not yet returned an id.
  *
  * **Sibling order is mirrored into native GitHub `blocked_by` edges** once
  * every id is known (Story #4544), so plan-created order stops depending on
  * prose. That pass is non-fatal — see `mirrorNativeDependencyEdges`.
+ *
+ * **A lite-routed cohort carries the `route::lite` hint** (Story #4707,
+ * hint-only since Story #4722). When the caller resolves the plan's
+ * effective complexity route to `lite` (the planner's recorded verdict,
+ * upheld by the shape backstop), it passes the label via `opts.routeLabel`
+ * and every created Story carries it — a **human-visible hint only**, never
+ * the control signal: `/deliver` re-derives the route from each Story body's
+ * own shape (`resolveStoryDispatchMode`), so a lost or failed label write
+ * cannot misroute delivery. A full-routed plan passes nothing and its
+ * Stories carry **no** route label. Like the cohort label, the ensure is
+ * non-fatal — the label is cosmetic either way.
  *
  * @param {object} args
  * @param {object} args.provider
  * @param {ReturnType<typeof assemblePlanStories>['stories']} args.stories
  * @param {object} [args.opts]
  * @param {boolean} [args.opts.dryRun=false]
+ * @param {string|null} [args.opts.routeLabel=null] Route marker label to
+ *   apply to every created Story (`route::lite`), or null for none.
  * @returns {Promise<{
  *   created: Array<{ slug: string, id: number, url?: string, title: string, adopted: boolean }>,
  *   dependencyEdges: { edgesAdded: number, edgesSkipped: number, edgesFailed: number, storiesProcessed: number }|null,
+ *   planRunLabel: string,
+ *   routeLabel: string|null,
  * }>}
  */
 export async function createStoryIssues({ provider, stories, opts = {} }) {
@@ -659,6 +844,17 @@ export async function createStoryIssues({ provider, stories, opts = {} }) {
   }
 
   const list = Array.isArray(stories) ? stories : [];
+  const routeLabel =
+    typeof opts.routeLabel === 'string' && opts.routeLabel.trim() !== ''
+      ? opts.routeLabel.trim()
+      : null;
+
+  // Derived once for the whole cohort, before any write — a pure function of
+  // the authored artifacts, so dry-run can report it write-free and a resume
+  // re-derives the identical label.
+  const cohortLabel = planRunLabel(
+    derivePlanRunId(list.map((story) => story.fingerprint)),
+  );
 
   if (opts.dryRun) {
     return {
@@ -670,8 +866,31 @@ export async function createStoryIssues({ provider, stories, opts = {} }) {
         adopted: false,
       })),
       dependencyEdges: null,
+      planRunLabel: cohortLabel,
+      routeLabel,
     };
   }
+
+  const applyCohortLabel = await ensurePersistLabel({
+    provider,
+    label: cohortLabel,
+    color: PLAN_RUN_LABEL_COLOR,
+    description:
+      'Groups the Stories one /plan persist run authored (metadata ' +
+      'only — /deliver stays ids-only).',
+    role: 'cohort',
+  });
+  const applyRouteLabel =
+    routeLabel !== null &&
+    (await ensurePersistLabel({
+      provider,
+      label: routeLabel,
+      color: LITE_ROUTE_LABEL_COLOR,
+      description:
+        'Ceremony-lite hint (human-visible only): /deliver re-derives the ' +
+        'route from the Story body shape; every close gate runs unchanged.',
+      role: 'route-marker',
+    }));
 
   const { byFingerprint, idsByTitle } = await indexExistingStories(provider);
   const created = [];
@@ -681,6 +900,9 @@ export async function createStoryIssues({ provider, stories, opts = {} }) {
     const already = byFingerprint.get(story.fingerprint);
     if (!already) warnOnDivergentSameTitleStory(story, idsByTitle);
     if (already) {
+      // Adopted Stories already carry the cohort label from their original
+      // create — the deterministic derivation guarantees it is the same
+      // label this run derived, so no relabel call is needed here.
       Logger.info(
         `[plan-persist] resuming: Story "${story.slug}" already exists as ` +
           `#${already.id} with byte-identical authored content ` +
@@ -700,7 +922,11 @@ export async function createStoryIssues({ provider, stories, opts = {} }) {
     const result = await provider.createIssue({
       title: story.title,
       body: renderStoryBodyForCreate(story, idBySlug),
-      labels: [...story.labels],
+      labels: [
+        ...story.labels,
+        ...(applyCohortLabel ? [cohortLabel] : []),
+        ...(applyRouteLabel ? [routeLabel] : []),
+      ],
     });
     const id = result?.id ?? result?.number;
     if (!Number.isInteger(id)) {
@@ -727,7 +953,12 @@ export async function createStoryIssues({ provider, stories, opts = {} }) {
     idBySlug,
   });
 
-  return { created, dependencyEdges };
+  return {
+    created,
+    dependencyEdges,
+    planRunLabel: cohortLabel,
+    routeLabel: applyRouteLabel ? routeLabel : null,
+  };
 }
 
 /**
@@ -741,6 +972,16 @@ export async function createStoryIssues({ provider, stories, opts = {} }) {
  * Fails closed: an un-flipped Story is invisible to `/deliver`, which is the
  * safe direction — the operator is told exactly which ids need the label.
  *
+ * **Collect failures, never fast-fail** (preserved verbatim under the
+ * Story #4952 concurrency conversion). Every Story is attempted even when an
+ * earlier one's PATCH rejects, because the whole value of the closing error is
+ * naming the *complete* set of ids that still need the label by hand. The
+ * mapper below therefore absorbs its own rejection into a per-Story outcome
+ * rather than letting `concurrentMap`'s first-rejection-wins policy abandon
+ * the remaining flips. `concurrentMap` preserves input order, so `readied[]`
+ * and the reported failures come back in `created[]` order exactly as the
+ * serial loop produced them.
+ *
  * @param {object} args
  * @param {object} args.provider
  * @param {Array<{ id: number, slug: string }>} args.created
@@ -753,18 +994,32 @@ export async function markStoriesReady({ provider, created }) {
         'Stories to agent::ready.',
     );
   }
-  const readied = [];
-  const failed = [];
-  for (const story of created) {
-    try {
-      await provider.updateTicket(story.id, {
-        labels: { add: [AGENT_LABELS.READY] },
-      });
-      readied.push(story.id);
-    } catch (err) {
-      failed.push(`#${story.id} (${story.slug}): ${err.message}`);
-    }
-  }
+  const outcomes = await concurrentMap(
+    created,
+    async (story) => {
+      try {
+        await provider.updateTicket(story.id, {
+          labels: { add: [AGENT_LABELS.READY] },
+        });
+        return { id: story.id, failure: null };
+      } catch (err) {
+        return {
+          id: story.id,
+          failure: `#${story.id} (${story.slug}): ${err.message}`,
+        };
+      }
+    },
+    // The terminal per-Story `agent::ready` PATCHes (Story #4952): each flip
+    // is an independent single-issue write, so the loop was serial only by
+    // construction. A latency fix, not a throughput one.
+    { concurrency: FANOUT_CONCURRENCY },
+  );
+  const readied = outcomes
+    .filter((outcome) => outcome.failure === null)
+    .map((outcome) => outcome.id);
+  const failed = outcomes
+    .filter((outcome) => outcome.failure !== null)
+    .map((outcome) => outcome.failure);
   if (failed.length > 0) {
     throw new Error(
       `[plan-persist] ${failed.length} Story(ies) were created with their ` +

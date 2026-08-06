@@ -1,127 +1,176 @@
 # CI Failure Triage & Remediation
 
 This rule applies when a delivery path is watching a pull request's CI checks
-and a required check is red (or repeatedly slow) — the `/deliver` router
-([`deliver.md`](../workflows/deliver.md)) runs each Story through the
-single-Story Step 4 CI watch + fix loop
-([`deliver-story.md`](../workflows/helpers/deliver-story.md)), which hands off
-to it. It is the single triage brain that mechanism defers to:
-the watcher (`pr-watch-with-update.js`) surfaces the failing check, the run
-link, and the failure signature; this rule decides what to do next.
+and a required check is red (or repeatedly slow). The Story Step 4 CI watch +
+fix loop ([`deliver-story.md`](../workflows/helpers/deliver-story.md)) hands off
+to it: the watcher (`pr-watch-with-update.js`) surfaces the failing check, the
+run link, and the failure signature; this rule decides what to do next.
 
-The animating principle: **a red check is a defect until proven otherwise, and
-the fix is always to remove the defect — never to hide it.** There is no
-rerun-the-failed-job path and no quarantine path in this rule, by design.
-Reruns and quarantines mask defects; a flaky test that passes on the second
-attempt is still a bug that will fail a future run for a real user or a future
-delivery. Root-cause it or file it — never re-roll the dice.
+## Goal
 
-## The triage decision tree
+**A red check is a defect until proven otherwise, and the fix is always to
+remove the defect — never to hide it.** A red required check is resolved in
+exactly one of two ways, and no others:
 
-When a required check goes red, walk this tree top to bottom. Do **not** skip
-to "fix" before you have classified the failure — an unclassified fix is a
-guess.
+1. **Remove the root cause on the branch.** Pull the failing job log and record
+   the failure signature (failing check, run id / run link, first distinctive
+   error line — the watcher writes this to
+   `temp/story-<id>-ci-digest.{json,md}`). Reproduce the failure, confirm it is
+   caused by the diff under review — **verify the same check against an
+   unmodified `main` checkout**; if it also fails on `main` the defect is
+   pre-existing and belongs in a separate change — then fix it at source,
+   commit on `story-<storyId>`, push, and re-run the watcher. Auto-merge is
+   **disarmed on the first red** and re-armed only by a green on a **new head
+   SHA**, so the fix must be a new commit. Route deterministic per-check
+   failures (lint/format,
+   maintainability/CRAP baseline drift, test failure, coverage threshold)
+   through the fix table in
+   [`deliver-story-reference.md` § Step 4](../workflows/helpers/deliver-story-reference.md#step-4--ci-watch--fix-recovery);
+   refresh a baseline only when the diff demonstrably can't be covered.
+2. **File a `meta::framework-gap` issue** when the root cause is outside this
+   delivery's scope — a pre-existing flaky test, a runner/infra weakness, a
+   framework-level environment gap. Open the issue with the `meta::framework-gap`
+   label (see [`git-conventions.md`](git-conventions.md)) carrying **the run
+   link and the failure signature** so a later `/plan` Phase 0 sweep can act on
+   it. Remediate this delivery only if the pre-existing defect is genuinely
+   blocking it.
 
-### 1. Pull the evidence
+Infra, transient, and flaky failures are root-cause defects too — a flaky test
+that passes on a rerun is still a bug that will fail a future run. They route
+through the same two options; bisect environment (runner OS, Node version,
+concurrency, a platform-conditional branch, an external service) vs. code (an
+order-dependent test, a race, a shared-state assumption) to decide which.
 
-Fetch the failing job log and record the failure signature (the failing check
-name, the run id / run link, and the first distinctive error line). The
-watcher already writes this to `temp/story-<id>-ci-digest.{json,md}` — start
-from that digest.
+## Verdicts
 
-### 2. Classify the failure
+Every red check reaches exactly one verdict, and each verdict routes to one of
+the two options above. Name the verdict you reached in the `friction` comment.
 
-- **Deterministic (real) failure** — the check fails the same way every time,
-  and the failure is caused by the diff under review (a lint violation, a
-  broken test, a coverage regression, a baseline drift the diff genuinely
-  caused). → Go to [§ Real failures](#real-failures--route-to-the-per-check-fix-table).
-- **Infra / transient failure** — a runner died, a network fetch timed out, a
-  dependency registry 5xx'd, a step hit a platform-conditional path. → Go to
-  [§ Infra, transient, and flaky failures](#infra-transient-and-flaky-failures-are-root-cause-defects).
-- **Flaky failure** — the check fails intermittently: green on one run, red on
-  the next, with **no diff change** between them (order-dependent tests,
-  timing/race assertions, shared-state bleed, wall-clock or timezone
-  assumptions). → Go to
-  [§ Infra, transient, and flaky failures](#infra-transient-and-flaky-failures-are-root-cause-defects).
+| Verdict | Evidence | Routes to |
+| --- | --- | --- |
+| **defect-in-diff** | The failure reproduces on the branch and not on an unmodified `main` | Option 1 — fix at source |
+| **pre-existing** | The same check fails on an unmodified `main` too | Option 2 — file `meta::framework-gap`; remediate here only if it blocks this delivery |
+| **capacity** | Proven exhaustion of a runner resource, not a property of the diff (see below) | Option 2 — file `meta::framework-gap` **and** escalate to the operator |
+| **unreproducible-tier** | The tier cannot be exercised in this sandbox at all, proven by an attempted attach (see below) | Option 2 — file `meta::framework-gap` **and** escalate on first encounter |
 
-## Real failures — route to the per-check fix table
+### The `capacity` verdict
 
-A deterministic failure caused by the diff is remediated at source. Use the
-existing per-check fix table — do **not** duplicate it here:
+A job can fail because the runner ran out of something, not because the code is
+wrong: no runner could be provisioned, the disk or memory ceiling was hit, a
+process/PTY/file-descriptor limit was exhausted, the job wall-clock timed out
+with no progress, or a self-hosted pool was saturated. Nothing on the branch
+causes it and nothing on the branch can fix it.
 
-- **Story Step 4**:
-  [`deliver-story-reference.md` § Step 4 — CI watch + fix recovery](../workflows/helpers/deliver-story-reference.md#step-4--ci-watch--fix-recovery).
+This verdict exists because the rule previously offered no landing for that
+case. The honest reading of "a red check is a defect until proven otherwise" is
+that capacity failures are the *otherwise* — but with no verdict for them the
+only shapes on offer were "fix the diff" (impossible) and "it's flaky, re-run
+it" (forbidden), so the rule got broken rather than followed. Naming the verdict
+removes the incentive to launder a capacity failure as a rerun.
 
-In short: lint/format → `npm run lint` + biome apply; maintainability/crap
-baseline drift → re-run the ratcheted script and fix at source (refresh a
-baseline only when the diff demonstrably can't be covered); test failure →
-reproduce with `npm test`, fix source or test; coverage threshold → add tests.
-Commit the fix on the delivery branch (`story-<storyId>`), push, and re-run the
-watcher. Auto-merge stays armed across retries.
+**Capacity must be proven, not inferred.** A green on re-run is the single
+weakest form of evidence for it and never establishes it — that is precisely the
+observation a flaky test produces. Cite the resource and the reading: the log
+line naming the exhausted limit (an OOM kill, `ENOSPC`, `EMFILE`,
+`forkpty/sudo: Device not configured`, a provisioning error, a no-output
+timeout), plus the fact that the failure is not specific to this diff. Absent
+that reading the verdict is **flaky, not capacity**, and it routes to Option 1.
 
-## Infra, transient, and flaky failures ARE root-cause defects
+On a `capacity` verdict: file the `meta::framework-gap` issue with the run link,
+the failure signature, and the resource reading; flip the Story to
+`agent::blocked` with a `friction` comment naming the verdict; and hand back to
+the operator, who owns the runner pool. Do not sit in a retry loop waiting for
+capacity to return.
 
-Treat every infra/transient failure **and** every flaky failure as a
-root-cause defect. The remediation sequence is the same for both — you do not
-get to wave it off because "CI was flaky."
+**Rerunning a failed job to reach green stays forbidden under every verdict,
+`capacity` and `unreproducible-tier` included.** The verdict changes who owns the fix and where it is
+filed; it never licenses a re-run, and it is not a route to a green bar. A
+capacity-blocked delivery ends `agent::blocked` — not merged.
 
-1. **Reproduce.** Run the failing check locally (or in a clean environment as
-   close to CI as you can get). Re-run it enough times to observe the
-   intermittency for a flaky failure. If you cannot reproduce it at all after a
-   genuine attempt, that itself is a finding — record it in the issue you file
-   in step 4.
-2. **Check whether it also fails on `main`.** Run the same check against an
-   unmodified `main` checkout. If it fails on `main`
-   too, the defect is **pre-existing** — it is not caused by the diff under
-   review, and the fix belongs in a separate change, not silently folded into
-   this delivery.
-3. **Bisect environment vs. code.** Determine whether the failure is driven by
-   the environment (runner OS, Node version, concurrency, a platform-
-   conditional branch, an external service) or by the code (an
-   order-dependent test, a race, a shared-state assumption). This tells you
-   where the fix has to land.
-4. **Then either fix in-scope OR file the defect.**
-   - **Fix in-scope** when the root cause is within this delivery's footprint
-     and the fix is a cohesive part of the change under review (e.g. a race in
-     a test the diff touches, a timezone assumption in code the Story owns).
-     Commit it on the delivery branch, push, and re-run the watcher.
-   - **File a `meta::framework-gap` issue** when the root cause is outside this
-     delivery's scope — a pre-existing flaky test, a runner/infra weakness, a
-     framework-level environment gap. Open the issue with the
-     `meta::framework-gap` label (see
-     [`git-conventions.md` § `meta::framework-gap`](git-conventions.md)),
-     and include **the run link and the failure signature** (failing check,
-     run id, first distinctive error line) captured in step 1 so a later
-     `/plan` Phase 0 sweep can act on it. Then remediate this delivery only if
-     the pre-existing defect is genuinely blocking it; otherwise proceed once
-     the defect is filed and the check is not caused by your diff.
+### The `unreproducible-tier` verdict
 
-**There is no shortcut.** You may **not** re-run the failed job to "see if it
-goes green," and you may **not** quarantine, skip, or `.only`/`.skip` a flaky
-test to get a green bar. Both mask the defect and are prohibited by this rule.
+A check can fail on a tier the sandbox cannot run at all — most often a
+browser suite whose Playwright `webServer` block supervises a dev server the
+local process manager daemonizes, which aborts the run with
+`Process from config.webServer exited early` before any test executes. The
+failure is a property of the sandbox's ability to *host* the suite, not of the
+diff.
 
-## Escalation criteria
+This is the same structural hole the `capacity` verdict was added to fill, one
+step earlier in the loop. Without it the honest reading is `flaky`, which routes
+to Option 1 — and fix-at-source requires reproducing the failure, which is the
+one thing that cannot be done. The agent then spends the full timebox
+rediscovering that before escalating anyway, and any fix it does author is
+written blind against a tier it never ran.
 
-Escalate — flip the ticket to `agent::blocked`, post a `friction` comment, and
-hand back to the operator — under **any** of the following. These extend the
-existing three-strikes halt rule; they do not replace it.
+**Unreproducible must be proven, not inferred.** "The suite did not run for me"
+is not the verdict — it is the symptom every misconfiguration produces. Cite
+both:
 
-- **Three strikes (existing).** Three consecutive remediation iterations on the
-  same failure class without convergence. Stop; the diagnosis is likely wrong
-  (see [`instructions.md` § 1.I Anti-Thrashing](../instructions.md)).
-- **Wall-clock timebox.** Regardless of iteration count, if you have spent more
-  than **30 minutes of active remediation** on a single CI failure without a
-  green bar in sight, stop and escalate. A long grind on one red check is
-  itself a signal that the failure exceeds a single delivery turn's judgment.
-- **Clearly-environmental → escalate immediately (fast path).** When the
-  failure is unambiguously environmental and outside your control — a runner
-  provisioning failure, a persistent registry/network outage, a
-  branch-protection or CI-configuration misconfiguration, an expired
-  credential — do **not** burn iterations trying to code around it. File the
-  `meta::framework-gap` issue (with run link + signature) and escalate on the
-  first encounter. This fast path exists so an operator-side or infra-side
-  problem reaches the operator immediately instead of consuming the turn.
+- **The attempted attach.** Work the attach-don't-boot seam in the
+  [`playwright`](../skills/stack/qa/playwright/SKILL.md) skill — boot the server
+  out-of-band, point the suite at the running origin, set `reuseExistingServer`
+  — and name which step failed and how. A tier that runs once attached was never
+  unreproducible.
+- **The observed signature.** The verbatim line the runner aborted on, so a
+  later reader can tell a lifetime-ownership mismatch from a genuine boot
+  failure in the app under test.
 
-When you escalate, name the failing check, the run link, the failure
-signature, the classification you reached, and what you tried — never fall
-silent.
+Absent both readings the verdict is unavailable and the failure routes as it did
+before. On the verdict: file the `meta::framework-gap` issue with the run link,
+the failure signature, and the attach attempt; flip the Story to
+`agent::blocked` with a `friction` comment naming the verdict; and hand back to
+the operator, who owns the sandbox. Do not author a fix for a tier you could not
+run — a blind fix to a suite nobody exercised is how the gap compounds.
+
+## Verifier
+
+The check is resolved only when it is **green with zero reruns of the failed
+job**, and the diff carries **no `.skip` / `.only`, no quarantine, and no
+deleted or loosened assertion** introduced to reach green. You may **not**
+re-run a failed job to "see if it goes green," and you may **not** skip,
+`.only`, or quarantine a flaky test to get a green bar. Both mask the defect
+and are prohibited by this rule.
+
+**The enforcement point is
+[`pr-watch-with-update.js`](../scripts/pr-watch-with-update.js)**, and it acts
+on the **first red** — GitHub's native auto-merge fires server-side, so it
+races any attempt to detect a rerun-green and block it after the fact. On the
+first red the watcher **disarms native auto-merge** (a disarm failure is a
+blocker, not a warning) and records the PR **head SHA** in the digest
+alongside the failing check-run identity. On green it adjudicates:
+
+- **Same head SHA** → the green came from re-running the failed job. The
+  watcher exits non-zero, flips the Story to `agent::blocked` with a
+  `friction` comment, and requires the `meta::framework-gap` issue (run link +
+  failure signature, both already in the digest) before the delivery proceeds.
+- **New head SHA** → fix at source. The digest is retired, auto-merge is
+  re-armed, and the delivery continues unobstructed.
+
+A delivery that never went red has no digest and is untouched.
+
+## Escalation
+
+Flip the ticket to `agent::blocked`, post a `friction` comment (naming the
+failing check, the run link, the failure signature, the classification you
+reached, and what you tried — **never fall silent**), and hand back to the
+operator under **any** of:
+
+- **Three strikes.** Three consecutive remediation iterations on the same
+  failure class without convergence — the diagnosis is likely wrong (see
+  [`instructions.md` § 1.I Anti-Thrashing](../instructions.md)).
+- **Wall-clock timebox.** More than **30 minutes** of active remediation on a
+  single CI failure without a green bar in sight.
+- **Clearly-environmental → escalate immediately.** An unambiguously
+  environmental failure outside your control (runner provisioning, a persistent
+  registry/network outage, a branch-protection or CI misconfiguration, an
+  expired credential) — file the `meta::framework-gap` issue (with run link +
+  signature) and escalate on the first encounter rather than burning iterations
+  trying to code around it. A proven-capacity failure is this case: reach the
+  `capacity` verdict above and escalate on the first encounter.
+- **Unrunnable tier → escalate immediately.** A tier the sandbox cannot host at
+  all is this case too: work the attach seam once, reach the
+  `unreproducible-tier` verdict above with its two readings, and escalate on the
+  **first encounter**. The 30-minute timebox is a ceiling here, never a budget
+  to spend — every minute past the failed attach buys nothing, because no
+  iteration can make an unhostable suite run.

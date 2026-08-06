@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-16T20:44:41.281Z",
+  "generatedAt": "2026-08-05T00:59:17.768Z",
   "generator": "generate-skills-index.js@1",
   "skills": [
     {
@@ -48,7 +48,7 @@
       "category": "core",
       "path": ".agents/skills/core/diagnose-friction/SKILL.md",
       "description": "Wrap a shell command with diagnostic capture. On failure, print static suggestions and append a structured `friction` record to the per-Story signals.ndjson stream. Use whenever a script in the orchestration loop invokes a tool whose failure shape we want the analyzer to attribute.",
-      "policyCapsuleBullets": 8,
+      "policyCapsuleBullets": 9,
       "allowedTools": ["Bash", "Read"],
       "vendor": null
     },
@@ -78,7 +78,7 @@
       "category": "core",
       "path": ".agents/skills/core/git-workflow-and-versioning/SKILL.md",
       "description": "Structures git workflow practices. Use when making any code change. Use when committing, branching, resolving conflicts, or when you need to organize work across multiple parallel streams.",
-      "policyCapsuleBullets": 10,
+      "policyCapsuleBullets": 6,
       "allowedTools": null,
       "vendor": null
     },
@@ -117,8 +117,8 @@
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/security-and-hardening/SKILL.md",
-      "description": "Hardens code against vulnerabilities. Use when handling user input, authentication, data storage, or external integrations. The non-negotiable security MUSTs live in `.agents/rules/security-baseline.md`; this skill shows how to apply them with code patterns, decision trees, and review checklists.",
-      "policyCapsuleBullets": 11,
+      "description": "Hardens code against vulnerabilities. Use when handling user input, authentication, data storage, or external integrations. The non-negotiable security MUSTs live in `.agents/rules/security-baseline.md`; this skill shows how to apply them with process guidance, an audit-triage tree, and a review checklist.",
+      "policyCapsuleBullets": 6,
       "allowedTools": null,
       "vendor": null
     },
@@ -148,7 +148,7 @@
       "category": "qa",
       "path": ".agents/skills/stack/qa/playwright/SKILL.md",
       "description": "Robust E2E browser testing with Playwright. Use when writing browser-driven tests — leverage auto-waiting (no `waitForTimeout`), prefer user-visible locators (`getByRole`, `getByText`, `getByLabel`) over CSS/XPath, reuse `storageState` for auth, and enable trace-on-first-retry for CI debugging.",
-      "policyCapsuleBullets": 7,
+      "policyCapsuleBullets": 8,
       "allowedTools": null,
       "vendor": "playwright"
     },
@@ -168,7 +168,7 @@
       "category": "qa",
       "path": ".agents/skills/stack/qa/qa-harness/SKILL.md",
       "description": "Conventions for the agent-driven QA harness that drives Gherkin scenarios through a real browser. Use when executing `/qa-run` or instrumenting a live surface — covers navigation-first execution, per-surface console and network capture, design-token visual checks, and the framework-generic heuristic cards for turning signal into findings. The harness procedure lives in `.agents/workflows/qa-run.md`; this skill is the conventions reference it leans on.",
-      "policyCapsuleBullets": 8,
+      "policyCapsuleBullets": 7,
       "allowedTools": null,
       "vendor": null
     },

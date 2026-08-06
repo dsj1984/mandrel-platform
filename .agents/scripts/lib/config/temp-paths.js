@@ -52,7 +52,11 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+
+import { reapOnExit } from '../test-temp.js';
 
 /**
  * Cache the resolved main-checkout root per spawn cwd so the
@@ -115,6 +119,91 @@ export function _clearMainCheckoutRootCache() {
 }
 
 /**
+ * Environment variable naming an absolute per-process scratch tempRoot that
+ * every stream writer must land in during a test run (Story #4696).
+ *
+ * The shared test bootstrap (`lib/test-env.js`) sets this to a fresh
+ * `os.tmpdir()` directory before spawning the test runner, so any test that
+ * reaches a writer (`signals-writer`, the lifecycle `LedgerWriter`, etc.)
+ * *without* explicitly injecting an absolute tempRoot still resolves under
+ * scratch instead of the repo's real `temp/` tree. This is the single
+ * injection seam: because every path helper funnels a relative root through
+ * `anchorTempRoot`, one redirect here covers all writers regardless of how
+ * each one resolved its root.
+ */
+export const TEST_TEMP_ROOT_ENV = 'MANDREL_TEST_TEMP_ROOT';
+
+/**
+ * Resolve the absolute scratch tempRoot override, or `null` when none is
+ * configured. Only an **absolute** value is honoured — a relative override
+ * would re-anchor against the repo tree and defeat the isolation, so it is
+ * ignored (treated as unset). Module-internal: the behaviour is exercised
+ * through `anchorTempRoot`, so it is deliberately not exported (keeps the
+ * public seam to `anchorTempRoot` + `TEST_TEMP_ROOT_ENV`).
+ *
+ * @param {NodeJS.ProcessEnv} [env=process.env]
+ * @returns {string|null}
+ */
+function testScratchTempRoot(env = process.env) {
+  const override = env?.[TEST_TEMP_ROOT_ENV];
+  return typeof override === 'string' &&
+    override.length > 0 &&
+    path.isAbsolute(override)
+    ? override
+    : null;
+}
+
+/**
+ * Environment variable that opts a test-context process back into the real
+ * `temp/` tree (Story #4711). The `anchorTempRoot` test-context fallback
+ * refuses to anchor a relative root into the repo's telemetry tree when the
+ * process is a node:test context; a test that genuinely needs the real tree
+ * sets this to `'1'` on its own spawn — an explicit, greppable opt-out
+ * instead of a silent bypass.
+ */
+export const TEST_ALLOW_REAL_TEMP_ENV = 'MANDREL_TEST_ALLOW_REAL_TEMP';
+
+/**
+ * Per-process memo for the lazily-created test-context scratch dir, so every
+ * relative-root resolution in one test process converges on a single scratch
+ * tree (mirrors the `_mainCheckoutRootCache` pattern above).
+ */
+let _testContextScratchDir = null;
+
+/**
+ * Test-only: clear the test-context scratch memo so a suite can exercise the
+ * lazy-arming branch repeatedly in one process.
+ */
+export function _clearTestContextScratchCache() {
+  _testContextScratchDir = null;
+}
+
+/**
+ * Is this process a node:test context? True when the env carries
+ * `NODE_TEST_CONTEXT` (set by the node:test runner on every spawned test
+ * child, regardless of how the runner itself was launched) or when the
+ * process was started with the `--test` flag (a direct `node --test <file>`
+ * runner process, or in-process isolation modes).
+ *
+ * Exported since Story #4837: the feedback loop's issue-filing path guards
+ * live GitHub writes on this same signal, and a second hand-rolled copy of
+ * the detection is exactly how the two would drift apart.
+ *
+ * @param {NodeJS.ProcessEnv} [env=process.env]
+ * @param {string[]} [execArgv=process.execArgv]
+ * @returns {boolean}
+ */
+export function inNodeTestContext(
+  env = process.env,
+  execArgv = process.execArgv,
+) {
+  return (
+    Boolean(env?.NODE_TEST_CONTEXT) ||
+    (Array.isArray(execArgv) && execArgv.includes('--test'))
+  );
+}
+
+/**
  * Anchor a resolved `tempRoot` to the main checkout root when it is a
  * relative path (Story #3900). Absolute roots are returned verbatim; a
  * relative root is joined onto the main checkout root so every caller
@@ -123,11 +212,63 @@ export function _clearMainCheckoutRootCache() {
  * root is returned unchanged so behaviour degrades to the prior
  * cwd-relative semantics rather than throwing.
  *
+ * Test isolation (Story #4696): when the scratch override
+ * (`MANDREL_TEST_TEMP_ROOT`) is set, a relative root is joined onto the
+ * scratch dir instead of the main checkout root, so a writer that reaches
+ * the default (or any relative) root under the test bootstrap lands in
+ * scratch and never pollutes the repo's real `temp/` telemetry tree. An
+ * absolute root injected by a well-behaved test still bypasses the redirect
+ * verbatim.
+ *
+ * Process-level arming (Story #4711): the wrapper-armed override above only
+ * covers processes spawned by `run-tests.js` — a direct `node --test <file>`
+ * run used to bypass it and append fixture records to the real tree. When no
+ * override is armed but the process *is* a node:test context (see
+ * `inNodeTestContext`), a per-process scratch dir is created lazily and the
+ * relative root anchors there instead. The scratch dir is memoized and — for
+ * the real `process.env` — written back to `MANDREL_TEST_TEMP_ROOT` so child
+ * processes the test spawns inherit the same scratch tree. Escape hatch: a
+ * test that genuinely needs the real tree sets
+ * `MANDREL_TEST_ALLOW_REAL_TEMP=1` (`TEST_ALLOW_REAL_TEMP_ENV`) to restore
+ * main-checkout anchoring; the `check-test-temp-hygiene` guard remains the
+ * backstop either way.
+ *
  * @param {string} tempRoot
+ * @param {NodeJS.ProcessEnv} [env=process.env]
+ * @param {{ mkdtemp?: typeof mkdtempSync, execArgv?: string[], onExit?: (fn: () => void) => void }} [deps]
+ *   Injectable for tests.
  * @returns {string}
  */
-export function anchorTempRoot(tempRoot) {
+export function anchorTempRoot(tempRoot, env = process.env, deps = {}) {
   if (path.isAbsolute(tempRoot)) return tempRoot;
+  const scratch = testScratchTempRoot(env);
+  if (scratch) return path.join(scratch, tempRoot);
+  const execArgv = deps.execArgv ?? process.execArgv;
+  if (
+    inNodeTestContext(env, execArgv) &&
+    env?.[TEST_ALLOW_REAL_TEMP_ENV] !== '1'
+  ) {
+    if (_testContextScratchDir === null) {
+      const mkdtemp = deps.mkdtemp ?? mkdtempSync;
+      // test-temp-allow: published to children below, so it must live
+      // outside the per-process suite root that this process reaps.
+      _testContextScratchDir = mkdtemp(
+        path.join(os.tmpdir(), 'mandrel-test-temp-'),
+      );
+      // Creator-only reaping (Story #4808): a process that read the root
+      // from the env returned at `scratch` above and never reaches here,
+      // so it can never remove a root its parent is still writing to.
+      reapOnExit(
+        _testContextScratchDir,
+        deps.onExit ? { onExit: deps.onExit } : {},
+      );
+      if (env === process.env) {
+        // Children spawned by this test process inherit the same scratch.
+        process.env[TEST_TEMP_ROOT_ENV] = _testContextScratchDir;
+      }
+    }
+    return path.join(_testContextScratchDir, tempRoot);
+  }
   const root = mainCheckoutRoot();
   return root ? path.join(root, tempRoot) : tempRoot;
 }
@@ -152,6 +293,95 @@ export function tempRootFrom(config) {
   return typeof tempRoot === 'string' && tempRoot.length > 0
     ? tempRoot
     : 'temp';
+}
+
+/**
+ * Directory segment (under `tempRoot`) holding every orchestration run log —
+ * the close gate transcripts (`close-gates-<sid>.log`) and the terse-result
+ * detail dumps (`story-init-result-<sid>.log`, `sync-result-<branch>.log`, …).
+ *
+ * Story #4794: the four writers that land here each hand-rolled the temp path
+ * from a literal `temp` segment joined onto their own cwd, which ignores
+ * `project.paths.tempRoot` entirely. On a consumer that relocates its temp
+ * root, the writers wrote to `<cwd>/temp/` while every reader — including the
+ * retention purge — resolved the configured root, so the artifacts were
+ * invisible to the tooling meant to manage them. Routing all four through this
+ * helper also picks up main-checkout anchoring for free, so a close running
+ * from a Story worktree lands its logs in the same tree the host reads.
+ */
+export const ORCHESTRATION_DIRNAME = 'orchestration';
+
+/**
+ * `<tempRoot>/orchestration/` — resolved against the configured temp root and
+ * anchored to the main checkout, like every other helper in this module.
+ *
+ * @param {object} [config]
+ * @returns {string}
+ */
+export function orchestrationLogDir(config) {
+  return path.join(anchorTempRoot(tempRootFrom(config)), ORCHESTRATION_DIRNAME);
+}
+
+/**
+ * Basename of one Story's close gate log (Story #4816 lifted it here from
+ * `single-story-close/gate-log.js`).
+ *
+ * The writer that appends this file and the reader that uses its **freshness**
+ * to tell a live close from a dead one (`deliver-recover.js`) sit in different
+ * subtrees, and the reader importing the writer is the wrong edge to draw for
+ * a filename. Both take it from the module that already owns every other
+ * tempRoot path instead.
+ *
+ * `null` is the sink's no-Story sentinel and keeps its `unknown` spelling.
+ *
+ * @param {number|null} sid
+ * @returns {string}
+ */
+function closeGateLogName(sid) {
+  return `close-gates-${sid ?? 'unknown'}.log`;
+}
+
+/**
+ * `<tempRoot>/orchestration/close-gates-<sid>.log`.
+ *
+ * @param {number|null} sid
+ * @param {object} [config]
+ * @returns {string}
+ */
+export function closeGateLogPath(sid, config) {
+  return path.join(orchestrationLogDir(config), closeGateLogName(sid));
+}
+
+/**
+ * Basename of the persisted terminal envelope for one Story (Story #4816).
+ *
+ * @param {number} sid
+ * @returns {string}
+ */
+function storyTerminalEnvelopeName(sid) {
+  return `story-deliver-terminal-${storyId(sid)}.json`;
+}
+
+/**
+ * `<tempRoot>/orchestration/story-deliver-terminal-<sid>.json` — the on-disk
+ * copy of the one terminal envelope a Story's close-and-land emits (Story
+ * #4816).
+ *
+ * Deliberately a sibling of the gate log rather than a per-Story temp dir
+ * entry: the envelope is a run artifact of the same close that writes
+ * `close-gates-<sid>.log`, and `deliver-recover.js` reads the pair together to
+ * tell a finished close from a live one. Sharing `orchestrationLogDir` also
+ * means it inherits main-checkout anchoring for free — the close runs inside
+ * `.worktrees/story-<sid>/` while the `/deliver` host reads from the main
+ * checkout, and an un-anchored path would put the envelope somewhere the
+ * router never looks.
+ *
+ * @param {number} sid
+ * @param {object} [config]
+ * @returns {string}
+ */
+export function storyTerminalEnvelopePath(sid, config) {
+  return path.join(orchestrationLogDir(config), storyTerminalEnvelopeName(sid));
 }
 
 const runId = (id) => {
@@ -237,10 +467,18 @@ export function storyTempDir(eid, sid, config) {
   const checkedEid = storyEpicId(eid);
   const parent =
     checkedEid === null
-      ? path.join(anchorTempRoot(tempRootFrom(config)), 'standalone')
+      ? path.join(anchorTempRoot(tempRootFrom(config)), STANDALONE_DIRNAME)
       : runTempDir(checkedEid, config);
-  return path.join(parent, 'stories', `story-${storyId(sid)}`);
+  return path.join(parent, STORIES_DIRNAME, `story-${storyId(sid)}`);
 }
+
+/**
+ * Basename of a per-Story signal stream. Exported so the reader that
+ * *discovers* streams by walking the temp tree (`signals-writer.js`'s
+ * cross-Story gather, Story #4824) names the same file the writer does,
+ * instead of re-spelling the literal in a second module.
+ */
+export const SIGNALS_BASENAME = 'signals.ndjson';
 
 /**
  * `temp/run-<eid>/stories/story-<sid>/signals.ndjson` — append-only
@@ -252,7 +490,33 @@ export function storyTempDir(eid, sid, config) {
  * @returns {string}
  */
 export function signalsFile(eid, sid, config) {
-  return path.join(storyTempDir(eid, sid, config), 'signals.ndjson');
+  return path.join(storyTempDir(eid, sid, config), SIGNALS_BASENAME);
+}
+
+/**
+ * Directory segment holding the standalone-Story subtree —
+ * `<tempRoot>/standalone/stories/story-<sid>/`. Named here (rather than
+ * inlined in `storyTempDir`) so the cross-Story stream discovery in
+ * `signals-writer.js` can recognise it without re-spelling the literal.
+ */
+export const STANDALONE_DIRNAME = 'standalone';
+
+/**
+ * Directory segment holding the per-Story subtree under either an Epic run
+ * dir or the standalone dir (Story #2940's separator).
+ */
+export const STORIES_DIRNAME = 'stories';
+
+/**
+ * `<tempRoot>` itself, resolved and main-checkout-anchored. The discovery
+ * walk needs the root the named helpers are built from; every other consumer
+ * should keep using a named helper.
+ *
+ * @param {object} [config]
+ * @returns {string}
+ */
+export function resolvedTempRoot(config) {
+  return anchorTempRoot(tempRootFrom(config));
 }
 
 /**

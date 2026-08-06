@@ -55,11 +55,13 @@ import { getStoryBranch, gitSpawn, gitSync } from './lib/git-utils.js';
 import { Logger } from './lib/Logger.js';
 import { TYPE_LABELS } from './lib/label-constants.js';
 import { setActiveStoryEnv } from './lib/observability/active-story-env.js';
+import { emitTerseResult } from './lib/observability/terse-result.js';
 import {
   executeFastForward,
   planFastForward,
 } from './lib/orchestration/git-cleanup/phases/fast-forward.js';
 import { verifyRemote } from './lib/orchestration/remote-verifier.js';
+import { pinRunScopedConfig } from './lib/orchestration/run-scoped-config.js';
 import {
   acquireStoryLease,
   releaseStoryLease,
@@ -734,6 +736,11 @@ export async function runSingleStoryInit({
     standalone: true,
     storyBranch,
     baseBranch,
+    // The write half of the run-scoped config pin. `baseBranch` above is the
+    // legacy field close still reads as a fallback; this block is the
+    // registry-driven form a second run-scoped key joins without a second
+    // mechanism (`lib/orchestration/run-scoped-config.js`).
+    runScopedConfig: pinRunScopedConfig(config),
     storyTitle: story.title,
     worktreeEnabled: runtime.worktreeEnabled,
     workCwd,
@@ -769,9 +776,24 @@ export async function runSingleStoryInit({
     }
   }
 
-  Logger.info('\n--- STORY INIT RESULT ---');
-  Logger.info(JSON.stringify(result, null, 2));
-  Logger.info('--- END RESULT ---\n');
+  // Story #4685 — route the full result to a temp log and emit a single-line
+  // summary carrying the fields the orchestrating agent acts on (workCwd,
+  // remoteVerified). The `## Spec` names this the hot-path stdout to quiet.
+  emitTerseResult({
+    label: 'STORY INIT RESULT',
+    result,
+    scope: storyId,
+    config,
+    summary: {
+      storyId,
+      storyBranch,
+      workCwd,
+      worktreeCreated,
+      dependenciesInstalled,
+      remoteVerified: result.remoteVerified,
+      dryRun,
+    },
+  });
   progress(
     'DONE',
     dryRun
@@ -789,6 +811,7 @@ export function renderSingleStoryInitComment(result) {
     standalone: true,
     storyBranch: result.storyBranch,
     baseBranch: result.baseBranch,
+    runScopedConfig: result.runScopedConfig,
     worktreeEnabled: result.worktreeEnabled,
     workCwd: result.workCwd,
     worktreeCreated: result.worktreeCreated,
@@ -815,4 +838,24 @@ export function renderSingleStoryInitComment(result) {
   ].join('\n');
 }
 
-runAsCli(import.meta.url, runSingleStoryInit, { source: 'single-story-init' });
+runAsCli(import.meta.url, runSingleStoryInit, {
+  source: 'single-story-init',
+  usage: {
+    invocation:
+      'node .agents/scripts/single-story-init.js --story <id> [--dry-run] [--steal] [--cwd <main-repo>]',
+    summary:
+      'Initialize a Story for delivery: acquire the lease, seed story-<id> from the base branch, materialize the worktree, and flip the Story to agent::executing.',
+    flags: [
+      ['--story <id>', 'GitHub issue number of the Story (required).'],
+      [
+        '--dry-run',
+        'Report what would happen; no mutations, no lease, no sweep.',
+      ],
+      ['--steal', 'Forcibly transfer a lease held by another assignee.'],
+      [
+        '--cwd <main-repo>',
+        'Main-repo checkout to run from (default: project root).',
+      ],
+    ],
+  },
+});

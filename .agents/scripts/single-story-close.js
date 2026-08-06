@@ -43,6 +43,16 @@
  *                              [--skip-validation] [--skip-sync]
  *                              [--no-auto-merge]
  *                              [--wait-merge | --no-wait-merge]
+ *                              [--merge-watch-mode <sync|async>]
+ *
+ * `--merge-watch-mode` (Story #4949) overrides `delivery.mergeWatch.mode` for
+ * one invocation, on the same explicit-wins-over-config precedence
+ * `--max-wait-seconds` uses, and the two compose. It exists because run
+ * topology is invisible from inside close: a solo delivery is cheapest waiting
+ * in the foreground, while the Nth close of a wave pays that wait as
+ * serialized dead time. The config default therefore stays `sync` and the
+ * orchestrator — the only party that knows N — passes `async` per close. An
+ * unrecognized value fails during option parsing, before any phase runs.
  *
  * Close-and-land is the DEFAULT for every run (Story #4428 introduced it as
  * `--wait-merge`; `delivery.routing.closeAndLand` — default `true` — made it
@@ -85,11 +95,16 @@
  * @see .agents/schemas/story-deliver-terminal.schema.json
  */
 
-import { parseSprintArgs } from './lib/cli-args.js';
+import { parseSprintArgsTolerant } from './lib/cli-args.js';
 import { runAsCli } from './lib/cli-utils.js';
 import { formatCliError } from './lib/error-redactor.js';
 import { Logger } from './lib/Logger.js';
 import { emitTerminalFriction } from './lib/observability/runtime-friction.js';
+import { resolveRunScopedConfig } from './lib/orchestration/run-scoped-config.js';
+import {
+  failedTerminalFor,
+  gatesForFailedPhase,
+} from './lib/orchestration/single-story-close/failed-terminal.js';
 import { enableAutoMergeWith } from './lib/orchestration/single-story-close/phases/auto-merge.js';
 import {
   buildSyncFailureCommentBody,
@@ -102,10 +117,8 @@ import {
 } from './lib/orchestration/single-story-close/phases/code-review.js';
 import { ensurePullRequestWith } from './lib/orchestration/single-story-close/phases/pull-request.js';
 import {
-  buildTerminalEnvelope,
   emitTerminalEnvelope,
   exitCodeForTerminal,
-  NEXT_COMMANDS,
 } from './lib/orchestration/story-deliver-terminal.js';
 
 // Story #2990 moved the `gh`-spawn boundary into the `lib/gh-exec.js`
@@ -118,11 +131,20 @@ export const enableAutoMerge = enableAutoMergeWith;
 
 // Re-export pure helpers verbatim — they don't touch `execFileSync`
 // or any URL-mocked module, so the phase exports work unmodified.
+// `gatesForFailedPhase` now lives beside the envelope it feeds
+// (`single-story-close/failed-terminal.js`); it is re-exported here so the
+// CLI's public surface is unchanged by that move.
+// `resolveRunScopedConfig` (Story #4891) is the run-scoped config pin the
+// pipeline reads before its first phase; it is part of this CLI's surface for
+// the same reason the sync helpers are — the runner reaches it only through a
+// dynamic import, so this file is where it is statically visible.
 export {
   buildStoryReviewCrossRefBody,
   buildSyncFailureCommentBody,
+  gatesForFailedPhase,
   handleSyncFailure,
   parsePrNumber,
+  resolveRunScopedConfig,
   runStoryScopeReview,
 };
 
@@ -135,106 +157,29 @@ export async function runSingleStoryClose(opts) {
 }
 
 /**
- * The close pipeline's phase order, as `setPhase` walks it. Only used to
- * decide whether a gate had already run when a later phase died.
- */
-const PHASE_ORDER = Object.freeze([
-  'init',
-  'wrong-tree-guard',
-  'close-validation',
-  'base-sync',
-  'push',
-  'pull-request',
-  'code-review',
-  'auto-merge',
-  'confirm-merge',
-  'post-land',
-  'done',
-]);
-
-/** Each reported gate and the pipeline phase that decides it. */
-const GATE_PHASES = Object.freeze([
-  ['validation', 'close-validation'],
-  ['baseSync', 'base-sync'],
-  ['codeReview', 'code-review'],
-]);
-
-/**
- * Report every gate's outcome for a run that died at `phase`.
- *
- * The schema's contract: "A gate the run skipped … reports `skipped` rather
- * than being omitted, so a missing gate is never mistaken for a passing one."
- * The previous shape named only the gate that died and omitted the rest
- * entirely — exactly the ambiguity the contract forbids.
- *
- * Reconstructed from the phase order, which is sound because the pipeline is
- * strictly sequential: reaching phase N means every gate before it completed.
- * A gate whose phase the run never reached is `skipped`; one the operator
- * turned off via `--skip-validation` / `--skip-sync` is `skipped` too (it did
- * not pass — it never ran).
- *
- * @param {string} phase The phase the run died in.
- * @param {{ skipValidation?: boolean, skipSync?: boolean }} args Parsed CLI args.
- * @returns {Record<string, 'passed'|'failed'|'skipped'>}
- */
-export function gatesForFailedPhase(phase, args = {}) {
-  const skipped = { validation: args.skipValidation, baseSync: args.skipSync };
-  const failedAt = PHASE_ORDER.indexOf(phase);
-  const gates = {};
-  for (const [gate, gatePhase] of GATE_PHASES) {
-    const at = PHASE_ORDER.indexOf(gatePhase);
-    if (gatePhase === phase) gates[gate] = 'failed';
-    else if (failedAt < 0 || at > failedAt) gates[gate] = 'skipped';
-    else gates[gate] = skipped[gate] ? 'skipped' : 'passed';
-  }
-  return gates;
-}
-
-/**
- * Build the `failed` terminal for a phase that crashed.
- *
- * The runner deliberately throws rather than returning a failure (a red gate
- * must not look like a return value), so without this the most common
- * non-happy ending — a failing close-validation gate — would emit **no
- * envelope at all**, exiting 1 with only a stderr line while the workflow
- * docs promise the agent a `failed` envelope naming the phase. Every close
- * invocation emits exactly one envelope; this is the path that keeps that
- * true when a phase dies.
- *
- * `err.closePhase` is tagged by the runner's phase tracker.
- *
- * @param {unknown} err
- * @returns {object|null} A validated envelope, or null when even the story id
- *   is unknown (a usage error — there is nothing to report an envelope about).
- */
-function failedTerminalFor(err) {
-  const phase = err?.closePhase ?? 'init';
-  const args = parseSprintArgs();
-  const storyId = Number(args.storyId);
-  if (!Number.isInteger(storyId) || storyId <= 0) return null;
-  return buildTerminalEnvelope({
-    storyId,
-    status: 'failed',
-    phase,
-    gates: gatesForFailedPhase(phase, args),
-    failure: { reason: String(err?.message ?? err) },
-    nextCommand: NEXT_COMMANDS.recover(storyId),
-    elapsedSeconds: 0,
-  });
-}
-
-/**
  * CLI entry — resolves the process exit code from the terminal envelope's
  * status rather than from a thrown/not-thrown distinction, so `pending`
  * (resumable) is distinguishable from `blocked` (come look) without parsing
  * stdout.
+ *
+ * The catch parses argv through the **non-throwing** wrapper (Story #4959).
+ * It used to call `parseSprintArgs()` — re-invoking the very parser that had
+ * just thrown, since `parseMergeWatchMode` made argv parsing fallible. The
+ * second throw escaped the handler, so an unparseable argv produced a bare
+ * stack trace with no envelope and no friction signal, on the surface whose
+ * whole contract is that every invocation emits exactly one envelope. An
+ * error handler may not depend on an operation already known to fail.
+ *
+ * A parse rejection carries no `closePhase`, so the envelope reports `init` —
+ * accurate: the runner rejected the flag before any phase ran, and nothing
+ * was mutated.
  */
 async function main() {
   try {
     const outcome = await runSingleStoryClose();
     return exitCodeForTerminal(outcome?.terminal ?? { status: 'failed' });
   } catch (err) {
-    const terminal = failedTerminalFor(err);
+    const terminal = failedTerminalFor(err, parseSprintArgsTolerant().args);
     if (!terminal) throw err;
     // Mirror runAsCli's default error line (which this catch pre-empts) so the
     // human-facing failure text is unchanged, then emit the envelope.
@@ -251,4 +196,32 @@ async function main() {
 runAsCli(import.meta.url, main, {
   source: 'single-story-close',
   propagateExitCode: true,
+  usage: {
+    invocation:
+      'node .agents/scripts/single-story-close.js --story <id> [--cwd <main-repo>] [options]',
+    summary:
+      'Run the whole delivery tail for one Story — close gates, base sync, push, PR to the base branch, merge wait, agent::done flip — and emit the terminal envelope.',
+    flags: [
+      ['--story <id>', 'GitHub issue number of the Story (required).'],
+      [
+        '--cwd <main-repo>',
+        'Main-repo checkout to run from (default: project root).',
+      ],
+      ['--skip-validation', 'Skip the close-validation gate chain.'],
+      ['--skip-sync', 'Skip the base-branch sync phase.'],
+      ['--no-auto-merge', 'Open the PR without arming native auto-merge.'],
+      ['--wait-merge', 'Force the in-close merge wait.'],
+      ['--no-wait-merge', 'Return as soon as the PR is open; do not wait.'],
+      ['--max-wait-seconds <n>', 'Per-invocation merge-wait bound.'],
+      [
+        '--merge-watch-mode <sync|async>',
+        'Override delivery.mergeWatch.mode for this invocation only. `async` caps the merge wait to a short probe window and returns the resumable `pending` terminal instead of holding the foreground slot — pass it on every close of a multi-Story run. An invalid value exits non-zero before any phase runs.',
+      ],
+      ['--no-evidence', 'Do not reuse or write gate evidence stamps.'],
+      ['--dry-run', 'Report the plan; mutate nothing.'],
+    ],
+    notes: [
+      'Exit codes:\n  0  landed\n  1  blocked or failed\n  3  pending (resumable — run the envelope’s nextCommand)',
+    ],
+  },
 });

@@ -9,9 +9,11 @@
  * @module lib/orchestration/check-baselines/phases/compare
  */
 
+import { EXIT_CONFIG } from '../../../baselines/exit-codes.js';
 import { readBaseFromGit } from '../../../baselines/git-base.js';
 import { getKindModule } from '../../../baselines/kernel.js';
 import { resolveScope } from '../../../baselines/scope.js';
+import { Logger } from '../../../Logger.js';
 import { DEFAULT_BASELINE_PATHS } from './parse-args.js';
 
 function baselineRelativePath(kind, gateBlock) {
@@ -29,10 +31,8 @@ export function resolveDispatchScope({ kind, quality, env }) {
     kind,
     configScope: cfg.scope,
     configRef: cfg.diffRef,
-    cliFlags: {
-      envScope: env?.BASELINE_SCOPE,
-      envRef: env?.BASELINE_REF,
-    },
+    envScope: env?.BASELINE_SCOPE,
+    envRef: env?.BASELINE_REF,
   });
 }
 
@@ -40,13 +40,44 @@ function emptyCompareResult(baseRef) {
   return { baseRef, baseRead: false };
 }
 
+/**
+ * Story #4914 — a base read that FAILS is not a base that is ABSENT.
+ *
+ * `readBaseFromGit` already draws that line itself: it returns `null` only
+ * for git exit 128 ("path does not exist in this revision") and throws on
+ * everything else. Swallowing the throw conflated the two, so a broken read
+ * silently emptied the whole head-vs-base arm — regressions AND additions —
+ * while the floors arm kept the run at exit 0. A gate that fails open is
+ * worse than no gate, because it is trusted.
+ *
+ * So the read failure fails CLOSED as `EXIT_CONFIG` (3) — "the gate could
+ * not even start", the same code `assertFloorAxesExist` uses for a
+ * misconfigured floor axis. `check-baselines.js#main` maps any throw out of
+ * the pipeline onto that code.
+ */
+function buildBaseReadError({ kind, ref, file, cause }) {
+  const detail = cause?.message ?? String(cause);
+  const err = new Error(
+    `[check-baselines:${kind}] could not read the base baseline at ` +
+      `${ref}:${file} — the head-vs-base compare arm cannot run, so the gate ` +
+      `fails closed rather than reporting zero regressions: ${detail}`,
+  );
+  err.code = 'EXIT_CONFIG';
+  err.exitCode = EXIT_CONFIG;
+  err.kind = kind;
+  err.baseRef = ref;
+  err.baselinePath = file;
+  err.cause = cause;
+  return err;
+}
+
 function readBaseBaselinePayload(scope, kind, gateBlock, cwd) {
   const rel = baselineRelativePath(kind, gateBlock);
   let raw;
   try {
     raw = readBaseFromGit(scope.ref, rel, { cwd });
-  } catch {
-    return null;
+  } catch (cause) {
+    throw buildBaseReadError({ kind, ref: scope.ref, file: rel, cause });
   }
   if (raw === null) return null;
   try {
@@ -67,6 +98,29 @@ export async function evaluateCompare({ kind, gateBlock, scope, cwd }) {
   return { baseRef: scope.ref, baseRead: true, basePayload, kindModule };
 }
 
+/**
+ * Is the base baseline comparable to the head baseline (Story #4775)?
+ *
+ * A kind can change its SCORING SEMANTICS — how it derives a row's metric —
+ * without moving `kernelVersion`. Across that boundary the same row can carry
+ * a different score for reasons that have nothing to do with the branch's
+ * changes, so a head-vs-base diff manufactures phantom regressions (and can
+ * hide real ones behind them).
+ *
+ * The head-side stamp is already a fail-closed gate: a stale HEAD baseline
+ * never reaches this point. What reaches here is the opposite and legitimate
+ * case — a branch that DOES carry a re-derived baseline, compared against a
+ * base that predates the change. The only honest verdict is "no comparison";
+ * floors still run, so a genuine ceiling breach is still caught, and once the
+ * refreshed baseline is the base the ratchet returns to full strength on the
+ * very next run without anything to remember to reset.
+ */
+function baseIsComparable(headBaseline, basePayload) {
+  const head = headBaseline?.scoringSemantics ?? null;
+  const base = basePayload?.scoringSemantics ?? null;
+  return head === base;
+}
+
 export function runCompareStage(headBaseline, cmp) {
   const empty = {
     regressions: [],
@@ -75,6 +129,17 @@ export function runCompareStage(headBaseline, cmp) {
     additions: [],
   };
   if (!cmp.baseRead || !cmp.basePayload || !cmp.kindModule) return empty;
+  if (!baseIsComparable(headBaseline, cmp.basePayload)) {
+    Logger.warn(
+      `[${cmp.kindModule.name}] ⚠ base baseline was scored under different ` +
+        `semantics (base=${cmp.basePayload.scoringSemantics ?? '<unstamped>'} ` +
+        `head=${headBaseline?.scoringSemantics ?? '<unstamped>'}); its rows are ` +
+        'not comparable, so the head-vs-base compare is skipped for this run. ' +
+        'Floors still enforced. The ratchet resumes once the re-derived ' +
+        'baseline is the base.',
+    );
+    return empty;
+  }
   try {
     const baseRows = Array.isArray(cmp.basePayload.rows)
       ? cmp.basePayload.rows

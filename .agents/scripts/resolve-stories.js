@@ -24,6 +24,7 @@
  *
  * Usage:
  *   node .agents/scripts/resolve-stories.js --ids 101,102
+ *   node .agents/scripts/resolve-stories.js --ids 101-104        # inclusive range
  *   node .agents/scripts/resolve-stories.js --ids 101,102 --pretty
  *   node .agents/scripts/resolve-stories.js --ids 101 --no-native   # skip the dependencies API
  *
@@ -65,7 +66,9 @@ blocked_by edges, with every blocker (in-set or foreign) resolved against its
 real issue state.
 
 Options:
-  --ids <csv>    Comma-separated Story issue numbers. Required.
+  --ids <csv>    Comma-separated Story issue numbers. Required. A token may be
+                 a single id (4922) or an inclusive dash range (4922-4926);
+                 ranges expand in place and dedupe against the rest.
   --pretty       Pretty-print the JSON envelope.
   --no-native    Skip the native blocked_by read (body edges only).
   --help         Show this help.
@@ -166,6 +169,57 @@ export async function resolveForeignDone({ provider, dag, inSetIds }) {
   return resolved.filter((id) => id !== null);
 }
 
+/**
+ * Resolve the requested ids into the `{ stories, dag, done }` envelope and
+ * write it to `stdout`. The flow core behind `main` — provider, config, and
+ * stdout are injected so the whole path is unit-testable without a live
+ * GitHub round-trip. Exported for testing.
+ *
+ * @param {{ ids: string, native?: boolean, pretty?: boolean }} args
+ * @param {{ provider: object, config: object, stdout?: { write(s: string): void } }} deps
+ * @returns {Promise<number>}
+ */
+export async function runResolveStories(
+  { ids: rawIds, native = true, pretty = false },
+  { provider, config, stdout = process.stdout },
+) {
+  const ids = parseIds(rawIds);
+  const owner = config.github?.owner;
+  const repo = config.github?.repo;
+
+  const stories = await fetchStories(provider, ids);
+  const nativeEdges = native
+    ? await readNativeEdges({ provider, stories, owner, repo })
+    : new Map();
+
+  const inSetIds = new Set(stories.map((s) => s.id));
+  const provisional = buildStoriesEnvelope({
+    stories,
+    nativeEdges,
+    warn: (m) => Logger.warn(m),
+    config,
+  });
+  const foreignDone = await resolveForeignDone({
+    provider,
+    dag: provisional.dag,
+    inSetIds,
+  });
+  const envelope = buildStoriesEnvelope({
+    stories,
+    nativeEdges,
+    foreignDone,
+    warn: () => {},
+    config,
+  });
+
+  stdout.write(
+    pretty
+      ? `${JSON.stringify(envelope, null, 2)}\n`
+      : `${JSON.stringify(envelope)}\n`,
+  );
+  return 0;
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -194,43 +248,14 @@ async function main() {
   // headless caller can pipe this straight into stories-wave-tick.js.
   routeAllOutputToStderr();
 
-  const ids = parseIds(values.ids);
-  const { provider, config } = resolveStoriesProvider();
-  const owner = config.github?.owner;
-  const repo = config.github?.repo;
-
-  const stories = await fetchStories(provider, ids);
-  const nativeEdges = values.native
-    ? await readNativeEdges({ provider, stories, owner, repo })
-    : new Map();
-
-  const inSetIds = new Set(stories.map((s) => s.id));
-  const provisional = buildStoriesEnvelope({
-    stories,
-    nativeEdges,
-    warn: (m) => Logger.warn(m),
-  });
-  const foreignDone = await resolveForeignDone({
-    provider,
-    dag: provisional.dag,
-    inSetIds,
-  });
-  const envelope = buildStoriesEnvelope({
-    stories,
-    nativeEdges,
-    foreignDone,
-    warn: () => {},
-  });
-
-  process.stdout.write(
-    values.pretty
-      ? `${JSON.stringify(envelope, null, 2)}\n`
-      : `${JSON.stringify(envelope)}\n`,
+  return runResolveStories(
+    { ids: values.ids, native: values.native, pretty: values.pretty },
+    resolveStoriesProvider(),
   );
-  return 0;
 }
 
 runAsCli(import.meta.url, main, {
   source: 'resolve-stories',
   propagateExitCode: true,
+  usage: HELP,
 });

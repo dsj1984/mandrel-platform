@@ -71,6 +71,19 @@ const DEFAULT_MI_FLOORS = Object.freeze({
   '*': Object.freeze({ min: 70 }),
 });
 
+/**
+ * Story #4981 — opt-in incremental coverage-capture + CRAP-join scoping.
+ * Disabled by default: `coverage-capture.js` and the CRAP join keep their
+ * pre-#4981 full-repo behaviour byte-for-byte until a consumer sets
+ * `enabled: true`. `baseRef: null` means "use the caller's own ref
+ * resolution" (the gate's `--ref` flag / `main`) rather than a second,
+ * possibly-conflicting default.
+ */
+const DEFAULT_INCREMENTAL_COVERAGE = Object.freeze({
+  enabled: false,
+  baseRef: null,
+});
+
 /** Framework defaults for the CRAP gate (post-1737 uniform shape). */
 export const CRAP_GATE_DEFAULTS = Object.freeze({
   enabled: true,
@@ -88,6 +101,16 @@ export const CRAP_GATE_DEFAULTS = Object.freeze({
   // semantics.
   refreshTimeoutMs: 60_000,
   ignoreGlobs: Object.freeze([]),
+  // Story #4775 — fail-closed floor on the per-method coverage JOIN. The
+  // fraction of methods that must resolve a coverage entry, counted only over
+  // files that HAVE one, before `update-crap-baseline.js` will persist. A
+  // broken join is silent by construction (unresolved methods are simply
+  // absent from the baseline), so the updater refuses rather than writing a
+  // thin baseline and logging it as success. 0.75 sits far above a healthy
+  // run (a repo with fresh coverage resolves ~98%) and far below the 4–6%
+  // signature of a coordinate-system mismatch.
+  minMethodResolutionRate: 0.75,
+  incrementalCoverage: DEFAULT_INCREMENTAL_COVERAGE,
 });
 
 /** Framework defaults for the coverage gate. */
@@ -110,10 +133,26 @@ export const MAINTAINABILITY_GATE_DEFAULTS = Object.freeze({
   tolerance: DEFAULT_MI_TOLERANCE,
   floors: DEFAULT_MI_FLOORS,
   targetDirs: Object.freeze([]),
+  // Story #4731 — the commit-subject substring that acknowledges a deliberate
+  // maintainability baseline refresh in the compared range. Mirrors the CRAP
+  // gate's `refreshTag`; the evaluate phase demotes head-vs-base regressions
+  // (floors still enforced) when a range commit carrying this tag touches the
+  // baseline file. Kept identical to the CRAP default so one refresh commit
+  // can acknowledge both gates.
+  refreshTag: 'baseline-refresh:',
   // Story #2165 — bounded timeout (ms) for `npm run maintainability:update`
   // spawned by the baseline-attribution refresh path. Defaults to 60 s.
   refreshTimeoutMs: 60_000,
   ignoreGlobs: Object.freeze([]),
+  // Story #4775 — fail-closed floor on the per-method coverage JOIN. The
+  // fraction of methods that must resolve a coverage entry, counted only over
+  // files that HAVE one, before `update-crap-baseline.js` will persist. A
+  // broken join is silent by construction (unresolved methods are simply
+  // absent from the baseline), so the updater refuses rather than writing a
+  // thin baseline and logging it as success. 0.75 sits far above a healthy
+  // run (a repo with fresh coverage resolves ~98%) and far below the 4–6%
+  // signature of a coordinate-system mismatch.
+  minMethodResolutionRate: 0.75,
 });
 
 /**
@@ -137,6 +176,8 @@ const CRAP_GATE_KEYS = new Set([
   'refreshTag',
   'refreshTimeoutMs',
   'ignoreGlobs',
+  'minMethodResolutionRate',
+  'incrementalCoverage',
 ]);
 
 const COVERAGE_GATE_KEYS = new Set([
@@ -154,6 +195,7 @@ const MI_GATE_KEYS = new Set([
   'tolerance',
   'floors',
   'targetDirs',
+  'refreshTag',
   'refreshTimeoutMs',
   'ignoreGlobs',
 ]);
@@ -197,6 +239,43 @@ function warnUnknownKeys(userBlock, knownKeys, blockLabel) {
  * @param {{ coveragePath: string }} coverageGate resolved coverage gate
  * @returns {object} flattened legacy-bag view that existing callers read
  */
+/**
+ * Clamp a user-supplied method-resolution floor into `[0, 1]`. A
+ * non-numeric, non-finite, or out-of-range value falls back to the framework
+ * default rather than silently disabling the guard (a floor of `NaN` would
+ * compare false against every rate and never fire).
+ *
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function resolveResolutionRate(value, fallback) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  if (value < 0 || value > 1) return fallback;
+  return value;
+}
+
+/**
+ * Resolve `gates.crap.incrementalCoverage` (Story #4981). A malformed or
+ * absent user block resolves to the framework default (disabled), so a
+ * consumer that never sets the key gets the exact pre-#4981 shape back.
+ *
+ * @param {{ enabled?: boolean, baseRef?: string } | undefined} user
+ * @param {{ enabled: boolean, baseRef: string | null }} defaults
+ * @returns {{ enabled: boolean, baseRef: string | null }}
+ */
+function resolveIncrementalCoverage(user, defaults) {
+  if (user == null || typeof user !== 'object') return { ...defaults };
+  return {
+    enabled:
+      typeof user.enabled === 'boolean' ? user.enabled : defaults.enabled,
+    baseRef:
+      typeof user.baseRef === 'string' && user.baseRef.length > 0
+        ? user.baseRef
+        : defaults.baseRef,
+  };
+}
+
 export function resolveMaintainabilityCrap(
   userCrap,
   gateScoping,
@@ -219,10 +298,12 @@ export function resolveMaintainabilityCrap(
         DEFAULT_CRAP_TOLERANCE.value,
       ),
       requireCoverage: defaults.requireCoverage,
+      minMethodResolutionRate: defaults.minMethodResolutionRate,
       friction: { ...defaults.friction },
       refreshTag: defaults.refreshTag,
       refreshTimeoutMs: defaults.refreshTimeoutMs,
       ignoreGlobs: [...defaults.ignoreGlobs],
+      incrementalCoverage: { ...defaults.incrementalCoverage },
       defaultScope: scoping.defaultScope,
       diffRef: scoping.diffRef,
     };
@@ -240,6 +321,10 @@ export function resolveMaintainabilityCrap(
       toleranceScalar(defaults.tolerance, DEFAULT_CRAP_TOLERANCE.value),
     ),
     requireCoverage: userCrap.requireCoverage ?? defaults.requireCoverage,
+    minMethodResolutionRate: resolveResolutionRate(
+      userCrap.minMethodResolutionRate,
+      defaults.minMethodResolutionRate,
+    ),
     friction: { ...defaults.friction, ...(userCrap.friction ?? {}) },
     refreshTag: userCrap.refreshTag ?? defaults.refreshTag,
     refreshTimeoutMs: resolvePositiveIntegerMs(
@@ -249,6 +334,10 @@ export function resolveMaintainabilityCrap(
     ignoreGlobs: Array.isArray(userCrap.ignoreGlobs)
       ? userCrap.ignoreGlobs.slice()
       : [...defaults.ignoreGlobs],
+    incrementalCoverage: resolveIncrementalCoverage(
+      userCrap.incrementalCoverage,
+      defaults.incrementalCoverage,
+    ),
     defaultScope: scoping.defaultScope,
     diffRef: scoping.diffRef,
   };
@@ -268,6 +357,7 @@ function resolveMaintainabilityQuality(userBlock, gateScoping) {
   if (userBlock == null || typeof userBlock !== 'object') {
     return {
       targetDirs: [...defaults.targetDirs],
+      refreshTag: defaults.refreshTag,
       refreshTimeoutMs: defaults.refreshTimeoutMs,
       ignoreGlobs: [...defaults.ignoreGlobs],
       defaultScope: scoping.defaultScope,
@@ -277,6 +367,10 @@ function resolveMaintainabilityQuality(userBlock, gateScoping) {
   warnUnknownKeys(userBlock, MI_GATE_KEYS, 'quality.gates.maintainability');
   const out = {
     targetDirs: resolveListValue(defaults.targetDirs, userBlock.targetDirs),
+    refreshTag:
+      typeof userBlock.refreshTag === 'string' && userBlock.refreshTag.length
+        ? userBlock.refreshTag
+        : defaults.refreshTag,
     refreshTimeoutMs: resolvePositiveIntegerMs(
       userBlock.refreshTimeoutMs,
       defaults.refreshTimeoutMs,

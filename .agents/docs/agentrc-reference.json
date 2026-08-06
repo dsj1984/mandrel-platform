@@ -67,27 +67,6 @@
     }
   },
   "planning": {
-    "codebaseSnapshot": {
-      "tier": "skinny",
-      "include": [
-        ".agents/scripts/**",
-        "src/**",
-        "lib/**",
-        "app/**",
-        "packages/**"
-      ],
-      "exclude": [
-        "**/node_modules/**",
-        "**/dist/**",
-        "**/build/**",
-        "**/.next/**",
-        "**/.turbo/**",
-        "**/coverage/**",
-        "**/*.test.*",
-        "**/*.spec.*"
-      ],
-      "recentCommitWindow": 30
-    },
     "riskHeuristics": [
       "Destructive or irreversible data mutations (dropping tables, deleting rows without soft-delete or backup, truncating production state).",
       "Modifications to shared security or auth infrastructure (IAM policies, auth middleware, session or token handling, secret rotation).",
@@ -121,12 +100,23 @@
       "watch": {
         "pollIntervalMs": 10000,
         "maxPolls": 180,
-        "maxResumes": 3
+        "maxResumes": 3,
+        "attachWindowMs": 1200000
       },
       "autoMerge": "trust-ci"
     },
     "docsFreshness": {
       "paths": ["README.md"]
+    },
+    "tempRetention": {
+      "enabled": true,
+      "staleDays": 7,
+      "classes": {
+        "orchestrationLogs": true,
+        "validationEvidence": true,
+        "auditResults": true,
+        "planDirs": true
+      }
     },
     "deliverRunner": {
       "concurrencyCap": 3

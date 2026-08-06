@@ -68,6 +68,21 @@ export const RUNTIME_FRICTION_CATEGORIES = Object.freeze({
   CLOSE_FAILED: 'close-failed',
   /** A bounded merge wait expired with the PR still in flight. */
   MERGE_WAIT_EXHAUSTED: 'merge-wait-exhausted',
+  /**
+   * A review/lens tool failed to *execute* (binary missing, unparseable
+   * output, materialization crash) — an operational degradation, not a code
+   * finding. Story #4699 routes these here so findings severity tiers
+   * reflect code findings only.
+   */
+  TOOL_DEGRADED: 'tool-degraded',
+  /**
+   * The light delivery path refused a scope — a suitability-gate `ask-operator`
+   * or a blocked diff backstop. Story #4856 added it because neither rejection
+   * emitted anything, so an over-tight ceiling could only reach the framework
+   * as anecdote; the roll-up aggregating these by category is what makes the
+   * ceilings recalibratable from recorded evidence.
+   */
+  LIGHT_SCOPE_REJECTED: 'light-scope-rejected',
 });
 
 /** Cap on free-form reason text copied into a signal's `details`. */
@@ -341,9 +356,25 @@ export async function emitCloseRecoveredFriction({ storyId, config } = {}) {
  * foreign rows attributes each one correctly; the fallback covers records
  * written before the field existed.
  *
+ * `tool` (from `emitter.tool`) joined the shape in Story #4824. `category`
+ * remains the routing and de-duplication unit — it is what titles and
+ * de-duplicates a filed issue — but a roll-up that discards a candidate has
+ * to be able to *name* it, and a bare category cannot distinguish a
+ * `tool-degraded` from the scoped-lint runner from one out of lens
+ * materialization. It is descriptive, never a routing key.
+ *
+ * `ts` joined the shape in Story #4850, and it joined it **here** rather than
+ * in a second read beside the run-scope gather. The composer had no notion of
+ * *when* its corpus happened, so it borrowed the triggering run as the window
+ * and titled every proposal with a claim the evidence block below it already
+ * contradicted. Carrying the timestamp through the one shared normalizer is
+ * what lets the recurrence window be both bounded and describable; re-reading
+ * it beside one of the two gathers is precisely the drift that made the
+ * recovery-netting unreachable in Story #4649.
+ *
  * @param {unknown} parsed          One parsed NDJSON row.
  * @param {number}  fallbackStoryId Stream owner, used when the row has none.
- * @returns {{ category: string, source: 'framework'|'consumer', storyId: number, details: object }|null}
+ * @returns {{ category: string, source: 'framework'|'consumer', storyId: number, tool: string, ts: string|null, details: object }|null}
  */
 export function normalizeGatheredSignal(parsed, fallbackStoryId) {
   if (!parsed || typeof parsed !== 'object') return null;
@@ -351,15 +382,39 @@ export function normalizeGatheredSignal(parsed, fallbackStoryId) {
     typeof parsed.category === 'string' ? parsed.category.trim() : '';
   if (!category) return null;
   const recordStoryId = Number(parsed.storyId);
+  const emitterTool =
+    parsed.emitter && typeof parsed.emitter === 'object'
+      ? parsed.emitter.tool
+      : undefined;
   return {
     category,
     source: parsed.source === 'framework' ? 'framework' : 'consumer',
     storyId: Number.isInteger(recordStoryId) ? recordStoryId : fallbackStoryId,
+    tool: typeof emitterTool === 'string' ? emitterTool.trim() : '',
+    ts: parsableTimestamp(parsed.ts),
     details:
       parsed.details && typeof parsed.details === 'object'
         ? parsed.details
         : {},
   };
+}
+
+/**
+ * The row's `ts` when it is a string a `Date` can read, else `null`.
+ *
+ * `signal-event.schema.json` requires `ts`, and both producers stamp
+ * `new Date().toISOString()` — but the gathers read whatever survives on disk,
+ * including rows a truncated write left half-formed. Resolving to `null`
+ * rather than guessing a time is what lets the recurrence window exclude an
+ * undateable row explicitly instead of aging it in as "recent".
+ *
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function parsableTimestamp(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return Number.isFinite(Date.parse(trimmed)) ? trimmed : null;
 }
 
 /**
@@ -479,18 +534,33 @@ function frictionForTerminal(envelope) {
  * Emit the friction record (if any) implied by a terminal envelope.
  * Best-effort; never throws.
  *
+ * `tool` is the CALLER's name, threaded in rather than assumed: TWO CLIs emit
+ * terminal envelopes — `single-story-close.js` (plus its runner) and
+ * `single-story-confirm-merge.js` — and `retro-proposals.js` reads
+ * `emitter.tool` (via {@link normalizeGatheredSignal}) to name the surface a
+ * candidate came from, so hard-coding the close name here attributed every
+ * confirm-merge record to a CLI that never ran and misdirected the follow-up.
+ * Both callers already declare their name once via `runAsCli({ source })`;
+ * pass that same string. The default keeps the close paths — the original
+ * callers, which pass none — emitting exactly what they always did.
+ *
  * @param {object} args
  * @param {object} args.envelope
+ * @param {string} [args.tool] Emitting surface (default `single-story-close`).
  * @param {object} [args.config]
  * @returns {Promise<boolean>} true when a record was appended.
  */
-export async function emitTerminalFriction({ envelope, config } = {}) {
+export async function emitTerminalFriction({
+  envelope,
+  tool = 'single-story-close',
+  config,
+} = {}) {
   const verdict = frictionForTerminal(envelope);
   if (!verdict) return false;
   return emitRuntimeFriction({
     storyId: envelope?.storyId,
     category: verdict.category,
-    tool: 'single-story-close',
+    tool,
     details: verdict.details,
     config,
   });

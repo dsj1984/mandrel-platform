@@ -21,21 +21,29 @@
  *       caller MUST surface this — silently passing here would defeat the
  *       CRAP gate's `requireCoverage: true` policy.
  */
-import path from 'node:path';
 import { getChangedFiles } from './lib/changed-files.js';
+import { isDirectInvocation } from './lib/cli-utils.js';
 import { getQuality, resolveConfig } from './lib/config-resolver.js';
 import {
-  anyChangedUnderTargets,
   computeContentDigest,
+  filterFilesUnderTargets,
   isCoverageFresh,
   runCapture,
   writeCaptureStamp,
 } from './lib/coverage-capture.js';
+import { runFullScopeCapture } from './lib/coverage-capture-fullscope.js';
+import { tryIncrementalCapture } from './lib/coverage-capture-incremental.js';
 
 import { Logger } from './lib/Logger.js';
 import { hasNpmScript, readPackageScripts } from './lib/npm-scripts.js';
 
-function parseArgs(argv) {
+/**
+ * Parse the full `process.argv` (index 2 onward) into the capture options.
+ *
+ * @param {string[]} argv
+ * @returns {{ skipWhenNoCrapFiles: boolean, ref: string, cwd: string }}
+ */
+export function parseArgs(argv) {
   const out = {
     skipWhenNoCrapFiles: false,
     ref: 'main',
@@ -50,13 +58,52 @@ function parseArgs(argv) {
   return out;
 }
 
-function main() {
-  const args = parseArgs(process.argv);
-  const config = resolveConfig({ cwd: args.cwd });
-  const { crap, coverage } = getQuality(config);
+/**
+ * The capture decision core, extracted from the CLI shell so the whole
+ * decision table (disabled gate, missing npm script, changed-file skip,
+ * freshness skip, capture + stamp) is reachable without spawning
+ * `npm run test:coverage` or touching the real filesystem.
+ *
+ * Every seam on the optional final `deps` parameter defaults to the real
+ * implementation (`.agents/rules/test-seams.md` rules 1-2, 4), so the CLI
+ * shell below and any production caller are unchanged.
+ *
+ * @param {string[]} [argv] Full `process.argv`-shaped array.
+ * @param {{
+ *   resolveConfigImpl?: typeof resolveConfig,
+ *   getQualityImpl?: typeof getQuality,
+ *   getChangedFilesImpl?: typeof getChangedFiles,
+ *   readPackageScriptsImpl?: typeof readPackageScripts,
+ *   hasNpmScriptImpl?: typeof hasNpmScript,
+ *   isCoverageFreshImpl?: typeof isCoverageFresh,
+ *   runCaptureImpl?: typeof runCapture,
+ *   computeContentDigestImpl?: typeof computeContentDigest,
+ *   writeCaptureStampImpl?: typeof writeCaptureStamp,
+ *   filterFilesUnderTargetsImpl?: typeof filterFilesUnderTargets,
+ *   logger?: { info: Function, warn: Function, error: Function },
+ * }} [deps]
+ * @returns {number} process exit code
+ */
+export function runCoverageCapture(argv = process.argv, deps = {}) {
+  const {
+    resolveConfigImpl = resolveConfig,
+    getQualityImpl = getQuality,
+    getChangedFilesImpl = getChangedFiles,
+    readPackageScriptsImpl = readPackageScripts,
+    hasNpmScriptImpl = hasNpmScript,
+    isCoverageFreshImpl = isCoverageFresh,
+    runCaptureImpl = runCapture,
+    computeContentDigestImpl = computeContentDigest,
+    writeCaptureStampImpl = writeCaptureStamp,
+    filterFilesUnderTargetsImpl = filterFilesUnderTargets,
+    logger = Logger,
+  } = deps;
+  const args = parseArgs(argv);
+  const config = resolveConfigImpl({ cwd: args.cwd });
+  const { crap, coverage } = getQualityImpl(config);
 
   if (crap.enabled === false) {
-    Logger.info('[coverage-capture] CRAP gate disabled — skipping capture.');
+    logger.info('[coverage-capture] CRAP gate disabled — skipping capture.');
     return 0;
   }
 
@@ -67,8 +114,8 @@ function main() {
   // defined it. Surface a one-line, fix-naming diagnostic instead of
   // spawning `npm run test:coverage` only to propagate npm's opaque
   // "Missing script" exit code.
-  if (!hasNpmScript(readPackageScripts(args.cwd), 'test:coverage')) {
-    Logger.error(
+  if (!hasNpmScriptImpl(readPackageScriptsImpl(args.cwd), 'test:coverage')) {
+    logger.error(
       '[coverage-capture] ✖ No "test:coverage" script in package.json. ' +
         'Add one (e.g. "test:coverage": "node --test --experimental-test-coverage") ' +
         'or disable the CRAP gate via delivery.quality.gates.crap.enabled=false.',
@@ -76,75 +123,46 @@ function main() {
     return 1;
   }
 
-  if (args.skipWhenNoCrapFiles) {
-    let changed;
-    try {
-      changed = getChangedFiles({ ref: args.ref, cwd: args.cwd });
-    } catch (err) {
-      // A bad ref must not silently relax the gate. Fall through to the
-      // freshness check so coverage still gets captured if needed.
-      Logger.warn(
-        `[coverage-capture] ⚠ ${err?.message ?? err} — falling back to freshness check.`,
-      );
-      changed = null;
-    }
-    if (changed && !anyChangedUnderTargets(changed, crap.targetDirs)) {
-      Logger.info(
-        `[coverage-capture] No changed files under [${crap.targetDirs.join(', ')}] — skipping capture.`,
-      );
-      return 0;
-    }
-  }
-
-  const freshness = isCoverageFresh({
-    coveragePath: crap.coveragePath,
-    targetDirs: crap.targetDirs,
-    cwd: args.cwd,
+  // Story #4981 — incremental mode, opt-in via
+  // `delivery.quality.gates.crap.incrementalCoverage.enabled`. `null` means
+  // "not applicable" (disabled, or a ref-resolution error) — fall through to
+  // the full-scope path below rather than silently skipping capture.
+  const incrementalResult = tryIncrementalCapture({
+    crap,
+    coverage,
+    args,
+    getChangedFilesImpl,
+    filterFilesUnderTargetsImpl,
+    isCoverageFreshImpl,
+    runCaptureImpl,
+    computeContentDigestImpl,
+    writeCaptureStampImpl,
+    logger,
   });
-  if (freshness.fresh) {
-    Logger.info(
-      `[coverage-capture] Coverage at ${path.resolve(args.cwd, crap.coveragePath)} is ${freshness.reason} — skipping capture.`,
-    );
-    return 0;
-  }
+  if (incrementalResult !== null) return incrementalResult;
 
-  Logger.info(
-    `[coverage-capture] Coverage at ${crap.coveragePath} is ${freshness.reason}; running npm run test:coverage…`,
-  );
-  const code = runCapture({
-    cwd: args.cwd,
-    timeoutMs: coverage?.timeoutMs,
-    log: (m) => Logger.info(m),
+  return runFullScopeCapture({
+    crap,
+    coverage,
+    args,
+    getChangedFilesImpl,
+    isCoverageFreshImpl,
+    runCaptureImpl,
+    computeContentDigestImpl,
+    writeCaptureStampImpl,
+    logger,
   });
-  if (code !== 0) {
-    Logger.error(
-      `[coverage-capture] ✖ npm run test:coverage exited ${code}. Fix failing tests or coverage-threshold breaches before re-running the CRAP gate.`,
-    );
-    return code;
-  }
-
-  // Persist the content digest next to the fresh artifact so subsequent
-  // freshness checks are content-aware (mtime churn from branch switches no
-  // longer invalidates). Best-effort — a missing stamp just means the next
-  // check falls back to the mtime heuristic.
-  const digest = computeContentDigest(args.cwd, crap.targetDirs);
-  if (
-    digest &&
-    writeCaptureStamp({
-      cwd: args.cwd,
-      coveragePath: crap.coveragePath,
-      digest,
-    })
-  ) {
-    Logger.info('[coverage-capture] Wrote content-digest capture stamp.');
-  }
-  return code;
 }
 
 // cli-opt-out: synchronous main returns an exit code that is forwarded via process.exit(code); runAsCli's async-main signature does not preserve the result code.
-try {
-  process.exit(main());
-} catch (err) {
-  Logger.error('[coverage-capture] unexpected error:', err);
-  process.exit(1);
+// The direct-invocation guard keeps `import`ing this module (from the unit
+// tests that drive `runCoverageCapture` with injected seams) side-effect free;
+// invoked as a CLI the behaviour — exit code and log lines — is unchanged.
+if (isDirectInvocation(import.meta.url)) {
+  try {
+    process.exit(runCoverageCapture());
+  } catch (err) {
+    Logger.error('[coverage-capture] unexpected error:', err);
+    process.exit(1);
+  }
 }

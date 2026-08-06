@@ -34,6 +34,19 @@ validated.
 
 ---
 
+## Durable local slash commands
+
+Reference mechanics behind the local-override pointer in
+[`instructions.md` § 1.E](../instructions.md). Any `.md` at
+`.agents/local/workflows/<name>.md` is projected into
+`.claude/commands/<name>.md` by `sync-claude-commands.js` as `/<name>`. The
+`.agents/local/` subtree is exempt from `mandrel sync`'s prune pass, so these
+commands survive `npm install`, `mandrel sync`, and `mandrel update`. A core
+payload command of the same basename wins — the local copy is ignored with a
+`shadowed` warning.
+
+---
+
 ## Log-level control
 
 The orchestrator logger (`lib/Logger.js`) emits progress/trace output based on
@@ -83,15 +96,28 @@ over-ceiling envelope or an over-budget Story count.
 - **`PLAN_CONTEXT_ENVELOPE_BYTE_CEILING`** (`lib/orchestration/plan-context.js`):
   256 KB (≈64K tokens at the ≈4-chars/token estimate) on the serialized
   envelope `buildPlanContext` assembles, checked at the single choke point
-  every mode returns through. Measured envelopes on this repo land at ~42 KB,
-  so the ceiling is >2× headroom over a worst-case seed plus a medium-tier
-  codebase snapshot.
-- **On refusal**, the error names the envelope's largest fields. Trim the seed,
-  plan fewer `--tickets` source issues in one run, or narrow
-  `planning.codebaseSnapshot`. The seed is carried **verbatim** by design — it
-  is the operator's request, and summarizing it silently would degrade planning
-  quality precisely when the input is richest — so there is no elision path to
-  fall back on. Raising the ceiling needs a measured justification.
+  every mode returns through. A measured seed-mode envelope on this repo's
+  thin `.feature` corpus is ~120 KB — `docsContext` (~63 KB) and
+  `systemPrompts` (~54 KB) are the bulk of the fixed floor, every other field
+  under 1 KB. That is **not** representative of every consumer: Story #4977
+  measured `bddScenarios` at 118 KB on a consumer with a mature Gherkin
+  corpus — larger than `docsContext` and `systemPrompts` combined, leaving
+  ~5.5% headroom instead of ~2×. `bddScenarios` is now truncated to
+  `BDD_SCENARIOS_BYTE_BUDGET` (`lib/bdd-scenario-budget.js`, ≤24 KB,
+  reported via `truncated` / `totalScenarios` / `includedScenarios` rather
+  than silently dropped) before it reaches the envelope, deliberately a fixed
+  framework constant rather than an `.agentrc.json` knob — the same reasoning
+  Story #4811 applied when it retired the codebase snapshot. The
+  operator-supplied seed remains the one field with no cap and no elision
+  path.
+- **On refusal**, the error names the envelope's largest fields and the
+  remedy that follows the single largest one (`OVERSIZE_FIELD_REMEDIES` in
+  `plan-context.js`) — trim the seed, plan fewer `--tickets` source issues in
+  one run, or trim `docsContextFiles`, depending on which field actually blew
+  the budget. The seed itself is carried **verbatim** by design — it is the
+  operator's request, and summarizing it silently would degrade planning
+  quality precisely when the input is richest — so it alone has no elision
+  path to fall back on. Raising the ceiling needs a measured justification.
 
 ### Session-mass capacity (plan-time sizing)
 

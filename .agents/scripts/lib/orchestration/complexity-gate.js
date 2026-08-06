@@ -1,0 +1,983 @@
+/**
+ * lib/orchestration/complexity-gate.js — shape-derived complexity routing
+ * (Story #4722, superseding the word-count gate of Stories #4683/#4707).
+ *
+ * ## Route on the work, not the words
+ *
+ * The original gate routed a planning seed on its **word count**
+ * (`maxSeedWords`), which is the wrong proxy in both directions: a detailed
+ * prompt can describe trivial work, a terse one complex work. The bench
+ * cohort (mandrel-bench 2.10.0) observed both failure modes — a lite verdict
+ * fired at plan time and was then lost (a swallowed label write) or ignored
+ * (deliver spawned a full story-worker anyway). This module now routes on the
+ * **objective shape of the authored work**, staged across the pipeline:
+ *
+ *   1. **Plan time — signals, not routing.** {@link buildComplexitySignals}
+ *      emits advisory complexity *signals* (enumerated-artifact count,
+ *      risk-heuristic hits, repo state of predicted paths, sensitive-path
+ *      classes) carrying **no routing authority**. There is no word ceiling.
+ *   2. **Planner judgment, ledgered.** The planner owns the
+ *      trivial-vs-standard verdict ({@link resolvePlannerRouteVerdict}) —
+ *      `lite` only with a recorded reason, persisted on plan state. This
+ *      generalizes the former one-way `applyPlannerDowngrade` seam into the
+ *      authored verdict itself; the conservative default without a recorded
+ *      reason is `full`.
+ *   3. **Deterministic backstop at persist.** After authoring, the work has
+ *      measurable shape: {@link deriveStoryShape} reads the Story's own
+ *      effort and risk — distinct change kinds, declared magnitude,
+ *      uncertainty, deployable/migration span, and sensitive-path classes —
+ *      against {@link STORY_SHAPE_CEILINGS}. A `lite` claim whose work exceeds
+ *      them **fails closed to `full`** (`run-plan-persist.js`). Artifact
+ *      cardinality is deliberately not an axis (Story #4764).
+ *   4. **Deliver re-derives.** `/deliver` computes the route from the fetched
+ *      Story body via the **same** shape function at dispatch
+ *      ({@link resolveStoryDispatchMode}) and **reports** it, while the
+ *      dispatch *mode* answers a different question: may the engine run in the
+ *      router's own session? Only a **single-Story run** may (Story #4736) —
+ *      sub-agent isolation buys nothing when there is no concurrent sibling to
+ *      isolate from. Shape cannot grant that session (Story #4829): a lite body
+ *      makes work cheap, it does not conjure a second session for a sibling to
+ *      run in. The `route::lite` label is a **human-visible hint only**, never
+ *      the control signal: a lost label or an unread marker can no longer
+ *      misroute delivery. Either way every `single-story-close.js` gate runs
+ *      unchanged.
+ *
+ * The shape taxonomy is deliberately the one `review-depth.js` already
+ * applies to the landed diff at close (`deriveChangeLevel` over the
+ * `audit-rules.json` sensitive-path classes): **predicted shape at dispatch,
+ * actual diff at close** — one taxonomy, two read points. And sensitivity
+ * always wins: a small change whose footprint intersects a sensitive-path
+ * class routes `full`, which keeps its fresh acceptance critic
+ * (`ceremony-routing.js` routes a high derived level to a fresh spawn).
+ *
+ * ## What "lite" changes and — critically — what it never changes
+ *
+ * The lite route collapses the **advisory ceremony** only: the story-worker
+ * sub-agent boot and the fresh acceptance-critic spawn. It **never** relaxes
+ * a non-negotiable. {@link LITE_PATH_INVARIANTS} is the machine-readable
+ * contract that the lite path still produces a Story ticket, still lands via
+ * a PR to `main`, still runs every repo quality gate, and still honours
+ * `rules/security-baseline.md`. Those gates run in `single-story-close.js`
+ * regardless of route; the router cannot and does not switch them off.
+ *
+ * ## Configuration
+ *
+ * Operators tune the surface via `planning.complexityGate` in `.agentrc.json`:
+ *
+ *   - `enabled`      (default `true`) — `false` disables lite routing
+ *     everywhere: persist refuses lite claims and dispatch always takes the
+ *     sub-agent path.
+ *   - `maxArtifacts` (default `1`)    — enumerated-artifact signal threshold;
+ *     an **input signal** for the planner, no longer a deterministic router.
+ *
+ * `maxSeedWords` is **removed** (hard cutover): word count routes nothing.
+ *
+ * @typedef {'lite'|'full'} ComplexityRoute
+ */
+
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import {
+  extractChangePaths,
+  parse as parseStoryBody,
+} from '../story-body/story-body.js';
+import { deriveChangeLevel } from './review-depth.js';
+
+/**
+ * Framework defaults for the complexity-routing surface. The SSOT the config
+ * schema mirror and the configuration reference both cite. `maxSeedWords` is
+ * gone: seed word count carries no routing authority (Story #4722).
+ */
+const DEFAULT_COMPLEXITY_GATE = Object.freeze({
+  enabled: true,
+  maxArtifacts: 1,
+});
+
+/**
+ * The persisted route marker for a lite-routed Story.
+ *
+ * **A human-visible hint only (Story #4722)** — never the control signal.
+ * Persist still applies it so a lite cohort is filterable in the GitHub UI,
+ * but `/deliver` derives the route from the Story body's own shape
+ * ({@link resolveStoryDispatchMode}); a Story with the label whose shape
+ * derives `full` dispatches as a sub-agent, and a lite-shaped Story with the
+ * label absent (or its write failed) still executes inline.
+ */
+export const LITE_ROUTE_LABEL = 'route::lite';
+
+/**
+ * Effort/risk ceilings a Story's work must fit for the `lite` route
+ * ({@link deriveStoryShape}). Framework constants, not operator knobs — a
+ * ceiling an operator can widen past what the inline path can safely absorb is
+ * a ceiling that fails silently.
+ *
+ * ## Effort and risk, never artifact cardinality (Story #4764)
+ *
+ * These ceilings used to count the declared footprint (`maxChanges: 2`,
+ * `maxAcceptance: 3`, `maxNonCreateChanges: 1`). Cardinality is the wrong axis
+ * in both directions: three identical one-line edits across three files is
+ * trivial work with a high count, while a 200-line rewrite of one module is a
+ * single change. And the count was read off a footprint the model **declares
+ * before doing the work** — a guess, and a gameable one — so counting it
+ * rejected genuinely small work (mandrel-bench's hello-world scenario is a
+ * server create plus a `package.json` edit plus a test create, structurally
+ * over the old ceilings) while admitting whatever an optimistic declaration
+ * under-counted.
+ *
+ * So the axes are effort, risk, and uncertainty, and the **prediction** gate
+ * they form is deliberately **coarse**: it rejects clearly-epic work only.
+ * Real enforcement belongs to the diff-derived backstop, which sees ground
+ * truth instead of a declaration
+ * ({@link module:lib/orchestration/light-suitability.checkLightDiffBackstop}).
+ *
+ *   - `maxChangeKinds` — distinct change KINDS, not files. N instances of one
+ *                        mechanical edit is one kind at N sites; enumerating
+ *                        more kinds than this is a multi-capability scope.
+ *   - `maxMagnitude`   — coarse magnitude bucket, declared alongside the
+ *                        footprint: `trivial` < `moderate` < `substantial`.
+ *   - `maxUncertainty` — is the shape determined by the request
+ *                        (`determined`), or does it still need the design
+ *                        decisions `/plan` exists to resolve
+ *                        (`needs-design`)?
+ *   - `maxDeployables` — named deployable roots (`apps/<x>`, `packages/<x>`, …)
+ *                        the footprint spans; more than one is epic by
+ *                        construction.
+ *
+ * Two rules ride beside the ceilings and are not tunable at all: a footprint
+ * pairing a migration with its consumers is epic scope, and a footprint
+ * intersecting a sensitive-path class routes `full` however small or mechanical
+ * it is — the hard gate, unchanged.
+ *
+ * Exposed as the `ceilings` field on every {@link deriveStoryShape} decision
+ * and exported directly (Story #4740) so the light path's suitability gate
+ * ({@link module:lib/orchestration/light-suitability}) judges a prompt's
+ * predicted footprint against the **same** axes the plan-time shape backstop
+ * applies — one source, so the light entry point and the plan path can never
+ * disagree about what work is trivial.
+ */
+export const STORY_SHAPE_CEILINGS = Object.freeze({
+  maxChangeKinds: 2,
+  maxMagnitude: 'moderate',
+  maxUncertainty: 'determined',
+  maxDeployables: 1,
+});
+
+/** Coarse effort buckets, ascending. Anything past `maxMagnitude` routes full. */
+const MAGNITUDE_SCALE = Object.freeze(['trivial', 'moderate', 'substantial']);
+
+/** Coarse uncertainty buckets, ascending. */
+const UNCERTAINTY_SCALE = Object.freeze(['determined', 'needs-design']);
+
+/**
+ * Directory roots whose immediate child is a separately-deployable unit. A
+ * footprint spanning two of them is the "multiple deployables" epic signal.
+ */
+const DEPLOYABLE_ROOTS = Object.freeze([
+  'apps',
+  'packages',
+  'services',
+  'functions',
+  'workers',
+]);
+
+/** Paths that are schema migrations rather than ordinary source. */
+const MIGRATION_PATH_RE =
+  /(?:^|\/)(?:migrations?|migrate)(?:\/|$)|\.sql$|(?:^|\/)schema\.(?:prisma|rb)$/i;
+
+/**
+ * Place a declared bucket on an ordered scale. **Absent** means "not declared"
+ * — no signal, so the coarse gate reads the supplied default rather than
+ * rejecting. **Present but unrecognized** is a malformed claim, which cannot be
+ * verified as small and therefore fails closed to the worst bucket on the
+ * scale.
+ *
+ * @param {unknown} value
+ * @param {readonly string[]} scale Ascending buckets.
+ * @param {string} whenAbsent Bucket to assume when nothing was declared.
+ * @returns {string}
+ */
+function normalizeBucket(value, scale, whenAbsent) {
+  if (value === undefined || value === null || value === '') return whenAbsent;
+  const key = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return scale.includes(key) ? key : scale[scale.length - 1];
+}
+
+/**
+ * Resolve the distinct change KINDS in a footprint. An explicit `kinds[]`
+ * declaration wins; absent one, each entry's `assumption` is its kind — which
+ * is exactly the "N instances of one mechanical edit is one kind at N sites"
+ * reading, since N same-assumption entries collapse to one kind.
+ *
+ * @param {{ changes?: unknown, kinds?: unknown }} args
+ * @returns {string[]} Distinct kinds, in order of first appearance.
+ */
+function resolveChangeKinds({ changes, kinds }) {
+  const clean = (list) =>
+    list
+      .filter((k) => typeof k === 'string' && k.trim() !== '')
+      .map((k) => k.trim().toLowerCase());
+  const declared = clean(Array.isArray(kinds) ? kinds : []);
+  if (declared.length > 0) return [...new Set(declared)];
+  const derived = (Array.isArray(changes) ? changes : []).map((entry) =>
+    entry && typeof entry === 'object' && typeof entry.assumption === 'string'
+      ? entry.assumption.trim().toLowerCase() || 'unspecified'
+      : 'unspecified',
+  );
+  return [...new Set(derived)];
+}
+
+/**
+ * Named deployable roots a footprint spans (`apps/web`, `packages/core`, …).
+ * The repository root itself is deliberately **not** counted: a change to one
+ * app plus a root-level README is one deployable, not two.
+ *
+ * @param {string[]} paths
+ * @returns {string[]}
+ */
+function resolveDeployables(paths) {
+  const ids = new Set();
+  for (const p of paths) {
+    const segments = String(p)
+      .split('/')
+      .filter((s) => s !== '');
+    if (segments.length >= 3 && DEPLOYABLE_ROOTS.includes(segments[0])) {
+      ids.add(`${segments[0]}/${segments[1]}`);
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Does the footprint pair a schema migration with its consumers? A migration
+ * plus the code that reads through it is epic scope: the two have to land
+ * together and the ordering is the design work.
+ *
+ * @param {string[]} paths
+ * @returns {boolean}
+ */
+function spansMigrationAndConsumers(paths) {
+  const migrations = paths.filter((p) => MIGRATION_PATH_RE.test(String(p)));
+  return migrations.length > 0 && migrations.length < paths.length;
+}
+
+/**
+ * Stable machine-readable identifiers for every reason a shape routes `full` —
+ * the `code` field on a {@link deriveStoryShape} decision (Story #4815).
+ *
+ * The prose in `reasons[]` is written for a human reading a gate envelope and
+ * is free to be re-worded; a caller that must **branch** on *which* rule
+ * objected reads this code instead. That distinction is load-bearing for the
+ * light path's operator override
+ * ({@link module:lib/orchestration/light-suitability.OVERRIDABLE_SHAPE_CODES}),
+ * which may waive a size *prediction* but never a risk rule: keying that
+ * decision off reason text would make a copy-edit a security change.
+ *
+ * Split three ways, and the grouping is the contract:
+ *
+ *   - **Ceiling rules** — `change-kinds`, `magnitude`, `uncertainty`,
+ *     `deployable-span`. Coarse predictions about size, enforced for real
+ *     against ground truth by the diff backstop.
+ *   - **Absolute rules** — `migration-span`, `sensitive-path`. Risk, not size.
+ *   - **Unknown-footprint rejections** — `no-changes`, `unreadable-changes`,
+ *     `glob-footprint`, `no-acceptance`, `classification-unavailable`,
+ *     `unparseable-body`. Nothing was judged, so there is nothing to waive.
+ *
+ * A `lite` route carries `code: null`.
+ */
+export const SHAPE_CODES = Object.freeze({
+  CHANGE_KINDS: 'change-kinds',
+  MAGNITUDE: 'magnitude',
+  UNCERTAINTY: 'uncertainty',
+  DEPLOYABLE_SPAN: 'deployable-span',
+  MIGRATION_SPAN: 'migration-span',
+  SENSITIVE_PATH: 'sensitive-path',
+  NO_CHANGES: 'no-changes',
+  UNREADABLE_CHANGES: 'unreadable-changes',
+  GLOB_FOOTPRINT: 'glob-footprint',
+  NO_ACCEPTANCE: 'no-acceptance',
+  CLASSIFICATION_UNAVAILABLE: 'classification-unavailable',
+  UNPARSEABLE_BODY: 'unparseable-body',
+});
+
+/**
+ * Ordered effort/risk rules, evaluated in order; the first hit is the recorded
+ * reason for a `full` route. Every rule names an effort, risk, or uncertainty
+ * property of the work — none counts artifacts.
+ *
+ * @type {ReadonlyArray<{
+ *   code: string,
+ *   when: (shape: object, ceilings: typeof STORY_SHAPE_CEILINGS) => boolean,
+ *   reason: (shape: object, ceilings: typeof STORY_SHAPE_CEILINGS) => string,
+ * }>}
+ */
+const EFFORT_RULES = Object.freeze([
+  {
+    code: SHAPE_CODES.CHANGE_KINDS,
+    when: (s, c) => s.kindCount > c.maxChangeKinds,
+    reason: (s, c) =>
+      `${s.kindCount} distinct change kinds (${s.changeKinds.join(', ')}) > maxChangeKinds ${c.maxChangeKinds} — an explicit multi-capability enumeration, not one capability; full route`,
+  },
+  {
+    code: SHAPE_CODES.MAGNITUDE,
+    when: (s, c) =>
+      MAGNITUDE_SCALE.indexOf(s.magnitude) >
+      MAGNITUDE_SCALE.indexOf(c.maxMagnitude),
+    reason: (s, c) =>
+      `declared magnitude "${s.magnitude}" > maxMagnitude "${c.maxMagnitude}" — a substantial rewrite is effort a single inline pass should not absorb, however few files it touches; full route`,
+  },
+  {
+    code: SHAPE_CODES.UNCERTAINTY,
+    when: (s, c) =>
+      UNCERTAINTY_SCALE.indexOf(s.uncertainty) >
+      UNCERTAINTY_SCALE.indexOf(c.maxUncertainty),
+    reason: (s) =>
+      `the shape is not determined by the request (uncertainty "${s.uncertainty}") — the design decisions /plan exists to resolve are still open; full route`,
+  },
+  {
+    code: SHAPE_CODES.DEPLOYABLE_SPAN,
+    when: (s, c) => s.deployables.length > c.maxDeployables,
+    reason: (s, c) =>
+      `footprint spans ${s.deployables.length} deployables (${s.deployables.join(', ')}) > maxDeployables ${c.maxDeployables} — clearly-epic scope; full route`,
+  },
+  {
+    code: SHAPE_CODES.MIGRATION_SPAN,
+    when: (s) => s.migrationSpan,
+    reason: () =>
+      'footprint pairs a migration with its consumers — clearly-epic scope; full route',
+  },
+  {
+    code: SHAPE_CODES.SENSITIVE_PATH,
+    when: (s) => s.sensitiveClasses.length > 0,
+    reason: (s) =>
+      `footprint intersects sensitive-path class(es) ${s.sensitiveClasses.join(', ')} — sensitivity wins over a small shape; full route (fresh acceptance critic retained)`,
+  },
+]);
+
+/**
+ * First effort/risk rule the shape violates as a `{ code, reason }` pair, or
+ * `null` when it clears them all.
+ *
+ * @param {object} shape
+ * @param {typeof STORY_SHAPE_CEILINGS} ceilings
+ * @returns {{ code: string, reason: string }|null}
+ */
+function firstEffortViolation(shape, ceilings) {
+  for (const rule of EFFORT_RULES) {
+    if (rule.when(shape, ceilings)) {
+      return { code: rule.code, reason: rule.reason(shape, ceilings) };
+    }
+  }
+  return null;
+}
+
+/**
+ * The non-negotiables the ceremony-lite path preserves (Story #4683 AC-2):
+ * collapsing ceremony never means dropping the Story ticket, the PR-to-`main`
+ * landing, the repo quality gates, or the security baseline. Attached
+ * verbatim to every route decision's `preserves` field so a downstream reader
+ * (or contract test) can assert the invariants held on either route.
+ */
+const LITE_PATH_INVARIANTS = Object.freeze({
+  storyTicket: true,
+  prToMain: true,
+  repoGates: true,
+  securityBaseline: true,
+});
+
+/**
+ * Coerce a candidate ceiling into a non-negative integer, falling back to the
+ * framework default for anything malformed — a stray `-1` or `NaN` must never
+ * widen the lite path (fail conservative).
+ *
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function normalizeCeiling(value, fallback) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  return Math.floor(value);
+}
+
+/**
+ * Resolve the effective complexity-gate config, shallow-overlaying an
+ * operator `planning.complexityGate` block onto
+ * {@link DEFAULT_COMPLEXITY_GATE}. Accepts the full resolved config, the bare
+ * `planning` bag, or the bare `complexityGate` bag, mirroring the tolerant
+ * unwrap the other routing accessors use.
+ *
+ * Exported for persist (`run-plan-persist.js#resolveEffectiveRoute`), which
+ * consults `enabled` to refuse a planner lite claim when the gate is off —
+ * the schema's documented contract, and the same switch dispatch reads in
+ * {@link resolveStoryDispatchMode}, so the two read points cannot disagree
+ * about whether lite routing is live.
+ *
+ * @param {object | null | undefined} config
+ * @returns {{ enabled: boolean, maxArtifacts: number }}
+ */
+export function resolveComplexityGate(config) {
+  const raw =
+    config?.planning?.complexityGate ?? config?.complexityGate ?? config ?? {};
+  const bag = raw && typeof raw === 'object' ? raw : {};
+  return {
+    enabled:
+      typeof bag.enabled === 'boolean'
+        ? bag.enabled
+        : DEFAULT_COMPLEXITY_GATE.enabled,
+    maxArtifacts: normalizeCeiling(
+      bag.maxArtifacts,
+      DEFAULT_COMPLEXITY_GATE.maxArtifacts,
+    ),
+  };
+}
+
+/**
+ * Count top-level enumerated items (`- `, `* `, `1. `) in a free-form seed —
+ * each enumerated line is one predicted artifact.
+ *
+ * @param {string} text
+ * @returns {number}
+ */
+function countSeedArtifacts(text) {
+  if (typeof text !== 'string' || text.length === 0) return 0;
+  return text
+    .split(/\r?\n/)
+    .filter((line) => /^\s*(?:[-*]|\d+\.)\s+\S/.test(line)).length;
+}
+
+/** Cap on predicted-path extraction, to bound pathological seeds. */
+const MAX_PREDICTED_PATHS = 50;
+
+/**
+ * Extract path-like tokens (at least one `/` plus a dotted extension) from a
+ * free-form seed — the predicted footprint the sensitive-path and repo-state
+ * signals classify.
+ *
+ * @param {string} text
+ * @returns {string[]} Deduplicated, in order of first appearance.
+ */
+function extractPredictedPaths(text) {
+  if (typeof text !== 'string' || text.length === 0) return [];
+  const re = /(?:^|[\s`'"([])((?:[\w@.-]+\/)+[\w@.-]+\.[A-Za-z0-9]{1,8})/gm;
+  const seen = new Set();
+  let match = re.exec(text);
+  while (match !== null && seen.size < MAX_PREDICTED_PATHS) {
+    seen.add(match[1]);
+    match = re.exec(text);
+  }
+  return [...seen];
+}
+
+/**
+ * Build the advisory complexity **signals** for a planning seed
+ * (Story #4722 AC-2). Signals, not routing: the result carries
+ * `routingAuthority: false` and no `route` field — the planner reads these
+ * alongside its own judgment ({@link resolvePlannerRouteVerdict}) and the
+ * deterministic shape backstop validates the authored Story at persist.
+ *
+ *   - `artifactCount`         — enumerated items in the seed, with the
+ *                               configured `maxArtifacts` threshold beside it
+ *                               as one input signal.
+ *   - `riskHeuristicHits`     — `planning.riskHeuristics` phrases present in
+ *                               the seed (same substring matcher the
+ *                               pre-mortem critic uses).
+ *   - `predictedPaths` / `repoState` — path-like tokens in the seed and
+ *                               which of them exist in the repo (existing
+ *                               paths predict refactors; missing predict
+ *                               creates).
+ *   - `sensitivePathClasses`  — `audit-rules.json` sensitive-path classes the
+ *                               predicted footprint intersects (the same
+ *                               taxonomy close applies to the landed diff).
+ *
+ * Total: never throws; a failed classification degrades to an empty class
+ * list (the honest "no signal", never a verdict).
+ *
+ * @param {{
+ *   seedText?: string,
+ *   config?: object,
+ *   riskHeuristics?: string[],
+ *   cwd?: string,
+ *   pathExistsFn?: (absPath: string) => boolean,
+ *   injectedRules?: object,
+ *   selectSensitivePathClassesFn?: Function,
+ * }} [args]
+ * @returns {{
+ *   artifactCount: number,
+ *   maxArtifacts: number,
+ *   riskHeuristicHits: string[],
+ *   predictedPaths: string[],
+ *   repoState: { existingPaths: string[], missingPaths: string[] },
+ *   sensitivePathClasses: string[],
+ *   gate: { enabled: boolean },
+ *   advisory: true,
+ *   routingAuthority: false,
+ * }}
+ */
+export function buildComplexitySignals({
+  seedText = '',
+  config,
+  riskHeuristics = [],
+  cwd,
+  pathExistsFn = existsSync,
+  injectedRules,
+  selectSensitivePathClassesFn,
+} = {}) {
+  const gate = resolveComplexityGate(config);
+  const text = typeof seedText === 'string' ? seedText : '';
+  const haystack = text.toLowerCase();
+
+  const riskHeuristicHits = (
+    Array.isArray(riskHeuristics) ? riskHeuristics : []
+  ).filter(
+    (phrase) =>
+      typeof phrase === 'string' &&
+      phrase.trim().length > 0 &&
+      haystack.includes(phrase.trim().toLowerCase()),
+  );
+
+  const predictedPaths = extractPredictedPaths(text);
+  const root = typeof cwd === 'string' && cwd !== '' ? cwd : process.cwd();
+  const existingPaths = [];
+  const missingPaths = [];
+  for (const p of predictedPaths) {
+    let exists = false;
+    try {
+      exists = pathExistsFn(path.resolve(root, p)) === true;
+    } catch {
+      exists = false;
+    }
+    (exists ? existingPaths : missingPaths).push(p);
+  }
+
+  const { classes } = deriveChangeLevel({
+    changedFiles: predictedPaths,
+    injectedRules,
+    selectSensitivePathClassesFn,
+  });
+
+  return {
+    artifactCount: countSeedArtifacts(text),
+    maxArtifacts: gate.maxArtifacts,
+    riskHeuristicHits,
+    predictedPaths,
+    repoState: { existingPaths, missingPaths },
+    sensitivePathClasses: classes,
+    gate: { enabled: gate.enabled },
+    advisory: /** @type {const} */ (true),
+    routingAuthority: /** @type {const} */ (false),
+  };
+}
+
+/**
+ * Resolve the planner's authored trivial-vs-standard verdict
+ * (Story #4722 AC-2, generalizing the former one-way `applyPlannerDowngrade`
+ * seam into the verdict itself).
+ *
+ * The planner — not a word count — owns the judgment, and the contract keeps
+ * it auditable: `lite` **only** with a non-empty recorded reason (carried on
+ * `authored` and ledgered on every created Story's `story-plan-state`
+ * checkpoint by persist). Absent a recorded reason the conservative default
+ * stands: `full`, with `authored: null`. Pure and total.
+ *
+ * The verdict is a **claim**, not the decision — persist validates it against
+ * the authored Story's shape ({@link deriveStoryShape}) and fails closed to
+ * `full` when the shape exceeds the ceilings.
+ *
+ * @param {{ reason?: unknown }} [args]
+ * @returns {{
+ *   route: ComplexityRoute,
+ *   reasons: string[],
+ *   authored: Readonly<{ route: 'lite', reason: string }>|null,
+ *   preserves: typeof LITE_PATH_INVARIANTS,
+ * }}
+ */
+export function resolvePlannerRouteVerdict({ reason } = {}) {
+  const recorded = typeof reason === 'string' ? reason.trim() : '';
+  if (recorded === '') {
+    return {
+      route: 'full',
+      reasons: [
+        'no authored lite verdict (no recorded reason) — standard full route',
+      ],
+      authored: null,
+      preserves: LITE_PATH_INVARIANTS,
+    };
+  }
+  return {
+    route: 'lite',
+    reasons: [`planner verdict: lite (recorded reason): ${recorded}`],
+    authored: Object.freeze({ route: 'lite', reason: recorded }),
+    preserves: LITE_PATH_INVARIANTS,
+  };
+}
+
+/**
+ * Assemble the effort/risk shape of a footprint — the evidence
+ * {@link deriveStoryShape} decides on and carries on its result.
+ *
+ * @param {{
+ *   changes: unknown[],
+ *   paths: string[],
+ *   acceptance?: unknown,
+ *   kinds?: unknown,
+ *   magnitude?: unknown,
+ *   uncertainty?: unknown,
+ *   sensitiveClasses: string[],
+ * }} args
+ * @returns {{
+ *   siteCount: number,
+ *   changeKinds: string[],
+ *   kindCount: number,
+ *   magnitude: string,
+ *   uncertainty: string,
+ *   acceptanceCount: number,
+ *   deployables: string[],
+ *   migrationSpan: boolean,
+ *   sensitiveClasses: string[],
+ * }}
+ */
+function buildEffortShape({
+  changes,
+  paths,
+  acceptance,
+  kinds,
+  magnitude,
+  uncertainty,
+  sensitiveClasses,
+}) {
+  const changeKinds = resolveChangeKinds({ changes, kinds });
+  return {
+    siteCount: paths.length,
+    changeKinds,
+    kindCount: changeKinds.length,
+    magnitude: normalizeBucket(magnitude, MAGNITUDE_SCALE, 'moderate'),
+    uncertainty: normalizeBucket(uncertainty, UNCERTAINTY_SCALE, 'determined'),
+    acceptanceCount: Array.isArray(acceptance) ? acceptance.length : 0,
+    deployables: resolveDeployables(paths),
+    migrationSpan: spansMigrationAndConsumers(paths),
+    sensitiveClasses,
+  };
+}
+
+/**
+ * Derive the complexity route from an authored Story's **effort and risk**
+ * (Story #4722 AC-3/AC-4; re-anchored off artifact cardinality by Story #4764)
+ * — the single shape function persist's backstop and `/deliver`'s dispatch
+ * derivation both read, so the two can never disagree about the same body.
+ *
+ * `lite` requires **every** signal to agree, against
+ * {@link STORY_SHAPE_CEILINGS}:
+ *
+ *   - a declared, parseable, glob-free `changes[]` footprint — width is not
+ *     counted, but an unknown width cannot be judged;
+ *   - at least one acceptance criterion (a Story with no contract cannot be
+ *     judged trivial). The criteria are **not** capped: criterion count is
+ *     contract detail, not effort;
+ *   - at most `maxChangeKinds` distinct change kinds, magnitude no worse than
+ *     `maxMagnitude`, uncertainty no worse than `maxUncertainty`, and at most
+ *     `maxDeployables` deployable roots — plus no migration-with-consumers
+ *     span. These are the clearly-epic rejections, and nothing finer: the
+ *     declared footprint is a guess, so the diff-derived backstop does the real
+ *     enforcement (see {@link STORY_SHAPE_CEILINGS});
+ *   - a footprint intersecting **no** sensitive-path class
+ *     (`deriveChangeLevel`, the taxonomy close applies to the landed diff).
+ *     Sensitivity always wins (AC-6): a sensitive footprint routes `full`
+ *     however small or mechanical, which keeps the fresh acceptance critic via
+ *     `ceremony-routing.js`.
+ *
+ * Everything else — an unknown/undeclared footprint, a malformed magnitude or
+ * uncertainty claim, or an unreadable sensitive-path manifest — fails toward
+ * `full`. Total: never throws.
+ *
+ * @param {{
+ *   changes?: unknown,
+ *   acceptance?: unknown,
+ *   kinds?: unknown,
+ *   magnitude?: unknown,
+ *   uncertainty?: unknown,
+ *   injectedRules?: object,
+ *   selectSensitivePathClassesFn?: Function,
+ * }} [args] `kinds` declares the distinct change kinds explicitly (absent, each
+ *   entry's `assumption` is its kind); `magnitude` and `uncertainty` are the
+ *   declared coarse buckets.
+ * @returns {{
+ *   route: ComplexityRoute,
+ *   reasons: string[],
+ *   code: string|null,
+ *   shape: ReturnType<typeof buildEffortShape>|null,
+ *   ceilings: typeof STORY_SHAPE_CEILINGS,
+ *   preserves: typeof LITE_PATH_INVARIANTS,
+ * }} `code` is the stable {@link SHAPE_CODES} identifier for the rule that
+ *   rejected the shape (`null` on `lite`) — the field a caller branches on,
+ *   since `reasons[]` is human prose and free to be re-worded.
+ */
+export function deriveStoryShape({
+  changes,
+  acceptance,
+  kinds,
+  magnitude,
+  uncertainty,
+  injectedRules,
+  selectSensitivePathClassesFn,
+} = {}) {
+  const ceilings = STORY_SHAPE_CEILINGS;
+  const preserves = LITE_PATH_INVARIANTS;
+  const decide = (route, code, reason, shape = null) => ({
+    route,
+    reasons: [reason],
+    code,
+    shape,
+    ceilings,
+    preserves,
+  });
+
+  if (!Array.isArray(changes) || changes.length === 0) {
+    return decide(
+      'full',
+      SHAPE_CODES.NO_CHANGES,
+      'no changes[] declared — the footprint is unknown, so the work cannot be judged trivial; conservative full route',
+    );
+  }
+
+  let entries;
+  try {
+    entries = extractChangePaths(changes);
+  } catch (err) {
+    return decide(
+      'full',
+      SHAPE_CODES.UNREADABLE_CHANGES,
+      `changes[] could not be read (${err?.message ?? err}) — unknown footprint; conservative full route`,
+    );
+  }
+
+  const paths = entries.map((e) => e.path);
+  const { level, classes } = deriveChangeLevel({
+    changedFiles: paths,
+    injectedRules,
+    selectSensitivePathClassesFn,
+  });
+  const shape = buildEffortShape({
+    changes,
+    paths,
+    acceptance,
+    kinds,
+    magnitude,
+    uncertainty,
+    sensitiveClasses: classes,
+  });
+
+  if (entries.some((e) => e.isGlob)) {
+    return decide(
+      'full',
+      SHAPE_CODES.GLOB_FOOTPRINT,
+      'changes[] contains a glob path — unknown footprint width; conservative full route',
+      shape,
+    );
+  }
+  if (shape.acceptanceCount === 0) {
+    return decide(
+      'full',
+      SHAPE_CODES.NO_ACCEPTANCE,
+      'no acceptance criteria — the contract cannot be judged trivial; conservative full route',
+      shape,
+    );
+  }
+
+  const violation = firstEffortViolation(shape, ceilings);
+  if (violation !== null) {
+    return decide('full', violation.code, violation.reason, shape);
+  }
+
+  if (level !== 'low') {
+    // `deriveChangeLevel` degraded to its null fail-safe (unreadable
+    // manifest / failed selector): there is no evidence the footprint is
+    // non-sensitive, and a classification failure must never buy lite.
+    return decide(
+      'full',
+      SHAPE_CODES.CLASSIFICATION_UNAVAILABLE,
+      'sensitive-path classification unavailable — cannot verify the footprint is non-sensitive; conservative full route',
+      shape,
+    );
+  }
+
+  return decide(
+    'lite',
+    null,
+    `trivial shape: ${shape.kindCount} change kind(s) (${shape.changeKinds.join(', ')}) ≤ ${ceilings.maxChangeKinds} across ${shape.siteCount} site(s), magnitude ${shape.magnitude} ≤ ${ceilings.maxMagnitude}, shape ${shape.uncertainty}, no epic-scope span, no sensitive-path class — inline-eligible; non-negotiables preserved`,
+    shape,
+  );
+}
+
+/**
+ * Derive the complexity route from a Story's **serialized body markdown** —
+ * the deliver-side entry to {@link deriveStoryShape} (`/deliver` already
+ * fetches the body; the route is computed from it, never from a label). An
+ * unparseable body degrades to `full`: unknown shape is not trivial shape.
+ *
+ * Module-private, reachable end to end through
+ * {@link resolveStoryDispatchMode} (which returns the derived route) — so
+ * there is no test-only export to leave production-dead.
+ *
+ * @param {string} body Serialized Story-body markdown.
+ * @param {{ injectedRules?: object, selectSensitivePathClassesFn?: Function }} [opts]
+ * @returns {ReturnType<typeof deriveStoryShape>}
+ */
+function deriveStoryRouteFromBody(body, opts = {}) {
+  let parsed;
+  try {
+    parsed = parseStoryBody(String(body ?? '')).body;
+  } catch (err) {
+    return {
+      route: 'full',
+      reasons: [
+        `Story body is unparseable (${err?.message ?? err}) — shape unknown; conservative full route`,
+      ],
+      code: SHAPE_CODES.UNPARSEABLE_BODY,
+      shape: null,
+      ceilings: STORY_SHAPE_CEILINGS,
+      preserves: LITE_PATH_INVARIANTS,
+    };
+  }
+  return deriveStoryShape({
+    changes: parsed?.changes,
+    acceptance: parsed?.acceptance,
+    injectedRules: opts.injectedRules,
+    selectSensitivePathClassesFn: opts.selectSensitivePathClassesFn,
+  });
+}
+
+/**
+ * Best-effort route derivation for reporting, when the *mode* is already
+ * pinned by run topology and only `route` remains to be filled in. A body
+ * that will not parse yields `null` rather than throwing — the caller is not
+ * asking the shape to decide anything.
+ *
+ * @param {unknown} body
+ * @param {{ injectedRules?: object, selectSensitivePathClassesFn?: Function }} opts
+ * @returns {ReturnType<typeof deriveStoryShape>|null}
+ */
+function routeForReporting(body, opts) {
+  if (typeof body !== 'string' || body.trim() === '') return null;
+  return deriveStoryRouteFromBody(body, opts);
+}
+
+/**
+ * Decide how `/deliver` executes a Story.
+ *
+ * **`inline` names one indivisible resource: the router's own session.** Two
+ * Stories cannot both own it, so exactly one premise can grant it —
+ * **run topology (Story #4736)**: a run resolving a *single* Story executes
+ * inline whatever its shape, because sub-agent isolation is load-bearing only
+ * for CONCURRENT dispatch (two workers sharing a checkout race on worktrees and
+ * branch refs) and a one-Story run has no sibling to race. It therefore pays
+ * the spawn premium (a boot is a cache WRITE at full rate, where an inline
+ * continuation is a cache read at ~10%; ~$1.43/M vs ~$1.07/M on comparable
+ * bench work) for nothing. That is a fact about the run, not about the work, so
+ * the shape gate's `enabled` switch — which governs *shape derivation* — does
+ * not reach it.
+ *
+ * **Shape cannot grant it (Story #4829).** The shape read used to return
+ * `inline` for any lite-shaped body in a multi-Story run, inheriting no
+ * topology guard. Measured twice on 2026-07-29: a two-Story and a three-Story
+ * run came back `inline` for *every* Story while `stories-wave-tick.js`
+ * reported the whole set ready under a concurrency cap of five — a router
+ * following both signals literally runs several engines over one session and
+ * one checkout, the precise hazard the sub-agent path exists to prevent. Both
+ * runs were completed only by an operator overriding the verdict by hand, which
+ * is an invariant held by judgment rather than by code. So this function has
+ * exactly **one** `inline` exit, guarded by the topology premise; every path
+ * below it returns `subagent`, and the derived shape is carried on `route` for
+ * reporting only. A lite shape makes the work cheap — it does not conjure a
+ * second session for a sibling to run in.
+ *
+ * The label is read only to report hint consistency in `reasons`; it never
+ * routes on either premise (Story #4722 AC-4/AC-5).
+ *
+ * Inline execution removes model-side fan-out only — it changes **where** the
+ * engine runs, never **what** runs. Every deterministic
+ * `single-story-close.js` gate, the PR to `main`, and the
+ * `story-deliver-terminal` envelope are identical in both modes; see the
+ * module header's non-negotiables.
+ *
+ * @param {{
+ *   body?: unknown,
+ *   labels?: unknown,
+ *   config?: object,
+ *   storyCount?: unknown,
+ *   injectedRules?: object,
+ *   selectSensitivePathClassesFn?: Function,
+ * }} [args] `storyCount` is the number of Stories the invoking `/deliver` run
+ *   resolved. Omitted (or not a positive integer) means "unknown run size",
+ *   which cannot be shown sibling-free and therefore dispatches as a sub-agent
+ *   — never an assumed 1.
+ * @returns {{ mode: 'inline'|'subagent', reasons: string[], route: ReturnType<typeof deriveStoryShape>|null }}
+ */
+export function resolveStoryDispatchMode({
+  body,
+  labels,
+  config,
+  storyCount,
+  injectedRules,
+  selectSensitivePathClassesFn,
+} = {}) {
+  const labelList = Array.isArray(labels)
+    ? labels.filter((l) => typeof l === 'string')
+    : [];
+  const hasHint = labelList.includes(LITE_ROUTE_LABEL);
+  const hintNote = hasHint
+    ? `the ${LITE_ROUTE_LABEL} label is present (hint only — the derived shape is the control signal)`
+    : `the ${LITE_ROUTE_LABEL} label is absent (hint only — the derived shape is the control signal)`;
+
+  // The ONLY `inline` exit in this function, and the guard is the whole
+  // contract: an inline verdict must mean the engine can actually run inline.
+  if (storyCount === 1) {
+    return {
+      mode: 'inline',
+      reasons: [
+        'single-Story run — execute deliver-story inline; sub-agent isolation is load-bearing only for concurrent dispatch, and a one-Story run has no sibling to race (close gates, PR, and terminal envelope unchanged)',
+        hintNote,
+      ],
+      route: routeForReporting(body, {
+        injectedRules,
+        selectSensitivePathClassesFn,
+      }),
+    };
+  }
+
+  const gate = resolveComplexityGate(config);
+  if (!gate.enabled) {
+    return {
+      mode: 'subagent',
+      reasons: [
+        'complexity routing disabled (planning.complexityGate.enabled=false) — standard sub-agent dispatch',
+      ],
+      route: null,
+    };
+  }
+
+  if (typeof body !== 'string' || body.trim() === '') {
+    return {
+      mode: 'subagent',
+      reasons: [
+        'no Story body to derive shape from — conservative sub-agent dispatch',
+        hintNote,
+      ],
+      route: null,
+    };
+  }
+
+  // Past the topology guard a sibling may be dispatched concurrently, so the
+  // router's session is not available to anyone. The shape is still derived and
+  // returned on `route` — ceremony and reporting read it — but it decides
+  // nothing here: both shapes dispatch as a sub-agent.
+  const route = deriveStoryRouteFromBody(body, {
+    injectedRules,
+    selectSensitivePathClassesFn,
+  });
+  const shapeNote =
+    route.route === 'lite'
+      ? `lite-shaped Story in a multi-Story run — the shape is inline-eligible but the router's session is not: a concurrent sibling would have to share it, racing worktrees and branch refs; sub-agent dispatch (${route.reasons[0]})`
+      : `full-shaped Story — ${route.reasons[0]}`;
+  return { mode: 'subagent', reasons: [shapeNote, hintNote], route };
+}
