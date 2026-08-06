@@ -50,20 +50,34 @@ export const DEFAULT_CLOSE_COMMENT =
 // Marker + digest contract
 // ---------------------------------------------------------------------------
 
+/** Both sequences close an HTML comment; a stripper that knows only `-->`
+ *  would leave a stray `!` inside the key and stop matching the live issue. */
+const COMMENT_CLOSERS = ["--!>", "-->"];
+
 /**
  * Normalize a marker key to its bare form, tolerating a caller that passed the
  * rendered HTML comment instead. Without this, `<!-- k -->` would render as
  * `<!-- <!-- k --> -->` and never match a live issue again.
  *
+ * Deliberately string-scanned rather than regex-stripped: the obvious
+ * `/\s*-->$/` is the CodeQL `js/bad-tag-filter` pattern, blind to the legacy
+ * `--!>` terminator that browsers and GitHub both honour.
+ *
  * @param {string} marker
  * @returns {string}
  */
 export function markerKey(marker) {
-  return String(marker ?? "")
-    .trim()
-    .replace(/^<!--\s*/, "")
-    .replace(/\s*-->$/, "")
-    .trim();
+  let s = String(marker ?? "").trim();
+  if (s.startsWith("<!--")) {
+    s = s.slice(4);
+    for (const closer of COMMENT_CLOSERS) {
+      if (s.endsWith(closer)) {
+        s = s.slice(0, -closer.length);
+        break;
+      }
+    }
+  }
+  return s.trim();
 }
 
 /** Render the discovery marker a tracked issue body is found by. */
@@ -76,11 +90,13 @@ export const defaultDigestPrefix = (marker) => `${markerKey(marker)}-digest:`;
 export const digestMarker = (digest, digestPrefix) =>
   `<!-- ${String(digestPrefix).trim()} ${digest} -->`;
 
-/** Escape a caller-supplied prefix for use inside a RegExp. */
-const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
 /**
  * Recover the digest a previously-filed issue body carries (null if none).
+ *
+ * Scanned as strings rather than compiled into a RegExp from the caller's
+ * prefix: a non-literal pattern is both a SAST finding
+ * (`detect-non-literal-regexp`) and a real hazard, since a prefix carrying
+ * regex metacharacters would silently match the wrong comment — or nothing.
  *
  * @param {string|null|undefined} body
  * @param {string} digestPrefix
@@ -88,8 +104,31 @@ const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  */
 export function extractDigest(body, digestPrefix) {
   if (!body) return null;
-  const m = body.match(new RegExp(`<!--\\s*${escapeRe(String(digestPrefix).trim())}\\s*(\\S+)\\s*-->`));
-  return m ? m[1] : null;
+  const prefix = String(digestPrefix).trim();
+  const text = String(body);
+
+  for (let from = 0; ; ) {
+    const open = text.indexOf("<!--", from);
+    if (open === -1) return null;
+
+    let close = -1;
+    let closerLength = 0;
+    for (const closer of COMMENT_CLOSERS) {
+      const at = text.indexOf(closer, open + 4);
+      if (at !== -1 && (close === -1 || at < close)) {
+        close = at;
+        closerLength = closer.length;
+      }
+    }
+    if (close === -1) return null;
+    from = close + closerLength;
+
+    const inner = text.slice(open + 4, close).trim();
+    if (!inner.startsWith(prefix)) continue;
+    // The digest is a single whitespace-free token, matching the rendered form.
+    const token = inner.slice(prefix.length).trim();
+    if (token !== "" && !/\s/.test(token)) return token;
+  }
 }
 
 // ---------------------------------------------------------------------------

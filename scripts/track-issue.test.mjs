@@ -196,6 +196,30 @@ test("a marker supplied as a rendered comment is not double-wrapped", () => {
   assert.equal(markerLine("<!-- acme:x -->"), "<!-- acme:x -->");
 });
 
+test("the legacy `--!>` comment terminator is stripped, not left in the key", () => {
+  // `--!>` closes an HTML comment just as `-->` does. A stripper blind to it
+  // leaves a stray `!` in the key, so the rendered marker stops matching the
+  // live issue and the next run opens a second one.
+  assert.equal(markerKey("<!-- acme:x --!>"), "acme:x");
+  assert.equal(markerLine("<!-- acme:x --!>"), "<!-- acme:x -->");
+});
+
+test("a digest marker closed with `--!>` is still recovered", () => {
+  assert.equal(extractDigest("<!-- acme:d: abc123 --!>", "acme:d:"), "abc123");
+});
+
+test("extractDigest skips non-matching comments and needs a single token", () => {
+  const body = [
+    "<!-- acme:nightly-tracker -->",
+    "<!-- unrelated: note -->",
+    "<!-- acme:d: two tokens -->",
+    "<!-- acme:d: realdigest -->",
+  ].join("\n");
+  assert.equal(extractDigest(body, "acme:d:"), "realdigest");
+  assert.equal(extractDigest("<!-- acme:d: -->", "acme:d:"), null);
+  assert.equal(extractDigest("<!-- acme:d: unterminated", "acme:d:"), null);
+});
+
 test("the digest prefix defaults from the marker but is overridable", () => {
   assert.equal(defaultDigestPrefix(MARKER), "acme:nightly-tracker-digest:");
   assert.match(digestMarker("abc", "custom:pfx:"), /<!-- custom:pfx: abc -->/);
