@@ -4,7 +4,7 @@ description: >-
   (resolve newest published version → install → re-materialize `.agents/` →
   migrate → doctor → surface changelog) as the single mechanical step, then
   walks the operator through the judgment wraparound the CLI deliberately
-  leaves unowned: reconcile `.agentrc.json`, install the Epic #1386
+  leaves unowned: reconcile `.agentrc.json`, install the stabilized
   quality-gate surface, refresh the harness permission allowlist, reconcile
   the consumer's `AGENTS.md` / runbooks against the surfaced changelog, and
   stage + commit the staged lockfile bump.
@@ -13,11 +13,11 @@ description: >-
 # /mandrel-update
 
 > **Upgrade owner.** The mechanical upgrade is owned end to end by the
-> [`mandrel update`](../../lib/cli/update.js) CLI under the npm distribution
-> model (#3436/#3437). This workflow wraps that CLI: it runs
+> [`mandrel update`](https://github.com/dsj1984/mandrel/blob/main/lib/cli/update.js) CLI under the npm distribution
+> model. This workflow wraps that CLI: it runs
 > `npx mandrel update`, then walks the operator through the
 > **distribution-agnostic judgment steps** the CLI deliberately does **not**
-> perform — config reconciliation, the Epic #1386 quality-gate installs, the
+> perform — config reconciliation, the quality-gate installs, the
 > permission-allowlist refresh, the consumer-side changelog reconciliation,
 > and the stage-and-commit of the staged lockfile bump.
 
@@ -66,7 +66,7 @@ envelope (`{ ok, blocked, findings[] }`) plus a human-readable report:
   the version probe.
 
 The preflight is a workflow-layer guard; it deliberately lives outside
-[`lib/cli/update.js`](../../lib/cli/update.js), which stays git-free.
+[`lib/cli/update.js`](https://github.com/dsj1984/mandrel/blob/main/lib/cli/update.js), which stays git-free.
 
 ## Step 1 — Run the updater
 
@@ -102,9 +102,9 @@ recovered and a clean re-run reports success.**
 
 Identify the failed phase (the CLI's stderr names it) and run the matching
 remedy. These commands match the hint strings
-[`lib/cli/update.js`](../../lib/cli/update.js) emits verbatim — it is the
+[`lib/cli/update.js`](https://github.com/dsj1984/mandrel/blob/main/lib/cli/update.js) emits verbatim — it is the
 single source of truth, kept in lockstep with this table by
-[`tests/bootstrap/mandrel-update-recovery-drift.test.js`](../../tests/bootstrap/mandrel-update-recovery-drift.test.js):
+[`tests/bootstrap/mandrel-update-recovery-drift.test.js`](https://github.com/dsj1984/mandrel/blob/main/tests/bootstrap/mandrel-update-recovery-drift.test.js):
 
 | Failed phase      | Manual remedy                                            |
 | ----------------- | ------------------------------------------------------- |
@@ -113,25 +113,19 @@ single source of truth, kept in lockstep with this table by
 | **migrate**       | `npx mandrel migrate --from <cur> --to <target>`        |
 | **doctor**        | `npx mandrel doctor` (then apply the per-check remedies) |
 
-The exact stderr the CLI prints per failed phase:
-
-- **sync** — the .agents/ materialization may be incomplete. Run `mandrel
-  sync` manually to restore.
-- **sync-commands** — the .claude/commands/ tree may be out of sync. Run `npm
-  run sync:commands` manually to restore.
-- **migrate** — some migrations for v\<cur\> → v\<target\> may not have
-  applied. Run `mandrel migrate --from <cur> --to <target>` manually to retry.
-- **doctor** — upgraded to v\<target\> but doctor reported failures. → Run
-  `mandrel doctor` for remedies.
-
-(`<cur>` / `<target>` are the installed and resolved-newest version strings
-the failing run reported.)
+The CLI prints the matching remedy command to stderr per failed phase; the
+workflow quotes those commands verbatim so an operator sees the same thing the
+CLI told them, and the drift gate above keys on them: Run `mandrel sync`
+manually to restore. · Run `npm run sync:commands` manually to restore. · Run
+`mandrel migrate --from <cur> --to <target>` manually to retry. · Run
+`mandrel doctor` for remedies. (`<cur>` / `<target>` are the installed and
+resolved-newest version strings the failing run reported.)
 
 Recovery sequence: run the matching remedy, then **re-run
 `npx mandrel update`** — it is idempotent (the install already landed, so a
 clean re-run short-circuits the bump and re-drives the post-install
 phases). Repeat until it reports success; only then proceed. A dedicated
-`--resume` entrypoint was evaluated and deferred (Story #4172) — the
+`--resume` entrypoint was evaluated and deferred — the
 per-phase remedies plus the idempotent re-run already cover every recovery
 case.
 
@@ -141,7 +135,7 @@ case.
 node .agents/scripts/sync-agentrc.js
 ```
 
-The helper (Story #1995) is default-aware and **read-only**: it validates
+The helper is default-aware and **read-only**: it validates
 the consumer config against the new schema (non-zero exit → fix the
 validation error and re-run before proceeding), never auto-fills missing
 optional keys (the runtime layers defaults at read time), and flags
@@ -150,7 +144,7 @@ advisory rows you may optionally delete by hand (commit alongside the bump
 in Step 5). Full procedure:
 [`helpers/mandrel-sync-config.md`](helpers/mandrel-sync-config.md).
 
-## Step 3.5 — Upgrade the stabilized-quality-gates surface (Epic #1386)
+## Step 3.5 — Upgrade the stabilized-quality-gates surface
 
 ```bash
 node .agents/scripts/apply-quality-bootstrap.js

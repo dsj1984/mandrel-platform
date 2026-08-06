@@ -449,15 +449,29 @@ function computeMissingBddScaffoldFindings(stories, reach, severity) {
  * Tasks satisfy (a) or (b). When ≥2 such Stories sit in the same wave (no
  * transitive `depends_on` between them), emit a single finding keyed by the
  * registry path.
+ *
+ * Reached from the module's `_internal` named export. The pass is pure — it
+ * performs no filesystem I/O and spawns no process — so its optional final
+ * `deps` parameter seams the three collaborating predicates rather than a
+ * built-in; each entry defaults to the real implementation
+ * (`.agents/rules/test-seams.md` rules 1-3: the defaults live on the function,
+ * never on a module-level mutable variable).
+ *
+ * @param {object} input
+ * @param {{
+ *   isRegistryPathImpl?: typeof isRegistryPath,
+ *   inSameWaveImpl?: typeof inSameWave,
+ *   registryRegistryImpl?: typeof registryRegistry,
+ * }} [deps]
  */
-function computeRegistryFindings({
-  stories,
-  reach,
-  patterns,
-  producers,
-  assumptionEntries,
-  severity,
-}) {
+function computeRegistryFindings(
+  { stories, reach, patterns, producers, assumptionEntries, severity },
+  {
+    isRegistryPathImpl = isRegistryPath,
+    inSameWaveImpl = inSameWave,
+    registryRegistryImpl = registryRegistry,
+  } = {},
+) {
   const findings = [];
   // Build the matching registry path set from producer & creator paths.
   const registryHits = new Map(); // registryPath -> Map<storySlug, producers[]>
@@ -474,7 +488,7 @@ function computeRegistryFindings({
   // (a) direct registry edits — object-form `{ path, assumption }` entries
   // from `indexAssumptionEntries` (and the producer index built from them).
   for (const [path, entries] of producers.entries()) {
-    if (!isRegistryPath(path, patterns)) continue;
+    if (!isRegistryPathImpl(path, patterns)) continue;
     for (const e of entries) {
       bump(path, {
         storySlug: e.storySlug,
@@ -485,7 +499,7 @@ function computeRegistryFindings({
     }
   }
   for (const e of assumptionEntries) {
-    if (!isRegistryPath(e.path, patterns)) continue;
+    if (!isRegistryPathImpl(e.path, patterns)) continue;
     bump(e.path, {
       storySlug: e.storySlug,
       taskSlug: e.taskSlug,
@@ -510,7 +524,7 @@ function computeRegistryFindings({
         continue;
       const childParent = parentDirOf(change.path);
       if (!childParent) continue;
-      for (const reg of registryRegistry(
+      for (const reg of registryRegistryImpl(
         producers,
         assumptionEntries,
         patterns,
@@ -532,7 +546,7 @@ function computeRegistryFindings({
     const cluster = new Set();
     for (let i = 0; i < stories.length; i += 1) {
       for (let j = i + 1; j < stories.length; j += 1) {
-        if (inSameWave(reach, stories[i], stories[j])) {
+        if (inSameWaveImpl(reach, stories[i], stories[j])) {
           cluster.add(stories[i]);
           cluster.add(stories[j]);
         }
@@ -803,6 +817,28 @@ export function renderFanOutRemedy(finding) {
 }
 
 /**
+ * The finding kinds that are genuinely **cross-Story conflicts** — the SSOT
+ * for that question (Story #4907).
+ *
+ * Two readers need it and must not disagree: the validator, which renders
+ * these through {@link renderHardConflictError} when policy upgrades them to
+ * `errors[]`, and the persist soft-finding surface, which announces a
+ * conflict as a conflict and every other soft kind (`spec-word-budget`,
+ * `merge-candidate`, `unanchored-constant`, `missing-reason-to-exist`) as the
+ * advisory it is. A second copy of this list is how the two drift back apart,
+ * so it is defined exactly once and imported.
+ */
+export const CONFLICT_KINDS = Object.freeze(
+  new Set([
+    'shared-editor',
+    'implicit-cross-story-dep',
+    'cross-cutting-registries',
+    'fan-out-warning',
+    'missing-bdd-scaffold',
+  ]),
+);
+
+/**
  * Render a `'hard'`-severity conflict finding as a human-readable error
  * message. Used by the validator when policy flags upgrade a finding to
  * the AC-visible `errors[]` channel.
@@ -828,6 +864,12 @@ export function renderHardConflictError(finding) {
   }
   if (finding.kind === 'missing-bdd-scaffold') {
     return `Missing BDD scaffold: Story "${finding.consumer.storySlug}" verifies against "${finding.path}" (created by Story "${finding.producer.storySlug}") via body.${finding.consumer.sourceField}, but "${finding.consumer.storySlug}" has no depends_on path to "${finding.producer.storySlug}" — the .feature file is scaffolded in the same wave (or later), so verification runs before the file exists. Add depends_on: ["${finding.producer.storySlug}"] to the consumer Story so the scaffold lands in an earlier wave.`;
+  }
+  // Findings from other passes (sizing, spec-word-budget) carry their own
+  // message — render it rather than a shape-blind generic line, so the soft
+  // surface (`surfaceSoftConflictFindings`) stays legible for every kind.
+  if (typeof finding.message === 'string' && finding.message.length > 0) {
+    return finding.message;
   }
   return `Conflict finding ${finding.kind} on path "${finding.path ?? '<unknown>'}".`;
 }

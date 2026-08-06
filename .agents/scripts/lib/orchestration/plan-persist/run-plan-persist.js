@@ -37,13 +37,21 @@
  * @module lib/orchestration/plan-persist/run-plan-persist
  */
 
-import { readdir, rm, stat } from 'node:fs/promises';
-import path from 'node:path';
-
-import { anchorTempRoot, tempRootFrom } from '../../config/temp-paths.js';
+import { rm } from 'node:fs/promises';
 import { getLimits, PROJECT_ROOT } from '../../config-resolver.js';
 import { gitSpawn } from '../../git-utils.js';
 import { Logger } from '../../Logger.js';
+import { sweepTempRetention } from '../../temp-retention.js';
+import {
+  concurrentMap,
+  FANOUT_CONCURRENCY,
+} from '../../util/concurrent-map.js';
+import {
+  deriveStoryShape,
+  LITE_ROUTE_LABEL,
+  resolveComplexityGate,
+  resolvePlannerRouteVerdict,
+} from '../complexity-gate.js';
 import {
   appendCriticSkip,
   readPlanMetrics,
@@ -262,11 +270,111 @@ async function renderRunScopedPlanMetricsLine({
 }
 
 /**
- * Age after which an abandoned `temp/plan-*` directory is reaped. A plan run
- * that is still being authored is minutes-to-hours old; a week is far past
- * any live run and comfortably past an operator returning to a paused one.
+ * Resolve the plan's **effective** complexity route for persist
+ * (Story #4722, superseding the envelope-verdict model of Story #4707).
+ *
+ * Two staged inputs, no word count anywhere:
+ *
+ *   1. **The planner's authored verdict** — `--route-downgrade-reason` is the
+ *      lite claim's recorded reason (`resolvePlannerRouteVerdict`). No
+ *      recorded reason means no claim: the plan persists as standard `full`
+ *      and nothing is ledgered (`null`).
+ *   2. **The deterministic shape backstop** — a lite claim is validated
+ *      against every assembled Story's own shape (`deriveStoryShape` over its
+ *      `changes[]`, acceptance count, creates-vs-refactors mix, and
+ *      sensitive-path classes). Any Story exceeding the ceilings **fails the
+ *      claim closed to `full`** — the honest gate: after authoring, the work
+ *      has measurable shape, so complexity is read from the work, not guessed
+ *      from the seed.
+ *
+ * The resolved route decides whether the created Stories carry the
+ * {@link LITE_ROUTE_LABEL} **hint** (never the control signal — `/deliver`
+ * re-derives the route from the Story body's shape) and the `route` block
+ * ledgered on their `story-plan-state` checkpoint, including the authored
+ * verdict, its recorded reason, and the per-Story shape evidence. A refused
+ * claim is ledgered too (route `full` with the refusal reasons), so the
+ * judgment stays auditable either way.
+ *
+ * Module-private: reachable end to end through {@link runPlanPersist}
+ * (whose result reports the resolved route), so there is no test-only
+ * export to leave production-dead.
+ *
+ * @param {{
+ *   stories: ReturnType<typeof assemblePlanStories>['stories'],
+ *   routeDowngradeReason?: string|null,
+ *   config?: object,
+ *   injectedRules?: object,
+ * }} args
+ * @returns {{
+ *   route: 'lite'|'full',
+ *   reasons: string[],
+ *   authored: { route: 'lite', reason: string },
+ *   shape: Array<{ slug: string, route: string, reasons: string[], shape: object|null }>,
+ * }|null} `null` when the planner authored no verdict (nothing to persist).
  */
-const STALE_PLAN_DIR_MS = 7 * 24 * 60 * 60 * 1000;
+function resolveEffectiveRoute({
+  stories,
+  routeDowngradeReason = null,
+  config = {},
+  injectedRules,
+}) {
+  const verdict = resolvePlannerRouteVerdict({ reason: routeDowngradeReason });
+  if (verdict.route !== 'lite') return null;
+
+  // The schema's documented contract: with the gate disabled
+  // (`planning.complexityGate.enabled=false`), persist refuses lite claims —
+  // the same switch dispatch reads (`resolveStoryDispatchMode` falls back to
+  // sub-agent), so neither read point can honor a lite claim the operator
+  // has switched off. The refusal is ledgered like any other, keeping the
+  // judgment auditable.
+  if (!resolveComplexityGate(config).enabled) {
+    return {
+      route: 'full',
+      reasons: [
+        'planner lite verdict refused: complexity routing is disabled ' +
+          '(planning.complexityGate.enabled=false)',
+      ],
+      authored: verdict.authored,
+      shape: [],
+    };
+  }
+
+  const perStory = (Array.isArray(stories) ? stories : []).map((story) => {
+    const derived = deriveStoryShape({
+      changes: story.bodyObject?.changes,
+      acceptance: story.acceptance,
+      injectedRules,
+    });
+    return {
+      slug: story.slug,
+      route: derived.route,
+      reasons: derived.reasons,
+      shape: derived.shape,
+    };
+  });
+  const offenders = perStory.filter((entry) => entry.route !== 'lite');
+  if (offenders.length > 0) {
+    return {
+      route: 'full',
+      reasons: [
+        `planner lite verdict refused: ${offenders.length} of ${perStory.length} ` +
+          'Story(ies) exceed the lite shape ceilings — failing closed to full',
+        ...offenders.map((entry) => `${entry.slug}: ${entry.reasons[0]}`),
+      ],
+      authored: verdict.authored,
+      shape: perStory,
+    };
+  }
+  return {
+    route: 'lite',
+    reasons: [
+      ...verdict.reasons,
+      'shape backstop: every authored Story fits the lite shape ceilings',
+    ],
+    authored: verdict.authored,
+    shape: perStory,
+  };
+}
 
 /**
  * Reap abandoned `plan-*` directories under the temp root (Story #4541).
@@ -276,9 +384,16 @@ const STALE_PLAN_DIR_MS = 7 * 24 * 60 * 60 * 1000;
  * `--dry-run` left its directory behind forever. This sweeps the stragglers
  * on each persist.
  *
+ * Story #4794 folded the age-floored reap into the shared temp-retention
+ * engine — `planDirs` is one of its declared classes, so the plan path and
+ * the delivery path now converge on one classifier and one staleness floor
+ * (`delivery.tempRetention.staleDays`, still 7 days by default) instead of
+ * this module owning a private constant. Behaviour is unchanged: only
+ * `plan-*` directories are considered, the age test is the directory's own
+ * mtime, and the current run's `planDir` is excluded.
+ *
  * Best-effort throughout: this is hygiene, never a reason to fail a run that
- * has already created Stories. The current run's own `planDir` is always
- * excluded — its cleanup is the caller's decision.
+ * has already created Stories.
  *
  * @param {{ config?: object, keepDir?: string|null, now?: number }} args
  * @returns {Promise<{ reaped: string[] }>}
@@ -288,35 +403,206 @@ export async function reapStalePlanDirs({
   keepDir = null,
   now = Date.now(),
 } = {}) {
-  const reaped = [];
-  const tempRoot = anchorTempRoot(tempRootFrom(config));
-  let entries;
-  try {
-    entries = await readdir(tempRoot, { withFileTypes: true });
-  } catch {
-    return { reaped }; // No temp root yet — nothing to reap.
-  }
-  const keep = keepDir ? path.resolve(keepDir) : null;
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith('plan-')) continue;
-    const dir = path.resolve(tempRoot, entry.name);
-    if (keep !== null && dir === keep) continue;
-    try {
-      const { mtimeMs } = await stat(dir);
-      if (now - mtimeMs < STALE_PLAN_DIR_MS) continue;
-      await rm(dir, { recursive: true, force: true });
-      reaped.push(dir);
-    } catch {
-      // A racing writer or a permission error: leave it for the next run.
-    }
-  }
-  if (reaped.length > 0) {
-    Logger.info(
-      `[plan-persist] reaped ${reaped.length} abandoned plan director(ies) ` +
-        `older than 7d under ${tempRoot}.`,
+  const result = await sweepTempRetention({
+    config,
+    only: ['planDirs'],
+    excludePaths: keepDir ? [keepDir] : [],
+    now,
+    label: 'plan-persist',
+  });
+  return { reaped: result.purged.map((entry) => entry.path) };
+}
+
+/**
+ * Fail closed on a payload that cannot be persisted, and warn on an
+ * explicitly-authorized over-budget one. Extracted from `runPlanPersist`
+ * (Story #4926) so the entry point carries the flow, not the guards.
+ *
+ * @param {unknown} rawStories
+ * @param {{ maxTickets: number, allowOverBudget: boolean }} limits
+ * @returns {void}
+ * @throws {Error} On an empty payload or an unauthorized over-budget one.
+ */
+function assertPersistablePlan(rawStories, { maxTickets, allowOverBudget }) {
+  if (!Array.isArray(rawStories) || rawStories.length === 0) {
+    throw new Error(
+      '[plan-persist] stories payload must be a non-empty array ' +
+        '(--stories <file>). Default is one Story.',
     );
   }
-  return { reaped };
+  if (rawStories.length <= maxTickets) return;
+  if (!allowOverBudget) {
+    throw new Error(
+      `[plan-persist] Stories (${rawStories.length}) exceed the reviewability ` +
+        `budget (${maxTickets}). Re-scope, or rerun with --allow-over-budget.`,
+    );
+  }
+  Logger.warn(
+    `[plan-persist] Persisting an over-budget plan: ${rawStories.length} ` +
+      `Stories vs. budget ${maxTickets} (--allow-over-budget).`,
+  );
+}
+
+/**
+ * Enforce the draft-reachability critic: orphans throw, a skip is ledgered.
+ *
+ * @param {{ status: string, reasons: string[], orphans?: object[] }} reachability
+ * @param {object} config
+ * @returns {Promise<void>}
+ * @throws {Error} `PLAN_REACHABILITY_ORPHANS` when the draft orphans a Story.
+ */
+async function enforceReachability(reachability, config) {
+  if (reachability.status === 'orphans') {
+    const err = new Error(renderReachabilityOrphans(reachability));
+    err.code = 'PLAN_REACHABILITY_ORPHANS';
+    err.orphans = reachability.orphans;
+    throw err;
+  }
+  Logger.info(`[plan-persist] reachability: ${reachability.reasons[0]}`);
+  if (reachability.status === 'skipped') {
+    await appendCriticSkip(
+      {
+        critic: 'reachability',
+        reasons: reachability.reasons,
+        cli: 'plan-persist',
+      },
+      config,
+    );
+  }
+}
+
+/**
+ * Write the per-Story checkpoint, upsert the plan-summary comment, and flip
+ * every created Story to `agent::ready`. Terminal ordering is load-bearing:
+ * `agent::ready` lands last so it can honestly mean "fully persisted"
+ * (Story #4541). A dry run performs none of it.
+ *
+ * **The checkpoints fan out; the phase boundary does not** (Story #4952). The
+ * per-Story upserts are independent of one another and run under bounded
+ * concurrency, but the `await` on that whole fan-out is what keeps the
+ * Story #4541 invariant intact: *every* checkpoint is on its ticket before the
+ * first `agent::ready` flip is issued, so `ready` still means "fully
+ * persisted" and a `/deliver` that picks a Story up cannot read a null
+ * checkpoint. Concurrency inside the phase is safe; overlapping the phases is
+ * the race this ordering exists to close.
+ *
+ * @param {object} args
+ * @returns {Promise<void>}
+ */
+async function persistStoryArtifacts({
+  provider,
+  created,
+  primary,
+  route,
+  summaryBody,
+}) {
+  const cohort = created.map((createdStory) => ({
+    slug: createdStory.slug,
+    id: createdStory.id,
+  }));
+  await concurrentMap(
+    created,
+    (story) =>
+      writeCheckpointV2(provider, story.id, {
+        persist: {
+          completedAt: new Date().toISOString(),
+          storyCount: created.length,
+          primaryStoryId: primary.id,
+          stories: cohort,
+        },
+        // Ledger the authored route verdict — the recorded reason and the
+        // per-Story shape evidence, including a shape-refused claim — on plan
+        // state (Story #4722). No authored verdict writes no block: absence
+        // is the standard full path.
+        ...(route ? { route } : {}),
+      }),
+    // The per-Story checkpoint upserts (Story #4952): each targets a
+    // different issue and reads nothing another writes, so this loop was
+    // serial only by construction — but see {@link persistStoryArtifacts}
+    // for the phase ordering that is *not* incidental.
+    { concurrency: FANOUT_CONCURRENCY },
+  );
+  await upsertStructuredComment(
+    provider,
+    primary.id,
+    PLAN_SUMMARY_COMMENT_TYPE,
+    summaryBody,
+  );
+  await markStoriesReady({ provider, created });
+}
+
+/**
+ * Remove this run's plan directory on terminal success, then sweep the
+ * abandoned ones terminal-success cleanup can never reach (Story #4541).
+ *
+ * @param {{ config: object, planDir: string|null, skipCleanup: boolean }} args
+ * @returns {Promise<void>}
+ */
+async function cleanupPlanDirs({ config, planDir, skipCleanup }) {
+  if (!skipCleanup && planDir) {
+    try {
+      await rm(planDir, { recursive: true, force: true });
+    } catch (err) {
+      Logger.warn(`[plan-persist] temp cleanup skipped: ${err.message}`);
+    }
+  }
+  await reapStalePlanDirs({ config, keepDir: skipCleanup ? planDir : null });
+}
+
+/**
+ * Log the effective complexity route (Story #4722). Lite is upheld by the
+ * shape backstop; anything else reports why it fell back to full.
+ *
+ * @param {object|null} route
+ * @param {boolean} isLiteRoute
+ * @returns {void}
+ */
+function logEffectiveRoute(route, isLiteRoute) {
+  if (isLiteRoute) {
+    Logger.info(
+      `[plan-persist] ceremony-lite route upheld by the shape backstop: ` +
+        `created Stories carry the ${LITE_ROUTE_LABEL} hint ` +
+        `(recorded reason: ${route.authored.reason}). /deliver re-derives ` +
+        'the route from each Story body — the label is never the control signal.',
+    );
+    return;
+  }
+  if (route) {
+    Logger.warn(
+      `[plan-persist] ${route.reasons.join('; ')} — persisting as full ` +
+        '(no route hint label).',
+    );
+  }
+}
+
+/**
+ * Log the operator-facing persist epilogue: adoption, the ready primary, the
+ * deliver command, and the cohort grouping label.
+ *
+ * @param {{ created: object[], primary: object, planRunLabel: string }} args
+ * @returns {void}
+ */
+function logPersistEpilogue({ created, primary, planRunLabel }) {
+  const adopted = created.filter((story) => story.adopted);
+  if (adopted.length > 0) {
+    Logger.info(
+      `[plan-persist] resumed ${adopted.length} of ${created.length} Story(ies) ` +
+        `from a previous persist: ${adopted.map((s2) => `#${s2.id}`).join(', ')}.`,
+    );
+  }
+  Logger.info(
+    `[plan-persist] Persisted ${created.length} Story(ies)` +
+      `; primary #${primary.id} is agent::ready.`,
+  );
+  Logger.info(
+    `[plan-persist] Deliver with: /deliver ${created.map((s2) => s2.id).join(' ')}`,
+  );
+  // Metadata only — a GitHub filter for the cohort this run authored, never
+  // a delivery-resolution input (/deliver stays ids-only, Story #4540).
+  Logger.info(
+    `[plan-persist] Cohort grouping label: ${planRunLabel} — filter with ` +
+      `label:${planRunLabel}`,
+  );
 }
 
 /**
@@ -328,6 +614,7 @@ export async function reapStalePlanDirs({
  *     stories: Array<object>,
  *     techSpecContent?: string|null,
  *     planAcceptance?: string[]|null,
+ *     planContextEnvelope?: object|null,
  *   },
  *   config?: object,
  *   settings?: object,
@@ -343,6 +630,8 @@ export async function reapStalePlanDirs({
  *     sourceTicketIds?: number[],
  *     sourceTicketOrigin?: 'flag'|'envelope'|'none',
  *     closeSuperseded?: boolean,
+ *     routeDowngradeReason?: string|null,
+ *     injectedRules?: object,
  *   },
  * }} input
  */
@@ -357,6 +646,7 @@ export async function runPlanPersist({
     stories: rawStories = null,
     techSpecContent = null,
     planAcceptance = null,
+    planContextEnvelope = null,
   } = artifacts ?? {};
   const {
     forceReview = false,
@@ -370,6 +660,8 @@ export async function runPlanPersist({
     sourceTicketIds = [],
     sourceTicketOrigin = 'none',
     closeSuperseded = true,
+    routeDowngradeReason = null,
+    injectedRules = undefined,
   } = opts;
 
   // Boundary for the plan-metrics summary below: everything this invocation
@@ -378,26 +670,10 @@ export async function runPlanPersist({
   // through the shared standalone ledger (Story #4541).
   const runStartedAt = opts.metricsSince ?? new Date().toISOString();
 
-  if (!Array.isArray(rawStories) || rawStories.length === 0) {
-    throw new Error(
-      '[plan-persist] stories payload must be a non-empty array ' +
-        '(--stories <file>). Default is one Story.',
-    );
-  }
-
-  const maxTickets = getLimits(config).maxTickets;
-  if (rawStories.length > maxTickets && !allowOverBudget) {
-    throw new Error(
-      `[plan-persist] Stories (${rawStories.length}) exceed the reviewability ` +
-        `budget (${maxTickets}). Re-scope, or rerun with --allow-over-budget.`,
-    );
-  }
-  if (rawStories.length > maxTickets && allowOverBudget) {
-    Logger.warn(
-      `[plan-persist] Persisting an over-budget plan: ${rawStories.length} ` +
-        `Stories vs. budget ${maxTickets} (--allow-over-budget).`,
-    );
-  }
+  assertPersistablePlan(rawStories, {
+    maxTickets: getLimits(config).maxTickets,
+    allowOverBudget,
+  });
 
   Logger.info(
     `[plan-persist] Running cross-validation on ${rawStories.length} Story ticket(s)...`,
@@ -419,35 +695,39 @@ export async function runPlanPersist({
     tickets: rawStories,
     config,
   });
-  if (reachability.status === 'orphans') {
-    const err = new Error(renderReachabilityOrphans(reachability));
-    err.code = 'PLAN_REACHABILITY_ORPHANS';
-    err.orphans = reachability.orphans;
-    throw err;
-  }
-  Logger.info(`[plan-persist] reachability: ${reachability.reasons[0]}`);
-  if (reachability.status === 'skipped') {
-    await appendCriticSkip(
-      {
-        critic: 'reachability',
-        reasons: reachability.reasons,
-        cli: 'plan-persist',
-      },
-      config,
-    );
-  }
+  await enforceReachability(reachability, config);
 
   // Split policy + inline Spec fold (over-budget Specs fail closed — no docs/).
   const { stories } = assemblePlanStories(rawStories, {
     sharedSpec: techSpecContent,
     planAcceptance: planAcceptance ?? undefined,
     sourceTicketIds,
+    // The seed this plan was authored from is the provenance source: an audit
+    // sweep's Single-plan seed carries the `audit-fingerprints` /
+    // `audit-semantic-keys` footers, which assembly copies into every persisted
+    // Story body so the next sweep recognises what it already planned
+    // (Story #4877). Empty for a `--tickets` run, which is a no-op.
+    provenanceSource: planContextEnvelope?.seed?.content ?? '',
   });
 
-  const { created } = await createStoryIssues({
+  // Effective complexity route (Story #4722): the planner's authored lite
+  // verdict (recorded reason), validated against every assembled Story's own
+  // shape — a claim exceeding the shape ceilings fails closed to full. Lite
+  // persists the `route::lite` HINT label + a checkpoint route block; a
+  // refused claim ledgers the refusal (no label); no claim persists nothing.
+  const route = resolveEffectiveRoute({
+    stories,
+    routeDowngradeReason,
+    config,
+    injectedRules,
+  });
+  const isLiteRoute = route?.route === 'lite';
+  logEffectiveRoute(route, isLiteRoute);
+
+  const { created, planRunLabel } = await createStoryIssues({
     provider,
     stories,
-    opts: { dryRun },
+    opts: { dryRun, routeLabel: isLiteRoute ? LITE_ROUTE_LABEL : null },
   });
 
   const primary = created[0];
@@ -487,30 +767,13 @@ export async function runPlanPersist({
   });
 
   if (!dryRun) {
-    for (const story of created) {
-      await writeCheckpointV2(provider, story.id, {
-        persist: {
-          completedAt: new Date().toISOString(),
-          storyCount: created.length,
-          primaryStoryId: primary.id,
-          stories: created.map((createdStory) => ({
-            slug: createdStory.slug,
-            id: createdStory.id,
-          })),
-        },
-      });
-    }
-    await upsertStructuredComment(
+    await persistStoryArtifacts({
       provider,
-      primary.id,
-      PLAN_SUMMARY_COMMENT_TYPE,
+      created,
+      primary,
+      route,
       summaryBody,
-    );
-
-    // Terminal step: every checkpoint above is now on every Story, so
-    // `agent::ready` can honestly mean "fully persisted" (Story #4541).
-    // Anything that picks a Story up from here reads a real checkpoint.
-    await markStoriesReady({ provider, created });
+    });
   }
 
   const supersede = await runSupersedePhase({
@@ -526,35 +789,14 @@ export async function runPlanPersist({
   // any) rather than reading as a clean no-op — Story #4554.
   supersede.sourceTicketOrigin = sourceTicketOrigin;
 
-  if (!skipCleanup && planDir) {
-    try {
-      await rm(planDir, { recursive: true, force: true });
-    } catch (err) {
-      Logger.warn(`[plan-persist] temp cleanup skipped: ${err.message}`);
-    }
-  }
-  // Terminal-success cleanup only ever removes *this* run's planDir, so
-  // abandoned ones accumulated forever. Sweep them (Story #4541).
-  await reapStalePlanDirs({ config, keepDir: skipCleanup ? planDir : null });
-
-  const adopted = created.filter((story) => story.adopted);
-  if (adopted.length > 0) {
-    Logger.info(
-      `[plan-persist] resumed ${adopted.length} of ${created.length} Story(ies) ` +
-        `from a previous persist: ${adopted.map((s2) => `#${s2.id}`).join(', ')}.`,
-    );
-  }
-  Logger.info(
-    `[plan-persist] Persisted ${created.length} Story(ies)` +
-      `; primary #${primary.id} is agent::ready.`,
-  );
-  Logger.info(
-    `[plan-persist] Deliver with: /deliver ${created.map((s2) => s2.id).join(' ')}`,
-  );
+  await cleanupPlanDirs({ config, planDir, skipCleanup });
+  logPersistEpilogue({ created, primary, planRunLabel });
 
   return {
     stories: created,
     primaryStoryId: primary.id,
+    planRunLabel,
+    route,
     forceReview,
     reachability,
     freshness,

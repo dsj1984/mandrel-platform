@@ -19,6 +19,7 @@ import {
 } from './commands.js';
 import { DEFAULT_GATES, partitionGates } from './gates.js';
 import { defaultGateRunner } from './process.js';
+import { runProjectionAdvisories as defaultRunProjections } from './projections/advisories.js';
 import { defaultGetHeadSha } from './projections/head-sha.js';
 
 /** @typedef {import('./gates.js').Gate} Gate */
@@ -90,10 +91,23 @@ function applyChangedFileScope({ gate, spawnCwd, log }) {
  * story-close uses it to drive `phaseTimer.mark(...)` for per-gate
  * wall-clock telemetry. Errors thrown from the hook propagate.
  *
+ * Projection advisories (Story #4776): when `baseBranch` and `storyBranch`
+ * are both supplied and every gate passed, the maintainability and CRAP
+ * pre-merge projections run through `projections/advisories.js` and log
+ * their advisories to the same `log` sink the gates use. They are advisory
+ * by construction — the returned `ok` is decided entirely by the gates, so
+ * a projected breach never fails a close. They are skipped after a gate
+ * failure, where the operator needs the failing gate's evidence, not a
+ * baseline-refresh nudge.
+ *
  * @param {{
  *   cwd: string,
  *   worktreePath?: string,
  *   gates?: Gate[],
+ *   baseBranch?: string|null,
+ *   storyBranch?: string|null,
+ *   config?: object|null,
+ *   runProjections?: typeof defaultRunProjections,
  *   runner?: (cmd: string, args: string[], opts: { cwd: string, signal?: AbortSignal, gateName?: string, log?: (m: string) => void }) => Promise<{ status: number }> | { status: number },
  *   log?: (m: string) => void,
  *   onGateStart?: (gate: Gate) => void,
@@ -114,6 +128,10 @@ export async function runCloseValidation({
   runner = defaultGateRunner,
   log = () => {},
   onGateStart,
+  baseBranch = null,
+  storyBranch = null,
+  config = null,
+  runProjections = defaultRunProjections,
   storyId = null,
   standalone = false,
   useEvidence = true,
@@ -297,17 +315,79 @@ export async function runCloseValidation({
   }
 
   // ── Phase 2: serial gates in declared order ─────────────────────────
+  await runSerialGates(serial, {
+    spawnCwd,
+    log,
+    failed,
+    skipped,
+    evidenceActive,
+    evidenceClock,
+    evidenceVerdict,
+    recordIfActive,
+    dispatchGate,
+  });
+
+  // ── Phase 3: advisory projections ───────────────────────────────────
+  // Story #4776 — the projection layer's live call site. Deliberately
+  // outside the `ok` computation: a projected breach informs, it never
+  // fails a close.
+  if (failed.length === 0) {
+    await runAdvisoryProjections({
+      runProjections,
+      cwd: spawnCwd,
+      baseBranch,
+      storyBranch,
+      config,
+      log,
+    });
+  }
+
+  return { ok: failed.length === 0, failed, skipped };
+}
+
+/**
+ * Phase 2 helper — run the serial gates in declared order, stopping at the
+ * first failure. Extracted from `runCloseValidation` (Story #4926); the
+ * evidence bookkeeping stays bit-identical to the parallel pass because both
+ * call the same injected `evidenceVerdict` / `recordIfActive` closures.
+ *
+ * Mutates the caller's `failed` / `skipped` accumulators — the same arrays
+ * Phase 1 already wrote into, so the returned verdict stays one list.
+ *
+ * @param {Array<object>} serial
+ * @param {object} deps
+ * @returns {Promise<void>}
+ */
+async function runSerialGates(
+  serial,
+  {
+    spawnCwd,
+    log,
+    failed,
+    skipped,
+    evidenceActive,
+    evidenceClock,
+    evidenceVerdict,
+    recordIfActive,
+    dispatchGate,
+  },
+) {
+  const failGate = (gate, status, message) => {
+    failed.push({ gate, status, cwd: spawnCwd });
+    log(message);
+    if (gate.hint) log(`[close-validation]   hint: ${gate.hint}`);
+  };
   for (const gate of serial) {
     let execution;
     try {
       execution = applyChangedFileScope({ gate, spawnCwd, log });
     } catch (err) {
-      failed.push({ gate, status: 1, cwd: spawnCwd });
-      log(
+      failGate(
+        gate,
+        1,
         `[close-validation] ✖ ${gate.name} failed to resolve changed-file scope: ${err?.message ?? err}`,
       );
-      if (gate.hint) log(`[close-validation]   hint: ${gate.hint}`);
-      break;
+      return;
     }
     if (execution.skip) {
       skipped.push({ gate, reason: 'no-changed-files' });
@@ -331,12 +411,12 @@ export async function runCloseValidation({
       tolerateNoFilesProcessed: execution.tolerateNoFilesProcessed,
     });
     if (result.status !== 0) {
-      failed.push({ gate, status: result.status, cwd: spawnCwd });
-      log(
+      failGate(
+        gate,
+        result.status,
         `[close-validation] ✖ ${gate.name} failed (exit ${result.status}) in ${spawnCwd}`,
       );
-      if (gate.hint) log(`[close-validation]   hint: ${gate.hint}`);
-      break;
+      return;
     }
     log(`[close-validation] ✓ ${gate.name}`);
     recordIfActive(
@@ -345,6 +425,39 @@ export async function runCloseValidation({
       evidenceActive ? evidenceClock() - startedAt : 0,
     );
   }
+}
 
-  return { ok: failed.length === 0, failed, skipped };
+/**
+ * Phase 3 helper — run the advisory projections, absorbing every failure.
+ *
+ * No-ops without a branch pair to diff (resume / legacy callers), and can
+ * never influence the close verdict: the caller has already decided `ok`
+ * before this runs, and a throw here is logged, not propagated.
+ *
+ * @param {{
+ *   runProjections: typeof defaultRunProjections,
+ *   cwd: string,
+ *   baseBranch: string|null,
+ *   storyBranch: string|null,
+ *   config: object|null,
+ *   log: (m: string) => void,
+ * }} opts
+ * @returns {Promise<void>}
+ */
+async function runAdvisoryProjections({
+  runProjections,
+  cwd,
+  baseBranch,
+  storyBranch,
+  config,
+  log,
+}) {
+  if (!(baseBranch && storyBranch)) return;
+  try {
+    await runProjections({ cwd, baseBranch, storyBranch, config, log });
+  } catch (err) {
+    log(
+      `[close-validation]   ⚠ projection advisories skipped: ${err?.message ?? err}`,
+    );
+  }
 }

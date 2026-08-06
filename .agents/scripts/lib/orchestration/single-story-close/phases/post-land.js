@@ -11,7 +11,7 @@
  * Story is already `agent::done`, so confirm short-circuits `noop` and the
  * capture's `action === 'done'` gate never opens).
  *
- * This module folds all four steps into one phase both landing surfaces
+ * This module folds every such step into one phase both landing surfaces
  * reach — the in-close wait (`phases/confirm-merge.js`) and the standalone
  * `single-story-confirm-merge.js` CLI — so the two paths cannot diverge and
  * "landed" means the whole tail ran.
@@ -39,11 +39,13 @@ import {
   RUNTIME_FRICTION_CATEGORIES,
 } from '../../../observability/runtime-friction.js';
 import { acquireLockWithWait as defaultAcquireLockWithWait } from '../../../single-story-sweep/sweep-lock.js';
+import { purgeStoryTempArtifacts as defaultPurgeStoryTempArtifacts } from '../../../temp-retention.js';
 import {
   executeFastForward as defaultExecuteFastForward,
   planFastForward as defaultPlanFastForward,
 } from '../../git-cleanup/phases/fast-forward.js';
 import { reassertStatusColumn as defaultReassertStatusColumn } from '../../reassert-status-column.js';
+import { releaseStoryLease as defaultReleaseStoryLease } from '../../single-story-lease-guard.js';
 import { captureStoryFollowUps as defaultCaptureStoryFollowUps } from '../../story-follow-ups.js';
 
 /**
@@ -225,6 +227,70 @@ async function stepBaseFastForward({
 }
 
 /**
+ * Purge this Story's spent temp artifacts now that its merge is confirmed
+ * (Story #4794).
+ *
+ * The engine already emits its own one-line summary and returns a disabled
+ * policy as `skipped` with no errors, so this step needs no branching of its
+ * own: errors degrade it, everything else — including a deliberate
+ * config-disabled no-op — is a success. Reporting a disabled purge as a failed
+ * step would train readers to ignore the field.
+ */
+async function stepTempPurge({ storyId, config, purgeStoryTempArtifactsFn }) {
+  const result = await purgeStoryTempArtifactsFn({ storyId, config });
+  const errors = result?.errors ?? [];
+  return { ok: errors.length === 0, detail: errors.join('; ') || null };
+}
+
+/**
+ * Release the Story's assignee-lease now that the merge is confirmed
+ * (Story #4860).
+ *
+ * The close used to release here-ish — immediately after the PR was opened
+ * and armed, before the merge wait ran — so a Story's ticket read *unassigned*
+ * for the entire window its PR was open, and indefinitely on the
+ * operator-merge path where a human owns the land. The claim is the only
+ * ticket-visible record of who owns in-flight work, so dropping it at PR
+ * creation is dropping it at exactly the wrong moment.
+ *
+ * It lives in the tail rather than in either landing surface because the tail
+ * is the one seam **both** reach — the in-close merge wait
+ * (`phases/confirm-merge.js`) and the standalone
+ * `single-story-confirm-merge.js` CLI. Homing it anywhere else re-opens the
+ * surface divergence this module exists to close.
+ *
+ * Idempotent by construction: `releaseStoryLease` no-ops when the resolved
+ * operator is no longer the recorded owner, so a re-run (or the belated
+ * manual confirm that backfills an already-`agent::done` Story) reports the
+ * no-op reason rather than yanking a claim someone else has since taken.
+ *
+ * A `released: false` no-op is **not** a step failure: an already-released
+ * ticket is the desired end state, and reporting it as `false` would train
+ * readers to ignore the field. Only a throw — an unreachable API, an
+ * unresolvable operator identity — degrades the step, and like every tail
+ * step that degrades the report, never the land.
+ */
+async function stepLeaseRelease({
+  storyId,
+  provider,
+  config,
+  progress,
+  releaseStoryLeaseFn,
+}) {
+  const outcome = await releaseStoryLeaseFn({ provider, storyId, config });
+  progress?.(
+    'POST-LAND',
+    outcome?.released
+      ? `🔓 Story #${storyId} lease released (merge confirmed).`
+      : `⏭  Story #${storyId} lease not released (${outcome?.reason ?? 'unknown'}).`,
+  );
+  return {
+    ok: true,
+    detail: outcome?.released ? null : (outcome?.reason ?? null),
+  };
+}
+
+/**
  * Run the whole post-land tail. Never throws.
  *
  * Steps run **sequentially** and in this order deliberately: follow-up
@@ -262,7 +328,9 @@ async function stepBaseFastForward({
  * @param {Function} [args.planFastForwardFn]       Test seam.
  * @param {Function} [args.executeFastForwardFn]    Test seam.
  * @param {Function} [args.acquireLockWithWaitFn]   Test seam.
- * @returns {Promise<{ followUps: boolean, statusResync: boolean, refCleanup: boolean, baseFastForward: boolean, details: Record<string, string|null> }>}
+ * @param {Function} [args.purgeStoryTempArtifactsFn] Test seam.
+ * @param {Function} [args.releaseStoryLeaseFn]     Test seam.
+ * @returns {Promise<{ followUps: boolean, statusResync: boolean, refCleanup: boolean, baseFastForward: boolean, tempPurge: boolean, leaseRelease: boolean, details: Record<string, string|null> }>}
  */
 export async function runPostLandTail({
   storyId,
@@ -280,6 +348,8 @@ export async function runPostLandTail({
   planFastForwardFn = defaultPlanFastForward,
   executeFastForwardFn = defaultExecuteFastForward,
   acquireLockWithWaitFn = defaultAcquireLockWithWait,
+  purgeStoryTempArtifactsFn = defaultPurgeStoryTempArtifacts,
+  releaseStoryLeaseFn = defaultReleaseStoryLease,
 }) {
   progress?.('POST-LAND', `🧾 Running land tail for Story #${storyId}...`);
 
@@ -373,16 +443,44 @@ export async function runPostLandTail({
     if (lock.acquired) lock.release();
   }
 
+  // Story #4794 — the merge is confirmed, so this Story's gate transcripts and
+  // validation evidence are spent. Runs LAST so a purge can never race a step
+  // that still reads them, and outside the checkout lock because it touches
+  // only the temp tree. Its `signals.ndjson` survives by construction.
+  const tempPurge = await step(
+    () => stepTempPurge({ storyId, config, purgeStoryTempArtifactsFn }),
+    { name: 'temp purge', progress },
+  );
+
+  // Story #4860 — the merge is confirmed, so the operator's claim on this
+  // Story has finally done its job. Released here rather than at PR creation
+  // so the ticket stays assigned for the whole time its PR is open.
+  const leaseRelease = await step(
+    () =>
+      stepLeaseRelease({
+        storyId,
+        provider,
+        config,
+        progress,
+        releaseStoryLeaseFn,
+      }),
+    { name: 'lease release', progress },
+  );
+
   const tail = {
     followUps: followUps.ok,
     statusResync: statusResync.ok,
     refCleanup: refCleanup.ok,
     baseFastForward: baseFastForward.ok,
+    tempPurge: tempPurge.ok,
+    leaseRelease: leaseRelease.ok,
     details: {
       followUps: followUps.detail,
       statusResync: statusResync.detail,
       refCleanup: refCleanup.detail,
       baseFastForward: baseFastForward.detail,
+      tempPurge: tempPurge.detail,
+      leaseRelease: leaseRelease.detail,
     },
   };
   const degraded = Object.entries(tail)

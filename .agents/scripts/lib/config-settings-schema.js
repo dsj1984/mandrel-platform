@@ -249,35 +249,47 @@ const GITHUB_SCHEMA = {
 // rejected as an additional property, so a resurrected key fails loudly rather
 // than silently doing nothing.
 
-/**
- * Story #2634 — `planning.codebaseSnapshot` controls the structural
- * view of the consumer repo threaded into `/plan` Phase 7 spec
- * authoring. Absent / partial entries resolve to defaults inside
- * `lib/codebase-snapshot.js#resolveSnapshotConfig` — the schema only
- * enforces shape (correct enum value, well-formed glob arrays).
- */
-const CODEBASE_SNAPSHOT_SCHEMA = {
-  type: 'object',
-  properties: {
-    tier: { type: 'string', enum: ['skinny', 'medium'] },
-    include: {
-      type: 'array',
-      items: { type: 'string', minLength: 1 },
-    },
-    exclude: {
-      type: 'array',
-      items: { type: 'string', minLength: 1 },
-    },
-    recentCommitWindow: { type: 'integer', minimum: 1 },
-  },
-  additionalProperties: false,
-};
+// Story #4811: the `planning` block's structural-snapshot key was retired
+// along with the snapshot itself. The pre-computed view it configured grounded
+// nothing — its default include globs missed the standard monorepo layout, and
+// its knobs only re-filtered the same matched set. Spec authoring is grounded
+// by the author's own targeted repo retrieval plus the Phase 8
+// `validateStoryFileAssumptions` gate, neither of which is configurable here.
+// `planning` carries `additionalProperties: false`, so a resurrected key fails
+// loudly; the 2.20.0 retirement migration strips it on upgrade.
 
 const PLANNING_SCHEMA = {
   type: 'object',
   properties: {
     riskHeuristics: LIST_OR_EXTENDER_OF_STRINGS,
-    codebaseSnapshot: CODEBASE_SNAPSHOT_SCHEMA,
+    // Story #4722 (superseding #4683's word-count gate) — shape-derived
+    // ceremony-lite routing. Complexity routes on the objective shape of the
+    // authored work (changes[] count, acceptance count, creates-vs-refactors
+    // mix, sensitive-path classes), never on seed word count: `maxSeedWords`
+    // was removed in the hard cutover and is rejected as an additional
+    // property. The lite path never relaxes a non-negotiable (Story ticket,
+    // PR-to-main, repo gates, security baseline). Defaults live on
+    // DEFAULT_COMPLEXITY_GATE in `lib/orchestration/complexity-gate.js`;
+    // shape ceilings are the framework constants STORY_SHAPE_CEILINGS.
+    complexityGate: {
+      type: 'object',
+      description:
+        'Shape-derived ceremony-lite complexity routing. A lite claim is validated against the authored Story shape at persist and re-derived from the Story body at dispatch; conservative (full on any doubt). Never relaxes the Story-ticket / PR-to-main / repo-gates / security-baseline non-negotiables.',
+      properties: {
+        enabled: {
+          type: 'boolean',
+          description:
+            'Master switch. When false, lite routing is disabled everywhere: persist refuses lite claims and dispatch always takes the sub-agent path. Default true.',
+        },
+        maxArtifacts: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'Enumerated-artifact threshold reported by the plan-context complexity signals. An input signal for the planner verdict — carries no routing authority. Default 1.',
+        },
+      },
+      additionalProperties: false,
+    },
     // Cross-Story conflict-finding severity gates. Off by default so
     // existing repos keep advisory-only behaviour; flipping either to
     // `true` upgrades the matching finding class to `'hard'`, which routes

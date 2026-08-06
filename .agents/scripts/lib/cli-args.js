@@ -62,13 +62,71 @@ function parsePositiveInt(value) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+/** The only two merge-watch postures `--merge-watch-mode` accepts. */
+const MERGE_WATCH_MODES = ['sync', 'async'];
+
+/**
+ * Parse `--merge-watch-mode` (Story #4949), the per-invocation override of
+ * `delivery.mergeWatch.mode`. Absence is preserved as `undefined` so the
+ * caller can distinguish "not supplied" (fall back to config) from an explicit
+ * posture — the same contract {@link parsePositiveInt} gives
+ * `--max-wait-seconds`.
+ *
+ * Unlike that sibling, an unrecognized value **throws** rather than degrading
+ * to absent. A `--max-wait-seconds` typo falls back to a sane bound; a
+ * `--merge-watch-mode` typo would fall back to `sync` and silently return a
+ * multi-Story run to a serialized foreground wait per close, with the wall
+ * clock as the only evidence. Parsing runs before the first close phase, so
+ * failing here costs no mutation.
+ *
+ * @param {unknown} value
+ * @returns {'sync'|'async'|undefined}
+ */
+export function parseMergeWatchMode(value) {
+  if (value == null) return undefined;
+  const mode = String(value).trim().toLowerCase();
+  if (MERGE_WATCH_MODES.includes(mode)) return mode;
+  throw new Error(
+    `--merge-watch-mode must be one of ${MERGE_WATCH_MODES.join('|')} (got "${value}")`,
+  );
+}
+
+/**
+ * {@link parseMergeWatchMode} degraded to the "absent" value instead of
+ * throwing — how the tolerant parse below treats a flag that failed
+ * validation. Reporting `undefined` is safe there and only there, because a
+ * tolerant parse never drives a pipeline: its caller surfaces the rejection
+ * as the run's failure and runs no phase at all.
+ *
+ * @param {unknown} value
+ * @returns {'sync'|'async'|undefined}
+ */
+function tolerantMergeWatchMode(value) {
+  try {
+    return parseMergeWatchMode(value);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Standardized CLI argument parser for sprint scripts.
  * Supports options like --epic, --story, --dry-run, --skip-dashboard.
+ *
+ * Throws when a *validating* parser rejects a flag value (currently only
+ * `--merge-watch-mode`). Callers that must not throw — an error handler
+ * needing `storyId` to report an envelope — use {@link parseSprintArgsTolerant}
+ * rather than calling this a second time inside their own catch.
+ *
  * @param {string[]} args Array of arguments (defaults to process.argv)
+ * @param {{ tolerant?: boolean }} [options] `tolerant` degrades a rejected
+ *   flag to its absent value instead of throwing. For reporting only.
  * @returns {object} Parsed and typed argument values
  */
-export function parseSprintArgs(args = process.argv) {
+export function parseSprintArgs(
+  args = process.argv,
+  { tolerant = false } = {},
+) {
   const { values, positionals } = parseArgs({
     args: args.slice(2),
     options: {
@@ -85,6 +143,10 @@ export function parseSprintArgs(args = process.argv) {
       // Story #4543 — per-run override of `delivery.mergeWatch.maxWaitSeconds`
       // (the merge wait's per-invocation bound). Absent means "use the config".
       'max-wait-seconds': { type: 'string' },
+      // Story #4949 — per-invocation override of `delivery.mergeWatch.mode`.
+      // Absent means "use the config"; see `parseMergeWatchMode` for why an
+      // unrecognized value fails closed instead of degrading to absent.
+      'merge-watch-mode': { type: 'string' },
       executor: { type: 'string' },
       cwd: { type: 'string' },
       'recut-of': { type: 'string' },
@@ -115,6 +177,12 @@ export function parseSprintArgs(args = process.argv) {
     // headless caller with no host tool-invocation ceiling, so it lands in
     // one block instead of returning `pending` at the default 300s.
     maxWaitSeconds: parsePositiveInt(values['max-wait-seconds']),
+    // Story #4949 — per-invocation override of `delivery.mergeWatch.mode`.
+    // `undefined` when the flag is absent, which is what lets the merge wait
+    // fall back to the config; anything unrecognized throws here.
+    mergeWatchMode: tolerant
+      ? tolerantMergeWatchMode(values['merge-watch-mode'])
+      : parseMergeWatchMode(values['merge-watch-mode']),
     executor: values.executor ?? null,
     // Resolve worktree cwd from flag or env. Empty string/whitespace → null.
     cwd:
@@ -135,6 +203,52 @@ export function parseSprintArgs(args = process.argv) {
     parseTicketId(positionals[0]) ?? parsed.storyId ?? parsed.epicId ?? null;
 
   return parsed;
+}
+
+/**
+ * Last-resort tolerant parse: the fields, or an empty bag if even the
+ * tolerant pass cannot produce one.
+ *
+ * @param {string[]} args
+ * @returns {object}
+ */
+function parseSprintArgsOrEmpty(args) {
+  try {
+    return parseSprintArgs(args, { tolerant: true });
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Parse argv **without ever throwing**, returning the fields alongside the
+ * rejection rather than in place of it.
+ *
+ * `parseSprintArgs` gained its first *validating* parser in
+ * {@link parseMergeWatchMode} (Story #4949), which made a latent shape in the
+ * CLI entries fatal: their catch blocks called
+ * `failedTerminalFor(err, parseSprintArgs())` — re-invoking the very parser
+ * that had just thrown. The second throw escaped the catch, so an
+ * unparseable argv produced a bare stack trace with **no terminal envelope
+ * and no friction signal**, on the two surfaces whose whole contract is that
+ * they always emit one. An error handler must not depend on an operation
+ * already known to fail.
+ *
+ * So the entries parse **once**, up front, through this wrapper: `args`
+ * carries the `storyId` and skip flags the envelope is built from, and
+ * `error` is the failure to report. The tolerant re-parse degrades **only**
+ * the flag that failed validation; every other field parses normally. Use
+ * the result to *report*, never to run a pipeline.
+ *
+ * @param {string[]} [args] Array of arguments (defaults to `process.argv`)
+ * @returns {{ args: object, error: Error|null }}
+ */
+export function parseSprintArgsTolerant(args = process.argv) {
+  try {
+    return { args: parseSprintArgs(args), error: null };
+  } catch (error) {
+    return { args: parseSprintArgsOrEmpty(args), error };
+  }
 }
 
 const SUPPORTED_FLAG_TYPES = new Set([

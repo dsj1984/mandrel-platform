@@ -2,15 +2,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import escomplex from 'typhonjs-escomplex';
 import { canonicalise as canonicalisePath } from './baselines/path-canon.js';
-import {
-  coverageForMethodInEntry,
-  findCoverageEntry,
-} from './coverage-utils.js';
+import { findCoverageEntry } from './coverage-utils.js';
 import { POOL_SERIAL_THRESHOLD, runOnPool } from './cpu-pool.js';
-import { crapFormula } from './crap-engine.js';
+import { finalizeMethodRowsWithBaseline } from './crap-baseline-join.js';
+import {
+  COORDINATE_ORIGINAL,
+  finalizeMethodRows,
+  methodRowsFromReport,
+} from './crap-engine.js';
+import {
+  resolvedFromBaselineFlag,
+  resolveIncrementalContext,
+  resolveQueueIncrementalFields,
+  shouldRunSerial,
+  shouldSkipFileForNoCoverage,
+} from './crap-utils-incremental.js';
 import { Logger } from './Logger.js';
 import { scanDirectory } from './maintainability-utils.js';
-import { resolveTsTranspilerVersion, transpileIfNeeded } from './transpile.js';
+import {
+  prepareSourceForScoring,
+  resolveTsTranspilerVersion,
+} from './transpile.js';
 
 const CRAP_WORKER_URL = new URL('./workers/crap-worker.js', import.meta.url);
 const COMBINED_MI_CRAP_WORKER_URL = new URL(
@@ -95,13 +107,98 @@ function resolveBaselinePath({ cwd = process.cwd(), baselinePath } = {}) {
  * }|null}
  */
 /**
+ * The envelope-level fields the CRAP compat axes read off a *loaded* baseline
+ * — the set every read path owes `assertBaselineCompatible`.
+ *
+ * It exists because there are TWO read paths and they have now diverged three
+ * times. `check-baselines` loads through `baselines/reader.js`; the
+ * `quality-preview` pre-commit arm loads through `projectCrapEnvelopeToLegacy`
+ * below. Both are ALLOW-LISTS, both feed the same axes, and a stamp added to
+ * one and not the other yields two opposite verdicts on one file: Story #4866
+ * (`scoringSemantics`, `tsTranspilerVersion`), Story #4969 (`rows[].anonymous`)
+ * and Story #4986 (`provenanceStamped`, half-fixed by #4973) were each that
+ * same half-landing.
+ *
+ * Every one of those axes keys on a POSITIVE marker, so a dropped field reads
+ * `undefined` and fails the baseline closed with a remedy that cannot work —
+ * re-deriving it writes the stamp the read path then discards. The projection
+ * below is DERIVED from this list rather than repeating it, so a new stamp is
+ * carried here the moment it is named; a parity test holds the reader to the
+ * same set and names whichever path forgot one.
+ *
+ * Row-level markers are deliberately out: they are projected per-row, not as
+ * envelope stamps.
+ *
+ * Deliberately module-local, mirroring `SCORING_SEMANTICS` in
+ * `baselines/kinds/crap.js`: the writer's `envelopeExtras()` is the single
+ * production door to the stamp set, and exporting this list would add a second
+ * one that only a test reaches. The parity test holds this projection to
+ * `Object.keys(envelopeExtras())` instead, so a stamp the writer starts
+ * emitting fails the test here until it is named — which is the enforcement
+ * this list needs, not an export.
+ */
+const COMPAT_STAMP_FIELDS = Object.freeze([
+  'scoringSemantics',
+  'tsTranspilerVersion',
+  'provenanceStamped',
+]);
+
+/**
+ * Per-stamp coercion applied on the way through the legacy projection. A field
+ * with no entry is carried VERBATIM, which is the correct default: the axes
+ * distinguish "stamped" from "absent", so inventing a value for a stamp the
+ * envelope never wrote is the one thing a read path must not do.
+ */
+const COMPAT_STAMP_NORMALIZERS = {
+  // `null` (not the running value) when unstamped, so `ts-transpiler-drift`
+  // can tell "written by a different transpiler" from "written before the
+  // stamp existed" instead of comparing a value against itself.
+  tsTranspilerVersion: (value) => (typeof value === 'string' ? value : null),
+  scoringSemantics: (value) => value ?? null,
+};
+
+/**
+ * Project the compat stamps off a v2 envelope, driven by
+ * `COMPAT_STAMP_FIELDS`.
+ *
+ * @param {Record<string, unknown>} parsed
+ * @returns {Record<string, unknown>}
+ */
+function projectCompatStamps(parsed) {
+  const stamps = {};
+  for (const field of COMPAT_STAMP_FIELDS) {
+    const normalize = COMPAT_STAMP_NORMALIZERS[field];
+    stamps[field] = normalize ? normalize(parsed[field]) : parsed[field];
+  }
+  return stamps;
+}
+
+/**
  * Story #1895: shipped baseline switched to the canonical envelope shape
  * (`$schema`, `kernelVersion`, `generatedAt`, `rollup`, `rows` keyed on
- * `path`). Backfill the legacy `escomplexVersion`/`tsTranspilerVersion`
- * version fields from the running scorer and re-key rows by `file` so
- * existing comparators keep working until Story #1912 lands the unified
- * gate. Detection probes the first row for the new `path` key — the
- * legacy envelope also carries `$schema` but keys rows by `file`.
+ * `path`). Backfill the legacy `escomplexVersion` field from the running
+ * scorer and re-key rows by `file` so existing comparators keep working
+ * until Story #1912 lands the unified gate. Detection probes the first row
+ * for the new `path` key — the legacy envelope also carries `$schema` but
+ * keys rows by `file`.
+ *
+ * **Compat stamps survive the projection (Story #4866).** `scoringSemantics`
+ * and `tsTranspilerVersion` are *baseline* facts, and the projection used to
+ * drop the first and overwrite the second with the RUNNING value — which made
+ * every compat axis reading them either unstamped or vacuously self-equal.
+ * They are carried verbatim now, `null` when the envelope never stamped them,
+ * so an axis can tell "written by a different transpiler" apart from "written
+ * before the stamp existed" instead of guessing.
+ *
+ * **This projection is one of TWO (Story #4986).** `check-baselines` reads a
+ * baseline through `baselines/reader.js`; `quality-preview` reads the same file
+ * through here. Both feed `assertBaselineCompatible`, so a stamp added to one
+ * allow-list and not the other produces two opposite verdicts on one envelope —
+ * which is what happened to `provenanceStamped`: #4973 added it to the reader
+ * and left this projection dropping it, so the pre-commit CRAP arm rejected
+ * every stamped baseline with an un-satisfiable "re-seed" remedy while the
+ * authoritative gate passed. The stamp block is derived from
+ * `COMPAT_STAMP_FIELDS` above so this projection cannot fall behind again.
  */
 function projectCrapEnvelopeToLegacy(parsed) {
   if (
@@ -114,12 +211,21 @@ function projectCrapEnvelopeToLegacy(parsed) {
   return {
     kernelVersion: parsed.kernelVersion,
     escomplexVersion: resolveEscomplexVersion(),
-    tsTranspilerVersion: resolveTsTranspilerVersion(),
+    ...projectCompatStamps(parsed),
     rows: parsed.rows.map((row) => ({
       crap: row.crap,
       file: row.path,
       method: row.method,
       startLine: row.startLine,
+      ...(row.coordinateSystem === undefined
+        ? {}
+        : { coordinateSystem: row.coordinateSystem }),
+      // Story #4969, same reason as the stamps above: `anonymous` is a
+      // BASELINE fact. Dropping it here left every re-keyed row looking like
+      // an unmarked anonymous one, which is precisely the shape the
+      // `anon-identity-unstamped` axis fails closed — the projection would
+      // have manufactured the very defect the axis exists to catch.
+      ...(row.anonymous === undefined ? {} : { anonymous: row.anonymous }),
     })),
   };
 }
@@ -196,9 +302,126 @@ export function buildBaselineEnvelope({
       file: r.file,
       method: r.method,
       startLine: r.startLine,
+      ...(r.anonymous === undefined ? {} : { anonymous: r.anonymous }),
     })),
     tsTranspilerVersion,
   };
+}
+
+/**
+ * True when a coverage artifact was actually loaded for this scan.
+ *
+ * Story #4871: "the tests ran and never reached this method" is a measurement
+ * and the CRAP formula's 0%-covered arm is the right answer for it. "No
+ * coverage run happened at all" — a freshly initialized story worktree with no
+ * `coverage/` directory — is an *absent* observation, and filling it with 0%
+ * drives every method to `c² + c`, failing the first commit on files the
+ * change never touched. Resolved once per scan and carried on each queue item
+ * so the pool workers, which only ever receive their own file's coverage
+ * entry, can still tell the two apart.
+ *
+ * @param {object|null|undefined} coverage Parsed `coverage-final.json` map.
+ * @returns {boolean}
+ */
+function isCoverageArtifactPresent(coverage) {
+  return coverage !== null && coverage !== undefined;
+}
+
+/**
+ * How many files to name when reporting the worst unresolved offenders. Long
+ * enough to point at a pattern, short enough to stay a readable CLI message.
+ */
+const WORST_OFFENDER_LIMIT = 5;
+
+/**
+ * Method-resolution telemetry (Story #4775, fix part 4).
+ *
+ * The updater used to persist a 100-row baseline built from 5023 dropped
+ * methods and log it as success — the rot that let a broken coverage join
+ * sit undetected for five weeks across three repos. These three helpers
+ * carry the counters that make a thin result *visible* and therefore
+ * refusable.
+ *
+ * The rate is deliberately measured over files that **do** have a coverage
+ * entry: a file the test run never touched has no join to fail, so counting
+ * it would dilute the signal the floor is meant to catch.
+ */
+function newResolutionAccumulator() {
+  return { resolved: 0, total: 0, byFile: [] };
+}
+
+function accumulateResolution(acc, relPath, result) {
+  if (result?.hasCoverageEntry !== true) return;
+  const total = result.totalMethods ?? 0;
+  if (total === 0) return;
+  const resolved = result.resolvedMethods ?? 0;
+  acc.resolved += resolved;
+  acc.total += total;
+  if (resolved < total) {
+    acc.byFile.push({ file: relPath, unresolved: total - resolved, total });
+  }
+}
+
+function summarizeResolution(acc) {
+  const worstFiles = [...acc.byFile]
+    .sort((a, b) => b.unresolved - a.unresolved || a.file.localeCompare(b.file))
+    .slice(0, WORST_OFFENDER_LIMIT);
+  return {
+    resolvedMethods: acc.resolved,
+    joinableMethods: acc.total,
+    rate: acc.total === 0 ? 1 : acc.resolved / acc.total,
+    worstFiles,
+  };
+}
+
+/**
+ * Minimum number of joinable methods before the resolution-rate floor is
+ * enforced. A diff-scoped run can legitimately touch a handful of methods,
+ * where one unresolved method is a 50% rate and says nothing about the health
+ * of the join. Below this sample the rate is reported, never enforced.
+ */
+const MIN_RESOLUTION_SAMPLE = 25;
+
+/**
+ * Fail-closed guard on the per-method coverage join (Story #4775, fix part 4).
+ *
+ * The updater used to persist a 100-row baseline distilled from 5023 dropped
+ * methods and log it as a success — which is exactly how a broken join stayed
+ * invisible for five weeks across three repositories. A thin result is now a
+ * refusal: the caller throws before anything is written, and the message names
+ * the rate, the counts, and the files carrying the most unresolved methods so
+ * the operator can tell "my tests do not cover that" apart from "the join is
+ * broken".
+ *
+ * Returns `null` when the run may proceed, or the operator-facing message when
+ * it must not.
+ *
+ * @param {{resolvedMethods: number, joinableMethods: number, rate: number,
+ *   worstFiles: Array<{file: string, unresolved: number, total: number}>}
+ *   | undefined} resolution
+ * @param {number} floor
+ * @returns {string|null}
+ */
+export function checkResolutionFloor(resolution, floor) {
+  if (!resolution) return null;
+  const { joinableMethods = 0, resolvedMethods = 0, rate = 1 } = resolution;
+  if (joinableMethods < MIN_RESOLUTION_SAMPLE) return null;
+  if (rate >= floor) return null;
+  const worst = (resolution.worstFiles ?? [])
+    .map((w) => `         - ${w.file} (${w.unresolved}/${w.total} unresolved)`)
+    .join('\n');
+  return (
+    `[CRAP] Refusing to persist: only ${resolvedMethods}/${joinableMethods} ` +
+    `method(s) (${(rate * 100).toFixed(1)}%) resolved a coverage entry in files ` +
+    `that HAVE coverage — below the ${(floor * 100).toFixed(1)}% floor ` +
+    '(delivery.quality.gates.crap.minMethodResolutionRate).\n' +
+    '       A baseline built from a broken join is not sparse, it is wrong: ' +
+    'unresolved methods are absent and coincidental line collisions are ' +
+    'mis-attributed.\n' +
+    (worst ? `       Worst unresolved files:\n${worst}\n` : '') +
+    "       Regenerate coverage ('npm run test:coverage') and re-run; if the " +
+    'rate stays low the coverage artifact and the scanned tree disagree.'
+  );
 }
 
 /**
@@ -216,6 +439,10 @@ export function buildBaselineEnvelope({
  *
  * @param {string} source Prepared (possibly transpiled) JavaScript source text.
  * @param {object|null} coverageForFile Istanbul coverage entry for this file.
+ * @param {((line: number) => number|null)|null} [mapLine] Transpiled →
+ *   original-source line resolver from `transpileIfNeeded(…, {withLineMap:
+ *   true})`; `null` for JavaScript, whose coordinates already match the
+ *   coverage entry's.
  * @returns {{
  *   report: object,
  *   miScore: number,
@@ -229,7 +456,7 @@ export function buildBaselineEnvelope({
  *   parseError: boolean,
  * }}
  */
-export function analyzeOnce(source, coverageForFile) {
+export function analyzeOnce(source, coverageForFile, mapLine = null) {
   let report;
   try {
     report = escomplex.analyzeModule(source);
@@ -238,18 +465,7 @@ export function analyzeOnce(source, coverageForFile) {
   }
   const miScore =
     typeof report.maintainability === 'number' ? report.maintainability : 0;
-  const methods = report?.methods ?? [];
-  const crapRows = [];
-  for (const m of methods) {
-    const startLine = m?.lineStart;
-    if (typeof startLine !== 'number') continue;
-    const cyclomatic = m?.cyclomatic ?? 0;
-    const coverage = coverageForFile
-      ? coverageForMethodInEntry(coverageForFile, startLine)
-      : null;
-    const crap = coverage === null ? null : crapFormula(cyclomatic, coverage);
-    crapRows.push({ method: m.name, startLine, cyclomatic, coverage, crap });
-  }
+  const crapRows = methodRowsFromReport(report, coverageForFile, mapLine);
   return { report, miScore, crapRows, parseError: false };
 }
 
@@ -274,6 +490,10 @@ export function analyzeOnce(source, coverageForFile) {
  * `regenerateMainFromTree`) SHOULD pass the MI scan's file list here so the
  * tree is walked only once per run.
  *
+ * `incremental` (Story #4981) resolves an untouched file's methods from
+ * `crap-baseline-join.js#finalizeMethodRowsWithBaseline` instead of
+ * requiring fresh coverage; omitted (the default), behaviour is unchanged.
+ *
  * @param {{
  *   targetDirs: string[],
  *   coverage: object|null,
@@ -281,6 +501,7 @@ export function analyzeOnce(source, coverageForFile) {
  *   cwd?: string,
  *   scopeFiles?: Set<string>|string[]|null,
  *   preScannedFiles?: string[]|null,
+ *   incremental?: { touchedFiles: Set<string>|string[], baselineRows: Array<object> } | null,
  * }} params
  * @returns {{
  *   rows: Array<{
@@ -304,6 +525,7 @@ export async function scanAndScore({
   scopeFiles = null,
   ignoreGlobs = [],
   preScannedFiles = null,
+  incremental = null,
 }) {
   if (!Array.isArray(targetDirs)) {
     throw new TypeError('scanAndScore: targetDirs must be an array');
@@ -325,29 +547,37 @@ export async function scanAndScore({
   }
   files.sort();
 
+  const incrementalCtx = resolveIncrementalContext(incremental);
+
   // Build the work-queue first so scopeFile filtering happens before
   // any I/O / IPC. `scannedFiles` is the in-scope count.
   // Story #2079: route every relPath through path-canon so a scan from
   // inside `.worktrees/<workspace>/` (with cwd pointing at the main
   // checkout) cannot leak the worktree prefix into the on-disk baseline's
   // `file` / `path` keys downstream.
+  const coverageAvailable = isCoverageArtifactPresent(coverage);
   const queue = [];
   for (const abs of files) {
     const rawRel = path.relative(cwd, abs).replace(/\\/g, '/');
     const relPath = canonicalisePath(rawRel);
     if (scopeSet && !scopeSet.has(relPath)) continue;
-    queue.push({ abs, relPath, requireCoverage });
+    queue.push(
+      resolveQueueIncrementalFields(
+        { abs, relPath, requireCoverage, coverageAvailable },
+        incrementalCtx,
+      ),
+    );
   }
   const scannedFiles = queue.length;
 
-  const perFile =
-    queue.length < SERIAL_THRESHOLD
-      ? queue.map((item) => ({ item, result: scoreFileSerial(item, coverage) }))
-      : await scoreFilesViaPool(queue, coverage);
+  const perFile = shouldRunSerial(queue.length, incremental, SERIAL_THRESHOLD)
+    ? queue.map((item) => ({ item, result: scoreFileSerial(item, coverage) }))
+    : await scoreFilesViaPool(queue, coverage);
 
   const rows = [];
   let skippedFilesNoCoverage = 0;
   let skippedMethodsNoCoverage = 0;
+  const resolution = newResolutionAccumulator();
   for (const { item, result } of perFile) {
     if (!result) continue; // unrecoverable per-file failure: drop silently to match pre-pool semantics
     if (result.skippedFileNoCoverage) {
@@ -366,14 +596,20 @@ export async function scanAndScore({
       continue;
     }
     skippedMethodsNoCoverage += result.skippedMethodsNoCoverage ?? 0;
+    accumulateResolution(resolution, item.relPath, result);
     for (const mr of result.rows) {
       rows.push({
         file: item.relPath,
         method: mr.method,
+        // Story #4969: `method` may be a derived anonymous identity; the flag
+        // is what lets the persisted row say so.
+        anonymous: mr.anonymous === true,
         startLine: mr.startLine,
         cyclomatic: mr.cyclomatic,
         coverage: mr.coverage,
         crap: mr.crap,
+        coordinateSystem: mr.coordinateSystem ?? COORDINATE_ORIGINAL,
+        ...resolvedFromBaselineFlag(mr),
       });
     }
   }
@@ -390,6 +626,7 @@ export async function scanAndScore({
     scannedFiles,
     skippedFilesNoCoverage,
     skippedMethodsNoCoverage,
+    resolution: summarizeResolution(resolution),
   };
 }
 
@@ -401,57 +638,57 @@ export async function scanAndScore({
  * Uses `analyzeOnce` so the source is parsed a single time and both the
  * CRAP rows and the MI score are derived from the same escomplex report.
  */
-function scoreFileSerial({ abs, relPath, requireCoverage }, coverage) {
+function scoreFileSerial(
+  {
+    abs,
+    relPath,
+    requireCoverage,
+    coverageAvailable = true,
+    touched = true,
+    baselineByKey = null,
+  },
+  coverage,
+) {
   const entry = findCoverageEntry(coverage, relPath);
-  if (requireCoverage && entry === null) {
+  if (
+    shouldSkipFileForNoCoverage(requireCoverage, entry, touched, baselineByKey)
+  ) {
     return {
       skippedFileNoCoverage: true,
       rows: [],
       skippedMethodsNoCoverage: 0,
+      hasCoverageEntry: false,
+      resolvedMethods: 0,
+      totalMethods: 0,
     };
   }
-  let source;
-  try {
-    source = fs.readFileSync(abs, 'utf-8');
-  } catch {
-    return {
-      skippedFileNoCoverage: false,
-      rows: null,
-      skippedMethodsNoCoverage: 0,
-    };
-  }
-  const prepared = transpileIfNeeded(abs, source);
-  if (prepared === null) {
-    return {
-      skippedFileNoCoverage: false,
-      rows: null,
-      skippedMethodsNoCoverage: 0,
-    };
-  }
-  const { crapRows, parseError } = analyzeOnce(prepared, entry);
-  if (parseError) {
-    return {
-      skippedFileNoCoverage: false,
-      rows: null,
-      skippedMethodsNoCoverage: 0,
-    };
-  }
-  const rows = [];
-  let skippedMethodsNoCoverage = 0;
-  for (const mr of crapRows) {
-    if (mr.crap === null || mr.coverage === null) {
-      skippedMethodsNoCoverage += 1;
-      continue;
-    }
-    rows.push({
-      method: mr.method,
-      startLine: mr.startLine,
-      cyclomatic: mr.cyclomatic,
-      coverage: mr.coverage,
-      crap: mr.crap,
-    });
-  }
-  return { skippedFileNoCoverage: false, rows, skippedMethodsNoCoverage };
+  const dropped = {
+    skippedFileNoCoverage: false,
+    rows: null,
+    skippedMethodsNoCoverage: 0,
+    hasCoverageEntry: entry !== null,
+    resolvedMethods: 0,
+    totalMethods: 0,
+  };
+  const prepared = prepareSourceForScoring(abs);
+  if (prepared.error) return dropped;
+  const { crapRows, parseError } = analyzeOnce(
+    prepared.code,
+    entry,
+    prepared.mapLine,
+  );
+  if (parseError) return dropped;
+  const finalized = finalizeMethodRowsWithBaseline(crapRows, {
+    requireCoverage,
+    coverageAvailable,
+    touched,
+    baselineByKey,
+  });
+  return {
+    skippedFileNoCoverage: false,
+    hasCoverageEntry: entry !== null,
+    ...finalized,
+  };
 }
 
 async function scoreFilesViaPool(queue, coverage) {
@@ -492,35 +729,29 @@ async function scoreFilesViaPool(queue, coverage) {
  *     file), `[]` when coverage-skipped, otherwise the scored method rows.
  *   - `skippedFileNoCoverage` / `skippedMethodsNoCoverage` — CRAP counters.
  */
-function scoreFileCombinedSerial({ abs, relPath, requireCoverage }, coverage) {
+function scoreFileCombinedSerial(
+  { abs, relPath, requireCoverage, coverageAvailable = true },
+  coverage,
+) {
   const entry = findCoverageEntry(coverage, relPath);
-  let source;
-  try {
-    source = fs.readFileSync(abs, 'utf-8');
-  } catch {
+  const prepared = prepareSourceForScoring(abs);
+  if (prepared.error) {
     return {
       relPath,
-      miScore: null,
+      miScore: prepared.error === 'read' ? null : 0,
       skippedFileNoCoverage: false,
       crapRows: null,
       skippedMethodsNoCoverage: 0,
-    };
-  }
-  const prepared = transpileIfNeeded(abs, source);
-  if (prepared === null) {
-    return {
-      relPath,
-      miScore: 0,
-      skippedFileNoCoverage: false,
-      crapRows: null,
-      skippedMethodsNoCoverage: 0,
+      hasCoverageEntry: entry !== null,
+      resolvedMethods: 0,
+      totalMethods: 0,
     };
   }
   const {
     miScore,
     crapRows: rawCrapRows,
     parseError,
-  } = analyzeOnce(prepared, entry);
+  } = analyzeOnce(prepared.code, entry, prepared.mapLine);
   if (parseError) {
     return {
       relPath,
@@ -528,6 +759,9 @@ function scoreFileCombinedSerial({ abs, relPath, requireCoverage }, coverage) {
       skippedFileNoCoverage: false,
       crapRows: null,
       skippedMethodsNoCoverage: 0,
+      hasCoverageEntry: entry !== null,
+      resolvedMethods: 0,
+      totalMethods: 0,
     };
   }
   if (requireCoverage && entry === null) {
@@ -537,29 +771,25 @@ function scoreFileCombinedSerial({ abs, relPath, requireCoverage }, coverage) {
       skippedFileNoCoverage: true,
       crapRows: [],
       skippedMethodsNoCoverage: 0,
+      hasCoverageEntry: false,
+      resolvedMethods: 0,
+      totalMethods: 0,
     };
   }
-  const crapRows = [];
-  let skippedMethodsNoCoverage = 0;
-  for (const mr of rawCrapRows) {
-    if (mr.crap === null || mr.coverage === null) {
-      skippedMethodsNoCoverage += 1;
-      continue;
-    }
-    crapRows.push({
-      method: mr.method,
-      startLine: mr.startLine,
-      cyclomatic: mr.cyclomatic,
-      coverage: mr.coverage,
-      crap: mr.crap,
+  const { rows, skippedMethodsNoCoverage, resolvedMethods, totalMethods } =
+    finalizeMethodRows(rawCrapRows, {
+      requireCoverage,
+      coverageAvailable,
     });
-  }
   return {
     relPath,
     miScore,
     skippedFileNoCoverage: false,
-    crapRows,
+    crapRows: rows,
     skippedMethodsNoCoverage,
+    hasCoverageEntry: entry !== null,
+    resolvedMethods,
+    totalMethods,
   };
 }
 
@@ -667,12 +897,19 @@ export async function scanAndScoreCombined({
   // Build the work queue. Each item carries both the canonicalised relPath
   // (CRAP's key + scope filter, matching scanAndScore) and the raw relPath
   // (MI's key, matching calculateAll's `path.relative(cwd, p)` shape).
+  const coverageAvailable = isCoverageArtifactPresent(coverage);
   const queue = [];
   for (const abs of files) {
     const rawRel = path.relative(cwd, abs).replace(/\\/g, '/');
     const relPath = canonicalisePath(rawRel);
     if (scopeSet && !scopeSet.has(relPath)) continue;
-    queue.push({ abs, relPath, miRel: rawRel, requireCoverage });
+    queue.push({
+      abs,
+      relPath,
+      miRel: rawRel,
+      requireCoverage,
+      coverageAvailable,
+    });
   }
   const scannedFiles = queue.length;
 
@@ -693,6 +930,7 @@ export async function scanAndScoreCombined({
   const crapRows = [];
   let skippedFilesNoCoverage = 0;
   let skippedMethodsNoCoverage = 0;
+  const resolution = newResolutionAccumulator();
 
   for (const { item, result } of perFile) {
     if (!result) continue; // unrecoverable per-file failure: drop silently
@@ -716,14 +954,19 @@ export async function scanAndScoreCombined({
       continue;
     }
     skippedMethodsNoCoverage += result.skippedMethodsNoCoverage ?? 0;
+    accumulateResolution(resolution, item.relPath, result);
     for (const mr of result.crapRows) {
       crapRows.push({
         file: item.relPath,
         method: mr.method,
+        // Story #4969: `method` may be a derived anonymous identity; the flag
+        // is what lets the persisted row say so.
+        anonymous: mr.anonymous === true,
         startLine: mr.startLine,
         cyclomatic: mr.cyclomatic,
         coverage: mr.coverage,
         crap: mr.crap,
+        coordinateSystem: mr.coordinateSystem ?? COORDINATE_ORIGINAL,
       });
     }
   }
@@ -750,6 +993,7 @@ export async function scanAndScoreCombined({
       scannedFiles,
       skippedFilesNoCoverage,
       skippedMethodsNoCoverage,
+      resolution: summarizeResolution(resolution),
     },
   };
 }

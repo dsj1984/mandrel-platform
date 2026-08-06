@@ -7,8 +7,10 @@
  * @module lib/orchestration/check-baselines/phases/evaluate
  */
 
-import { resolveBundleSizeEnvOverrides } from '../../../baselines/env-overrides.js';
+import { resolveKindRefreshOverrides } from '../../../baselines/env-overrides.js';
+import { readRangeSubjectsTouchingFile } from '../../../baselines/git-base.js';
 import {
+  checkBaselineSemantics,
   checkKernelVersion,
   getKindModule,
 } from '../../../baselines/kernel.js';
@@ -17,6 +19,10 @@ import { Logger } from '../../../Logger.js';
 import { isIgnoredByGlobs } from '../../../maintainability-utils.js';
 import { applyTolerance, evaluateCompare, runCompareStage } from './compare.js';
 import { applyFloors, flattenBreaches } from './floors.js';
+import { DEFAULT_BASELINE_PATHS } from './parse-args.js';
+
+/** Default refresh-tag substring when the gate omits `refreshTag`. */
+const DEFAULT_REFRESH_TAG = 'baseline-refresh:';
 
 /**
  * Defense-in-depth against an `ignoreGlobs`-poisoned baseline (Epic #4326
@@ -82,26 +88,85 @@ function loadHeadBaseline(kind, cwd, configPath) {
 }
 
 /**
- * One-shot bundle-size refresh/acknowledge (Story #151). When
- * `BUNDLE_SIZE_REFRESH=1` is set, demote every `bundle-size` regression to
- * `unchanged` for this run only — floors still apply, so a genuine budget
- * breach is still caught. The flag is read fresh on every invocation and
- * never persisted, so the ratchet returns to full strength automatically on
- * the very next run (no lingering loosened tolerance to remember to reset).
+ * Resolve the one-shot refresh trigger for any ratcheted kind (Story #4802,
+ * generalizing Story #151's bundle-size env flag and Story #4731's
+ * maintainability env-or-commit-tag pair). Two paths, either of which
+ * acknowledges:
  *
- * No-op for every other kind.
+ *   1. Env parity: `<KIND>_REFRESH=1` (the manual override) — upper-snaked,
+ *      so the two pre-existing names (`BUNDLE_SIZE_REFRESH`,
+ *      `MAINTAINABILITY_REFRESH`) keep working unchanged.
+ *   2. Commit tag: a commit in the compared range `<baseRef>..HEAD` whose
+ *      subject contains the configured `refreshTag` AND whose diff touches
+ *      that kind's baseline file. One-shot by construction — once merged, the
+ *      refreshed baseline becomes the base and the tag leaves the range.
+ *
+ * The tag is matched as a plain substring of a conventional commit subject, so
+ * commitlint stays satisfied (e.g. `chore(baselines): baseline-refresh: …`).
+ *
+ * Fails closed: a kind whose baseline path is neither configured nor present
+ * in `DEFAULT_BASELINE_PATHS` simply skips the commit-tag path rather than
+ * throwing, leaving the run un-acknowledged.
+ *
+ * @returns {{ triggered: boolean, reasons: string[] }}
  */
-function applyBundleSizeAcknowledgment(kind, compareOutput, env) {
-  if (kind !== 'bundle-size') return { compareOutput, acknowledged: false };
-  const { acknowledged, overrides } = resolveBundleSizeEnvOverrides(env);
-  if (!acknowledged || compareOutput.regressions.length === 0) {
+function resolveRefreshTrigger({ kind, gateBlock, cmp, cwd, env }) {
+  const reasons = [];
+  const { acknowledged: envAck, overrides } = resolveKindRefreshOverrides(
+    kind,
+    env,
+  );
+  if (envAck) reasons.push(...overrides);
+
+  const baseRef = cmp?.baseRef ?? null;
+  if (baseRef) {
+    const refreshTag =
+      typeof gateBlock?.refreshTag === 'string' && gateBlock.refreshTag.length
+        ? gateBlock.refreshTag
+        : DEFAULT_REFRESH_TAG;
+    const baselinePath =
+      typeof gateBlock?.baselinePath === 'string' &&
+      gateBlock.baselinePath.length
+        ? gateBlock.baselinePath
+        : DEFAULT_BASELINE_PATHS[kind];
+    if (typeof baselinePath === 'string' && baselinePath.length) {
+      const subjects = readRangeSubjectsTouchingFile(baseRef, baselinePath, {
+        cwd,
+      });
+      const match = subjects.find((s) => s.includes(refreshTag));
+      if (match) {
+        reasons.push(
+          `refresh commit "${match}" (subject contains ${JSON.stringify(refreshTag)}, touches ${baselinePath})`,
+        );
+      }
+    }
+  }
+
+  return { triggered: reasons.length > 0, reasons };
+}
+
+/**
+ * One-shot baseline refresh/acknowledge for any ratcheted kind (Story #4802).
+ * When triggered (env flag OR a `baseline-refresh:`-tagged range commit
+ * touching that kind's baseline), demote every head-vs-base regression to
+ * `unchanged` for this run only — floors still apply, so a row below its floor
+ * still breaches. The trigger is read fresh every run and never persisted:
+ * post-merge the refreshed baseline is the new base and the tag leaves the
+ * range, so the ratchet returns to full strength automatically.
+ *
+ * A no-op absent a trigger, so an unacknowledged run of any kind reports its
+ * regressions exactly as before.
+ */
+function applyRefreshAcknowledgment(kind, compareOutput, ctx) {
+  const { triggered, reasons } = resolveRefreshTrigger({ ...ctx, kind });
+  if (!triggered || compareOutput.regressions.length === 0) {
     return { compareOutput, acknowledged: false };
   }
   Logger.warn(
-    `[bundle-size] ⚠ ${overrides.join(', ')} — ` +
+    `[${kind}] ⚠ ${reasons.join('; ')} — ` +
       `${compareOutput.regressions.length} regression(s) acknowledged for this run only; ` +
-      'floors still enforced. This does not persist: the next run without ' +
-      'BUNDLE_SIZE_REFRESH re-enforces the ratchet at full strength.',
+      'floors still enforced. This does not persist: once the refresh is the ' +
+      'new base the ratchet re-enforces at full strength.',
   );
   return {
     acknowledged: true,
@@ -141,6 +206,11 @@ function buildGateReport({
     additions: compareOutput.additions ?? [],
     regressionCount: compareOutput.regressions.length,
     baseRef: cmp.baseRef ?? null,
+    // Story #4914 — the compare arm's read status was internal to compare.js,
+    // which is why a dead compare arm looked byte-identical to a clean run.
+    // Surfacing it makes "the head-vs-base arm did not run" diagnosable from
+    // the JSON report alone.
+    baseRead: cmp.baseRead === true,
     generatedAt: baseline.generatedAt,
     acknowledged,
   };
@@ -157,6 +227,18 @@ export async function evaluateKind({
   const headLoad = loadHeadBaseline(kind, cwd, configPath);
   if (headLoad.schemaError) return { kind, schemaError: headLoad.schemaError };
   const baseline = headLoad.baseline;
+  // Story #4775 — scoring-semantics gate. A baseline whose rows were produced
+  // by superseded scoring semantics is structurally valid but semantically
+  // incomparable, so schema validation alone would wave it through. Fail
+  // closed on the `semantics` tag rather than compare across the boundary;
+  // the message names the exact re-baseline command.
+  const semanticsError = checkBaselineSemantics(kind, baseline);
+  if (semanticsError) {
+    return {
+      kind,
+      schemaError: { tag: 'semantics', message: semanticsError },
+    };
+  }
   const floorRollup = rollupExcludingIgnored({
     kind,
     baseline,
@@ -171,11 +253,14 @@ export async function evaluateKind({
     rawCompare,
     gateBlock.tolerance ?? null,
   );
-  const { compareOutput, acknowledged } = applyBundleSizeAcknowledgment(
-    kind,
-    toleratedCompare,
+  const ack = applyRefreshAcknowledgment(kind, toleratedCompare, {
+    gateBlock,
+    cmp,
+    cwd,
     env,
-  );
+  });
+  const compareOutput = ack.compareOutput;
+  const acknowledged = ack.acknowledged;
   return buildGateReport({
     kind,
     gateBlock,

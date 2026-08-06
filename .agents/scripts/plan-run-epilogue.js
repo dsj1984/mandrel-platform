@@ -5,6 +5,7 @@
  *
  * Usage:
  *   node .agents/scripts/plan-run-epilogue.js --stories 1,2,3
+ *   node .agents/scripts/plan-run-epilogue.js --stories 101-104   # inclusive range
  *
  * Keyed on the delivered id set: an `adhoc-<sorted-ids>` run id is
  * synthesized from `--stories`. Story #4540 retired the `--run <planRunId>`
@@ -19,6 +20,7 @@ import { resolveConfig } from './lib/config-resolver.js';
 import { Logger } from './lib/Logger.js';
 import { runPlanRunEpilogue } from './lib/orchestration/run-epilogue.js';
 import { createProvider } from './lib/provider-factory.js';
+import { expandIdList } from './lib/util/parse-id-list.js';
 
 const CLI_OPTIONS = {
   stories: { type: 'string' },
@@ -27,9 +29,23 @@ const CLI_OPTIONS = {
 
 /**
  * @param {string[]} [argv]
+ * @param {{
+ *   resolveConfigImpl?: typeof resolveConfig,
+ *   createProviderImpl?: typeof createProvider,
+ *   runPlanRunEpilogueImpl?: typeof runPlanRunEpilogue,
+ *   logger?: { info: Function, warn: Function },
+ * }} [deps] Injectable seams; every entry defaults to the real
+ *   implementation (`.agents/rules/test-seams.md` rules 1-2), so the CLI path
+ *   and every production caller are unchanged.
  * @returns {Promise<object>}
  */
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  const {
+    resolveConfigImpl = resolveConfig,
+    createProviderImpl = createProvider,
+    runPlanRunEpilogueImpl = runPlanRunEpilogue,
+    logger = Logger,
+  } = deps;
   const { values } = parseArgs({
     args: argv,
     options: CLI_OPTIONS,
@@ -44,30 +60,37 @@ export async function main(argv = process.argv.slice(2)) {
     typeof values.cwd === 'string' && values.cwd.trim()
       ? values.cwd.trim()
       : process.cwd();
-  const config = resolveConfig({ cwd });
-  const provider = createProvider(config);
+  const config = resolveConfigImpl({ cwd });
+  const provider = createProviderImpl(config);
 
   // Story #4540 retired the `--run <planRunId>` label-resolution branch
   // along with the label itself. The epilogue is keyed on the delivered id
   // set, and the synthesized `adhoc-<ids>` id it already used for positional
   // runs is now the only id it needs.
-  const stories = values.stories
-    .split(',')
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isInteger(n) && n > 0);
+  // Range tokens expand here too (`--stories 101-104`): /deliver blesses the
+  // dash range at the operator surface, so the id set the epilogue is keyed on
+  // must read the same shape. Rejecting a bad token is deliberate — the old
+  // silent filter turned a typo into an empty, wrongly-keyed rollup.
+  const { ids: stories, error: storiesError } = expandIdList(values.stories, {
+    flag: '--stories',
+    prefix: '[plan-run-epilogue] ',
+  });
+  if (storiesError) {
+    throw new Error(storiesError);
+  }
 
   const planRunId = `adhoc-${[...stories].sort((a, b) => a - b).join('-')}`;
 
-  const result = await runPlanRunEpilogue({
+  const result = await runPlanRunEpilogueImpl({
     planRunId,
     stories,
     provider,
     config,
     cwd,
   });
-  warnOnUnresolvedBase(result);
-  warnOnEmptyRollup(result);
-  Logger.info(JSON.stringify(result, null, 2));
+  warnOnUnresolvedBase(result, logger);
+  warnOnEmptyRollup(result, logger);
+  logger.info(JSON.stringify(result));
   if (result.errors?.length) {
     process.exitCode = 1;
   }
@@ -84,15 +107,16 @@ export async function main(argv = process.argv.slice(2)) {
  * roster is still useful.
  *
  * @param {object} result - `runPlanRunEpilogue` envelope.
+ * @param {{ warn: Function }} [logger]
  * @returns {void}
  */
-function warnOnUnresolvedBase(result) {
+function warnOnUnresolvedBase(result, logger = Logger) {
   const roster = (result?.results ?? []).find(
     (r) => r?.kind === 'audit-roster',
   );
   const base = roster?.baseResolution;
   if (base?.resolved !== false) return;
-  Logger.warn(
+  logger.warn(
     `⚠️  Combined landed diff unavailable — the pre-run base sha could not be ` +
       `resolved against \`${base.baseRef}\`: ${base.reason}\n` +
       `    changedFiles is null (NOT an empty set). Determine the run diff by ` +
@@ -117,14 +141,15 @@ function warnOnUnresolvedBase(result) {
  * rather than asserting either reading.
  *
  * @param {object} result - `runPlanRunEpilogue` envelope.
+ * @param {{ warn: Function }} [logger]
  * @returns {void}
  */
-function warnOnEmptyRollup(result) {
+function warnOnEmptyRollup(result, logger = Logger) {
   const rollup = (result?.results ?? []).find(
     (r) => r?.kind === 'follow-up-rollup',
   );
   if (!rollup?.emptyRollupSuspect) return;
-  Logger.warn(
+  logger.warn(
     `⚠️  0 friction signals across ${rollup.storyCount} Stories — telemetry may not ` +
       `have fired.\n` +
       `    An empty roll-up is NOT evidence of a clean run: it is the same output a ` +
@@ -139,4 +164,18 @@ function warnOnEmptyRollup(result) {
   );
 }
 
-await runAsCli(import.meta.url, main);
+await runAsCli(import.meta.url, main, {
+  usage: {
+    invocation:
+      'node .agents/scripts/plan-run-epilogue.js --stories <id,id,...> [--cwd <path>]',
+    summary:
+      'Close out a delivery run: roll up the delivered Stories’ signals and report the run’s loop health.',
+    flags: [
+      [
+        '--stories <ids>',
+        'Comma-separated delivered Story ids, singles or A-B ranges (required).',
+      ],
+      ['--cwd <path>', 'Repository root (default: process cwd).'],
+    ],
+  },
+});

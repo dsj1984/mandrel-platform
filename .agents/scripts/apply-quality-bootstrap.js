@@ -69,11 +69,17 @@ async function main() {
   // Mirror the retired heredoc's output: pretty-printed `{ quality, baselines }`
   // to stdout. Use process.stdout.write (not console.log) per the no-console
   // enforcement boundary.
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
   return 0;
 }
 
 runAsCli(import.meta.url, main, {
   source: 'apply-quality-bootstrap',
   propagateExitCode: true,
+  usage: {
+    invocation: 'node .agents/scripts/apply-quality-bootstrap.js',
+    summary:
+      'Install the quality-gate surface into the consumer repo (guardrails helper, pre-commit line, npm scripts, config defaults) and migrate the baselines layout. Idempotent; prints { quality, baselines } JSON to stdout.',
+    flags: [],
+  },
 });

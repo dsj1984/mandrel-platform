@@ -21,19 +21,14 @@ import path from 'node:path';
 
 import { resolvePreviewScope } from '../changed-files.js';
 import { getBaselines, getQuality, resolveConfig } from '../config-resolver.js';
-import { loadCoverage } from '../coverage-utils.js';
-import {
-  KERNEL_VERSION,
-  resolveEscomplexVersion,
-  scanAndScore,
-} from '../crap-utils.js';
+import { KERNEL_VERSION, resolveEscomplexVersion } from '../crap-utils.js';
 import { calculateAll, scanDirectory } from '../maintainability-utils.js';
-import { resolveCrapEnvOverrides } from './env-overrides.js';
+import { computeCrapPreviewScan } from './crap-preview-scan.js';
 import {
-  buildCrapReport,
-  compareCrap,
-  filterRowsByFileScope,
+  assertBaselineCompatible,
+  INCOMPATIBLE_BASELINE_DIAGNOSTIC,
   loadCrapBaseline,
+  suppressVerdicts,
 } from './kinds/crap.js';
 import {
   buildMaintainabilityReport,
@@ -107,28 +102,31 @@ function compareScores(scores, baseline, tolerance) {
 }
 
 /**
- * Narrow a CRAP baseline to the rows whose file path is in `scopeSet`,
- * or return all rows when no diff-scope filter is active.
+ * Build the zero-row CRAP envelope the preview returns when it has nothing to
+ * compare against — no baseline, or the gate disabled.
  *
- * @param {{ rows: object[] }} baseline
- * @param {Set<string>|null|undefined} scopeSet
- * @returns {object[]}
+ * @param {{scope: string, diffRef: string|null}} scopeInfo
+ * @returns {object}
  */
-function resolveBaselineRows(baseline, scopeSet) {
-  return scopeSet
-    ? filterRowsByFileScope(baseline.rows, scopeSet)
-    : baseline.rows;
-}
-
-/**
- * Return true when the CRAP compare result contains regressions or new
- * violations — i.e. when the preview gate should exit non-zero.
- *
- * @param {{ regressions: number, newViolations: number }} result
- * @returns {boolean}
- */
-function hasCrapRegressions(result) {
-  return result.regressions > 0 || result.newViolations > 0;
+function emptyCrapEnvelope({ scope, diffRef }) {
+  return {
+    kernelVersion: KERNEL_VERSION,
+    escomplexVersion: resolveEscomplexVersion(),
+    summary: {
+      total: 0,
+      regressions: 0,
+      newViolations: 0,
+      drifted: 0,
+      incomparable: 0,
+      provenanceMismatched: 0,
+      unscorable: 0,
+      removed: 0,
+      skippedNoCoverage: 0,
+      scope,
+      diffRef,
+    },
+    violations: [],
+  };
 }
 
 function applyDiffScopeMi({ files, baseline, scopeSet, cwd }) {
@@ -236,63 +234,33 @@ export async function runCrapPreview({
   const quality = getQuality(config);
   const crap = quality.crap;
   if (!baseline || crap.enabled === false) {
+    return { exitCode: 0, envelope: emptyCrapEnvelope({ scope, diffRef }) };
+  }
+
+  // Story #4866 (AC-6): judge the loaded envelope BEFORE comparing anything
+  // against it. A baseline whose scoring semantics or transpiler coordinates
+  // predate the running scorer cannot yield a meaningful per-method verdict,
+  // and emitting regressions from it asks the operator to fix code that is
+  // not broken. Fail open — the authoritative `check-baselines` gate still
+  // gates the merge, so a permissive pre-commit hook costs no real coverage
+  // while a blocking one costs a provably defect-free commit.
+  const incompatible = assertBaselineCompatible(baseline);
+  if (incompatible) {
     return {
       exitCode: 0,
-      envelope: {
-        kernelVersion: KERNEL_VERSION,
-        escomplexVersion: resolveEscomplexVersion(),
-        summary: {
-          total: 0,
-          regressions: 0,
-          newViolations: 0,
-          drifted: 0,
-          removed: 0,
-          skippedNoCoverage: 0,
-          scope,
-          diffRef,
-        },
-        violations: [],
-      },
+      envelope: suppressVerdicts(emptyCrapEnvelope({ scope, diffRef }), {
+        name: INCOMPATIBLE_BASELINE_DIAGNOSTIC,
+        message: incompatible,
+      }),
     };
   }
 
-  const targetDirs = Array.isArray(crap.targetDirs) ? crap.targetDirs : [];
-  const crapIgnoreGlobs = Array.isArray(crap.ignoreGlobs)
-    ? crap.ignoreGlobs
-    : [];
-  const requireCoverage = crap.requireCoverage !== false;
-  const coveragePath = crap.coveragePath ?? 'coverage/coverage-final.json';
-  const coverage = loadCoverage(path.resolve(cwd, coveragePath));
-  const { newMethodCeiling, tolerance } = resolveCrapEnvOverrides(
+  return computeCrapPreviewScan({
     crap,
-    process.env,
-  );
-  const scan = await scanAndScore({
-    targetDirs,
-    coverage,
-    requireCoverage,
     cwd,
-    scopeFiles: scopeSet,
-    ignoreGlobs: crapIgnoreGlobs,
+    scopeSet,
+    scope,
+    diffRef,
+    baseline,
   });
-  const baselineRows = resolveBaselineRows(baseline, scopeSet);
-  const result = compareCrap({
-    currentRows: scan.rows,
-    baselineRows,
-    newMethodCeiling,
-    tolerance,
-  });
-  const envelope = buildCrapReport({
-    compareResult: result,
-    scanSummary: scan,
-    kernelVersion: KERNEL_VERSION,
-    escomplexVersion: resolveEscomplexVersion(),
-    newMethodCeiling,
-    scopeInfo: {
-      scope,
-      diffRef,
-    },
-  });
-  const exitCode = hasCrapRegressions(result) ? 1 : 0;
-  return { exitCode, envelope };
 }

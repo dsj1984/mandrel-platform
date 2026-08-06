@@ -46,6 +46,25 @@ import { Logger } from './lib/Logger.js';
 import { createProvider } from './lib/provider-factory.js';
 import { buildProtectionCtx } from './lib/single-story-sweep/protection-ctx.js';
 import { sweepMergedBranches } from './lib/single-story-sweep.js';
+import { sweepTempRetention } from './lib/temp-retention.js';
+
+/**
+ * Recover the Story ids from the branch names a sweep reaped. Only the
+ * canonical `story-<id>` shape yields an id — an operator's ad-hoc branch that
+ * happened to match the include glob contributes nothing, so a purge can never
+ * be triggered by a name this framework did not create.
+ *
+ * @param {string[]|undefined} branches
+ * @returns {number[]}
+ */
+export function storyIdsFromBranches(branches) {
+  const ids = [];
+  for (const branch of Array.isArray(branches) ? branches : []) {
+    const match = /^story-(\d+)$/.exec(String(branch));
+    if (match) ids.push(Number(match[1]));
+  }
+  return ids;
+}
 
 const HELP = `Usage: node .agents/scripts/boot-sweep.js [options]
 
@@ -85,9 +104,11 @@ Options:
  *   injectedConfig?: object,
  *   injectedProvider?: object,
  *   injectedSweep?: Function,
+ *   purgeFn?: Function,
  *   logger?: { info?: Function, warn?: Function },
  * }} [args]
- * @returns {Promise<object>} the {@link sweepMergedBranches} envelope.
+ * @returns {Promise<object>} the {@link sweepMergedBranches} envelope, plus a
+ *   `tempPurge` result from the Story #4794 temp-retention catch-up.
  */
 export async function runBootSweep({
   cwd,
@@ -99,6 +120,7 @@ export async function runBootSweep({
   injectedConfig,
   injectedProvider,
   injectedSweep,
+  purgeFn = sweepTempRetention,
   logger = Logger,
 } = {}) {
   const root = path.resolve(cwd ?? PROJECT_ROOT);
@@ -125,7 +147,7 @@ export async function runBootSweep({
       config.delivery?.worktreeIsolation?.sweepLockMs ?? 60_000;
 
     const sweepFn = injectedSweep ?? sweepMergedBranches;
-    return await sweepFn({
+    const result = await sweepFn({
       cwd: root,
       baseBranch,
       include: includeGlobs,
@@ -140,6 +162,21 @@ export async function runBootSweep({
       lockPath,
       lockTimeoutMs,
     });
+
+    // Story #4794 — the temp-retention catch-up. Two eligibility signals, both
+    // already paid for: every branch this sweep reaped is a merge it CONFIRMED
+    // (merged PR + matching headRefOid), so those Stories' artifacts are spent;
+    // and the age floor collects everything else — the backlog from Stories
+    // merged before this existed, merged through the GitHub UI, or whose branch
+    // was already gone. Best-effort like the sweep itself: `runBootSweep`'s
+    // catch swallows any throw into the `ok: false` envelope, and exit stays 0.
+    const purge = await purgeFn({
+      config,
+      mergedStoryIds: storyIdsFromBranches(result?.reaped),
+      label: 'boot-sweep',
+      logger,
+    });
+    return { ...result, tempPurge: purge };
   } catch (err) {
     const msg = err?.message ?? String(err);
     logger.warn?.(`[boot-sweep] sweep threw (host continues): ${msg}`);
@@ -176,8 +213,25 @@ export function buildSummaryLine(result) {
   return `[boot-sweep] reaped ${result.localDeleted} local + ${result.remoteDeleted} remote; protected ${protectedCount}${contentMergedSuffix}.`;
 }
 
-async function main() {
+/**
+ * The CLI core: parse argv, run the sweep, render the report. Extracted from
+ * the `main` shell so the argv → render decision table is reachable without
+ * spawning a real sweep against a real git tree.
+ *
+ * Both seams on the optional final `deps` parameter default to the real
+ * implementation (`.agents/rules/test-seams.md` rules 1-2), so `main` and any
+ * production caller are unchanged.
+ *
+ * @param {string[]} [argv]
+ * @param {{ runBootSweepImpl?: typeof runBootSweep, logger?: { info: Function } }} [deps]
+ * @returns {Promise<object>} the sweep envelope that was rendered.
+ */
+export async function runBootSweepCli(
+  argv = process.argv.slice(2),
+  { runBootSweepImpl = runBootSweep, logger = Logger } = {},
+) {
   const { values } = parseArgs({
+    args: argv,
     options: {
       base: { type: 'string' },
       cwd: { type: 'string' },
@@ -192,11 +246,11 @@ async function main() {
   });
 
   if (values.help) {
-    Logger.info(HELP);
-    return;
+    logger.info(HELP);
+    return undefined;
   }
 
-  const result = await runBootSweep({
+  const result = await runBootSweepImpl({
     cwd: typeof values.cwd === 'string' ? values.cwd : undefined,
     base: typeof values.base === 'string' ? values.base : undefined,
     include: Array.isArray(values.include) ? values.include : [],
@@ -206,10 +260,18 @@ async function main() {
   });
 
   if (values.json) {
-    Logger.info(JSON.stringify(result, null, 2));
+    logger.info(JSON.stringify(result, null, 2));
   } else {
-    Logger.info(buildSummaryLine(result));
+    logger.info(buildSummaryLine(result));
   }
+  return result;
 }
 
-runAsCli(import.meta.url, main, { source: 'boot-sweep' });
+async function main() {
+  await runBootSweepCli();
+}
+
+runAsCli(import.meta.url, main, {
+  source: 'boot-sweep',
+  usage: HELP,
+});

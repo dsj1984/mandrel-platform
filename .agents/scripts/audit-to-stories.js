@@ -31,6 +31,7 @@ import fs from 'node:fs';
 import { glob } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { buildStoryBody } from './lib/audit-to-stories/build-story-body.js';
 import { classifyGroupsAgainstGitHub } from './lib/audit-to-stories/dedupe-against-github.js';
@@ -46,17 +47,34 @@ import { parseAuditReports } from './lib/audit-to-stories/parse-audit-md.js';
 import { buildPlanSeedMarkdown } from './lib/audit-to-stories/seed-from-findings.js';
 import { runAsCli } from './lib/cli-utils.js';
 import { searchSemanticCandidates } from './lib/findings/semantic-issue-search.js';
+import { SEVERITIES, SEVERITY_RANK } from './lib/findings/severity.js';
 import { Logger } from './lib/Logger.js';
 import { parse as parseStoryBody } from './lib/story-body/story-body.js';
 
-const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
 const DEFAULT_GLOB = 'temp/audits/audit-*-results.md';
 const FAN_OUT_REPORT = 'audit-fan-out-results.md';
 
+/**
+ * Does `finding` clear the `threshold` severity floor?
+ *
+ * `SEVERITY_RANK` is imported from the canonical scale rather than declared
+ * here (Story #4877). The local copy this replaces ranked only four levels
+ * (`critical|high|medium|low`), so `info` — the canonical floor — ranked `0`,
+ * below even `--severity low`, and every informational finding was silently
+ * dropped from every filtered run. Sourcing the ranking from the SSOT means a
+ * level cannot exist in the vocabulary and be invisible to the filter.
+ *
+ * An unrecognised or absent severity still ranks below every real floor: it
+ * failed to parse, so it is not evidence that a threshold was met.
+ *
+ * @param {{ severity?: string }} finding
+ * @param {string} [threshold] — a canonical level, `'all'`, or falsy for no floor.
+ * @returns {boolean}
+ */
 function meetsSeverity(finding, threshold) {
   if (!threshold || threshold === 'all') return true;
   const minRank = SEVERITY_RANK[threshold] ?? 0;
-  const fRank = SEVERITY_RANK[finding.severity] ?? 0;
+  const fRank = SEVERITY_RANK[finding.severity] ?? -1;
   return fRank >= minRank;
 }
 
@@ -76,13 +94,42 @@ function readReports(paths) {
   }));
 }
 
+/**
+ * Count findings per severity bucket. The buckets are the canonical levels plus
+ * `unknown` for a finding whose severity did not parse — kept as a visible
+ * bucket so an unparseable severity is reported rather than absorbed into a
+ * real level. Derived from `SEVERITIES` so a new level appears in the tally
+ * automatically instead of falling into `unknown` (Story #4877).
+ *
+ * @param {Array<{ severity?: string }>} findings
+ * @returns {Record<string, number>}
+ */
 function tallyBySeverity(findings) {
-  const t = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
+  const t = {
+    ...Object.fromEntries(SEVERITIES.map((s) => [s, 0])),
+    unknown: 0,
+  };
   for (const f of findings) {
     if (Object.hasOwn(t, f.severity)) t[f.severity] += 1;
     else t.unknown += 1;
   }
   return t;
+}
+
+/**
+ * Test-only seam: when `AUDIT_TO_STORIES_PROVIDER_FIXTURE` names a module, load
+ * its default export as the dedup provider (ports) instead of the live GitHub
+ * provider. This lets the soft-fail contract be exercised end-to-end through
+ * the real `--scan` CLI with a search port that fails for a subset of groups
+ * (Story #4678, AC-8), with no network. Returns null when the env var is unset.
+ *
+ * @returns {Promise<object|null>}
+ */
+async function loadFixtureProvider() {
+  const fixturePath = process.env.AUDIT_TO_STORIES_PROVIDER_FIXTURE;
+  if (!fixturePath) return null;
+  const mod = await import(pathToFileURL(fixturePath).href);
+  return mod.default ?? null;
 }
 
 async function loadProvider({ createProviderImpl, resolveConfigImpl } = {}) {
@@ -91,6 +138,8 @@ async function loadProvider({ createProviderImpl, resolveConfigImpl } = {}) {
   // `createProviderImpl` / `resolveConfigImpl` seams let a contract test drive
   // this exact adapter (fingerprint + semantic-candidate ports) with an
   // in-memory issue store instead of the live GitHub provider.
+  const fixture = await loadFixtureProvider();
+  if (fixture) return fixture;
   try {
     const resolveConfig =
       resolveConfigImpl ??
@@ -180,8 +229,63 @@ function dedupSkippedWarning(reason) {
   );
 }
 
-async function buildPlan({ glob: pattern, severity, useProvider, ledger }) {
-  const reportPaths = await collectReportPaths(pattern ?? DEFAULT_GLOB);
+/**
+ * Render the loud, operator-visible warning emitted when Phase 6 dedup ran but
+ * one or more groups' lookups could not complete (an HTTP 422, or a rate limit
+ * still exhausted after the endpoint budget's cooldown). Those groups degrade
+ * to `create` rather than aborting the whole scan (Story #4678); this warning
+ * names each affected group so the operator knows exactly which to check by
+ * hand. Mirrors the `dedupSkippedWarning` shape so a partially-checked plan
+ * reads as clearly as a wholly-unchecked one.
+ *
+ * Pure: returns the message string so `buildPlan` owns the single `Logger.warn`
+ * write site (stderr) and the text stays unit-testable.
+ *
+ * @param {Array<{ group: string, reason: string }>} entries
+ * @returns {string}
+ */
+function dedupDegradedWarning(entries) {
+  const lines = (entries ?? []).map((e) => `  - ${e.group}: ${e.reason}`);
+  return (
+    `dedup degraded for ${lines.length} group(s): their GitHub lookup could ` +
+    'not complete, so they are classified "create" WITHOUT a dedup check. A ' +
+    'run that creates Stories from this plan may open duplicates of these ' +
+    `groups — verify each by hand before opening:\n${lines.join('\n')}`
+  );
+}
+
+/**
+ * Scan → group → dedup → (optionally) reconcile the cross-run ledger, and
+ * return the plan envelope.
+ *
+ * Every seam on the optional final `deps` parameter defaults to the real
+ * implementation (`.agents/rules/test-seams.md` rules 1-2, 4), so `main`,
+ * `runAuto`, and every production caller are unchanged.
+ *
+ * @param {{ glob?: string, severity?: string, useProvider?: boolean, ledger?: object }} params
+ * @param {{
+ *   collectReportPathsImpl?: typeof collectReportPaths,
+ *   readReportsImpl?: typeof readReports,
+ *   loadProviderImpl?: typeof loadProvider,
+ *   classifyGroupsImpl?: typeof classifyGroupsAgainstGitHub,
+ *   reconcileScanLedgerImpl?: typeof reconcileScanLedger,
+ *   logger?: { warn: Function },
+ * }} [deps]
+ * @returns {Promise<object>} the plan envelope.
+ */
+async function buildPlan(
+  { glob: pattern, severity, useProvider, ledger },
+  deps = {},
+) {
+  const {
+    collectReportPathsImpl = collectReportPaths,
+    readReportsImpl = readReports,
+    loadProviderImpl = loadProvider,
+    classifyGroupsImpl = classifyGroupsAgainstGitHub,
+    reconcileScanLedgerImpl = reconcileScanLedger,
+    logger = Logger,
+  } = deps;
+  const reportPaths = await collectReportPathsImpl(pattern ?? DEFAULT_GLOB);
   if (reportPaths.length === 0) {
     return {
       generatedAt: new Date().toISOString(),
@@ -201,8 +305,8 @@ async function buildPlan({ glob: pattern, severity, useProvider, ledger }) {
     };
   }
 
-  const reports = readReports(reportPaths);
-  const allFindings = parseAuditReports(reports);
+  const reports = readReportsImpl(reportPaths);
+  const allFindings = parseAuditReports(reports, { repoRoot: process.cwd() });
   const filtered = allFindings.filter((f) => meetsSeverity(f, severity));
   const stamped = withFingerprints(filtered);
   const { groups, edges } = groupFindings(stamped);
@@ -217,9 +321,9 @@ async function buildPlan({ glob: pattern, severity, useProvider, ledger }) {
   let dedupApplied = false;
 
   if (useProvider) {
-    const provider = await loadProvider();
+    const provider = await loadProviderImpl();
     if (provider) {
-      const result = await classifyGroupsAgainstGitHub({
+      const result = await classifyGroupsImpl({
         groups,
         provider,
         searchCandidates: provider.searchCandidates,
@@ -227,17 +331,23 @@ async function buildPlan({ glob: pattern, severity, useProvider, ledger }) {
       classifications = result.classifications;
       summary = result.summary;
       dedupApplied = true;
+      // A partially-checked plan is a useful result — warn loudly (stderr, so
+      // the --scan JSON on stdout stays clean) naming the groups that degraded
+      // to create because their lookup could not complete (Story #4678).
+      if (summary.dedupDegraded?.count > 0) {
+        logger.warn(dedupDegradedWarning(summary.dedupDegraded.groups));
+      }
     } else {
       // The provider could not resolve a searchIssues port — the dedup gate
       // is silently a no-op without this. Surface it loudly (stderr, so the
       // --scan JSON on stdout stays clean) so the operator does not read a
       // create-only plan as "no duplicates found".
-      Logger.warn(dedupSkippedWarning('no-provider-port'));
+      logger.warn(dedupSkippedWarning('no-provider-port'));
     }
   } else {
     // Operator explicitly opted out via --no-provider. Still warn so a
     // duplicate-opening re-run is never a surprise.
-    Logger.warn(dedupSkippedWarning('disabled'));
+    logger.warn(dedupSkippedWarning('disabled'));
   }
 
   // Cross-run ledger (Story #4626): fold this scan onto the committed memory,
@@ -246,7 +356,7 @@ async function buildPlan({ glob: pattern, severity, useProvider, ledger }) {
   // --scan path leaves it untouched so it never mutates a committed file.
   let ledgerSummary;
   if (ledger) {
-    const suppressed = reconcileScanLedger({
+    const suppressed = reconcileScanLedgerImpl({
       ledgerPath: ledger.path ?? DEFAULT_LEDGER_PATH,
       findings: stamped,
       classifications,
@@ -488,6 +598,7 @@ export const __testing = {
   buildPlan,
   loadProvider,
   dedupSkippedWarning,
+  dedupDegradedWarning,
   buildAndGateStories,
   runAuto,
   resolveSeverityFloor,
@@ -495,9 +606,42 @@ export const __testing = {
   issueStatesFromClassifications,
 };
 
-async function main() {
+/**
+ * The CLI core: dispatch one of the four sub-commands and persist its output.
+ * Extracted from the `main` shell so the whole sub-command table (including
+ * the no-sub-command usage throw) is reachable without spawning the CLI.
+ *
+ * Every seam on the optional final `deps` parameter defaults to the real
+ * implementation (`.agents/rules/test-seams.md` rules 1-2, 4), so `main` and
+ * every production invocation are unchanged.
+ *
+ * @param {string[]} [argv]
+ * @param {{
+ *   buildPlanImpl?: typeof buildPlan,
+ *   runAutoImpl?: typeof runAuto,
+ *   loadPlanImpl?: typeof loadPlan,
+ *   buildAndGateStoriesImpl?: typeof buildAndGateStories,
+ *   buildPlanSeedMarkdownImpl?: typeof buildPlanSeedMarkdown,
+ *   persistImpl?: typeof persist,
+ *   stdout?: { write: (s: string) => void },
+ * }} [deps]
+ * @returns {Promise<void>}
+ */
+export async function runAuditToStories(
+  argv = process.argv.slice(2),
+  deps = {},
+) {
+  const {
+    buildPlanImpl = buildPlan,
+    runAutoImpl = runAuto,
+    loadPlanImpl = loadPlan,
+    buildAndGateStoriesImpl = buildAndGateStories,
+    buildPlanSeedMarkdownImpl = buildPlanSeedMarkdown,
+    persistImpl = persist,
+    stdout = process.stdout,
+  } = deps;
   const { values } = parseArgs({
-    args: process.argv.slice(2),
+    args: argv,
     options: {
       scan: { type: 'boolean' },
       auto: { type: 'boolean' },
@@ -516,47 +660,47 @@ async function main() {
   });
 
   if (values.auto) {
-    const { summary } = await runAuto({
+    const { summary } = await runAutoImpl({
       glob: values.glob,
       severity: values.severity,
       dryRun: values['dry-run'],
       useProvider: !values['no-provider'],
       ledgerPath: values.ledger,
     });
-    persist(JSON.stringify(summary, null, 2), values.out);
-    if (!values.out) process.stdout.write('\n');
+    persistImpl(JSON.stringify(summary, null, 2), values.out);
+    if (!values.out) stdout.write('\n');
     return;
   }
 
   if (values.scan) {
-    const plan = await buildPlan({
+    const plan = await buildPlanImpl({
       glob: values.glob,
       severity: values.severity,
       useProvider: !values['no-provider'],
     });
     const out = JSON.stringify(plan, null, 2);
-    persist(out, values.out);
-    if (!values.out) process.stdout.write('\n');
+    persistImpl(out, values.out);
+    if (!values.out) stdout.write('\n');
     return;
   }
 
   if (values['emit-plan-seed']) {
-    const plan = loadPlan(values.plan);
-    const md = buildPlanSeedMarkdown({
+    const plan = loadPlanImpl(values.plan);
+    const md = buildPlanSeedMarkdownImpl({
       groups: plan.groups ?? [],
       findings: plan.findings ?? [],
       sourceReports: plan.sourceReports ?? [],
     });
-    persist(md, values.out);
+    persistImpl(md, values.out);
     return;
   }
 
   if (values['emit-stories']) {
-    const plan = loadPlan(values.plan);
+    const plan = loadPlanImpl(values.plan);
     const eligible = (plan.classifications ?? [])
       .filter((c) => c.action === 'create')
       .map((c) => c.group);
-    const built = buildAndGateStories(eligible, plan.edges ?? []);
+    const built = buildAndGateStoriesImpl(eligible, plan.edges ?? []);
     const out = values.json
       ? JSON.stringify(built, null, 2)
       : built
@@ -565,8 +709,8 @@ async function main() {
               `--- story ${i + 1} ---\nTitle: ${s.title}\nLabels: ${s.labels.join(', ')}\n\n${s.body}\n`,
           )
           .join('\n');
-    persist(out, values.out);
-    if (!values.out) process.stdout.write('\n');
+    persistImpl(out, values.out);
+    if (!values.out) stdout.write('\n');
     return;
   }
 
@@ -575,4 +719,33 @@ async function main() {
   );
 }
 
-runAsCli(import.meta.url, main, { source: 'audit-to-stories' });
+async function main() {
+  await runAuditToStories();
+}
+
+runAsCli(import.meta.url, main, {
+  source: 'audit-to-stories',
+  usage: {
+    invocation:
+      'node .agents/scripts/audit-to-stories.js (--scan | --auto | --emit-plan-seed | --emit-stories) [options]',
+    summary:
+      'Turn audit-lens findings under temp/audits/ into a dedup-checked plan seed or standalone Stories.',
+    flags: [
+      ['--scan', 'Print the grouped, deduplicated plan as JSON.'],
+      ['--auto', 'Run the full scan → file pipeline and print the summary.'],
+      ['--emit-plan-seed', 'Emit a /plan --seed-file document.'],
+      ['--emit-stories', 'Emit the Story drafts as JSON.'],
+      ['--glob <pattern>', 'Override the audit-results glob.'],
+      ['--severity <level>', 'Lowest severity to include (high|medium|low).'],
+      ['--ledger <path>', 'Path to the dedup ledger.'],
+      [
+        '--plan <path>',
+        'Read a previously emitted plan instead of re-scanning.',
+      ],
+      ['--out <path>', 'Write output to a file instead of stdout.'],
+      ['--no-provider', 'Skip live GitHub dedup lookups (offline).'],
+      ['--json', 'Force JSON output.'],
+      ['--dry-run', 'Report what would be filed; create nothing.'],
+    ],
+  },
+});

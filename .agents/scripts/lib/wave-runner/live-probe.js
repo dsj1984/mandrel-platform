@@ -2,7 +2,7 @@
  * lib/wave-runner/live-probe.js — the state-probing adapter that feeds the
  * ready-set kernel from live GitHub state.
  *
- * `selectReadySet` (`./ready-set.js`) is deliberately a pure, side-effect-free
+ * `planReadySet` (`./ready-set.js`) is deliberately a pure, side-effect-free
  * kernel: callers hand it the live Story records, the done set, and the
  * in-flight count, and it decides. Until now the only adapter was the
  * flag-driven one (`stories-wave-tick.js --dag/--done/--in-flight`), which
@@ -41,7 +41,7 @@
  *     "waiting" (Story #4601).
  *
  * It is an **adapter, not a kernel change**: it gathers inputs and hands them
- * to `selectReadySet` unchanged. The kernel stays pure and flag-driven, and
+ * to `planReadySet` unchanged. The kernel stays pure and flag-driven, and
  * the legacy flag mode stays byte-compatible.
  *
  * The graph resolution is **not** reimplemented here — it reuses
@@ -217,7 +217,7 @@ export function createProbeContext({
 
 /**
  * Probe live state for a set of Story ids and return the exact inputs
- * `selectReadySet` consumes.
+ * `planReadySet` consumes.
  *
  * Mirrors `resolve-stories.js`'s two-pass envelope build: a provisional pass
  * yields the DAG whose foreign dependency ids are then resolved against live
@@ -239,14 +239,15 @@ export function createProbeContext({
  *   skipped (the probe never fails closed).
  * @param {(msg: string) => void} [args.warn]
  * Each returned node carries its **live labels**. That is load-bearing, not
- * decoration: `selectReadySet` classifies from labels, so a node stripped of
+ * decoration: `planReadySet` classifies from labels, so a node stripped of
  * them reads as `ready` and an `agent::executing` Story gets re-dispatched
  * onto a second branch while its first run is still going. The resolver's DAG
  * projection (`{id, dependsOn, files}`) drops labels because flag mode's
  * caller tracked in-flight itself; probe mode must put them back.
  *
  * @returns {Promise<{
- *   nodes: Array<{id: number, dependsOn: number[], files: string[], labels: string[]}>,
+ *   nodes: Array<{id: number, dependsOn: number[], files: string[], body: string, labels: string[]}>,
+ *   inFlightRecords: Array<{id: number, dependsOn: number[], files: string[], body: string, labels: string[]}>,
  *   doneIds: Set<number>,
  *   inFlight: number,
  *   blockedIds: number[],
@@ -282,6 +283,11 @@ export async function probeLiveState({
   });
 
   const labelsById = new Map(stories.map((s) => [s.id, s.labels ?? []]));
+  // Bodies ride along with the node so the co-dispatch guard can widen a
+  // declared footprint from the paths a Story's own text names (Story #4875).
+  // They are consumed in-process by `planReadySet` and never serialized into
+  // the beat envelope, which stays a list of ids.
+  const bodyById = new Map(stories.map((s) => [s.id, s.body ?? '']));
   const inFlightIds = deriveInFlightIds(stories, dispatched);
   // A Story another operator's lease holds occupies a (global) dispatch slot
   // just like an in-flight one: fold it into the in-flight set so it is both
@@ -289,14 +295,24 @@ export async function probeLiveState({
   // never dispatched by this run.
   const foreignHeld = deriveForeignHeld(stories, self, warn);
   for (const id of foreignHeld.keys()) inFlightIds.add(id);
+  const nodes = envelope.dag.map((node) => ({
+    ...node,
+    body: bodyById.get(node.id) ?? '',
+    labels: projectInFlightLabels(
+      labelsById.get(node.id) ?? [],
+      inFlightIds.has(node.id),
+    ),
+  }));
   return {
-    nodes: envelope.dag.map((node) => ({
-      ...node,
-      labels: projectInFlightLabels(
-        labelsById.get(node.id) ?? [],
-        inFlightIds.has(node.id),
-      ),
-    })),
+    nodes,
+    // The same nodes, narrowed to the Stories occupying a slot. `inFlight` is
+    // only a count, so it can shrink capacity but can never stop a Story
+    // admitted now from sharing files with one dispatched on an earlier beat
+    // and still implementing. These records carry the `files[]` and `body` the
+    // co-dispatch guard needs, so the kernel can RESERVE those footprints
+    // rather than merely count them (Story #4950). No extra fetch: this is a
+    // projection of what the probe already read.
+    inFlightRecords: nodes.filter((node) => inFlightIds.has(node.id)),
     doneIds: new Set(envelope.done),
     inFlight: inFlightIds.size,
     blockedIds: deriveBlockedIds(stories),
@@ -310,7 +326,7 @@ export async function probeLiveState({
  *
  * This is the load-bearing half of the dispatch-window fix, and it is why
  * `inFlight` alone is not enough. The two inputs do **different** jobs inside
- * `selectReadySet`:
+ * `planReadySet`:
  *
  *   - `inFlight` is only a **count**. It reserves capacity (`slots = cap −
  *     inFlight`) and nothing more.

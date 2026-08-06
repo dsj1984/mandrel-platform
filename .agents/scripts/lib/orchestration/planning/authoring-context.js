@@ -7,50 +7,23 @@
  * the provider call needed to load the Epic.
  */
 
-import * as os from 'node:os';
 import path from 'node:path';
 import {
   resolveFeatureRoots,
   verifyBddRunnerPendingTag,
 } from '../../bdd-runner-detect.js';
+import { capBddScenarios } from '../../bdd-scenario-budget.js';
 import { scanBddScenarios } from '../../bdd-scenario-scanner.js';
-import { buildCodebaseSnapshot } from '../../codebase-snapshot.js';
 import { getPaths, PROJECT_ROOT } from '../../config-resolver.js';
-import { scanMemoryFreshness } from '../../feedback-loop/memory-freshness.js';
 import { fetchPriorFeedback } from '../../feedback-loop/prior-feedback-fetcher.js';
 import { Logger } from '../../Logger.js';
 import { hasTicketSection } from '../../ticket-body-sections.js';
+import {
+  concurrentMap,
+  FANOUT_CONCURRENCY,
+} from '../../util/concurrent-map.js';
 import { ensureDocsDigest } from '../docs-digest.js';
-import { collectReferences, hasNewFileCue } from '../spec-freshness.js';
-import { buildAuthoringGrounding } from './spec-authoring-grounding.js';
-
-/**
- * Resolve the per-project memory directory used by the memory-freshness
- * pre-flight (Story #2557 / Epic #2547).
- *
- * Resolution order:
- *   1. `MANDREL_MEMORY_DIR` environment variable (test seam and operator
- *      override).
- *   2. `~/.claude/projects/<repo>/memory/` — the standard Claude Code
- *      memory substrate path, scoped by the configured GitHub repo so each
- *      consumer project gets its own memory pool.
- *   3. `null` when neither is resolvable. The scanner tolerates a missing
- *      `memoryDir` and surfaces a single `errors[]` entry.
- *
- * @param {{ github?: { owner?: string, repo?: string }|null }} opts
- * @returns {string|null}
- */
-function resolveMemoryDir({ github } = {}) {
-  if (
-    typeof process.env.MANDREL_MEMORY_DIR === 'string' &&
-    process.env.MANDREL_MEMORY_DIR.length > 0
-  ) {
-    return process.env.MANDREL_MEMORY_DIR;
-  }
-  const repo = github?.repo;
-  if (typeof repo !== 'string' || repo.length === 0) return null;
-  return path.join(os.homedir(), '.claude', 'projects', repo, 'memory');
-}
+import { buildMemoryPoolAdvisory } from './memory-pool-advisory.js';
 
 /**
  * Build the digest-first `docsContext` envelope field (Story #4433 — hard
@@ -99,6 +72,30 @@ async function buildPlanningDocsContext({ seedIssueId, settings, cwd }) {
 }
 
 /**
+ * Story #2637 — index existing BDD scenarios so the Acceptance Engineer step
+ * can annotate planned ACs with matches from the project's `.feature` files.
+ * Empty (capped-shape) result when the project has not adopted BDD; the
+ * scanner is best-effort and never throws on filesystem errors.
+ *
+ * Story #4977 — the scan itself stays uncapped (a faithful `.feature`
+ * index), but the envelope-bound result is truncated to
+ * `BDD_SCENARIOS_BYTE_BUDGET` via `capBddScenarios` so a mature Gherkin
+ * corpus cannot alone consume the `/plan` context-envelope ceiling. Callers
+ * needing the raw count read `totalScenarios` vs `includedScenarios`.
+ *
+ * @returns {ReturnType<typeof capBddScenarios>}
+ */
+function scanBddScenariosBestEffort() {
+  try {
+    const featureRoots = resolveFeatureRoots({ cwd: PROJECT_ROOT });
+    return capBddScenarios(scanBddScenarios({ featureRoots }));
+  } catch (err) {
+    Logger.warn(`[plan-context] BDD scenario scan skipped: ${err.message}`);
+    return capBddScenarios([]);
+  }
+}
+
+/**
  * Build the authoring context the host LLM (or the
  * `/plan` author step) needs to write the Tech Spec.
  *
@@ -133,114 +130,67 @@ export async function buildAuthoringContext(
 
   const { cwd = PROJECT_ROOT } = opts;
 
-  const docsContext = await buildPlanningDocsContext({
-    seedIssueId: epic.id,
-    settings,
-    cwd,
-  });
-
-  // Story #2094 Task #2103 — verify the project's BDD runner pending-tag
-  // support so the acceptance-spec body can record either the verified tag
-  // (features-first ordering) or "fallback: dependencies-first ordering"
-  // when no supported runner is present.
-  const bddRunner = await verifyBddRunnerPendingTag({ cwd: PROJECT_ROOT });
-
-  // Story #2637 — index existing BDD scenarios so the Acceptance Engineer
-  // step can annotate planned ACs with matches from the project's
-  // `.feature` files. Empty array when the project has not adopted BDD;
-  // the scanner is best-effort and never throws on filesystem errors.
-  let bddScenarios = [];
-  try {
-    const featureRoots = resolveFeatureRoots({ cwd: PROJECT_ROOT });
-    bddScenarios = scanBddScenarios({ featureRoots });
-  } catch (err) {
-    Logger.warn(`[plan-context] BDD scenario scan skipped: ${err.message}`);
-  }
-
-  // Story #2557 — memory-freshness pre-flight runs BEFORE the prior-feedback
-  // fetch so the planner sees a deduplicated, currently-actionable memory
-  // store. The scanner is best-effort: missing memory dir or gh-CLI failures
-  // land in `memoryFreshness.errors[]` and never throw.
   const githubCfg = opts.github ?? null;
-  const memoryDir = resolveMemoryDir({ github: githubCfg });
-  const memoryFreshness = await scanMemoryFreshness({
-    memoryDir,
-    owner: githubCfg?.owner,
-    repo: githubCfg?.repo,
-    projectRoot: PROJECT_ROOT,
-  });
 
-  // Story #2554 — surface open meta feedback issues to the planner so retro
-  // signals are routed into durable substrates rather than lost in chat.
-  // The fetcher is best-effort: missing owner/repo or gh-CLI failures land
-  // in `errors[]` and never throw.
-  const priorFeedback = await fetchPriorFeedback({
-    owner: githubCfg?.owner,
-    repo: githubCfg?.repo,
-  });
+  // Story #4952 — these five gathers share no data, so they run under bounded
+  // concurrency instead of five sequential awaits on the interactive `/plan`
+  // path. `concurrentMap` preserves input order, so the destructuring is
+  // positional and the produced context is identical to the serial build:
+  //
+  //   1. the digest-first `docsContext` pointer (Story #4433);
+  //   2. Story #2094 Task #2103 — the project's BDD runner pending-tag
+  //      support, so the acceptance-spec body records either the verified tag
+  //      (features-first ordering) or "fallback: dependencies-first ordering"
+  //      when no supported runner is present;
+  //   3. the best-effort `.feature` scenario index;
+  //   4. Story #4919 — the memory-pool advisory that replaced the retired
+  //      memory-freshness pre-flight (#2557 / #4414) in the same slot. The
+  //      scanner marked an entry stale when a cited issue was closed, but the
+  //      memory corpus is delivery retrospectives whose subject IS a delivered
+  //      Story — and its directory (`~/.claude/projects/<repo>/memory/`) never
+  //      resolved, because harness project dirs are cwd-slugs. This renders no
+  //      per-entry verdict at all: it stats and counts, and the `/plan` spine
+  //      surfaces `recommend` at Gate #1. Filesystem-only and total;
+  //   5. Story #2554 — open meta feedback issues, so retro signals are routed
+  //      into durable substrates rather than lost in chat. Best-effort:
+  //      missing owner/repo or gh-CLI failures land in `errors[]`, never throw.
+  const [
+    docsContext,
+    bddRunner,
+    bddScenarios,
+    memoryPoolAdvisory,
+    priorFeedback,
+  ] = await concurrentMap(
+    [
+      () => buildPlanningDocsContext({ seedIssueId: epic.id, settings, cwd }),
+      () => verifyBddRunnerPendingTag({ cwd: PROJECT_ROOT }),
+      () => scanBddScenariosBestEffort(),
+      () => buildMemoryPoolAdvisory({ cwd: PROJECT_ROOT }),
+      () =>
+        fetchPriorFeedback({
+          owner: githubCfg?.owner,
+          repo: githubCfg?.repo,
+        }),
+    ],
+    (gather) => gather(),
+    // The independent context gathers (Story #4952): a handful of local
+    // probes plus one `gh` read, so this rides the shared fan-out bound
+    // rather than declaring its own.
+    { concurrency: FANOUT_CONCURRENCY },
+  );
 
-  // Story #2634 — codebase snapshot. Generates a bounded structural view
-  // of the consumer repo (file tree + package surface + recent activity
-  // + optional export signatures at the `medium` tier) so the Architect
-  // can prefer real module names over doc-only ones. The check is
-  // best-effort: any git/filesystem error degrades to an empty snapshot
-  // so Phase 7 stays non-blocking.
-  let codebaseSnapshot = null;
-  try {
-    codebaseSnapshot = buildCodebaseSnapshot({
-      cwd: PROJECT_ROOT,
-      tier: settings?.planning?.codebaseSnapshot?.tier,
-      include: settings?.planning?.codebaseSnapshot?.include,
-      exclude: settings?.planning?.codebaseSnapshot?.exclude,
-      recentCommitWindow:
-        settings?.planning?.codebaseSnapshot?.recentCommitWindow,
-    });
-    // Story #4139 (F10) — ground the spec author in the files it will cite.
-    // Two signals are attached to the snapshot envelope so the author (which
-    // consumes the JSON, not stderr) cannot miss them:
-    //   1. `grounding.truncation` — the structured, in-envelope form of the
-    //      Story #3959 dropped-file warning. The skinny-tier cap used to drop
-    //      the majority of matched files with only a stderr `Logger.warn` and
-    //      a bare `truncated: true` flag; the author never learned the
-    //      snapshot was partial (a real run dropped "377 of 627 files").
-    //   2. `grounding.citedButAbsent` — path-shaped references in the Epic
-    //      body (the prose the author grounds *from*) that are absent from
-    //      the snapshot's file set and not phrased as net-new, so cited-but-
-    //      absent surfaces are visible *during* authoring rather than only
-    //      after the post-author freshness gate (Story #2635).
-    // The grounding consults only the snapshot's file set and the Epic body —
-    // no new filesystem or git probes — so the context stays bounded for cost.
-    if (codebaseSnapshot) {
-      const grounding = buildAuthoringGrounding({
-        snapshot: codebaseSnapshot,
-        prose: epic.body ?? '',
-        collectReferences,
-        hasNewFileCue,
-      });
-      codebaseSnapshot.grounding = grounding;
-      if (grounding.truncation) {
-        const { dropped, matched, tier } = grounding.truncation;
-        Logger.warn(
-          `[plan-context] codebase snapshot truncated: ${dropped} of ` +
-            `${matched} matched file(s) dropped from the ${tier}-tier view. ` +
-            `The /plan authoring context is partial. To restore full ` +
-            `grounding, ` +
-            `set planning.codebaseSnapshot.tier: "medium" and/or narrow ` +
-            `planning.codebaseSnapshot.include in .agentrc.json.`,
-        );
-      }
-      if (grounding.citedButAbsent.length > 0) {
-        Logger.warn(
-          `[plan-context] ${grounding.citedButAbsent.length} path(s) cited ` +
-            `in the authored Spec are absent from the codebase snapshot: ` +
-            `${grounding.citedButAbsent.join(', ')}. /plan will flag these ` +
-            `as drift unless they are net-new.`,
-        );
-      }
-    }
-  } catch (err) {
-    Logger.warn(`[plan-context] codebase snapshot skipped: ${err.message}`);
-  }
+  // Story #4811 — the codebase snapshot (#2634), its authoring grounding
+  // (#4139 F10) and the spec-freshness helpers behind it are retired. The
+  // pre-computed structural view grounded nothing it promised: the default
+  // include globs missed the standard monorepo layout outright, its remedies
+  // pointed at knobs that re-filtered the same set, and its cited-but-absent
+  // signal inverted into noise whenever the snapshot was the thing that was
+  // wrong. Grounding now rests on the two mechanisms that read the real tree:
+  // the authoring model's own targeted retrieval (the digest-first precedent
+  // of Story #4433) and the Phase 8 `validateStoryFileAssumptions` gate, which
+  // probes every authored `{path, assumption}` against the working tree as a
+  // hard error. Nothing pre-computed replaces it — a stale inventory is the
+  // failure mode, not the fix.
 
   // Story #4542 — planning authors no risk artifact at all. Review depth and
   // the acceptance-critic mode are derived from the diff at close time
@@ -262,10 +212,9 @@ export async function buildAuthoringContext(
       },
     },
     docsContext,
-    codebaseSnapshot,
     bddRunner,
     bddScenarios,
-    memoryFreshness,
+    memoryPoolAdvisory,
     priorFeedback,
   };
 }

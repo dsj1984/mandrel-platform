@@ -35,14 +35,13 @@ it once and reuse the context as you read through any individual gate.
 
 ## Concurrent close safety
 
-`/deliver` may close multiple Stories from separate Story branches in quick
-succession. Each Story rebases onto the latest `main` in its own base-sync
-phase (`phases/base-sync.js`) before the push, so concurrent closes serialize
+`/deliver` may close multiple Stories from separate branches in quick
+succession; each rebases onto the latest `main` in its own base-sync phase
+(`phases/base-sync.js`) before the push, so concurrent closes serialize
 through their own worktrees rather than racing one shared branch. The push
-step itself does not retry: a rejected push fails the close non-zero and the
-operator resolves it, and a real content conflict (both Stories touched the
-same lines) surfaces at base-sync with a clear error, leaving the local tree
-clean for manual resolution.
+does not retry — a rejected push or a real content conflict fails the close
+non-zero and leaves the tree clean for manual resolution. See
+[`SDLC.md` § Concurrent close](SDLC.md#concurrent-close).
 
 ---
 
@@ -50,24 +49,18 @@ clean for manual resolution.
 
 `npm test` (via [`.agents/scripts/run-tests.js`](../scripts/run-tests.js))
 derives `--test-concurrency` from `os.availableParallelism()` at startup,
-clamped into the `[TEST_CONCURRENCY_MIN, TEST_CONCURRENCY_MAX]` range of
-`[1, 16]` (`resolveTestConcurrency`). The clamp keeps the value sane at
-both extremes: on the GitHub Actions 2-vCPU runner the derived value
-matches the host instead of leaving wall-clock on the table, and on
-very-wide dev hosts the cap of 16 bounds the filesystem-race surface
-from shared FS fixtures (`memfs` mounts, `temp/` snapshot dirs, the
-`coverage/` artifact directory shared with the CRAP gate).
+clamped into `[1, 16]` (`resolveTestConcurrency`). The clamp keeps the value
+sane at both extremes: on the GitHub Actions 2-vCPU runner the derived value
+matches the host, and on very-wide dev hosts the cap of 16 bounds the
+filesystem-race surface from shared FS fixtures (`memfs` mounts, `temp/`
+snapshot dirs, the `coverage/` artifact directory shared with the CRAP gate).
 
 The coverage run is the exception: `npm run test:coverage`
-([`.agents/scripts/run-coverage.js`](../scripts/run-coverage.js))
-still pins `--test-concurrency=8` so coverage timings stay comparable
-across hosts. That fixed 8 sits in the same neighborhood as the cap=8
-orchestration helpers (`SUBTICKET_HYDRATION_CONCURRENCY`, and
-historically the since-deleted wave-gate helper, removed in PR #3936)
-that settled on 8 as the project house-style ceiling. Any change to the
-clamp bounds or the coverage pin must be paired with a benchmark run on
-both a Windows dev host and a GitHub Actions runner to confirm it
-doesn't reintroduce concurrency flakes.
+([`.agents/scripts/run-coverage.js`](../scripts/run-coverage.js)) pins
+`--test-concurrency=8` so coverage timings stay comparable across hosts. Any
+change to the clamp bounds or the coverage pin should be validated on both a
+Windows dev host and a GitHub Actions runner to confirm it doesn't reintroduce
+concurrency flakes.
 
 ---
 
@@ -108,33 +101,19 @@ npm run coverage:update # writes baselines/coverage.json from the run
 `coverage-final.json` artifact (useful from CI hooks or close-validation
 runners that orchestrate coverage capture separately).
 
-The same files-out-of-scope list as before, declared in `.c8rc.cjs`:
+The files-out-of-scope list is declared in [`.c8rc.cjs`](../../.c8rc.cjs) —
+thin CLI shells plus the larger Story #1702 carve-out of
+top-level/orchestration/git CLIs and `lib/*` glue. The `exclude[]` array is
+the **single** declaration: each entry carries its rationale as an inline
+comment on the line above it. Story #4922 removed the prose inventory the
+header used to duplicate — two copies of one list in one file, 27 files
+apart by the time it was measured. Do not reintroduce one. Every excluded
+file also carries `/* node:coverage ignore file */` at the top of its source
+as a second line of defence.
 
-- `.agents/scripts/agents-bootstrap-github.js` — one-shot bootstrap CLI
-  whose meaningful logic (label taxonomy + project field defs) lives
-  in `lib/label-taxonomy.js` and is unit-tested there. The CLI shell
-  itself is integration-only against a live GitHub repo.
-- `plan-context.js`, `plan-persist.js` —
-  `/plan` CLI shells with no unit-test seam; the meaningful
-  orchestration logic lives in `lib/orchestration/plan-context.js`,
-  `lib/orchestration/plan-persist/*`, and the plan phase modules, and is
-  unit-tested there.
-- A larger Story #1702 carve-out of top-level CLI gates, orchestration
-  CLIs, git-manipulation CLIs, and `lib/*` glue (e.g. `lint-baseline.js`,
-  `single-story-init.js`, `run-tests.js`,
-  `lib/config-schema.js`) — see the `.c8rc.cjs` header comment for the
-  per-category rationale and the authoritative entry list.
-
-Each excluded file also carries `/* node:coverage ignore file */` at
-the top of its source as a second line of defence; the full
-justification for each exclusion lives in the header comment of
-[`.c8rc.cjs`](../../.c8rc.cjs) and MUST be updated when the list changes.
-
-The current shape of this pipeline (NODE_V8_COVERAGE +
-`c8 report` instead of wrapping the run in `c8 <cmd>`) was chosen
-after a one-off A/B benchmark showed it was ~19 % faster end-to-end
-on a Windows dev host while producing the same `coverage-final.json`
-artifact.
+`.c8rc.cjs`'s `include` globs and `delivery.quality.gates.coverage.targetDirs`
+in [`.agentrc.json`](../../.agentrc.json) MUST name the same roots — the gate
+scores what c8 measures. `tests/c8rc-scope.test.js` asserts both invariants.
 
 ---
 
@@ -149,11 +128,30 @@ touched it:
 
 | Metric | Floor | Scope |
 | --- | --- | --- |
-| Coverage — lines | ≥ 90 % | per file |
-| Coverage — branches | ≥ 85 % | per file |
-| Coverage — functions | ≥ 90 % | per file |
-| Maintainability Index | ≥ 70 | per file |
-| CRAP | ≤ 20 | per method |
+| Coverage — lines | ≥ 94 % | repo rollup |
+| Coverage — branches | ≥ 85 % | repo rollup |
+| Coverage — functions | ≥ 87 % | repo rollup |
+| Maintainability Index | ≥ 70 | repo rollup |
+| CRAP — methods above 20 | ≤ 13 | repo rollup |
+
+Floors are enforced against the baseline's `rollup` components — the
+`applyFloors` phase compares `rollup["*"]` (and any named component), never
+individual rows. Story #4922 corrected this table, which previously read
+"per file" and quoted 90/85/90 for coverage; those numbers came from the
+example in `.agents/docs/agentrc-reference.json`, which is validated only
+against itself, and the coverage gate was not configured at all.
+
+The live coverage floors are derived from the measurement in
+[`baselines/coverage.json`](../../baselines/coverage.json) — a full-tier run
+scored 95.65 / 86.16 / 88.52, and each floor sits ~1–1.7 points under its
+axis. Re-derive them, do not invent them, whenever the baseline is
+regenerated wholesale.
+
+The coverage gate deliberately declares **no `tolerance`**, so its
+head-vs-base ratchet arm reports regressions without failing the build (the
+same shape the `crap` gate uses). Story #4922's scope was making the
+instrument honest; arming the ratchet belongs with the debt burn-down that
+the widened measurement newly exposes.
 
 The floors are declared in [`.agentrc.json`](../../.agentrc.json) under
 `delivery.quality.gates.<gate>.floors.*` (defaults baked into the helper
@@ -199,11 +197,11 @@ The floor gate is only as strict as its scope, so the `exclude` list in
 [`.c8rc.cjs`](../../.c8rc.cjs) carries three hard requirements that are
 enforced by review (and partially by the audit suite):
 
-1. **One-line rationale per entry.** Every file in `exclude[]` MUST have
-   a bulleted justification in the `.c8rc.cjs` header comment naming
-   *why* it is excluded — typically "thin CLI shell, meaningful logic
-   lives in `lib/<X>` and is unit-tested there." A bare path with no
-   rationale is a review-block.
+1. **One-line rationale per entry.** Every file in `exclude[]` MUST carry
+   an inline comment on the line(s) directly above it naming *why* it is
+   excluded — typically "thin CLI shell, meaningful logic lives in
+   `lib/<X>` and is unit-tested there." A bare path with no rationale is a
+   review-block, and `tests/c8rc-scope.test.js` fails on one.
 2. **`/* node:coverage ignore file */` pragma at source.** Every
    excluded file MUST carry the Node coverage pragma at the top of its
    own source. This is the second line of defence: when `c8 report` and
@@ -217,66 +215,31 @@ enforced by review (and partially by the audit suite):
    risk the floor gate exists to surface; the audit suite spot-checks
    the callee map at exclude-list churn time.
 
-Story #1602 audit pass (2026-05-13) removed two stale exclude entries
-(`epic-runner.js`, `ticket-decomposer.js`) whose source files had already
-been deleted in earlier refactors. Every remaining entry was re-verified
-against requirements 1 and 2 above.
-
-### Discontinuity with v5 baselines
-
-The floor gate landed alongside a fresh baseline reset
-(Tasks #1623, #1625, #1626, #1629). Any direct numeric comparison
-against pre-floor-gate baseline snapshots is meaningless because the
-pre-rebrand scope included files the current tree excludes (CLI shells,
-generated artifacts) and because the absolute-floor gate is new —
-historical files that were "green" on the ratchet may now show as below
-floor and require either real test additions or an intentional
-`.c8rc.cjs` exclude. The Story #1602 close-out lists every file that
-flipped category in the reset.
-
 ---
 
 ## Anti-thrashing protocol
 
-Agents MUST halt, summarize blockers, and re-plan if they hit consecutive
-tool errors or perform consecutive analysis steps without modifying a
-file. When any threshold under
-the qualitative anti-thrashing cues in
-[`.agents/instructions.md`](../instructions.md) are tripped, the
-friction logger flips the Story to `agent::blocked` and
-posts a structured `friction` comment on the Story so the operator has
-the trace.
+The qualitative anti-thrashing cues are owned by
+[`.agents/instructions.md`](../instructions.md) § 1.I. When they trip, the
+friction logger flips the Story to `agent::blocked` and posts a structured
+`friction` comment on the Story so the operator has the trace.
 
 ---
 
 ## Per-Story acceptance self-eval gate
 
-After a Story's implementation commits land and **before** the Story
-proceeds to close, delivery runs a bounded acceptance self-eval loop
-(Step 1a of
-[`helpers/deliver-story`](../workflows/helpers/deliver-story.md); the shared
-per-round mechanic lives in
-[`helpers/acceptance-self-eval`](../workflows/helpers/acceptance-self-eval.md),
-with the gate CLI at
-[`.agents/scripts/acceptance-eval.js`](../scripts/acceptance-eval.js)).
-Each round, a fresh-context **critic pass** — independent of the
-implementing agent — scores the change set its caller injected (never one
-it re-derives) against every inline `acceptance[]` item, using `verify[]`
-output as evidence, and yields one of three decisions:
-
-- **proceed** — all criteria met; the Story continues to close.
-- **redraft** — unmet criteria are redrafted and re-implemented, then
-  re-evaluated in the next round.
-- **block** — criteria remain unmet after the round cap; the Story
-  escalates to the blocked path (`agent::blocked`) for operator review.
-
-The loop is always on (hard cutover, no enable flag) and bounded by
-`delivery.acceptanceEval.maxRounds` (default 2, clamped to a minimum of
-1 so the cap cannot be disabled). This gate is complementary to the
-close-validation chain above: that chain proves the code is *healthy*;
-this loop proves it satisfies *this Story's* acceptance criteria. See
-[`.agents/docs/configuration.md`](../docs/configuration.md) for
-the `delivery.acceptanceEval` field reference.
+After a Story's implementation commits land and **before** it proceeds to
+close, delivery runs a bounded acceptance self-eval loop: a fresh-context
+critic scores the caller-injected change set against every inline
+`acceptance[]` item (using `verify[]` output as evidence) and yields
+**proceed** / **redraft** / **block**. This gate is complementary to the
+close-validation chain above — that chain proves the code is *healthy*, this
+loop proves it satisfies *this Story's* acceptance criteria. The per-round
+mechanic is owned by
+[`helpers/acceptance-self-eval`](../workflows/helpers/acceptance-self-eval.md)
+(Step 1a of [`helpers/deliver-story`](../workflows/helpers/deliver-story.md));
+the `delivery.acceptanceEval` field reference is in
+[`configuration.md`](../docs/configuration.md).
 
 ---
 
@@ -298,8 +261,8 @@ node .agents/scripts/lint-baseline.js capture
 
 Refresh commits should use a `baseline-refresh:` subject + non-empty body so
 the operator can spot baseline edits in review — same convention as the CRAP
-and maintainability ratchets. The CI guardrail that mechanically enforced
-this was removed in a pre-npm-era release; the operator is now the gate.
+and maintainability ratchets. There is no CI guardrail enforcing the
+convention; the operator is the gate.
 
 ---
 
@@ -316,8 +279,44 @@ between Stories.
 Refresh with `npm run maintainability:update`.
 
 `delivery.quality.gates.maintainability.targetDirs` controls the scanned
-directories — defaults to `["src"]`, accepts `{ "append": [...] }` /
-`{ "prepend": [...] }` for additive overrides.
+directories (see [`configuration.md`](../docs/configuration.md) for the
+default and the deep-merge extender form).
+
+---
+
+## Cyclomatic ceiling ratchet
+
+`delivery.quality.codingGuardrails.cyclomaticMustFix` (default `12`) is the
+per-function complexity ceiling, enforced by `check-cyclomatic.js`. It is a
+**standalone ratchet** — the same slot as `check-arch-cycles.js`,
+`check-dead-exports.js`, and `check-context-budget.js` — not a
+`delivery.quality.gates` kind, so it needs no gate block and no floor.
+
+```bash
+node .agents/scripts/check-cyclomatic.js            # the gate
+node .agents/scripts/check-cyclomatic.js --update   # re-record the breaches
+```
+
+`baselines/cyclomatic.json` records, per file, how many functions currently
+sit above the ceiling and how bad the worst one is. The gate fails when a
+file's over-ceiling count rises (including `0 → 1`, a brand-new breach) or
+when its worst function gets worse than recorded. Shrinking and disappearing
+are the success signals and never fail.
+
+Recording existing breaches is what makes the ceiling adoptable: a repository
+with dozens of over-ceiling functions can turn the gate on today and burn them
+down on its own schedule, instead of disabling a gate that fails on the first
+commit. Re-run `--update` after a deliberate refactor; that is the only motion
+allowed to raise a recorded count, and it shows up in review as a baseline
+diff.
+
+The scan reuses `delivery.quality.gates.maintainability.targetDirs` /
+`ignoreGlobs` — both instruments read the same coverage-free escomplex
+surface, so a separate scope declaration could only ever restate it.
+
+`cyclomaticFlag` (default `8`) is the softer half of the pair: it is not
+gated, and names the ceiling `quality:preview` counts new methods against in
+its `new-method count over c=<flag>` column.
 
 ---
 
@@ -354,10 +353,8 @@ generate `baselines/crap.json`, and commit the file with a
 `baseline-refresh:` tagged subject + non-empty body so the
 refresh-guardrail accepts it on the next PR.
 
-The transitional informational mode (exit 0 on first sync) was retired in
-Story #791 because it allowed broken pipelines to ride green for an
-indeterminate window. If your test runner doesn't produce per-method
-coverage, see "Disabling the gate" below.
+If your test runner doesn't produce per-method coverage, see "Disabling the
+gate" below.
 
 ### Disabling the gate (single-flag opt-out)
 
@@ -381,28 +378,11 @@ source edits required. The maintainability ratchet keeps running.
 
 ### Extending `targetDirs` without re-listing framework defaults
 
-The config resolver supports deep-merge for list-valued keys. To add your
-own source dirs to the framework default (`["src"]`):
-
-```jsonc
-{
-  "delivery": {
-    "quality": {
-      "gates": {
-        "crap": {
-          "targetDirs": { "append": ["packages/foo/src", "packages/bar/src"] }
-        }
-      }
-    }
-  }
-}
-```
-
-`{ "append": [...] }` and `{ "prepend": [...] }` are the deep-merge forms.
-Passing a plain array replaces the default entirely — useful when you
-want exactly your dirs and not the framework's. Unknown keys under
-`delivery.quality.gates.crap` warn but don't fail resolution, so you can
-extend forward-compatibly.
+`targetDirs` (like the other list-valued gate keys) accepts the deep-merge
+extender form — `{ "append": [...] }` / `{ "prepend": [...] }` add to the
+framework default (`["src"]`), while a plain array replaces it entirely. The
+worked example and the general rule live once in
+[`configuration.md` § How to extend](../docs/configuration.md#how-to-extend).
 
 ### Interpreting the JSON report
 
@@ -437,11 +417,148 @@ should land in a commit whose:
    `baseline-refresh:`).
 2. Body is non-empty and explains why the refresh is justified.
 
-The CI guardrail that mechanically rejected unlabeled baseline edits was
-removed in a pre-npm-era release alongside the bot-approver pipeline. The convention is
-preserved so the operator can grep refresh commits in PR diff, but
-self-policing is the operator's job during `/deliver`'s Phase 7
-watch loop — an unjustified baseline ratchet is no longer caught by CI.
+There is no CI guardrail rejecting unlabeled baseline edits; the convention is
+preserved so the operator can grep refresh commits in a PR diff, but
+self-policing is the operator's job during `/deliver`'s watch loop.
+
+### The per-method coverage join (Story #4775)
+
+CRAP is the only gate that joins two independently-produced artifacts: the
+per-method complexity escomplex derives from the source, and the per-function
+coverage istanbul derives from the test run. Everything below exists because
+that join is silent when it fails — an unresolved method is simply absent from
+the baseline, so a broken join looks exactly like a small repo.
+
+**One coordinate system.** For a TS/TSX source, escomplex parses the
+*transpiled* output and reports each method's `lineStart` in transpiled
+coordinates, while `coverage-final.json` is keyed against the *original*
+source. The scorer therefore asks `transpileIfNeeded` for a source map
+(`{ withLineMap: true }`, backed by Node's built-in `SourceMap` — no extra
+runtime dependency) and remaps each method start into original coordinates
+before the lookup. JavaScript is a passthrough: its coordinates already are
+original coordinates, so no map is computed and nothing changes. The
+maintainability path never requests a map, and the emitted code is
+byte-identical either way, so MI scores are unaffected.
+
+**Tolerant matching.** Remapping alone is insufficient: escomplex's method
+start and istanbul's `decl.start.line` disagree by a line when a decorator, a
+leading `export`, or a wrapped parameter list sits between them. The lookup is
+exact-line first (so every already-resolving row keeps its exact prior value),
+then innermost containment, then nearest declaration within ±1.
+
+**`requireCoverage: false` means score it.** A method with no coverage entry
+scores as 0% covered — `crap = c² + c`, the formula's own treatment of
+untested code — and lands in the baseline. It used to be dropped individually
+regardless of the flag, which made the flag a no-op for baseline population.
+`requireCoverage: true` still skips and counts it.
+
+**The updater fails closed on a thin result.** `update-crap-baseline.js`
+reports `resolved/joinable` over files that *have* coverage and refuses to
+persist below `delivery.quality.gates.crap.minMethodResolutionRate` (default
+`0.75`), naming the worst unresolved files. The floor is not enforced below 25
+joinable methods, where a diff-scoped run's rate is noise. A healthy repo
+resolves ~98%; the 4–6% signature of a coordinate-system mismatch is far below
+the floor.
+
+**Re-derive your floors after adopting this — but do not re-pin `max`.** A
+`crap.floors` `max` ceiling pinned before the fix was computed over the
+minority of methods the join could see, so it is not a real ceiling — it is an
+artefact. The honest scan sees far more (in this repository, 2215 → 4058
+visible methods), and the newly-visible methods include the worst ones.
+
+The tempting response — raise `*.max` until the gate is green again — produces a
+floor fitted to the tree's current high-water mark, which **can never fire**:
+nothing breaches it until something becomes worse than the worst method already
+present. Prefer a *count* budget over a max ceiling:
+
+```jsonc
+"crap": {
+  // Number of methods allowed to score above 20. Ratchet this down; it
+  // breaches the moment the count grows, which a `max` ceiling cannot do.
+  "floors": { "*": { "methodsAbove20": 40 } }
+}
+```
+
+`max` remains available and is the right instrument when you genuinely have a
+hard per-method ceiling to hold. It is the wrong instrument for absorbing
+pre-existing debt.
+
+Note that neither choice is what protects new code. `floors` is an absolute
+tree-wide comparison against the rollup; the forward pressure lives in
+`newMethodCeiling` (a *new* method scoring above it fails, default 30) and in
+`compareCrap`'s ratchet (an *existing* method fails when it regresses against
+its own baseline row). Both are unaffected by how much old debt the gate can
+now see, and neither consults `floors`.
+
+**Old baselines are invalidated explicitly.** Rows scored by the previous join
+are not comparable to rows scored by this one, and neither `kernelVersion` nor
+`escomplexVersion` moves (both track the same upstream package). The envelope
+therefore carries a `scoringSemantics` stamp; `check-baselines` fails closed on
+a mismatch with the exact re-baseline command rather than comparing across the
+boundary. Bump the stamp whenever the coverage join, the line coordinate
+system, the unresolved-method policy, or the method identity rule changes —
+Story #4969 bumped it for the last of these, replacing escomplex's positional
+`<anon method-N>` label with an enclosing-scope-path identity.
+
+---
+
+## Keeping a baseline fresh (Story #4776)
+
+Populating a baseline correctly is only half the loop. The other half is
+keeping it correct as the tree grows, and that half has two distinct holes —
+one at close time, one over the long run. Both are **advisory**:
+`check-baselines` already fails closed on a real regression, and duplicating
+that would double-gate the same defect.
+
+### Pre-merge projections — the refresh nudge at close time
+
+Close-validation projects, after its gates pass, which committed baseline rows
+the post-merge tree would breach, and names the exact remedy while the operator
+still has the branch in hand:
+
+- `lib/close-validation/projections/maintainability.js` — per-file MI.
+- `lib/close-validation/projections/crap.js` — per-method CRAP, against each
+  method's baseline row or, for methods with no row, `newMethodCeiling`.
+
+Both are wired through `projections/advisories.js`, which
+`close-validation/runner.js` calls once. Each self-skips — logging the reason,
+never erroring — when its gate is disabled, when no baseline exists, when the
+diff has no scorable files, or when the CRAP scorer finds no coverage
+artifact. A projected breach never changes the close verdict.
+
+> The maintainability projection shipped in v1 fully written and fully
+> unit-tested, and the v2 Epic-tier collapse removed its only caller. It sat
+> importable-but-unimported for the whole of v2, so its advisory never fired
+> once. `tests/lib/close-validation/runner-projections.test.js` now walks the
+> import graph and fails if **any** module under `projections/` is reachable
+> from nothing in production — the orphaning itself is the regression.
+
+### `check-baseline-drift.js` — the scheduled full-scope re-score
+
+Every per-PR enforcement site (close-validation, pre-push, CI) is
+**diff-scoped**: it compares the files a branch touched against their baseline
+rows. A file nobody touches after its row is written is therefore never
+re-scored, so drift introduced *indirectly* — a dependency getting more
+complex, coverage moving underneath a method — stays invisible indefinitely.
+Full-scope scoring on every push is far too expensive to be the answer.
+
+```bash
+node .agents/scripts/check-baseline-drift.js                     # both kinds
+node .agents/scripts/check-baseline-drift.js --gate crap         # one kind
+node .agents/scripts/check-baseline-drift.js --tolerance 1 --json
+```
+
+It re-scores full-scope through the *same* scorer that writes the baseline
+(`refresh-service.resolveDefaultScorer`) — scoring by a second implementation
+would report the two implementations' disagreement as drift — and prints a
+per-row before/after table for everything that moved beyond the gate's
+tolerance, **in either direction**. A row that silently improved is equally
+strong evidence the baseline no longer describes the tree.
+
+Exit codes: `0` no drift (or every kind skipped), `1` drift detected, `2` the
+check could not run. It is designed to be wired as a scheduled CI job;
+scheduling it is deliberately consumer-side work, and nothing in this
+repository runs it automatically.
 
 ---
 
@@ -508,50 +625,11 @@ correct shape for a gate with no rescoring path of its own.
 
 ## HITL blocker escalation
 
-`risk::high` is informational/planning metadata only. Runtime execution
-does not pause automatically on `risk::high`.
-
-The sole runtime HITL pause point is `agent::blocked`: when an agent
-encounters an unresolvable blocker (including unsafe destructive actions
-lacking explicit authorization), it flips the ticket to
-`agent::blocked`, posts friction context, and waits for operator resume
-(`agent::executing`).
-
-`planning.riskHeuristics` remains the rubric for identifying
-high-impact operations that should trigger blocker escalation.
-
----
-
-## Post-floor-gate baseline reset (Story #1701)
-
-**Date:** 2026-05-14
-**Commit:** `0657272` (Story #1701, Epic #1653)
-**Files refreshed:** `baselines/coverage.json`,
-`baselines/maintainability.json`, `baselines/crap.json`.
-
-A one-time baseline reset captured fresh coverage, maintainability, and
-CRAP snapshots on the post-remediation `main` HEAD. The ratchet
-continues from this new floor, not from any pre-floor-gate history.
-
-**Policy:** these baselines are **non-comparable** to any prior
-baseline. Do not diff per-file numbers against pre-reset entries to
-reason about regressions — the post-remediation tree contains refactors,
-extractions, and coverage gains that shift the absolute numbers in ways
-the per-file ratchet cannot reconcile across the discontinuity. Use the
-post-reset capture as the new floor; ratchet from there.
-
-**Why:** Epic #1184 closed the floor-gate rollout. The absolute-floor
-gate (coverage 90/85/90, MI ≥ 70, CRAP ≤ 20) is wired into
-`.husky/pre-push` and the CI coverage workflow (see
-[`§ Absolute quality floors`](#absolute-quality-floors-epic-1184)).
-With the floor enforced on every in-scope file, every per-file baseline
-entry must clear the absolute floor — this snapshot is the first
-capture that holds that invariant repository-wide.
-
-**Operator action:** none. The baseline is committed and
-`maintainability:check` / `coverage:check` / `crap:check` pass against
-it out of the box. The next regression you see will be diffed against
-this baseline, not against pre-reset history.
+`risk::high` is planning/audit metadata only — it never pauses runtime. The
+sole runtime HITL pause point is `agent::blocked`; `planning.riskHeuristics`
+is the rubric for what should escalate. The full model is owned by
+[`.agents/instructions.md`](../instructions.md) § 1.J and
+[`SDLC.md` § HITL model](SDLC.md#hitl-human-in-the-loop-model).
 
 ---
 

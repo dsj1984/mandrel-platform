@@ -34,6 +34,8 @@ import {
   extractChangePaths,
   parse as parseStoryBody,
 } from '../story-body/story-body.js';
+import { expandIdList } from '../util/parse-id-list.js';
+import { resolveStoryDispatchMode } from './complexity-gate.js';
 
 /** Labels/state that mean a blocker no longer gates its dependents. */
 const DONE_LABEL = 'agent::done';
@@ -299,6 +301,9 @@ export async function readNativeBlockedBy({
  * @param {Map<number, number[]>} nativeEdges
  * @param {number[]} foreignDone Ids outside the set already satisfied.
  * @param {(msg: string) => void} [warn]
+ * @param {object} [injectedRules] Test seam forwarded to the shape
+ *   derivation — skips the `audit-rules.json` disk read. Production callers
+ *   omit it (the real manifest, memoized per process, is the default).
  * @returns {{ kind: string, stories: object[], dag: object[], done: number[] }}
  */
 export function buildStoriesEnvelope({
@@ -306,17 +311,44 @@ export function buildStoriesEnvelope({
   nativeEdges = new Map(),
   foreignDone = [],
   warn,
+  config,
+  injectedRules,
 }) {
   const sorted = [...stories].sort((a, b) => a.id - b.id);
   const inSetDone = sorted.filter(isSatisfiedBlocker).map((s) => s.id);
   return {
     kind: 'stories',
-    stories: sorted.map(({ id, title, url, labels, state }) => ({
+    // `dispatchMode` (Story #4722, #4736, #4829): the resolver reports the
+    // per-Story execution mode so `/deliver` reads one field — `inline` (run
+    // deliver-story in the router's own session: no story-worker /
+    // acceptance-critic sub-agent boots) or `subagent` (the conservative
+    // default). Model-side fan-out only; close gates are untouched.
+    //
+    // `storyCount` is the premise that decides it, and it is this call site's
+    // load-bearing argument: `inline` names the router's ONE session, so it is
+    // granted only to a run resolving exactly ONE Story, which has no
+    // concurrent sibling to share that session with. Passing the resolved set
+    // size here is therefore what makes the envelope self-consistent with the
+    // ready set `stories-wave-tick.js` computes from the same `dag`: a set of
+    // more than one can never come back with a Story claiming the session
+    // (Story #4829 — it previously could, whenever the body was lite-shaped).
+    // It is the resolved set size, NOT the undelivered remainder, so the mode
+    // a caller reads for a given `--ids` list never changes as siblings land
+    // mid-run. The `route::lite` label is a human-visible hint only, never the
+    // control signal.
+    stories: sorted.map(({ id, title, body, url, labels, state }) => ({
       id,
       title,
       url,
       labels,
       state,
+      dispatchMode: resolveStoryDispatchMode({
+        body,
+        labels,
+        config,
+        storyCount: sorted.length,
+        injectedRules,
+      }).mode,
     })),
     dag: storiesToDag(sorted, nativeEdges, warn),
     done: [...new Set([...inSetDone, ...foreignDone])].sort((a, b) => a - b),
@@ -324,29 +356,29 @@ export function buildStoriesEnvelope({
 }
 
 /**
- * Parse and validate the `--ids` list.
+ * Parse and validate the `--ids` list, expanding any `A-B` dash range.
+ *
+ * A contiguous span is how an operator names a plan run — `/deliver 4922 -
+ * 4926` — so the range is expanded here rather than transcribed by the host.
+ * `stories-wave-tick.js --stories` reads through this same function, which is
+ * what keeps the sequencing set identical to the resolved one.
  *
  * @param {string|undefined} raw
+ * @param {string} [flag] Flag name, for the error message.
  * @returns {number[]}
  */
-export function parseIds(raw) {
-  const ids = String(raw ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => {
-      const n = Number.parseInt(s, 10);
-      if (!Number.isInteger(n) || n <= 0 || String(n) !== s) {
-        throw new Error(
-          `[resolve-stories] --ids must be a comma-separated list of positive issue numbers (got "${s}").`,
-        );
-      }
-      return n;
-    });
+export function parseIds(raw, flag = '--ids') {
+  const { ids, error } = expandIdList(raw, {
+    flag,
+    prefix: '[resolve-stories] ',
+  });
+  if (error) {
+    throw new Error(error);
+  }
   if (ids.length === 0) {
     throw new Error(
-      '[resolve-stories] --ids is required: node resolve-stories.js --ids 101,102',
+      `[resolve-stories] ${flag} is required: node resolve-stories.js --ids 101,102 (or a range: --ids 101-104)`,
     );
   }
-  return [...new Set(ids)];
+  return ids;
 }

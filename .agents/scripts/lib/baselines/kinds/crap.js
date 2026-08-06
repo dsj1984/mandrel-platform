@@ -14,10 +14,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readBaselineAtRef } from '../../baseline-loader.js';
-import { deriveFixGuidance } from '../../crap-engine.js';
+import {
+  COORDINATE_ORIGINAL,
+  COORDINATE_TRANSPILED,
+  deriveFixGuidance,
+} from '../../crap-engine.js';
+import { isAnonymousMethodLabel } from '../../crap-method-identity.js';
 import { getCrapBaseline } from '../../crap-utils.js';
 import { loadBaseline } from '../../gates/baseline-store.js';
 import { Logger } from '../../Logger.js';
+import { resolveTsTranspilerVersion } from '../../transpile.js';
 import {
   kernelDriftAxis,
   missingBaselineAxis,
@@ -75,13 +81,110 @@ export function kernelVersion() {
   return '0.0.0';
 }
 
-export function projectRow(row) {
+/**
+ * Scoring-semantics stamp (Story #4775, fix part 5).
+ *
+ * `kernelVersion()` above tracks the `typhonjs-escomplex` package and
+ * `escomplexVersion` tracks the same dependency — so a change in how THIS
+ * repo joins escomplex methods to istanbul coverage moves neither. Rows
+ * scored by the pre-#4775 join (exact transpiled-line equality, methods
+ * dropped when unresolved) are not comparable to rows scored by the join
+ * that replaced it (original-source coordinates, containment matching,
+ * honest `requireCoverage: false`): the same method can carry a different
+ * `crap`, a different `startLine`, or exist in one baseline and not the
+ * other. Comparing across that boundary produces phantom regressions and,
+ * worse, phantom passes.
+ *
+ * The stamp makes the boundary explicit and fails closed. Bump it whenever
+ * the coverage join, the line coordinate system, the unresolved-method policy,
+ * or the **method identity rule** changes.
+ *
+ * Story #4969 bumped it to `method-identity-v3` for the last of those. An
+ * anonymous method used to be keyed by escomplex's `<anon method-N>` ordinal
+ * and is now keyed by its enclosing-scope path; 34.6% of rows changed identity
+ * in one step. Rows keyed the old way and rows keyed the new way describe the
+ * same functions under different names, so pairing them is exactly the
+ * mis-keyed join this stamp exists to refuse — hence the bump, which is what
+ * makes the migration report nothing rather than a wall of phantom verdicts.
+ *
+ * Deliberately module-local: `envelopeExtras()` is the single production door
+ * to this value, so exporting the bare constant would add a second entry
+ * point that nothing in production reaches. Callers and tests that need the
+ * string read it off `envelopeExtras().scoringSemantics`.
+ */
+const SCORING_SEMANTICS = 'method-identity-v3';
+
+/**
+ * Envelope-level stamps this kind contributes beyond the shared envelope
+ * keys. Consumed by `writer.write` via the kind-module protocol.
+ *
+ * `tsTranspilerVersion` joined the stamp set in Story #4866. A TS row's
+ * `startLine` is only an original-source coordinate because a sourcemap said
+ * so, and that map is the transpiler's output — so a transpiler change can
+ * move every TS row's coordinate, which is half the row identity key. Without
+ * the stamp on disk the `ts-transpiler-drift` axis had nothing to compare and
+ * passed vacuously.
+ *
+ * `provenanceStamped` joined in Story #4901 as a **positive** marker: the
+ * writer asserting it recorded per-row provenance at all. Absence is the only
+ * evidence a pre-#4866 baseline leaves, and no other stamp detects it —
+ * `kernelVersion` / `escomplexVersion` track the escomplex package (unmoved
+ * by the fix), `scoringSemantics` did not change, and `tsTranspilerVersion`
+ * is unreliable in the negative (the `'0.0.0'` sentinel). See the
+ * `provenance-unstamped` axis.
+ *
+ * @returns {{scoringSemantics: string, tsTranspilerVersion: string,
+ *   provenanceStamped: boolean}}
+ */
+export function envelopeExtras() {
   return {
+    scoringSemantics: SCORING_SEMANTICS,
+    tsTranspilerVersion: resolveTsTranspilerVersion(),
+    provenanceStamped: true,
+  };
+}
+
+/**
+ * Project a scan row onto the persisted baseline row shape.
+ *
+ * `coordinateSystem` is written **only** when it is not the default
+ * `original` (Story #4866). A pure-JavaScript scan therefore emits the exact
+ * four-key row it always did — byte-identical baselines, no refresh — while a
+ * row that kept transpiled coordinates is distinguishable on disk from one
+ * whose sourcemap lookup resolved.
+ */
+export function projectRow(row) {
+  const projected = {
     path: canonicalise(row.path ?? row.file),
     method: row.method,
     startLine: row.startLine,
     crap: row.crap,
   };
+  if (row.coordinateSystem === COORDINATE_TRANSPILED) {
+    projected.coordinateSystem = COORDINATE_TRANSPILED;
+  }
+  // Story #4969, same write-only-when-non-default idiom: `anonymous` marks a
+  // `method` that is a derived scope-path identity rather than a name the
+  // source carries. A named row stays the exact four-key row it always was.
+  if (row.anonymous === true) {
+    projected.anonymous = true;
+  }
+  return projected;
+}
+
+/**
+ * Read a row's coordinate provenance, defaulting to `original`.
+ *
+ * A baseline written before Story #4866 carries no stamp at all, and every
+ * such row IS an original-source coordinate — un-remapped rows could not
+ * reach a `requireCoverage: true` baseline, and the pure-JavaScript case was
+ * never affected. Defaulting is therefore back-compatible, not a guess.
+ *
+ * @param {{coordinateSystem?: string}|null|undefined} row
+ * @returns {string}
+ */
+function coordinateSystemOf(row) {
+  return row?.coordinateSystem ?? COORDINATE_ORIGINAL;
 }
 
 export function sortRows(rows) {
@@ -141,6 +244,19 @@ export const compare = makeCompare({
 function crapRowKey(row) {
   return `${row.path}::${row.method}@${row.startLine}`;
 }
+
+// `methodIdentityKey` / `indexBaselineRowsByFile` (Story #4981) live in
+// crap-baseline-index.js, not here — `crap-utils.js#scanAndScore` needs them
+// to build the incremental join's per-file baseline lookup, and crap-utils.js
+// already imports `getCrapBaseline` FROM this module. Defining them here and
+// importing them into crap-utils.js would close that edge into a cycle
+// (kinds/crap.js → crap-utils.js → kinds/crap.js). Re-exported here so
+// existing importers of this module keep a single door to the identity key
+// `crapRowKey` composes with the file path.
+export {
+  indexBaselineRowsByFile,
+  methodIdentityKey,
+} from '../../crap-baseline-index.js';
 
 /**
  * Pure stabilizer for s-stability-epsilon (Story #1964). CRAP rows match
@@ -238,18 +354,47 @@ export function checkCrapRegression(row, baseline, tolerance, kind) {
 
 /**
  * Pure comparator. Given scanned `currentRows` and committed
- * `baselineRows`, produce a structured verdict covering all four match
+ * `baselineRows`, produce a structured verdict covering all five match
  * paths:
  *
- *   1. **exact**     — same (file, method, startLine). Regresses if
- *                      current crap > baseline crap + tolerance.
- *   2. **drifted**   — same (file, method) but startLine shifted. Uses
- *                      the closest line-drifted baseline row under the
- *                      same no-regression rule. A drift without
- *                      regression is reported informationally.
- *   3. **new**       — no baseline match. Violates if crap > ceiling.
- *   4. **removed**   — baseline rows not seen in the current scan.
- *                      Surfaced only; never a failure.
+ *   1. **exact**        — same (file, method, startLine). Regresses if
+ *                         current crap > baseline crap + tolerance.
+ *   2. **drifted**      — same (file, method) but startLine shifted. Uses
+ *                         the closest line-drifted baseline row under the
+ *                         same no-regression rule. A drift without
+ *                         regression is reported informationally.
+ *   3. **incomparable** — same (file, method), but the two rows express
+ *                         their startLine in DIFFERENT coordinate systems
+ *                         (Story #4866). Reported, never scored.
+ *   4. **new**          — no baseline match. Violates if crap > ceiling.
+ *   5. **removed**      — baseline rows not seen in the current scan.
+ *                         Surfaced only; never a failure.
+ *
+ * **Why the incomparable bucket exists.** The drift heuristic assumes both
+ * rows measure the same axis and the method simply moved along it. When one
+ * row's line is an original-source coordinate and the other's is a transpiled
+ * one, the "distance" it minimises over is the gap between two coordinate
+ * systems, not a code movement — so it pairs rows arbitrarily and then scores
+ * the pairing. That is precisely how a scan that changed nothing reports a
+ * regression no edit can satisfy. Refusing is the only sound answer: a row
+ * whose provenance differs from every candidate's is counted and surfaced,
+ * and it does NOT fall through to the new-method arm (it is not new; it is
+ * unmeasurable against this baseline).
+ *
+ * **`provenanceMismatched` is captured BEFORE the provenance filter runs**
+ * (Story #4871). `incomparable` only counts rows where *every* candidate
+ * disagreed on coordinates; a row with one agreeing candidate and three
+ * disagreeing ones scores normally and leaves no trace. That made the
+ * evidence of coordinate mixing strictly narrower than the mixing itself —
+ * and the unsound-basis backstop, which needs exactly that evidence, had
+ * nothing sound to read. The counter below is incremented for **any** row
+ * with at least one provenance-mismatched candidate, whichever arm then
+ * resolves it.
+ *
+ * **Unscorable rows never reach an arm.** A row the scan could not score
+ * (`crap: null` / `coverage: null`, or an explicit `unscorable: true`) carries
+ * no measurement to compare. It is bucketed and counted, and it is excluded
+ * from `comparable` so it cannot dilute any ratio derived from this result.
  */
 export function compareCrap({
   currentRows,
@@ -268,15 +413,29 @@ export function compareCrap({
   const seenBaselineKeys = new Set();
 
   const violations = [];
+  const incomparableRows = [];
+  const unscorableRows = [];
   let regressions = 0;
   let newViolations = 0;
   let drifted = 0;
+  let provenanceMismatched = 0;
 
   for (const row of currentRows ?? []) {
+    if (isUnscorableRow(row)) {
+      unscorableRows.push({ ...row, kind: 'unscorable' });
+      continue;
+    }
     const exactKey = `${row.file}::${row.method}@${row.startLine}`;
     const methodKey = `${row.file}::${row.method}`;
+    const rowCoords = coordinateSystemOf(row);
+    const candidates = methodIndex.get(methodKey) ?? [];
+    // Evidence first, filtering second — see the block comment above.
+    if (candidates.some((c) => coordinateSystemOf(c) !== rowCoords)) {
+      provenanceMismatched += 1;
+    }
+
     const exact = exactIndex.get(exactKey);
-    if (exact) {
+    if (exact && coordinateSystemOf(exact) === rowCoords) {
       seenBaselineKeys.add(exactKey);
       const v = checkCrapRegression(row, exact, tolerance, 'regression');
       if (v) {
@@ -286,22 +445,26 @@ export function compareCrap({
       continue;
     }
 
-    const candidates = methodIndex.get(methodKey);
-    if (Array.isArray(candidates) && candidates.length > 0) {
-      // Pick the closest un-seen candidate by startLine distance; fall back
-      // to the first one if all have been seen (duplicate method names).
-      let pick = null;
-      let bestDist = Number.POSITIVE_INFINITY;
-      for (const c of candidates) {
-        const k = `${c.file}::${c.method}@${c.startLine}`;
-        if (seenBaselineKeys.has(k)) continue;
-        const d = Math.abs(c.startLine - row.startLine);
-        if (d < bestDist) {
-          bestDist = d;
-          pick = c;
+    if (candidates.length > 0) {
+      // Only rows expressed in the SAME coordinate system are comparable;
+      // everything else would be resolved through a line-distance heuristic
+      // that cannot mean anything across two coordinate systems.
+      const comparable = candidates.filter(
+        (c) => coordinateSystemOf(c) === rowCoords,
+      );
+      if (comparable.length === 0) {
+        incomparableRows.push({
+          ...row,
+          kind: 'incomparable',
+          coordinateSystem: rowCoords,
+          baselineCoordinateSystem: coordinateSystemOf(candidates[0]),
+        });
+        for (const c of candidates) {
+          seenBaselineKeys.add(`${c.file}::${c.method}@${c.startLine}`);
         }
+        continue;
       }
-      if (!pick) pick = candidates[0];
+      const pick = pickDriftCandidate(comparable, row, seenBaselineKeys);
       seenBaselineKeys.add(`${pick.file}::${pick.method}@${pick.startLine}`);
       drifted += 1;
       const v = checkCrapRegression(row, pick, tolerance, 'drifted-regression');
@@ -329,14 +492,167 @@ export function compareCrap({
     if (!seenBaselineKeys.has(k)) removedRows.push(b);
   }
 
+  const total = currentRows?.length ?? 0;
   return {
-    total: currentRows?.length ?? 0,
+    total,
+    // Rows that carried a measurement and therefore *could* be compared. The
+    // denominator of every ratio derived from this result.
+    comparable: total - unscorableRows.length,
     regressions,
     newViolations,
     drifted,
+    provenanceMismatched,
+    incomparable: incomparableRows.length,
+    unscorable: unscorableRows.length,
     removed: removedRows.length,
     violations,
+    incomparableRows,
+    unscorableRows,
     removedRows,
+  };
+}
+
+/**
+ * True when a scanned row carries no measurement to compare.
+ *
+ * Deliberately strict on `null`: a scan row always sets `crap`, and the
+ * scorer's own contract is that an unresolved method yields `crap: null` /
+ * `coverage: null` rather than an inferred zero. A caller-built row that
+ * simply omits `coverage` is not making that claim and stays scorable.
+ *
+ * @param {{crap?: number|null, coverage?: number|null, unscorable?: boolean}} row
+ * @returns {boolean}
+ */
+function isUnscorableRow(row) {
+  return (
+    row?.unscorable === true || row?.crap === null || row?.coverage === null
+  );
+}
+
+/**
+ * Pick the baseline row a drifted method should be scored against: the
+ * closest un-seen candidate by `startLine` distance, falling back to the
+ * first when every candidate has already been claimed (duplicate method
+ * names in one file).
+ *
+ * @param {Array<{file: string, method: string, startLine: number}>} comparable
+ * @param {{startLine: number}} row
+ * @param {Set<string>} seenBaselineKeys
+ * @returns {object}
+ */
+function pickDriftCandidate(comparable, row, seenBaselineKeys) {
+  let pick = null;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const c of comparable) {
+    const k = `${c.file}::${c.method}@${c.startLine}`;
+    if (seenBaselineKeys.has(k)) continue;
+    const d = Math.abs(c.startLine - row.startLine);
+    if (d < bestDist) {
+      bestDist = d;
+      pick = c;
+    }
+  }
+  return pick ?? comparable[0];
+}
+
+/**
+ * Fraction of a compare's comparable rows that hit a coordinate-provenance
+ * mismatch before the comparison basis is judged self-evidently unsound
+ * (Story #4866, numerator corrected in Story #4871).
+ *
+ * **What this ratio must measure.** The backstop exists for one condition: the
+ * scan and the baseline expressing `startLine` in different coordinate
+ * systems, which makes the nearest-line drift heuristic pair rows arbitrarily
+ * and then score the pairing. The only quantity that evidences that condition
+ * is a provenance disagreement between a row and its baseline candidates.
+ *
+ * **Why `drifted` was the wrong numerator.** A row reaches the drift arm only
+ * *after* passing the provenance filter, so every drifted row is one whose
+ * coordinate system **agreed** with its baseline's. Counting agreements as
+ * evidence of disagreement is not a mis-calibration, it is the wrong
+ * measurement: on this pure-JavaScript repository — where a coordinate mix is
+ * structurally impossible — it read 56–68% across every diff scope, which
+ * suppressed the gate's per-method verdicts on every commit while the gate
+ * still reported success. `startLine` is half the row identity key, so any
+ * insertion re-keys every method below it; ordinary drift is the normal
+ * operating state, not an anomaly.
+ *
+ * Deliberately module-local, like `SCORING_SEMANTICS` above: the three
+ * tuning values below are reachable through `assessComparisonBasis` — which
+ * takes them as overridable options — so exporting the bare constants would
+ * add entry points nothing in production reaches.
+ */
+const UNSOUND_BASIS_MISMATCH_RATIO = 0.5;
+
+/**
+ * Minimum comparable rows before the unsound-basis check is allowed to fire.
+ * A diff-scoped preview can legitimately score three methods, two of which
+ * moved; that is a normal edit, not a broken basis. Mirrors the
+ * minimum-sample discipline the coverage-join resolution floor already uses.
+ */
+const UNSOUND_BASIS_MIN_SAMPLE = 20;
+
+/** Diagnostic name for an unsound comparison basis. */
+const UNSOUND_BASIS_DIAGNOSTIC = 'crap-unsound-comparison-basis';
+
+/** Diagnostic name for a baseline the running scorer refuses to compare. */
+export const INCOMPATIBLE_BASELINE_DIAGNOSTIC = 'crap-baseline-incompatible';
+
+/**
+ * Pure verdict on whether a `compareCrap` result rests on a sound basis.
+ *
+ * The numerator is `provenanceMismatched` — rows whose baseline candidates
+ * included at least one expressed in a different coordinate system, counted
+ * by `compareCrap` **before** its provenance filter discards that evidence.
+ * The denominator is `comparable`: rows that carried a measurement at all, so
+ * a method the scan could not score cannot dilute the ratio into silence.
+ *
+ * Above the ratio the per-method verdicts are noise derived from a mis-keyed
+ * join, and reporting them as regressions asks the operator to fix code that
+ * is not broken. Below it — including a scan where every row drifted, which
+ * is what an ordinary insertion produces — the verdicts stand.
+ *
+ * Returns `{ sound: true }` or `{ sound: false, diagnostic: {name, message} }`.
+ *
+ * @param {{total?: number, comparable?: number, provenanceMismatched?: number,
+ *   incomparable?: number}} compareResult
+ * @param {{ratio?: number, minSample?: number}} [opts]
+ */
+export function assessComparisonBasis(compareResult, opts = {}) {
+  const ratio = Number.isFinite(opts.ratio)
+    ? opts.ratio
+    : UNSOUND_BASIS_MISMATCH_RATIO;
+  const minSample = Number.isFinite(opts.minSample)
+    ? opts.minSample
+    : UNSOUND_BASIS_MIN_SAMPLE;
+  const comparable = compareResult?.comparable ?? compareResult?.total ?? 0;
+  if (comparable < minSample) return { sound: true };
+  // `incomparable` is the total-mismatch subset of `provenanceMismatched`, so
+  // it is already counted; the max guards a caller that supplies only one.
+  const mismatched = Math.max(
+    compareResult?.provenanceMismatched ?? 0,
+    compareResult?.incomparable ?? 0,
+  );
+  const observed = mismatched / comparable;
+  if (observed <= ratio) return { sound: true };
+  return {
+    sound: false,
+    diagnostic: {
+      name: UNSOUND_BASIS_DIAGNOSTIC,
+      message:
+        `[CRAP] ⚠ Comparison basis is unsound: ${mismatched}/${comparable} ` +
+        `(${(observed * 100).toFixed(1)}%) of comparable methods matched a ` +
+        'baseline row expressed in a DIFFERENT line coordinate system — ' +
+        `above the ${(ratio * 100).toFixed(0)}% threshold.\n` +
+        '       At this ratio the baseline and the scan are not describing ' +
+        'the same line coordinates, so every per-method verdict below would ' +
+        'be derived from a mis-keyed join rather than from your change. ' +
+        'They are suppressed.\n' +
+        "       Re-seed the baseline: run 'npm run test:coverage' then " +
+        "'npm run crap:update -- --full-scope' and commit the result with a " +
+        "'baseline-refresh:' subject. The authoritative check-baselines gate " +
+        'still gates the merge.',
+    },
   };
 }
 
@@ -358,6 +674,17 @@ export function compareCrap({
  * and `tsTranspilerVersion` drift to **warn**, not fail; `escomplexVersion`
  * mismatch continues to fail closed.
  */
+/**
+ * The one re-seed recipe every coordinate-invalidating axis ends on. Three
+ * axes and the unsound-basis diagnostic previously carried their own copy of
+ * this sentence; a single constant keeps them from drifting apart on the
+ * command an operator is told to run.
+ */
+const RESEED_REMEDY =
+  "Re-derive the baseline: run 'npm run test:coverage' then " +
+  "'npm run crap:update -- --full-scope' and commit the result with a " +
+  "'baseline-refresh:' subject.";
+
 export const CRAP_COMPAT_AXES = [
   // Universal axes hoisted into envelope.js (Story #2467, Task #2492). The
   // missing-baseline and kernel-drift checks live in exactly one place;
@@ -373,19 +700,133 @@ export const CRAP_COMPAT_AXES = [
   },
   kernelDriftAxis('CRAP'),
   {
-    name: 'ts-transpiler-drift',
-    severity: 'warn',
-    check: ({ baseline, runningTsTranspilerVersion }) => {
-      if (!baseline || !runningTsTranspilerVersion) return null;
-      const baselineTs = baseline.tsTranspilerVersion ?? '0.0.0';
-      if (baselineTs === runningTsTranspilerVersion) return null;
+    name: 'scoring-semantics-drift',
+    severity: 'fatal',
+    check: ({ baseline }) => {
+      if (!baseline) return null;
+      const stamped = baseline.scoringSemantics ?? null;
+      if (stamped === SCORING_SEMANTICS) return null;
       return (
-        `[CRAP] ⚠ tsTranspilerVersion drift: baseline=${baselineTs} running=${runningTsTranspilerVersion}. ` +
-        "Run 'npm run crap:update' and commit with a 'baseline-refresh:' subject to refresh."
+        `[CRAP] scoring semantics changed: baseline=${stamped ?? '<unstamped>'} ` +
+        `running=${SCORING_SEMANTICS}. Rows scored by the previous per-method ` +
+        'coverage join are not comparable to rows scored by the current one, ' +
+        `so this baseline cannot be compared. ${RESEED_REMEDY}`
+      );
+    },
+  },
+  {
+    name: 'ts-transpiler-drift',
+    severity: 'fatal',
+    check: ({ baseline, runningTsTranspilerVersion }) => {
+      if (!baseline) return null;
+      if (!isKnownVersion(runningTsTranspilerVersion)) return null;
+      const baselineTs = baseline.tsTranspilerVersion;
+      // An unstamped (or sentinel) baseline has nothing to compare — the
+      // stamp landed in Story #4866 and comparing against its absence would
+      // fail every pre-existing baseline closed for no evidence at all.
+      if (!isKnownVersion(baselineTs)) return null;
+      if (baselineTs === runningTsTranspilerVersion) return null;
+      // Scoped to baselines that actually contain transpiled sources: a
+      // transpiler change moves TS row coordinates and nothing else. A
+      // pure-JavaScript tree has no coordinate to move, so a TS bump there is
+      // not a coordinate-invalidating event and must not fail its gate.
+      if (!hasTranspiledRows(baseline)) return null;
+      return (
+        `[CRAP] tsTranspilerVersion changed: baseline=${baselineTs} running=${runningTsTranspilerVersion}. ` +
+        "A TS row's startLine is an original-source coordinate only because the transpiler's " +
+        'sourcemap said so, and that coordinate is half the row identity key — so rows scored ' +
+        `under the previous transpiler are not comparable to rows scored under this one. ${RESEED_REMEDY}`
+      );
+    },
+  },
+  {
+    // Story #4901. Closes the exemption directly above: `ts-transpiler-drift`
+    // returns null for an unstamped baseline rather than fail every
+    // pre-existing one for want of evidence — and a pre-#4866 baseline is
+    // exactly that shape, so the one door that could catch it lets it through
+    // while it asserts by omission that all its rows are original coordinates.
+    // Keyed on a positive marker because absence alone cannot separate
+    // "written before provenance existed" from "typescript was unresolvable".
+    // Scoped like `ts-transpiler-drift`: a pure-JavaScript baseline's two
+    // coordinate systems coincide, so it was never affected and must not fail.
+    name: 'provenance-unstamped',
+    severity: 'fatal',
+    check: ({ baseline }) =>
+      baseline &&
+      baseline.provenanceStamped !== true &&
+      hasTranspiledRows(baseline)
+        ? '[CRAP] baseline predates coordinate-provenance stamping: it carries ' +
+          'transpiled-source rows but no `provenanceStamped` marker, so it ' +
+          'asserts by omission that every row is an original-source coordinate. ' +
+          '`startLine` is half the row identity key, so the comparator would ' +
+          'key those rows against a coordinate space they are not in and ' +
+          `report regressions no edit can satisfy. ${RESEED_REMEDY}`
+        : null,
+  },
+  {
+    // Story #4969. The `scoring-semantics-drift` axis above rejects a baseline
+    // stamped with the OLD semantics wholesale, which covers a clean migration.
+    // It cannot see a HALF-migrated one: a diff-scoped refresh preserves
+    // out-of-scope rows verbatim, so a baseline can carry ordinal-keyed rows
+    // for the files that were never re-scored while the writer stamps the
+    // envelope with the current semantics — the stamp says v3, some rows are
+    // still v2, and the one axis that would catch it has already passed.
+    //
+    // Such a row cannot be paired with anything: its `<anon method-N>` label
+    // matches no scope-path identity, so the comparator files the live method
+    // as NEW (scored against the ceiling, not its own baseline) and the stale
+    // row as removed. Keyed on the positive `anonymous` marker for the same
+    // reason `provenance-unstamped` is: absence is the only trace the old
+    // writer leaves.
+    name: 'anon-identity-unstamped',
+    severity: 'fatal',
+    check: ({ baseline }) => {
+      if (!baseline) return null;
+      const stale = (baseline.rows ?? []).filter(
+        (row) => isAnonymousMethodLabel(row?.method) && row?.anonymous !== true,
+      );
+      if (stale.length === 0) return null;
+      return (
+        `[CRAP] baseline carries ${stale.length} anonymous row(s) keyed by the ` +
+        'superseded `<anon method-N>` ordinal (e.g. ' +
+        `${stale[0].path ?? stale[0].file}::${stale[0].method}) while the ` +
+        'envelope claims the current scoring semantics. Those ordinals ' +
+        'renumber whenever any anonymous function is added or removed, so the ' +
+        'comparator would score the live methods against the new-method ' +
+        `ceiling instead of their own baseline. ${RESEED_REMEDY}`
       );
     },
   },
 ];
+
+/** Sources whose escomplex coordinates are transpiled, not original. */
+const TRANSPILED_SOURCE_RE = /\.(?:ts|tsx|mts|cts)$/i;
+
+/**
+ * `'0.0.0'` is this codebase's established "unknown environment" sentinel for
+ * a resolved dependency version, not a real release. Treating it as a
+ * comparable value would turn "we could not resolve typescript" into
+ * "typescript changed".
+ *
+ * @param {unknown} version
+ * @returns {boolean}
+ */
+function isKnownVersion(version) {
+  return typeof version === 'string' && version !== '' && version !== '0.0.0';
+}
+
+/**
+ * True when a baseline contains at least one row derived from a transpiled
+ * source — the only rows a transpiler-version change can move.
+ *
+ * @param {{rows?: Array<{path?: string, file?: string}>}|null} baseline
+ * @returns {boolean}
+ */
+function hasTranspiledRows(baseline) {
+  return (baseline?.rows ?? []).some((row) =>
+    TRANSPILED_SOURCE_RE.test(String(row?.path ?? row?.file ?? '')),
+  );
+}
 
 /**
  * Pure decision helper for the missing-baseline / kernel-mismatch /
@@ -399,6 +840,56 @@ export const CRAP_COMPAT_AXES = [
  */
 export function evaluateBaselineCompatibility(ctx) {
   return reduceCompatAxes(CRAP_COMPAT_AXES, ctx);
+}
+
+/**
+ * The compat axes a *loaded* envelope can be judged against on its own,
+ * without a second baseline to diff. Each invalidates one half of the row
+ * identity key. Three are about the `startLine` half: one names the join that
+ * produced the rows, one names the transpiler whose sourcemap decided what a
+ * TS row's `startLine` even means, and one (Story #4901) catches a baseline
+ * predating both questions. The fourth (Story #4969) is about the `method`
+ * half — a baseline still carrying ordinal-keyed anonymous rows.
+ *
+ * `escomplex-mismatch` and `kernel-drift` stay out — the v2 envelope carries
+ * no `escomplexVersion`, so that axis would compare `undefined` to `undefined`
+ * and pass vacuously, which is worse than not running it.
+ */
+const LOADED_ENVELOPE_AXES = [
+  'scoring-semantics-drift',
+  'ts-transpiler-drift',
+  'provenance-unstamped',
+  'anon-identity-unstamped',
+];
+
+/**
+ * Kind-module hook (Story #4775, extended by Story #4866): judge a *loaded*
+ * v2 envelope against the axes that need no peer baseline. The unified
+ * `check-baselines` gate calls it straight after `reader.load` and turns a
+ * message into a fail-closed schema-class error, so a baseline written by
+ * incompatible scoring semantics — or by a different transpiler, which moves
+ * the coordinates that are half the row identity key — can never be silently
+ * compared against current scores.
+ *
+ * This is the *production* door for `ts-transpiler-drift`. Before #4866 the
+ * axis was reachable only from its own unit test: nothing in production called
+ * `evaluateBaselineCompatibility`, and this function deliberately excluded it.
+ *
+ * @param {object|null} baseline A loaded v2 baseline envelope.
+ * @param {{runningTsTranspilerVersion?: string}} [ctx] Injectable running
+ *   versions; resolved from the environment when omitted.
+ * @returns {string|null} Operator-facing message, or null when compatible.
+ */
+export function assertBaselineCompatible(baseline, ctx = {}) {
+  if (!baseline) return null;
+  const runningTsTranspilerVersion =
+    ctx.runningTsTranspilerVersion ?? resolveTsTranspilerVersion();
+  for (const name of LOADED_ENVELOPE_AXES) {
+    const axis = CRAP_COMPAT_AXES.find((a) => a.name === name);
+    const message = axis?.check({ baseline, runningTsTranspilerVersion });
+    if (message) return message;
+  }
+  return null;
 }
 
 /**
@@ -495,12 +986,50 @@ export function buildCrapReport({
       regressions: compareResult.regressions,
       newViolations: compareResult.newViolations,
       drifted: compareResult.drifted,
+      // Story #4866: rows the compare refused to resolve because their
+      // coordinate provenance differs from the baseline's.
+      incomparable: compareResult.incomparable ?? 0,
+      // Story #4871: rows whose baseline candidates included at least one in a
+      // different coordinate system — the evidence the unsound-basis backstop
+      // reads, captured before the provenance filter discards it.
+      provenanceMismatched: compareResult.provenanceMismatched ?? 0,
+      // Story #4871: methods carrying no measurement to compare — the scan
+      // found no coverage artifact for them. Reported, never scored from an
+      // assumed zero, and never part of a ratio's denominator.
+      unscorable: (compareResult.unscorable ?? 0) + skippedNoCoverage,
       removed: compareResult.removed,
       skippedNoCoverage,
       scope,
       diffRef,
     },
     violations,
+  };
+}
+
+/**
+ * Rebuild a CRAP envelope with its per-method verdicts suppressed and one
+ * named diagnostic in their place (Story #4866).
+ *
+ * Used by the preview gate on the two conditions under which a per-method
+ * verdict cannot mean anything: a baseline the running scorer refuses to
+ * compare, and a comparison basis whose drifted-row ratio proves the two
+ * sides disagree on coordinates. The counts stay so the operator can see the
+ * evidence; only the accusations go.
+ *
+ * @param {object} envelope
+ * @param {{name: string, message: string}} diagnostic
+ * @returns {object}
+ */
+export function suppressVerdicts(envelope, diagnostic) {
+  return {
+    ...envelope,
+    summary: {
+      ...envelope.summary,
+      regressions: 0,
+      newViolations: 0,
+    },
+    violations: [],
+    diagnostics: [diagnostic],
   };
 }
 
@@ -515,6 +1044,8 @@ export function printSummaryHeader(result, scanSummary) {
   Logger.info(`Regressions:           ${result.regressions}`);
   Logger.info(`New-method violations: ${result.newViolations}`);
   Logger.info(`Drifted (matched):     ${result.drifted}`);
+  Logger.info(`Provenance mismatched: ${result.provenanceMismatched ?? 0}`);
+  Logger.info(`Unscorable (no cov):   ${result.unscorable ?? 0}`);
   Logger.info(`Removed from baseline: ${result.removed}`);
   if (scanSummary?.skippedFilesNoCoverage) {
     Logger.info(

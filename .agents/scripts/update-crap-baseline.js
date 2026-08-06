@@ -5,6 +5,7 @@ import './lib/runtime-deps/ensure-installed.js';
 import path from 'node:path';
 import { parseDiffScopeFlag } from './lib/baselines/diff-scope-cli.js';
 import { refreshBaseline } from './lib/baselines/refresh-service.js';
+import { runAsCli } from './lib/cli-utils.js';
 import { getBaselineEpsilon } from './lib/config/quality.js';
 import {
   getBaselines,
@@ -13,6 +14,7 @@ import {
 } from './lib/config-resolver.js';
 import { loadCoverage } from './lib/coverage-utils.js';
 import {
+  checkResolutionFloor,
   resolveEscomplexVersion,
   resolveTsTranspilerVersion,
   scanAndScore,
@@ -43,6 +45,40 @@ import { Logger } from './lib/Logger.js';
  * "no baseline yet".
  */
 
+/**
+ * Usage block for `--help` (Story #4872). This CLI *writes* on invocation, so
+ * the help branch must short-circuit before `main` runs rather than inside it —
+ * `runAsCli` answers help first, which makes "a usage probe never mutates a
+ * baseline" structural instead of a check `main` has to remember.
+ */
+const USAGE = {
+  invocation:
+    'node .agents/scripts/update-crap-baseline.js [--baseline <path>] [--coverage <path>] [--full-scope | --diff-scope <ref>]',
+  summary:
+    'Scan → score → write the CRAP baseline. With no scope flag the refresh is scoped to the files changed in `origin/main..HEAD`; out-of-scope rows are preserved verbatim.',
+  flags: [
+    [
+      '--baseline <path>',
+      'Write to this path instead of `delivery.quality.baselines.crap.path`.',
+    ],
+    [
+      '--coverage <path>',
+      'Read coverage from this path (default `coverage/coverage-final.json`).',
+    ],
+    [
+      '--full-scope',
+      'Rescore every file in every target dir (no out-of-scope merge).',
+    ],
+    [
+      '--diff-scope <ref>',
+      'Scope the refresh to files changed between <ref> and HEAD. Incompatible with --full-scope.',
+    ],
+  ],
+  notes: [
+    'Run `npm run test:coverage` first — without a coverage artifact every file is skipped.',
+  ],
+};
+
 function parseCliArgs(argv = process.argv.slice(2)) {
   const out = {
     baselinePath: undefined,
@@ -71,6 +107,7 @@ async function main() {
   const crap = getQuality(config).crap;
   const targetDirs = Array.isArray(crap.targetDirs) ? crap.targetDirs : [];
   const requireCoverage = crap.requireCoverage !== false;
+  const minMethodResolutionRate = crap.minMethodResolutionRate ?? 0.75;
   const coveragePath =
     args.coveragePath ?? crap.coveragePath ?? 'coverage/coverage-final.json';
   const baselinePath = args.baselinePath ?? getBaselines(config).crap.path;
@@ -117,6 +154,7 @@ async function main() {
       scannedFiles,
       skippedFilesNoCoverage,
       skippedMethodsNoCoverage,
+      resolution,
     } = await scanAndScore({
       targetDirs,
       coverage,
@@ -137,6 +175,16 @@ async function main() {
         `[CRAP] Skipped ${skippedMethodsNoCoverage} method(s) whose per-method coverage was unresolved.`,
       );
     }
+    if (resolution) {
+      Logger.info(
+        `[CRAP] Method resolution: ${resolution.resolvedMethods}/${resolution.joinableMethods} ` +
+          `(${(resolution.rate * 100).toFixed(1)}%) in files with coverage.`,
+      );
+    }
+    // Fail closed BEFORE the service persists anything — a thin baseline is
+    // never written and then apologised for.
+    const refusal = checkResolutionFloor(resolution, minMethodResolutionRate);
+    if (refusal) throw new Error(refusal);
 
     return (rows ?? []).filter(
       (r) => typeof r?.crap === 'number' && Number.isFinite(r.crap),
@@ -170,8 +218,11 @@ async function main() {
   );
 }
 
-// cli-opt-out: top-level main().catch predates runAsCli; never imported elsewhere so the auto-run risk is moot.
-main().catch((err) => {
-  Logger.error(`[CRAP] ❌ Fatal error: ${err?.stack ?? err?.message ?? err}`);
-  process.exit(1);
+runAsCli(import.meta.url, main, {
+  source: 'crap-baseline',
+  usage: USAGE,
+  onError: (err) => {
+    Logger.error(`[CRAP] ❌ Fatal error: ${err?.stack ?? err?.message ?? err}`);
+    process.exitCode = 1;
+  },
 });
