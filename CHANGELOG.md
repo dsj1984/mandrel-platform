@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.3.0...mandrel-platform-v1.4.0) (2026-08-06)
+
+
+### Added
+
+* generalize the tracking-issue upsert into a parameterized single-issue failure tracker ([#389](https://github.com/dsj1984/mandrel-platform/issues/389)) ([#390](https://github.com/dsj1984/mandrel-platform/issues/390)) ([f9ed94b](https://github.com/dsj1984/mandrel-platform/commit/f9ed94bae8963ce9cef5e7e1d06f8df431b9ec5b))
+
 ## [1.3.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.2.0...mandrel-platform-v1.3.0) (2026-08-01)
 
 
