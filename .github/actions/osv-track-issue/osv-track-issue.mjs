@@ -1,135 +1,159 @@
 #!/usr/bin/env node
 /**
- * Tracking-issue upsert for the scheduled OSV advisory scan (Story #310).
+ * OSV advisory preset over the generic single-issue failure tracker
+ * (Story #310, generalized in Story #389).
  *
  * The scheduled advisory-scan.yml workflow runs the osv-scan composite in
  * non-blocking mode against the default branch, then hands the findings here.
- * This module keeps a SINGLE tracking issue in sync with the current blocking
- * finding set:
+ * Everything about the "one tracked issue, never a second one" state machine —
+ * the four-way verdict, the marker/digest contract, the gh adapter — now lives
+ * in the sibling `.github/actions/track-issue/track-issue.mjs`, because that
+ * behaviour is useful to any non-gating scheduled workflow and was reachable
+ * only through this OSV-shaped input contract.
  *
- *   • blocking findings present, no marked open issue  → CREATE one
- *   • blocking findings present, marked issue, same set → NOOP (no daily spam)
- *   • blocking findings present, marked issue, new set  → UPDATE its body
- *   • blocking set now empty, marked issue open         → CLOSE with a comment
- *   • blocking set empty, no marked issue               → NOOP
+ * What remains here is the ADAPTER: it converts the osv-scan findings envelope
+ * (`counts.blocking` / `digest` / `summary` / `failOn`) into the generic env
+ * contract and hands it to the next composite step through `$GITHUB_ENV`. It
+ * also re-exports the core's named symbols BOUND to the OSV marker and digest
+ * prefix, so the pre-existing verdict suite keeps importing the same names
+ * from this same path.
  *
- * The decision is a pure function of (existing issue, finding set), so the
- * idempotence contract is unit-tested without any network access
- * (scripts/osv-track-issue.test.mjs). `main()` only translates the verdict
- * into `gh` CLI calls.
+ * Marker continuity is load-bearing. `<!-- mandrel:osv-advisory-tracker -->`
+ * and `mandrel:osv-advisory-digest:` are what a LIVE advisory issue in a
+ * consumer repo is keyed on: changing either byte would leave that issue
+ * undiscoverable and open a second one.
  *
- * The issue is discovered by an HTML-comment MARKER in its body, and the
- * change-detection key is the findings DIGEST embedded as a second marker —
- * so a run over an unchanged advisory set rewrites nothing. Allow-list-
- * suppressed and below-gate findings never open or reopen an issue; they are
- * context in the body, not a reason to raise.
+ * Allow-list-suppressed and below-gate findings never open or reopen an issue;
+ * they are context in the body, not a reason to raise.
  */
 
 import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 
-export const TRACKER_MARKER = "<!-- mandrel:osv-advisory-tracker -->";
-const DIGEST_PREFIX = "mandrel:osv-advisory-digest:";
+import {
+  buildIssueBody as buildGenericIssueBody,
+  decideVerdict as decideGenericVerdict,
+  digestMarker as genericDigestMarker,
+  extractDigest as genericExtractDigest,
+  findTrackingIssue as findGenericTrackingIssue,
+  markerLine,
+  writeGithubEnv,
+} from "../track-issue/track-issue.mjs";
+
+/** Bare marker key handed to the generic action as its `marker` input. */
+export const TRACKER_MARKER_KEY = "mandrel:osv-advisory-tracker";
+
+/** The rendered discovery marker a live advisory issue carries. */
+export const TRACKER_MARKER = markerLine(TRACKER_MARKER_KEY);
+
+/**
+ * The live digest prefix. Passed to the generic action explicitly rather than
+ * derived: the live pair (`…-tracker` / `…-digest:`) is not derivable from
+ * either half, and deriving it would silently orphan every existing issue.
+ */
+export const DIGEST_PREFIX = "mandrel:osv-advisory-digest:";
 
 /** Embed the change-detection digest as a discoverable HTML comment. */
-export const digestMarker = (digest) => `<!-- ${DIGEST_PREFIX} ${digest} -->`;
+export const digestMarker = (digest) => genericDigestMarker(digest, DIGEST_PREFIX);
 
 /** Recover the digest a previously-filed issue body carries (null if none). */
-export function extractDigest(body) {
-  if (!body) return null;
-  const m = body.match(new RegExp(`<!--\\s*${DIGEST_PREFIX}\\s*(\\S+)\\s*-->`));
-  return m ? m[1] : null;
-}
+export const extractDigest = (body) => genericExtractDigest(body, DIGEST_PREFIX);
 
 /**
- * Pure upsert decision.
+ * Pure upsert decision, in OSV vocabulary.
  *
- * @param {object|null} existing  The open marked issue ({ number, body }) or null.
- * @param {object} findings       { blockingCount, digest }.
- * @returns {{ action: 'create'|'update'|'noop'|'close', reason: string }}
+ * @param {{number: number, body: string}|null} existing The open marked issue, or null.
+ * @param {{blockingCount: number, digest: string}} findings
+ * @returns {{action: 'create'|'update'|'noop'|'close', reason: string, changed: boolean}}
  */
 export function decideVerdict(existing, findings) {
-  const blocking = Number(findings?.blockingCount ?? 0);
-
-  if (blocking > 0) {
-    if (!existing) return { action: "create", reason: "blocking findings and no open tracking issue" };
-    const prevDigest = extractDigest(existing.body);
-    if (prevDigest === findings.digest) {
-      return { action: "noop", reason: "tracking issue already reflects this finding set" };
-    }
-    return { action: "update", reason: "finding set changed since the tracking issue was last written" };
-  }
-
-  // No blocking findings.
-  if (existing) return { action: "close", reason: "blocking finding set is now empty" };
-  return { action: "noop", reason: "no blocking findings and no tracking issue to close" };
+  return decideGenericVerdict(
+    existing,
+    { failedCount: Number(findings?.blockingCount ?? 0), digest: findings?.digest },
+    { digestPrefix: DIGEST_PREFIX, unchangedBehavior: "noop" },
+  );
 }
 
-/**
- * Compose the tracking-issue body: the two markers, then the rendered
- * advisory summary from the osv-scan findings JSON.
- */
-export function buildIssueBody({ digest, summary, repo, branch }) {
-  return [
-    TRACKER_MARKER,
-    digestMarker(digest),
-    "",
+/** The prose the advisory issue body carries under its markers. */
+export const buildIntro = (repo, branch) =>
+  [
     `Scheduled OSV advisory scan of \`${repo}\` (default branch \`${branch}\`) found advisories at or`,
     "above the configured gate. This issue is maintained automatically by the",
     "`advisory-scan.yml` reusable workflow — it is updated when the finding set changes",
     "and closed automatically when the set clears. Do not edit the markers above.",
-    "",
-    summary || "_(no summary provided)_",
   ].join("\n");
+
+/** The comment posted immediately before the advisory issue is closed. */
+export const buildCloseComment = (repo) =>
+  `✅ The scheduled OSV advisory scan of \`${repo}\` no longer reports any finding at or above the gate. Closing automatically.`;
+
+/**
+ * Compose the advisory tracking-issue body.
+ *
+ * @param {{digest: string, summary: string, repo: string, branch: string}} args
+ * @returns {string}
+ */
+export function buildIssueBody({ digest, summary, repo, branch }) {
+  return buildGenericIssueBody({
+    marker: TRACKER_MARKER_KEY,
+    digestPrefix: DIGEST_PREFIX,
+    digest,
+    intro: buildIntro(repo, branch),
+    detail: summary || "_(no summary provided)_",
+  });
+}
+
+/** Find the single open issue carrying the advisory tracker marker. */
+export function findTrackingIssue({ repo, labels }, runner) {
+  return findGenericTrackingIssue({ repo, labels, marker: TRACKER_MARKER_KEY }, runner);
 }
 
 // ---------------------------------------------------------------------------
-// gh CLI adapter — thin, so the verdict above stays pure and testable.
+// Adapter — osv-scan findings envelope → the generic env contract
 // ---------------------------------------------------------------------------
 
-function gh(args, { repo }) {
-  return execFileSync("gh", [...args, "--repo", repo], { encoding: "utf8" });
-}
+/**
+ * Translate the findings envelope plus this step's own inputs into the
+ * `TRACK_*` entries the generic tracker reads.
+ *
+ * The failing SET is a single count-derived label rather than a list of
+ * advisory ids: the envelope carries counts, not identities. That costs
+ * nothing, because `TRACK_DIGEST` is supplied explicitly from the scanner's own
+ * finding-identity digest — the item names never drive change detection here.
+ *
+ * @param {object} findings Parsed osv-scan findings envelope.
+ * @param {Record<string, string|undefined>} env
+ * @returns {Array<[string, string]>}
+ */
+export function buildEnvUpdates(findings, env) {
+  const repo = String(env.OSV_TRACK_REPO || "").trim();
+  const branch = String(env.OSV_TRACK_BRANCH || "main").trim();
+  const blockingCount = Number(findings?.counts?.blocking ?? findings?.blockingCount ?? 0);
+  const failOn = String(findings?.failOn || "the configured");
+  const failedItems =
+    blockingCount > 0
+      ? [`${blockingCount} advisory finding(s) at or above the '${failOn}' gate`]
+      : [];
 
-/** Find the single open issue carrying the tracker marker (null if none). */
-export function findTrackingIssue({ repo, labels }, runner = gh) {
-  const searchLabels = (labels || []).filter(Boolean);
-  const args = [
-    "issue",
-    "list",
-    "--state",
-    "open",
-    "--search",
-    `"${TRACKER_MARKER}" in:body`,
-    "--json",
-    "number,body",
-    "--limit",
-    "50",
+  return [
+    ["TRACK_MARKER", TRACKER_MARKER_KEY],
+    ["TRACK_DIGEST_PREFIX", DIGEST_PREFIX],
+    ["TRACK_FAILED_ITEMS", JSON.stringify(failedItems)],
+    ["TRACK_DIGEST", String(findings?.digest ?? "empty-0")],
+    ["TRACK_REPO", repo],
+    ["TRACK_BRANCH", branch],
+    ["TRACK_TITLE", String(env.OSV_TRACK_TITLE || "OSV advisory scan — default branch findings")],
+    ["TRACK_LABELS", String(env.OSV_TRACK_LABELS || "")],
+    ["TRACK_BODY_INTRO", buildIntro(repo, branch)],
+    ["TRACK_BODY_DETAIL", String(findings?.summary ?? "") || "_(no summary provided)_"],
+    ["TRACK_CLOSE_COMMENT", buildCloseComment(repo)],
+    ["TRACK_DRY_RUN", String(env.OSV_TRACK_DRY_RUN || "").trim() === "true" ? "true" : "false"],
   ];
-  for (const l of searchLabels) args.push("--label", l);
-  let out;
-  try {
-    out = runner(args, { repo });
-  } catch (e) {
-    throw new Error(`gh issue list failed: ${e.message}`);
-  }
-  const issues = JSON.parse(out || "[]");
-  // The `in:body` search is a hint, not an exact match — confirm the marker.
-  return issues.find((i) => (i.body || "").includes(TRACKER_MARKER)) || null;
 }
 
-export function main() {
-  const findingsPath = process.env.OSV_FINDINGS_PATH;
-  const repo = process.env.OSV_TRACK_REPO;
-  const branch = process.env.OSV_TRACK_BRANCH || "main";
-  const title = process.env.OSV_TRACK_TITLE || "OSV advisory scan — default branch findings";
-  const labels = (process.env.OSV_TRACK_LABELS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const dryRun = String(process.env.OSV_TRACK_DRY_RUN || "").trim() === "true";
+export function main(env = process.env) {
+  const findingsPath = env.OSV_FINDINGS_PATH;
 
-  if (!repo) {
+  if (!String(env.OSV_TRACK_REPO || "").trim()) {
     console.error("::error::OSV_TRACK_REPO is required (owner/repo of the tracking target).");
     return 1;
   }
@@ -142,53 +166,13 @@ export function main() {
     return 1;
   }
 
-  const blockingCount = Number(findings?.counts?.blocking ?? findings?.blockingCount ?? 0);
-  const digest = findings?.digest ?? "empty-0";
-  const summary = findings?.summary ?? "";
-
-  const existing = findTrackingIssue({ repo, labels });
-  const verdict = decideVerdict(existing, { blockingCount, digest });
-  console.log(`osv-track-issue: ${verdict.action} — ${verdict.reason}`);
-
-  if (dryRun) {
-    console.log(`(dry-run) would ${verdict.action}` + (existing ? ` issue #${existing.number}` : ""));
-    return 0;
+  try {
+    writeGithubEnv(buildEnvUpdates(findings, env), env.GITHUB_ENV);
+  } catch (e) {
+    console.error(`::error::Could not hand the advisory signal to the tracker step: ${e.message}`);
+    return 1;
   }
-
-  const body = buildIssueBody({ digest, summary, repo, branch });
-
-  switch (verdict.action) {
-    case "create": {
-      const args = ["issue", "create", "--title", title, "--body", body];
-      for (const l of labels) args.push("--label", l);
-      const out = gh(args, { repo });
-      console.log(`Opened tracking issue: ${out.trim()}`);
-      return 0;
-    }
-    case "update": {
-      gh(["issue", "edit", String(existing.number), "--body", body], { repo });
-      console.log(`Updated tracking issue #${existing.number} (finding set changed).`);
-      return 0;
-    }
-    case "close": {
-      gh(
-        [
-          "issue",
-          "comment",
-          String(existing.number),
-          "--body",
-          `✅ The scheduled OSV advisory scan of \`${repo}\` no longer reports any finding at or above the gate. Closing automatically.`,
-        ],
-        { repo },
-      );
-      gh(["issue", "close", String(existing.number), "--reason", "completed"], { repo });
-      console.log(`Closed tracking issue #${existing.number} — advisory set cleared.`);
-      return 0;
-    }
-    case "noop":
-    default:
-      return 0;
-  }
+  return 0;
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {

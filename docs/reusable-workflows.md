@@ -2610,6 +2610,168 @@ nothing:
 Allow-list-suppressed and below-gate findings are rendered in the issue body as
 context — they never open or reopen an issue.
 
+> **The state machine above is no longer OSV-specific.** Since Story #389 it
+> lives in the generic [`track-issue` action](#track-issue--generic-single-issue-failure-tracker)
+> and `osv-track-issue` is a thin preset over it. The advisory path's public
+> contract is unchanged — same inputs, same markers, same behaviour.
+
+---
+
+## `track-issue` — generic single-issue failure tracker
+
+A first-party **composite action**
+([`.github/actions/track-issue/action.yml`](../.github/actions/track-issue/action.yml))
+that keeps exactly **one** tracked issue in sync with a failing set. Any
+scheduled, non-gating workflow needs this: with no red required check to report
+through, the signal has to be an issue — and filing one per run turns a
+persistent failure into a wall of duplicates.
+
+It is the generalization of the advisory tracker described above, which had the
+right behaviour behind an OSV-shaped input contract. The state machine, the
+marker/digest scheme and the `gh` adapter now live here;
+[`osv-track-issue`](#tracking-issue-upsert-semantics) is a preset that converts
+an osv-scan findings envelope into this contract.
+
+### The four-way state table
+
+| Situation                                             | Action                                        |
+| ----------------------------------------------------- | --------------------------------------------- |
+| Failing set non-empty, no open tracked issue          | **Open** one issue.                           |
+| Failing set non-empty, open issue, **same** digest    | **Noop** — or **update** under `refresh`.     |
+| Failing set non-empty, open issue, **changed** digest | **Update** the issue body.                    |
+| Failing set now **empty**, open issue                 | **Comment + close** the issue (`completed`).  |
+| Failing set empty, no open issue                      | **Noop**.                                     |
+
+The decision is a pure function of `(existing issue, failing set)`, unit-tested
+without network access in
+[`scripts/track-issue.test.mjs`](../scripts/track-issue.test.mjs).
+
+### The marker / digest contract
+
+Two HTML comments at the top of the issue body carry the whole contract, and
+**the action owns both lines** — a caller supplies the marker *key*, never the
+rendered comment:
+
+```text
+<!-- acme:nightly-tracker -->
+<!-- acme:nightly-tracker-digest: 9f2c41ab77de -->
+```
+
+- The **marker** is how the issue is discovered. `gh issue list --search
+  "<marker>" in:body` is treated as a hint only; the marker is re-confirmed in
+  each returned body, because a fuzzy match that opened a second issue would
+  defeat the entire point. It must stay stable for the life of the tracker —
+  changing it orphans the live issue.
+- The **digest** is the change-detection key, so a daily run over an unchanged
+  failing set writes nothing. Absent an explicit `digest`, it is the first 12
+  hex of the sha256 of the sorted, de-duplicated failing set, or `green-0` when
+  the set is empty. Supply one explicitly when the caller already computes a
+  richer identity than the item names alone — the OSV preset does, because the
+  scanner's digest covers advisory id, package, version and source.
+
+A caller that could rewrite either line could silently orphan its own tracked
+issue and open a second one, which is why neither is a caller input.
+
+### Inputs
+
+| Input                | Required | Default  | Notes                                                                                       |
+| -------------------- | -------- | -------- | ------------------------------------------------------------------------------------------- |
+| `marker`             | yes      | —        | Bare marker key, rendered as `<!-- <marker> -->`.                                            |
+| `digest-prefix`      | no       | `''`     | Empty derives `<marker>-digest:`. Set explicitly when the live pair is not derivable.        |
+| `failed-items`       | no       | `''`     | JSON string array of what is failing; `[]` means ok. Takes precedence over `job-results`.    |
+| `job-results`        | no       | `''`     | A `toJSON(needs)` payload. See the `failure`-only rule below.                                |
+| `digest`             | no       | `''`     | Explicit change-detection key; empty derives one from the failing set.                       |
+| `title`              | yes      | —        | Title used when opening a new issue.                                                         |
+| `labels`             | no       | `''`     | Comma-separated; applied on open and used to scope the lookup.                               |
+| `repo`               | yes      | —        | `owner/repo` of the tracking target.                                                         |
+| `branch`             | no       | `'main'` | Branch the run covered (context for the body).                                               |
+| `run-url`            | no       | `''`     | Empty omits the line, keeping the body byte-stable across runs.                              |
+| `github-token`       | yes      | —        | Needs `issues: write` on the target repo.                                                    |
+| `dry-run`            | no       | `'false'`| Print the verdict without writing anything.                                                  |
+| `body-intro`         | no       | `''`     | Caller-owned prose under the markers.                                                        |
+| `body-detail`        | no       | `''`     | Caller-owned detail block at the end of the body.                                            |
+| `close-comment`      | no       | `''`     | Comment posted immediately before closing.                                                   |
+| `unchanged-behavior` | no       | `'noop'` | `noop` writes nothing on an unchanged set; `refresh` silently rewrites the body.              |
+| `comment-on-change`  | no       | `'false'`| `true` also comments when the failing set changes, on top of the body update.                 |
+
+> **`cancelled` and `skipped` are not failures.** Only a `job-results` entry
+> whose `result` is exactly `failure` counts. A self-hosted fleet going down
+> produces a wall of `cancelled` jobs, and raising an issue for those is
+> precisely the noise this action exists to avoid — so an all-cancelled run
+> reads as an empty failing set and **closes** a tracked issue rather than
+> opening one.
+
+The two knobs at the bottom of the table are the only places the two known
+callers genuinely disagree, and both default to the quieter posture the
+advisory path already had: a daily scheduled scan must not spam, whereas a
+tracker whose body carries a run link wants `refresh` so that link stays
+current.
+
+### Calling it
+
+Nothing in this repo `uses:` the generic action — the OSV preset reaches it by
+relative path from its own directory, not by pin — so a consumer adopting it
+pins it directly like any other first-party action:
+
+```yaml
+permissions:
+  contents: read
+  issues: write
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - id: suite
+        run: ./run-nightly.sh
+  track:
+    needs: [nightly]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dsj1984/mandrel-platform/.github/actions/track-issue@<sha> # <tag>
+        with:
+          marker: acme:nightly-tracker
+          title: Nightly suite failures
+          labels: ci,tracking
+          repo: ${{ github.repository }}
+          job-results: ${{ toJSON(needs) }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          unchanged-behavior: refresh
+          github-token: ${{ github.token }}
+```
+
+`if: always()` matters: a tracker job that is itself skipped when an upstream
+job fails can never file — or close — anything.
+
+### Compatibility posture for existing `osv-track-issue` consumers
+
+The extraction is deliberately non-breaking at every level:
+
+1. **A consumer pinned at an immutable `osv-track-issue@<sha>` is untouched.**
+   GitHub resolves the action from the repo at that SHA, so nothing landing on
+   `main` can reach it.
+2. **A consumer that re-pins to a newer SHA still compiles.** `findings-path`,
+   `repo`, `branch`, `title`, `labels` and `github-token` keep their names,
+   requiredness and defaults — `title` still defaults to
+   `OSV advisory scan — default branch findings`. Nothing was removed or
+   renamed; the new behaviour is reachable only through the generic action.
+3. **`advisory-scan.yml` is unchanged.** Its `tracking-issue-title` /
+   `tracking-issue-labels` inputs and its upsert step wiring are byte-identical,
+   so every consumer of the reusable workflow sees no contract change at all.
+4. **The markers survive byte-identically.**
+   `<!-- mandrel:osv-advisory-tracker -->` and `mandrel:osv-advisory-digest:`
+   are what a **live** advisory issue is keyed on; a changed byte would leave it
+   undiscoverable and open a second one. They are asserted as literals in
+   [`scripts/osv-track-issue.test.mjs`](../scripts/osv-track-issue.test.mjs),
+   not derived from the module under test.
+
+> **The pin-freshness guard follows the shared core.** Because nothing `uses:`
+> the generic action, a rewrite of `track-issue.mjs` would otherwise leave every
+> `osv-track-issue` pin reading *fresh* while the pinned SHA runs the old state
+> machine — the Story #379 blind spot, reopened one directory up. The freshness
+> checker's companion map closes it; see
+> [Companion subpaths](#companion-subpaths-a-shared-core-no-uses-line-names).
+
 ---
 
 ## `secret-scan-push.yml`
@@ -3286,6 +3448,36 @@ into one of two classes — kept distinct because their remedies differ:
 > files under it, so a sibling that **differs**, was **added**, or was
 > **removed** is all drift. Untracked and ignored files are excluded: a stray
 > build artefact inside an action directory is not something a consumer runs.
+
+#### Companion subpaths — a shared core no `uses:` line names
+
+The subpaths this checker knows are exactly the ones named on `uses:` lines,
+which reopens the same blind spot one level up the moment an action's behaviour
+moves into a **sibling directory**. Story #389 reduced
+`.github/actions/osv-track-issue` to a thin preset that executes
+`.github/actions/track-issue/track-issue.mjs`, and **nothing `uses:` the
+generic action** — so a rewrite of that shared core would leave every
+`osv-track-issue` pin reading fresh while the pinned SHA ran the old state
+machine.
+
+`COMPANION_SUBPATHS` in the checker closes it. A subpath's companions are
+folded into the tree comparison **and into the drift cache key**, so an edit
+confined to the shared core marks every call site of every dependent preset
+`stale`:
+
+| Subpath                             | Companions compared alongside it   |
+| ----------------------------------- | ---------------------------------- |
+| `.github/actions/osv-track-issue`   | `.github/actions/track-issue`      |
+
+The relationship is **directional, not symmetric**: a pin on the core is not
+made stale by an edit to a preset that happens to call it. The map is
+deliberately explicit rather than inferred from `run:` bodies — a heuristic
+would both miss indirection and invent false drift. **Add an entry whenever you
+split an action into a preset and a core**; an omitted entry is a pin that
+reads fresh while running old code, which is the whole failure class this
+checker exists to catch. A sibling test asserts that every mapped subpath and
+companion still resolves to a real manifest, so a stale map entry fails rather
+than silently disabling the guard.
 
 Run it locally against a full clone:
 

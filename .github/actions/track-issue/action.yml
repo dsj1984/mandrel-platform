@@ -1,0 +1,150 @@
+# Single-issue failure-tracker composite action (Story #389).
+#
+# A scheduled, non-gating workflow has no red required check to report through,
+# so its signal has to be an issue. Filing one per run turns a persistent
+# failure into a wall of duplicates; this action instead keeps exactly ONE
+# tracked issue in sync with the current failing set — open it when something
+# fails, update it (digest-keyed, so an unchanged set writes nothing) when the
+# set changes, and close it when the set clears.
+#
+# The issue is discovered by an HTML-comment marker this action always owns:
+# the caller supplies the marker KEY, never the rendered comment. A caller that
+# could rewrite the marker line would orphan its own live tracked issue and
+# open a second one — the exact failure this action exists to prevent.
+#
+# Issue-writing belongs in a scheduled caller, never in a pull-request-gating
+# reusable workflow: a consumer resolves a reusable workflow at compile time,
+# so adding `issues: write` there breaks every consumer's CI at once. The
+# scheduled caller declares `issues: write` itself and forwards its token here.
+name: Single-Issue Failure Tracker
+description: >
+  Keep exactly one tracked issue in sync with a failing set — open it on new
+  failures, update it on a changed set (digest-keyed, idempotent), and close it
+  when the set clears.
+
+inputs:
+  marker:
+    description: >
+      Marker key the tracked issue is discovered by. The action renders it as
+      an HTML comment in the issue body and searches for that exact line, so it
+      must be stable for the life of the tracker — changing it orphans the live
+      issue and opens a second one. Supply the bare key, not the comment.
+    required: true
+  digest-prefix:
+    description: >
+      Prefix of the change-detection marker embedded alongside the discovery
+      marker. Empty derives `<marker>-digest:`. Set it explicitly when the pair
+      is already live and not derivable from the marker alone.
+    required: false
+    default: ''
+  failed-items:
+    description: >
+      JSON string array naming what is currently failing; `[]` means nothing is
+      failing. Takes precedence over `job-results` when both are supplied.
+    required: false
+    default: ''
+  job-results:
+    description: >
+      A `toJSON(needs)` payload. Failing ids are the entries whose `result` is
+      exactly `failure` — `cancelled` and `skipped` are deliberately not
+      failures, because a self-hosted fleet produces spurious cancellations and
+      raising an issue for those is the noise this action exists to avoid.
+    required: false
+    default: ''
+  digest:
+    description: >
+      Explicit change-detection key. Empty derives the first 12 hex of the
+      sha256 of the sorted failing set, or `green-0` when the set is empty.
+      Supply one when the caller already computes a richer identity than the
+      item names alone.
+    required: false
+    default: ''
+  title:
+    description: Title used when opening a new tracked issue.
+    required: true
+  labels:
+    description: >
+      Comma-separated labels applied to a newly-opened issue and used to scope
+      the open-issue lookup. Empty for none.
+    required: false
+    default: ''
+  repo:
+    description: >
+      owner/repo of the tracking target — where the issue is opened, updated or
+      closed. Normally the caller's own repository.
+    required: true
+  branch:
+    description: Branch name the run covered (context for the issue body).
+    required: false
+    default: 'main'
+  run-url:
+    description: >
+      Link to the run that produced this verdict. Empty omits the line
+      entirely, which is what keeps a body byte-stable across runs under the
+      default `noop` unchanged-behavior.
+    required: false
+    default: ''
+  github-token:
+    description: >
+      Token with `issues: write` on the target repo. The caller forwards its
+      own github.token (scheduled workflows run with the caller's token).
+    required: true
+  dry-run:
+    description: Print the verdict without opening, editing or closing anything.
+    required: false
+    default: 'false'
+  body-intro:
+    description: >
+      Prose placed under the markers explaining what this tracker watches. The
+      caller owns this text; the action owns the marker lines above it.
+    required: false
+    default: ''
+  body-detail:
+    description: Rendered detail block placed at the end of the issue body.
+    required: false
+    default: ''
+  close-comment:
+    description: Comment posted immediately before the issue is closed.
+    required: false
+    default: ''
+  unchanged-behavior:
+    description: >
+      What an unchanged failing set does. `noop` (default) writes nothing,
+      which is what keeps a daily run from spamming. `refresh` silently
+      rewrites the body so a run link stays current.
+    required: false
+    default: 'noop'
+  comment-on-change:
+    description: >
+      `true` also posts a comment when the failing set changes, on top of the
+      body update. Default `false` comments only on close.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Upsert tracked issue
+      shell: bash
+      env:
+        TRACK_MARKER: ${{ inputs.marker }}
+        TRACK_DIGEST_PREFIX: ${{ inputs.digest-prefix }}
+        TRACK_FAILED_ITEMS: ${{ inputs.failed-items }}
+        TRACK_JOB_RESULTS: ${{ inputs.job-results }}
+        TRACK_DIGEST: ${{ inputs.digest }}
+        TRACK_TITLE: ${{ inputs.title }}
+        TRACK_LABELS: ${{ inputs.labels }}
+        TRACK_REPO: ${{ inputs.repo }}
+        TRACK_BRANCH: ${{ inputs.branch }}
+        TRACK_RUN_URL: ${{ inputs.run-url }}
+        TRACK_DRY_RUN: ${{ inputs.dry-run }}
+        TRACK_BODY_INTRO: ${{ inputs.body-intro }}
+        TRACK_BODY_DETAIL: ${{ inputs.body-detail }}
+        TRACK_CLOSE_COMMENT: ${{ inputs.close-comment }}
+        TRACK_UNCHANGED_BEHAVIOR: ${{ inputs.unchanged-behavior }}
+        TRACK_COMMENT_ON_CHANGE: ${{ inputs.comment-on-change }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        node "${ACTION_PATH}/track-issue.mjs"

@@ -14,6 +14,14 @@
 #
 # GHAS-free like the rest of the OSV tier: the signal is a normal issue in
 # the run log and on the tracker, never SARIF / Code Scanning.
+#
+# Since Story #389 this action is a thin PRESET over the generic sibling
+# `.github/actions/track-issue`, which owns the whole state machine. The two
+# steps below are the split: the first translates the osv-scan findings
+# envelope into the generic contract, the second runs the shared tracker. The
+# public input contract here is unchanged — a consumer re-pinning to a newer
+# SHA still compiles, and the live marker / digest prefix are passed through
+# byte-identically so an existing advisory issue is still discovered.
 name: OSV Advisory Tracking-Issue Upsert
 description: >
   Upsert a single OSV advisory tracking issue in the target repo from an
@@ -54,7 +62,11 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Upsert OSV advisory tracking issue
+    # Adapter: findings envelope → the generic TRACK_* contract, handed to the
+    # step below through $GITHUB_ENV. Deliberately no env: block on that step
+    # for the TRACK_* names — a step-level env would take precedence over
+    # $GITHUB_ENV and silently discard everything resolved here.
+    - name: Translate advisory findings for the tracker
       shell: bash
       env:
         OSV_FINDINGS_PATH: ${{ inputs.findings-path }}
@@ -62,8 +74,16 @@ runs:
         OSV_TRACK_BRANCH: ${{ inputs.branch }}
         OSV_TRACK_TITLE: ${{ inputs.title }}
         OSV_TRACK_LABELS: ${{ inputs.labels }}
-        GH_TOKEN: ${{ inputs.github-token }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
         node "${ACTION_PATH}/osv-track-issue.mjs"
+
+    - name: Upsert OSV advisory tracking issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        node "${ACTION_PATH}/../track-issue/track-issue.mjs"

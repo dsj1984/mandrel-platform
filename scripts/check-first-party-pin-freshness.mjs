@@ -38,6 +38,22 @@
  * <subpath>` names, plus every tracked working-tree file under it, so an added
  * or removed sibling is drift too.
  *
+ * ## Why a subpath can have COMPANIONS (Story #389)
+ *
+ * The subpaths this checker knows are exactly the ones named on `uses:` lines,
+ * which reopens the same blind spot one level up the moment an action's
+ * behaviour moves into a SIBLING DIRECTORY. Story #389 reduced
+ * `.github/actions/osv-track-issue` to a thin preset that executes
+ * `.github/actions/track-issue/track-issue.mjs` — nothing `uses:` the generic
+ * action, so a rewrite of that shared core would leave every `osv-track-issue`
+ * pin reading fresh while the pinned SHA runs the old state machine.
+ *
+ * `COMPANION_SUBPATHS` closes it: a subpath's companions are folded into the
+ * tree comparison and into the drift cache key, so an edit confined to the
+ * shared core marks every call site of every dependent preset stale. The map
+ * is deliberately explicit rather than inferred — a heuristic over `run:`
+ * bodies would both miss indirection and invent false drift.
+ *
  * This checker closes it by classifying every first-party SHA pin into one of
  * two failure classes — deliberately kept distinct, because their remedies
  * differ:
@@ -325,6 +341,33 @@ export function createGit(repoRoot) {
 // Subpath tree comparison
 // ---------------------------------------------------------------------------
 
+/**
+ * Subpaths whose runtime behaviour lives partly in ANOTHER directory that no
+ * `uses:` line names. Each key's companions are compared alongside it, so an
+ * edit confined to a shared core still marks the dependent pins stale.
+ *
+ * Keep this map in step with any preset/core split under `.github/actions/`:
+ * an entry omitted here is a pin that reads fresh while running old code.
+ *
+ * @type {Record<string, string[]>}
+ */
+export const COMPANION_SUBPATHS = {
+  // Story #389 — the preset executes ../track-issue/track-issue.mjs.
+  ".github/actions/osv-track-issue": [".github/actions/track-issue"],
+};
+
+/**
+ * Companion subpaths for a `uses:` subpath (empty when it stands alone).
+ * Trailing slashes are tolerated so `foo/` and `foo` resolve identically.
+ *
+ * @param {string} subpath
+ * @param {Record<string, string[]>} [map]
+ * @returns {string[]}
+ */
+export function companionsFor(subpath, map = COMPANION_SUBPATHS) {
+  return map[String(subpath).replace(/\/+$/, "")] || [];
+}
+
 /** How each drift kind reads in the report. */
 const DRIFT_PHRASE = {
   differs: "differs from the working-tree copy",
@@ -341,15 +384,21 @@ const DRIFT_PHRASE = {
  * since the pinned revision is drift just as much as one whose bytes changed —
  * all three change what the pinned revision actually executes.
  *
+ * `companions` extends the comparison to directories the subpath EXECUTES but
+ * no `uses:` line names (Story #389). They are compared identically: a shared
+ * core that differs at the pinned SHA is exactly as inert as a sibling script.
+ *
  * @param {{lsTree: Function, lsFiles: Function, show: Function}} git
  * @param {string} repoRoot
  * @param {string} sha
  * @param {string} subpath
+ * @param {string[]} [companions]
  * @returns {Array<{path: string, kind: "differs" | "added" | "removed" | "unreadable"}>}
  */
-export function diffSubpathAtSha(git, repoRoot, sha, subpath) {
-  const pinned = new Set(git.lsTree(sha, subpath));
-  const working = new Set(git.lsFiles(subpath));
+export function diffSubpathAtSha(git, repoRoot, sha, subpath, companions = []) {
+  const roots = [subpath, ...companions];
+  const pinned = new Set(roots.flatMap((root) => git.lsTree(sha, root)));
+  const working = new Set(roots.flatMap((root) => git.lsFiles(root)));
   const drift = [];
 
   for (const path of [...new Set([...pinned, ...working])].sort()) {
@@ -384,12 +433,17 @@ export function diffSubpathAtSha(git, repoRoot, sha, subpath) {
  *
  * @param {string} subpath
  * @param {ReturnType<typeof diffSubpathAtSha>} drift
+ * @param {string[]} [companions]
  * @returns {string}
  */
-export function describeDrift(subpath, drift) {
+export function describeDrift(subpath, drift, companions = []) {
   const detail = drift.map((d) => `${d.path} ${DRIFT_PHRASE[d.kind]}`).join("; ");
+  const scope =
+    companions.length > 0
+      ? `${subpath} (and the shared code it executes: ${companions.join(", ")})`
+      : subpath;
   return (
-    `${drift.length} file(s) under ${subpath} lag the pinned SHA — the pinned ` +
+    `${drift.length} file(s) under ${scope} lag the pinned SHA — the pinned ` +
     `revision is what actually runs: ${detail}`
   );
 }
@@ -406,7 +460,11 @@ export function describeDrift(subpath, drift) {
  * `git` is injectable so a caller can drive the classification against a
  * substitute history; it defaults to the real git bound to `opts.cwd`.
  *
- * @param {{cwd?: string, workflowsDir?: string, actionsDir?: string, firstPartyOwner?: string, ref?: string}} opts
+ * `opts.companions` overrides {@link COMPANION_SUBPATHS} — injectable so a
+ * fixture can exercise the shared-core relationship without depending on this
+ * repo's own action layout.
+ *
+ * @param {{cwd?: string, workflowsDir?: string, actionsDir?: string, firstPartyOwner?: string, ref?: string, companions?: Record<string, string[]>}} opts
  * @param {ReturnType<typeof createGit>} [git]
  * @returns {{ok: boolean, fatal: string|null, stale: object[], unreachable: object[], unpinnedRefs: object[], scanned: number, files: string[], headSha: string|null}}
  */
@@ -457,12 +515,15 @@ export function runCheck(opts = {}, git = createGit(resolve(opts.cwd || process.
 
   // Every call site for a subpath must move together, so the same
   // (sha, subpath) pair is compared repeatedly — `setup-toolchain` alone has
-  // five. Resolve each tree once.
+  // five. Resolve each tree once. The companions are part of the key: two
+  // subpaths sharing a core must not collide, and a companion map override
+  // must not read a cache entry computed without it.
+  const companionMap = opts.companions || COMPANION_SUBPATHS;
   const driftCache = new Map();
-  const driftFor = (sha, subpath) => {
-    const key = `${sha}:${subpath}`;
+  const driftFor = (sha, subpath, companions) => {
+    const key = `${sha}:${[subpath, ...companions].join(",")}`;
     if (!driftCache.has(key)) {
-      driftCache.set(key, diffSubpathAtSha(git, repoRoot, sha, subpath));
+      driftCache.set(key, diffSubpathAtSha(git, repoRoot, sha, subpath, companions));
     }
     return driftCache.get(key);
   };
@@ -511,12 +572,13 @@ export function runCheck(opts = {}, git = createGit(resolve(opts.cwd || process.
         continue;
       }
 
-      const drift = driftFor(pin.sha, pin.subpath);
+      const companions = companionsFor(pin.subpath, companionMap);
+      const drift = driftFor(pin.sha, pin.subpath, companions);
       if (drift.length > 0) {
         stale.push({
           ...pin,
           manifest: manifest.path,
-          reason: describeDrift(pin.subpath, drift),
+          reason: describeDrift(pin.subpath, drift, companions),
         });
       }
     }

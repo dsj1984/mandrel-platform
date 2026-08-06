@@ -37,8 +37,10 @@ import {
   resolveManifest,
   manifestsMatch,
   diffSubpathAtSha,
+  companionsFor,
   runCheck,
   runCli,
+  COMPANION_SUBPATHS,
 } from "./check-first-party-pin-freshness.mjs";
 
 const OWNER = "test-owner/test-repo";
@@ -388,6 +390,165 @@ test("diffSubpathAtSha: a blob git cannot resolve at the pinned SHA is drift, no
   const drift = diffSubpathAtSha(fake, root, "0".repeat(40), SUBPATH);
 
   assert.deepEqual(drift, [{ path, kind: "differs" }]);
+});
+
+// ---------------------------------------------------------------------------
+// Story #389 — a subpath's COMPANIONS are compared alongside it
+//
+// The subpaths this checker knows are exactly the ones named on `uses:` lines,
+// so the moment an action's behaviour moves into a sibling DIRECTORY the
+// Story #379 blind spot reopens one level up. `osv-track-issue` is now a thin
+// preset that executes `../track-issue/track-issue.mjs`, and nothing `uses:`
+// the generic action — so without a companion map, a rewrite of that shared
+// core leaves every preset call site reading fresh while the pinned SHA runs
+// the old state machine.
+// ---------------------------------------------------------------------------
+
+const PRESET_SUBPATH = ".github/actions/osv-track-issue";
+const CORE_SUBPATH = ".github/actions/track-issue";
+const PRESET_COMPANIONS = { [PRESET_SUBPATH]: [CORE_SUBPATH] };
+
+/** A workflow pinning `subpath@sha`, one step per call site. */
+function workflowFor(subpath, sha) {
+  return [
+    "name: fixture",
+    "on:",
+    "  push:",
+    "    branches: [main]",
+    "jobs:",
+    "  demo:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    `      - uses: ${OWNER}/${subpath}@${sha}`,
+    "",
+  ].join("\n");
+}
+
+/**
+ * A repo shaped like the post-#389 split: a preset directory whose manifest
+ * runs a script in a sibling core directory that no `uses:` line names. Both
+ * are committed; the caller then edits the CORE in the working tree only.
+ */
+function makePresetRepo(label) {
+  const root = mkdtempSync(join(tmpdir(), `pinfresh-${label}-`));
+  git(root, "init", "-b", "main");
+  git(root, "config", "user.email", "fixture@example.invalid");
+  git(root, "config", "user.name", "Pin Freshness Fixture");
+  git(root, "config", "commit.gpgsign", "false");
+  git(root, "config", "core.hooksPath", join(root, ".no-hooks"));
+
+  put(root, `${CORE_SUBPATH}/action.yml`, SIBLING_MANIFEST);
+  put(root, `${CORE_SUBPATH}/track-issue.mjs`, "export const verdict = () => 'noop';\n");
+  put(root, `${PRESET_SUBPATH}/action.yml`, SIBLING_MANIFEST);
+  put(root, `${PRESET_SUBPATH}/osv-track-issue.mjs`, "import '../track-issue/track-issue.mjs';\n");
+  git(root, "add", "-A");
+  git(root, "commit", "-m", "split the tracker into a core and a preset");
+  const after = git(root, "rev-parse", "HEAD");
+
+  return { root, after };
+}
+
+test("stale: an edit confined to the shared core marks every preset call site stale", () => {
+  const { root, after } = makePresetRepo("companion-stale");
+  track(root);
+  // Two call sites, both pinning the preset — neither names the core.
+  put(root, ".github/workflows/one.yml", workflowFor(PRESET_SUBPATH, after));
+  put(root, ".github/workflows/two.yml", workflowFor(PRESET_SUBPATH, after));
+
+  // The edit is confined to the core, and nothing under the preset changes.
+  put(root, `${CORE_SUBPATH}/track-issue.mjs`, "export const verdict = () => 'create';\n");
+
+  // The premise, asserted rather than assumed: without the companion map this
+  // fixture reads perfectly fresh — which is the blind spot, not a pass.
+  const blind = runCheck({ cwd: root, firstPartyOwner: OWNER, companions: {} });
+  assert.equal(blind.ok, true, "premise: a preset-only comparison sees no drift");
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER, companions: PRESET_COMPANIONS });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.scanned, 2);
+  assert.equal(result.stale.length, 2, "every call site of the preset is stale, not just one");
+  assert.equal(result.unreachable.length, 0);
+  for (const f of result.stale) {
+    assert.equal(f.subpath, PRESET_SUBPATH);
+    assert.match(f.reason, /track-issue\.mjs/, "the report names the drifting shared file");
+    assert.match(f.reason, /shared code it executes/, "and explains why a sibling tree is in scope");
+  }
+});
+
+test("stale: a file added to the shared core since the pinned SHA is drift", () => {
+  const { root, after } = makePresetRepo("companion-added");
+  track(root);
+  put(root, ".github/workflows/one.yml", workflowFor(PRESET_SUBPATH, after));
+  put(root, `${CORE_SUBPATH}/helper.mjs`, "export const help = () => 1;\n");
+  git(root, "add", "-A");
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER, companions: PRESET_COMPANIONS });
+
+  assert.equal(result.ok, false);
+  assert.match(result.stale[0].reason, /helper\.mjs/);
+});
+
+test("clean: a pin carrying the current core AND preset exits 0", () => {
+  const { root, after } = makePresetRepo("companion-clean");
+  track(root);
+  put(root, ".github/workflows/one.yml", workflowFor(PRESET_SUBPATH, after));
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER, companions: PRESET_COMPANIONS });
+  assert.equal(result.ok, true);
+});
+
+test("a subpath with no companions is compared exactly as before", () => {
+  const { root, after } = makePresetRepo("companion-unmapped");
+  track(root);
+  // Pin the CORE directly — it has no companions of its own, so a preset edit
+  // must not leak into its comparison.
+  put(root, ".github/workflows/one.yml", workflowFor(CORE_SUBPATH, after));
+  put(root, `${PRESET_SUBPATH}/osv-track-issue.mjs`, "// rewritten preset\n");
+
+  const result = runCheck({ cwd: root, firstPartyOwner: OWNER, companions: PRESET_COMPANIONS });
+  assert.equal(result.ok, true, "companions are directional, not symmetric");
+});
+
+test("diffSubpathAtSha: companions are unioned into both sides of the comparison", () => {
+  const presetPath = `${PRESET_SUBPATH}/action.yml`;
+  const corePath = `${CORE_SUBPATH}/action.yml`;
+  const presetBody = readFileSync(join(REPO_ROOT, presetPath), "utf8");
+  // The pinned side knows only the preset; the working side also has the core.
+  const fake = {
+    lsTree: (_sha, root) => (root === PRESET_SUBPATH ? [presetPath] : []),
+    lsFiles: (root) => (root === PRESET_SUBPATH ? [presetPath] : [corePath]),
+    show: () => presetBody,
+  };
+
+  const without = diffSubpathAtSha(fake, REPO_ROOT, "0".repeat(40), PRESET_SUBPATH);
+  assert.deepEqual(without, [], "the preset tree alone is identical at both ends");
+
+  const withCore = diffSubpathAtSha(fake, REPO_ROOT, "0".repeat(40), PRESET_SUBPATH, [CORE_SUBPATH]);
+  assert.deepEqual(withCore, [{ path: corePath, kind: "added" }]);
+});
+
+test("companionsFor: unmapped subpaths stand alone, and trailing slashes resolve", () => {
+  assert.deepEqual(companionsFor(".github/actions/setup-toolchain"), []);
+  assert.deepEqual(companionsFor(PRESET_SUBPATH, PRESET_COMPANIONS), [CORE_SUBPATH]);
+  assert.deepEqual(companionsFor(`${PRESET_SUBPATH}/`, PRESET_COMPANIONS), [CORE_SUBPATH]);
+});
+
+test("COMPANION_SUBPATHS: every mapped subpath and companion exists in this repo", () => {
+  // A map entry pointing at a path that no longer exists is a silently-dead
+  // guard — the pin would read fresh again with nothing flagging it.
+  for (const [subpath, companions] of Object.entries(COMPANION_SUBPATHS)) {
+    assert.ok(
+      resolveManifest(REPO_ROOT, subpath),
+      `${subpath} is mapped but resolves to no manifest`
+    );
+    for (const companion of companions) {
+      assert.ok(
+        resolveManifest(REPO_ROOT, companion),
+        `${subpath} names companion ${companion}, which resolves to no manifest`
+      );
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
