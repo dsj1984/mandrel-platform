@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.4.0...mandrel-platform-v1.4.1) (2026-08-07)
+
+
+### Fixed
+
+* **pr-quality:** always install Playwright browsers, salt the cache key (refs [#396](https://github.com/dsj1984/mandrel-platform/issues/396)) ([#397](https://github.com/dsj1984/mandrel-platform/issues/397)) ([f866352](https://github.com/dsj1984/mandrel-platform/commit/f866352de4f47bfe42e30737eb38851878f8a0c6))
+
 ## [1.4.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.3.0...mandrel-platform-v1.4.0) (2026-08-06)
 
 
