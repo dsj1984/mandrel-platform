@@ -1445,11 +1445,42 @@ jobs:
 
       - *setup-toolchain
 
+      # This step only LABELS a cache key, so it must never be able to fail the
+      # tier (Story #400). It previously ran the lookup as a bare
+      # `PW_VERSION=$(node -e "…require('./node_modules/@playwright/test/…')")`.
+      # GitHub runs `shell: bash` as `bash --noprofile --norc -eo pipefail`, and
+      # a bare assignment propagates its command substitution's exit status — so
+      # on a consumer whose ROOT node_modules lacks the package, `set -e` killed
+      # the step and took the whole e2e job with it. pnpm's isolated layout only
+      # symlinks a root DIRECT dependency, so a monorepo holding Playwright in
+      # the workspace that runs the tests has no such path.
+      #
+      # Two properties fix that. The BARE SPECIFIER walks node_modules the way
+      # the e2e project's own import does, instead of asserting one hardcoded
+      # location (legal against the real package: its `exports` map lists
+      # `"./package.json"`). And the lookup sits inside an `if`, where `set -e`
+      # is suspended, so an unresolvable package falls through to the sentinel.
+      #
+      # The sentinel MUST stay a fixed literal. Anything host- or run-derived
+      # ($GITHUB_SHA, a date) would mint a new key every run and permanently
+      # defeat the ~460 MiB cache this step exists to label — worse than the
+      # abort it replaces. On the sentinel path the key goes version-agnostic,
+      # but `restore-keys` still prefix-matches and a prefix restore leaves
+      # `cache-hit` false, so the post-job save writes a complete tree: it
+      # self-heals, and the unconditional install below fills any gap.
+      #
+      # Keep this block free of `${{ }}`: the guard executes this exact text.
+      # Guarded by scripts/check-playwright-browser-install.test.mjs.
       - name: Resolve Playwright version
         id: pw-version
         shell: bash
         run: |
-          PW_VERSION=$(node -e "const p=require('./node_modules/@playwright/test/package.json');console.log(p.version)")
+          PW_VERSION=unresolved
+          if resolved=$(node -p "require('@playwright/test/package.json').version || ''" 2>/dev/null) && [ -n "$resolved" ]; then
+            PW_VERSION="$resolved"
+          else
+            echo "::warning::Could not resolve @playwright/test; using a version-agnostic browser cache key. The install below still runs, so the tier is unaffected — but the cache entry is shared across Playwright versions. See the playwright-cache-salt docs."
+          fi
           echo "version=${PW_VERSION}" >> "$GITHUB_OUTPUT"
 
       # `restore-keys` is deliberately NOT salted (Story #396): the prefix
