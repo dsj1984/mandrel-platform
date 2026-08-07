@@ -263,6 +263,24 @@ on:
         type: boolean
         default: true
 
+      # Cache-key escape hatch (Story #396). Actions cache entries are
+      # IMMUTABLE under a key and `actions/cache` skips its post-job save on an
+      # exact hit, so an entry that was saved incomplete can never be rewritten
+      # in place — the only way off it is a different key. The unconditional
+      # install below already keeps a bad entry from failing the run; this lets
+      # an operator stop paying the resulting repair download on every run
+      # without hand-deleting caches through the GitHub API.
+      playwright-cache-salt:
+        description: >
+          Opaque salt appended to the Playwright browser cache key. Bump it to
+          any new value (e.g. 'v2') to abandon a cache entry that was saved
+          incomplete; the next run repopulates a clean one. Default '' leaves
+          the key byte-for-byte identical to today's, so an existing warm cache
+          keeps hitting.
+        required: false
+        type: string
+        default: ''
+
       # Destructive-migration guard (Story #111). Platformizes the guard domio
       # and athportal each hand-rolled and swarm-os lacked. OPT-IN (default
       # false) because not every consumer ships DB migrations; repos with a
@@ -1434,22 +1452,35 @@ jobs:
           PW_VERSION=$(node -e "const p=require('./node_modules/@playwright/test/package.json');console.log(p.version)")
           echo "version=${PW_VERSION}" >> "$GITHUB_OUTPUT"
 
+      # `restore-keys` is deliberately NOT salted (Story #396): the prefix
+      # fallback must keep matching older entries so a salt bump still gets a
+      # warm start. The unconditional install below fills whatever the restored
+      # tree lacks, and because a prefix (non-exact) restore leaves `cache-hit`
+      # false, the post-job save then writes a COMPLETE tree under the new
+      # salted key. That is what completes the escape, in one run.
       - name: Cache Playwright browsers
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}${{ inputs.playwright-cache-salt }}
           restore-keys: |
             playwright-${{ runner.os }}-
 
+      # UNCONDITIONAL by contract (Story #396) — do not reintroduce an
+      # `if: steps.playwright-cache.outputs.cache-hit != 'true'` guard here.
+      # `cache-hit` reports only that an entry EXISTS under the key; it says
+      # nothing about the entry's contents. Gating on it let a cache saved
+      # partially (or saved before a Playwright patch added a browser variant
+      # under the same version key) skip the only step that would repair it,
+      # failing every scenario in milliseconds at `browserType.launch` with no
+      # path back. `playwright install` is idempotent — on a good cache it
+      # verifies the manifest and returns — and the OS-dependency install this
+      # replaced ran on BOTH former branches, so the hit path gains only that
+      # verify while the cache keeps its real benefit of not re-downloading
+      # ~460 MiB. Guarded by scripts/check-playwright-browser-install.test.mjs.
       - name: Install Playwright browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: pnpm exec playwright install --with-deps
-
-      - name: Install browser OS dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: pnpm exec playwright install-deps
 
       - name: E2E / Smoke (shard ${{ matrix.shard }}/${{ strategy.job-total }})
         run: pnpm run test:e2e --shard=${{ matrix.shard }}/${{ strategy.job-total }}

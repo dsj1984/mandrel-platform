@@ -112,6 +112,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-unit`      | boolean | `true`           | Set `false` to skip the unit-test tier.                                                                                                        |
 | `enable-contract`  | boolean | `true`           | Set `false` to skip the contract-test tier.                                                                                                    |
 | `enable-e2e`       | boolean | `true`           | Set `false` to skip the e2e / smoke (Playwright) tier.                                                                                          |
+| `playwright-cache-salt` | string | `''`         | Opaque salt appended to the Playwright browser **cache key**. Bump it to any new value (e.g. `'v2'`) to abandon a cache entry that was saved incomplete — Actions cache entries are immutable under a key, so a new key is the only way off a bad one. Default `''` leaves the key byte-for-byte identical to today's, so an existing warm cache keeps hitting. See [Playwright browser cache](#playwright-browser-cache-playwright-cache-salt). |
 | `enable-migration-guard` | boolean | `false`    | **Opt-in.** Set `true` to enable the destructive-migration label guard. See [Destructive-migration guard](#destructive-migration-guard-enable-migration-guard). |
 | `migration-guard-label`  | string  | `'migration:destructive-ok'` | PR label that overrides a destructive-migration finding. Override only when you want a different acknowledgement-label name. |
 | `migration-guard-globs`  | string  | `'**/migrations/**,**/drizzle/**'` | Comma-separated migration path globs the guard scans. A changed file matching one of these (or any `*.sql`) is inspected. |
@@ -502,6 +503,55 @@ identically-named input behaves identically.
 > to infer it from timings. Raise
 > [`tier-timeouts`](#caller-addressable-tier-timeouts-tier-timeouts) only when
 > the **work** needs the room.
+
+### Playwright browser cache (`playwright-cache-salt`)
+
+The e2e tier caches `~/.cache/ms-playwright` under a key derived from the
+runner OS and the resolved `@playwright/test` version, so a run does not
+re-download ~460 MiB of browsers. **The browser install itself is
+unconditional** — the tier runs `playwright install --with-deps` on every run,
+cache hit or miss.
+
+That is deliberate, and it is the one thing not to "optimize" back:
+
+> `actions/cache` sets `cache-hit: true` on an **exact key match**. That
+> reports only that an entry *exists* under the key — it says nothing about
+> what the entry *contains*. Gating the install on it means a cache that was
+> saved incomplete, or saved before a Playwright patch added a browser variant
+> under the same version key, permanently skips the only step that would repair
+> it. Every scenario then fails in 1–5 ms at `browserType.launch`, and the run
+> cannot self-heal: the hit keeps skipping the repair.
+
+Running it unconditionally costs almost nothing. `playwright install` is
+idempotent — with the binaries already present it verifies the manifest and
+returns — and the OS-dependency install already ran on both former branches. So
+a cache hit now pays a manifest verify, and the cache keeps the download it was
+there to avoid.
+
+**When to reach for the salt.** An unconditional install makes a bad entry
+survivable, not free: a poisoned entry still gets restored, and the missing
+browser is re-downloaded on *every* run. Actions cache entries are immutable
+under a key (`actions/cache` skips its post-job save on an exact hit), so
+nothing can rewrite the entry in place — a different key is the only way off
+it. Bump the salt to any new value:
+
+```yaml
+with:
+  playwright-cache-salt: 'v2'
+```
+
+One run completes the escape. `restore-keys` is intentionally left unsalted, so
+the bumped key still falls back to the old entry for a warm start; the
+unconditional install fills whatever it lacks; and because a prefix (non-exact)
+restore leaves `cache-hit` false, the post-job save writes a **complete** tree
+under the new key. Subsequent runs hit that clean entry. No cache deletion
+through the GitHub API is required.
+
+Leaving the input at its default `''` resolves the key byte-for-byte identically
+to the pre-`playwright-cache-salt` releases, so adopting this version does not
+invalidate a warm cache. `scripts/check-playwright-browser-install.test.mjs`
+holds both halves — the unconditional install and the key-compatibility
+property — against regression.
 
 ### Affected-only tier execution (`affected`)
 
