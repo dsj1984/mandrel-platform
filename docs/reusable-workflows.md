@@ -553,6 +553,32 @@ invalidate a warm cache. `scripts/check-playwright-browser-install.test.mjs`
 holds both halves — the unconditional install and the key-compatibility
 property — against regression.
 
+**The key is a label, not an inventory.** It names a runner OS and a resolved
+`@playwright/test` version; it does **not** describe which browsers the restored
+directory actually contains. The workflow cannot know that — the browser set
+comes from *your* Playwright config, which the tier never reads. So the key and
+the contents can legitimately disagree: an entry saved while your config
+installed only Chromium keeps hitting after you add WebKit, and a Playwright
+patch can add a browser variant under a version the key already claims. The
+unconditional install is what makes that safe rather than fatal, and the salt is
+the escape when an entry is wrong often enough to be worth abandoning.
+
+**If the version cannot be resolved.** The tier resolves `@playwright/test`
+through a bare specifier, so it works whether the package sits at the repo root
+or in the workspace that runs the tests. When it resolves to nothing at all the
+step does **not** fail — it logs a warning and labels the key `unresolved`,
+because a step that only names a cache key should never be able to take down the
+tier. Everything still works: the install runs, the tier passes, and
+`restore-keys` plus a non-exact restore let the entry heal itself.
+
+The cost is real but bounded, and worth knowing: on that path every Playwright
+version you ever use shares **one** immutable entry. Upgrade Playwright and the
+key does not move, so the restored tree is missing the new build and the install
+re-downloads it — on every run, indefinitely. That is a standing tax, not a
+failure. If you see the warning, make `@playwright/test` resolvable from the
+directory the tier runs in; bump the salt once afterwards to retire the stale
+shared entry.
+
 ### Affected-only tier execution (`affected`)
 
 By default every diff-scoped tier (lint, typecheck, unit, contract, e2e) runs

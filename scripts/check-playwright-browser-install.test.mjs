@@ -40,10 +40,23 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const QUALITY = ".github/workflows/pr-quality.yml";
 const SALT_INPUT = "playwright-cache-salt";
+
+/**
+ * The fixed literal the resolve step falls back to (Story #400).
+ *
+ * It must stay a CONSTANT. A host- or run-derived fallback (`$GITHUB_SHA`, a
+ * date) satisfies "the step no longer fails" while minting a new cache key on
+ * every run — permanently defeating the ~460 MiB cache the step exists to
+ * label, which is a worse outcome than the abort it replaced.
+ */
+const SENTINEL = "unresolved";
 
 /** The exact key template the tier carried before Story #396. */
 const PRE_FIX_KEY = "playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}";
@@ -76,8 +89,8 @@ const code = text
  * dynamically-constructed regex is a SAST finding (ReDoS surface) and buys
  * nothing here, since the block boundary is just indentation.
  */
-function jobBlock(name) {
-  const lines = code.split("\n");
+function jobBlock(name, source = code) {
+  const lines = source.split("\n");
   const start = lines.indexOf(`  ${name}:`);
   assert.notEqual(start, -1, `${QUALITY}: job \`${name}\` not found`);
   const out = [];
@@ -93,9 +106,16 @@ function jobBlock(name) {
   return out.join("\n");
 }
 
-/** The `- name: <step>` … block for one step of a job, sliced by indentation. */
-function stepBlock(job, stepName) {
-  const lines = jobBlock(job).split("\n");
+/**
+ * The `- name: <step>` … block for one step of a job, sliced by indentation.
+ *
+ * `source` defaults to the comment-stripped text — right for asserting what the
+ * workflow DOES. Pass the raw `text` when the block is going to be EXECUTED, so
+ * the guard runs the same script the runner does rather than a stripped
+ * paraphrase of it.
+ */
+function stepBlock(job, stepName, source = code) {
+  const lines = jobBlock(job, source).split("\n");
   const start = lines.findIndex((l) => l.trim() === `- name: ${stepName}`);
   assert.notEqual(start, -1, `${QUALITY}: step \`${stepName}\` not found in job \`${job}\``);
   const indent = lines[start].match(/^(\s*)/)[1].length;
@@ -146,6 +166,83 @@ function resolveSalt(template, salt) {
     .join(salt)
     .split(`\${{ inputs['${SALT_INPUT}'] }}`)
     .join(salt);
+}
+
+/**
+ * The dedented body of a step's `run: |` block, taken from the RAW workflow
+ * text so the guard executes what the runner executes.
+ *
+ * This is only sound while the block holds no `${{ }}` expression — the runner
+ * substitutes those before bash ever sees them, and there is no substituting
+ * them here. A dedicated test below pins that precondition rather than leaving
+ * it as a silent assumption.
+ */
+function runScript(job, stepName) {
+  const lines = stepBlock(job, stepName, text).split("\n");
+  const start = lines.findIndex((l) => l.trim() === "run: |");
+  assert.notEqual(start, -1, `${QUALITY}: step \`${stepName}\` has no \`run: |\` block`);
+  const body = lines.slice(start + 1);
+  assert.ok(body.length > 0, `${QUALITY}: step \`${stepName}\` has an empty \`run:\` block`);
+  const indent = body[0].match(/^(\s*)/)[1].length;
+  return body.map((l) => l.slice(indent)).join("\n");
+}
+
+/**
+ * Run a script under the runner's own shell invocation, in a throwaway cwd.
+ *
+ * GitHub executes `shell: bash` as `bash --noprofile --norc -eo pipefail
+ * {0}` — the `-e` is the whole reason the pre-fix step could kill the tier, so
+ * the guard reproduces the flags exactly. `cwd` is passed to `spawnSync` and
+ * `process.chdir` is never called: this file's later tests read
+ * `docs/reusable-workflows.md` by a RELATIVE path, and a leaked cwd would fail
+ * them for a reason that has nothing to do with the change under test.
+ */
+function runInDir(script, cwd) {
+  const outPath = join(cwd, "github-output");
+  writeFileSync(outPath, "");
+  const scriptPath = join(cwd, "step.sh");
+  writeFileSync(scriptPath, script);
+  const res = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", scriptPath], {
+    cwd,
+    env: { ...process.env, GITHUB_OUTPUT: outPath },
+    encoding: "utf8",
+  });
+  const outputs = new Map();
+  for (const line of readFileSync(outPath, "utf8").split("\n")) {
+    const eq = line.indexOf("=");
+    if (eq > 0) outputs.set(line.slice(0, eq), line.slice(eq + 1));
+  }
+  return { status: res.status, stderr: res.stderr, outputs };
+}
+
+/** A temp directory, removed however the callback exits. */
+function withTempDir(fn) {
+  const dir = mkdtempSync(join(tmpdir(), "pw-version-"));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Plant a resolvable `@playwright/test` under `dir`.
+ *
+ * The `exports` map matters: the real package restricts subpath access and
+ * lists `"./package.json"` explicitly. Without it here, a resolution strategy
+ * that is ILLEGAL against the real package would still pass this guard.
+ */
+function plantPlaywright(dir, version) {
+  const pkgDir = join(dir, "node_modules", "@playwright", "test");
+  mkdirSync(pkgDir, { recursive: true });
+  writeFileSync(
+    join(pkgDir, "package.json"),
+    JSON.stringify({
+      name: "@playwright/test",
+      version,
+      exports: { "./package.json": "./package.json" },
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -252,4 +349,103 @@ test("the documented input row states the default and the escape semantics", () 
   assert.equal(rows.length, 1, "expected exactly one documented input row");
   assert.match(rows[0], /`''`/, "row does not state the empty-string default");
   assert.match(rows[0], /cache/i, "row does not explain what the salt affects");
+});
+
+// ---------------------------------------------------------------------------
+// Version resolution (Story #400)
+//
+// The pre-fix step ran `node -e "…require('./node_modules/@playwright/test/…')"`
+// as a bare `VAR=$(…)` assignment. Under `bash -eo pipefail` that propagates
+// the substitution's exit status, so on a consumer whose ROOT node_modules
+// lacks the package — pnpm's isolated layout only symlinks a root DIRECT
+// dependency, so a workspace-owned Playwright has no such path — `set -e`
+// killed the step and took the whole e2e tier with it. A step that exists only
+// to LABEL a cache key must never be able to do that.
+// ---------------------------------------------------------------------------
+
+test("version resolution uses a bare specifier, not a hardcoded root path", () => {
+  const block = stepBlock("e2e", "Resolve Playwright version");
+  assert.doesNotMatch(
+    block,
+    /\.\/node_modules\/@playwright\/test/,
+    "a hardcoded root path is back: a workspace-owned Playwright would not resolve",
+  );
+  assert.match(
+    block,
+    /require\((['"])@playwright\/test\/package\.json\1\)/,
+    "resolution must go through the bare specifier, which walks node_modules",
+  );
+});
+
+test("the resolve step's run block holds no workflow expression", () => {
+  // The precondition for executing this step in the tests below: the runner
+  // substitutes `${{ }}` before bash sees it, and nothing substitutes it here.
+  // Threading an input into the block would leave the guard asserting against
+  // a string that never runs.
+  assert.doesNotMatch(
+    runScript("e2e", "Resolve Playwright version"),
+    /\$\{\{/,
+    "keep the run block expression-free so the guard executes the runner's text",
+  );
+});
+
+test("the sentinel is assigned as a fixed literal", () => {
+  // Invariant 2 (see SENTINEL above). Assert the SHAPE of the assignment, not
+  // merely that the step stopped failing — `PW_VERSION=$(date +%F)` would pass
+  // a stability check across two runs in the same second and still rekey the
+  // cache on every push.
+  const script = runScript("e2e", "Resolve Playwright version");
+  const assignments = script
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => !l.startsWith("#") && l.includes(`=${SENTINEL}`));
+  assert.equal(assignments.length, 1, `expected exactly one \`=${SENTINEL}\` assignment`);
+  const [assignment] = assignments;
+  assert.match(assignment, /^[A-Za-z_][A-Za-z0-9_]*=unresolved$/, "the sentinel must be a literal");
+  assert.ok(!assignment.includes("$("), "the sentinel must not be command-substituted");
+  assert.ok(!assignment.includes("${"), "the sentinel must not be parameter-expanded");
+});
+
+test("an unresolvable @playwright/test yields the sentinel instead of failing the tier", () => {
+  // The defect itself. A temp dir has no `node_modules` anywhere up its tree,
+  // which is exactly the consumer shape that lost the tier.
+  const script = runScript("e2e", "Resolve Playwright version");
+  withTempDir((dir) => {
+    const { status, outputs, stderr } = runInDir(script, dir);
+    assert.equal(status, 0, `the step must not fail the tier; stderr:\n${stderr}`);
+    assert.equal(outputs.get("version"), SENTINEL);
+  });
+});
+
+test("the sentinel is stable across runs, so the cache key does not churn", () => {
+  // Invariant 2 again, from the outside: a value that varies run to run mints a
+  // fresh key every time and permanently defeats the cache.
+  const script = runScript("e2e", "Resolve Playwright version");
+  const read = () => withTempDir((dir) => runInDir(script, dir).outputs.get("version"));
+  const first = read();
+  // Pin the value, not just its stability: two runs that both emit NOTHING are
+  // trivially equal, which would let a step that never writes the output pass.
+  assert.equal(first, SENTINEL);
+  assert.equal(read(), first);
+});
+
+test("a resolvable @playwright/test produces the pre-fix cache key exactly", () => {
+  // The compatibility contract, end to end: what the step actually emits, fed
+  // through the real key template at the default salt, must equal the key
+  // consumers' warm caches already sit under.
+  const script = runScript("e2e", "Resolve Playwright version");
+  const version = "1.61.1";
+  const resolved = withTempDir((dir) => {
+    plantPlaywright(dir, version);
+    const { status, outputs, stderr } = runInDir(script, dir);
+    assert.equal(status, 0, `stderr:\n${stderr}`);
+    return outputs.get("version");
+  });
+  assert.equal(resolved, version, "the step must report the resolved package's version");
+
+  const { key } = cacheKeys();
+  const withVersion = resolveSalt(key, "")
+    .split("${{ steps.pw-version.outputs.version }}")
+    .join(resolved);
+  assert.equal(withVersion, `playwright-\${{ runner.os }}-${version}`);
 });
