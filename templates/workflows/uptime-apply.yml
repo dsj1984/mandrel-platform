@@ -46,9 +46,15 @@ jobs:
       # the checked-in config; a workflow_dispatch preview run can pass
       # apply:'false' instead to dry-run without writing.
       apply: ${{ github.event_name == 'push' && 'true' || 'false' }}
-    # Frozen secret surface: only these two cross into the shared workflow.
-    # Both are optional on the shared side — an absent BETTERSTACK_API_TOKEN
-    # is the documented graceful-degradation (skip-with-notice) path.
+    # Frozen secret surface. BETTERSTACK_API_TOKEN is optional on the shared
+    # side — absent, the apply takes the documented graceful-degradation
+    # (skip-with-notice) path and raises a warning annotation.
+    #
+    # UPTIME_ALERT_EMAIL is deprecated and deliberately not passed here:
+    # Better Stack's monitor `email` field is a boolean switch, not a
+    # recipient, so the address never routed alerts. Set a monitor entry's
+    # `policyId` (escalation policy) to control who is alerted. The shared
+    # workflow still declares the secret, so an existing caller that passes
+    # it keeps compiling.
     secrets:
       BETTERSTACK_API_TOKEN: ${{ secrets.BETTERSTACK_API_TOKEN }}
-      UPTIME_ALERT_EMAIL: ${{ secrets.UPTIME_ALERT_EMAIL }}

@@ -128,7 +128,13 @@ Better Stack monitor), and an injectable-fetch Better Stack API client
 (`createBetterStackClient`). swarm-os's implementation (Story #163) is the
 seed donor per standing decision #4 (best-of-breed seeding) — the newest and
 cleanest of the three. The secret surface is `BETTERSTACK_API_TOKEN` (apply
-credential) and `UPTIME_ALERT_EMAIL` (default alert contact); an absent
+credential); `UPTIME_ALERT_EMAIL` was specified as a default alert contact
+but is **deprecated and inert** as of Story #403 — Better Stack types a
+monitor's `email` field as a boolean switch, so an address could never route
+alerts, and recipients resolve from the team roster and the escalation policy
+(`policyId` → `policy_id`) instead. It stays declared on the reusable
+workflow because removing a declared secret breaks any caller still passing
+it at workflow-compile time. An absent
 token is a documented **skip-with-notice** (the job runs, exits 0, prints a
 notice) rather than an `if:`-skipped job (which renders as neither pass nor
 fail) or a hard failure — this preserves the graceful-degradation behaviour

@@ -42,16 +42,19 @@ test("parseMonitorConfig accepts a bare array of monitor entries", () => {
   assert.equal(monitors.length, 1);
   assert.equal(monitors[0].url, "https://api.example.com/health");
   assert.equal(monitors[0].name, "api.example.com");
-  assert.equal(monitors[0].alertEmail, null);
+  assert.equal(monitors[0].emailAlerts, true, "e-mail alerts default to on");
+  assert.equal(monitors[0].policyId, null);
   assert.equal(monitors[0].checkFrequency, DEFAULT_CHECK_FREQUENCY_SECONDS);
 });
 
 test("parseMonitorConfig accepts a wrapped { monitors: [...] } object", () => {
   const { monitors } = parseMonitorConfig({
-    monitors: [{ url: "https://x.example.com", name: "x", alertEmail: "a@b.com", checkFrequency: 60 }],
+    monitors: [
+      { url: "https://x.example.com", name: "x", emailAlerts: false, policyId: "pol-1", checkFrequency: 60 },
+    ],
   });
   assert.deepEqual(monitors, [
-    { url: "https://x.example.com", name: "x", alertEmail: "a@b.com", checkFrequency: 60 },
+    { url: "https://x.example.com", name: "x", emailAlerts: false, policyId: "pol-1", checkFrequency: 60 },
   ]);
 });
 
@@ -83,12 +86,42 @@ test("parseMonitorConfig rejects non-string name/alertEmail", () => {
   );
 });
 
+test("parseMonitorConfig rejects a non-boolean emailAlerts, naming the index", () => {
+  assert.throws(
+    () => parseMonitorConfig([{ url: "https://a.example.com" }, { url: "https://x.example.com", emailAlerts: "yes" }]),
+    /entry \[1\] "emailAlerts" must be a boolean/
+  );
+});
+
+test("parseMonitorConfig rejects a non-string policyId, naming the index", () => {
+  assert.throws(
+    () => parseMonitorConfig([{ url: "https://a.example.com" }, { url: "https://x.example.com", policyId: 12345 }]),
+    /entry \[1\] "policyId" must be a string/
+  );
+});
+
+test("parseMonitorConfig reports a retired alertEmail as a deprecation and drops it", () => {
+  const { monitors, deprecations } = parseMonitorConfig([
+    { url: "https://x.example.com", alertEmail: "oncall@example.com" },
+  ]);
+  assert.equal(deprecations.length, 1);
+  assert.match(deprecations[0], /entry \[0\] sets "alertEmail" — that field is ignored/);
+  assert.match(deprecations[0], /policyId/);
+  assert.equal(monitors[0].alertEmail, undefined, "the retired field never reaches the normalized entry");
+  assert.equal(monitors[0].emailAlerts, true);
+});
+
+test("parseMonitorConfig reports no deprecations for a clean config", () => {
+  const { deprecations } = parseMonitorConfig([{ url: "https://x.example.com", emailAlerts: false }]);
+  assert.deepEqual(deprecations, []);
+});
+
 // ---------------------------------------------------------------------------
 // diffMonitors
 // ---------------------------------------------------------------------------
 
 test("diffMonitors classifies a brand-new url as toCreate", () => {
-  const desired = [{ url: "https://new.example.com", name: "new", alertEmail: null, checkFrequency: 30 }];
+  const desired = [{ url: "https://new.example.com", name: "new", emailAlerts: true, policyId: null, checkFrequency: 30 }];
   const { toCreate, toUpdate, unchanged } = diffMonitors(desired, []);
   assert.equal(toCreate.length, 1);
   assert.equal(toUpdate.length, 0);
@@ -96,7 +129,7 @@ test("diffMonitors classifies a brand-new url as toCreate", () => {
 });
 
 test("diffMonitors classifies a matching, identical url as unchanged", () => {
-  const desired = [{ url: "https://x.example.com", name: "x", alertEmail: null, checkFrequency: 30 }];
+  const desired = [{ url: "https://x.example.com", name: "x", emailAlerts: true, policyId: null, checkFrequency: 30 }];
   const live = [{ id: "1", url: "https://x.example.com", name: "x", checkFrequency: 30 }];
   const { toCreate, toUpdate, unchanged } = diffMonitors(desired, live);
   assert.equal(toCreate.length, 0);
@@ -105,7 +138,7 @@ test("diffMonitors classifies a matching, identical url as unchanged", () => {
 });
 
 test("diffMonitors classifies a url with a drifted name/frequency as toUpdate", () => {
-  const desired = [{ url: "https://x.example.com", name: "renamed", alertEmail: null, checkFrequency: 60 }];
+  const desired = [{ url: "https://x.example.com", name: "renamed", emailAlerts: true, policyId: null, checkFrequency: 60 }];
   const live = [{ id: "1", url: "https://x.example.com", name: "x", checkFrequency: 30 }];
   const { toUpdate } = diffMonitors(desired, live);
   assert.equal(toUpdate.length, 1);
@@ -113,7 +146,7 @@ test("diffMonitors classifies a url with a drifted name/frequency as toUpdate", 
 });
 
 test("diffMonitors url matching is trailing-slash and case insensitive", () => {
-  const desired = [{ url: "https://X.example.com/", name: "x", alertEmail: null, checkFrequency: 30 }];
+  const desired = [{ url: "https://X.example.com/", name: "x", emailAlerts: true, policyId: null, checkFrequency: 30 }];
   const live = [{ id: "1", url: "https://x.example.com", name: "x", checkFrequency: 30 }];
   const { toCreate, unchanged } = diffMonitors(desired, live);
   assert.equal(toCreate.length, 0);
@@ -121,7 +154,7 @@ test("diffMonitors url matching is trailing-slash and case insensitive", () => {
 });
 
 test("diffMonitors never proposes deleting a live monitor absent from desired (additive apply only)", () => {
-  const desired = [{ url: "https://kept.example.com", name: "kept", alertEmail: null, checkFrequency: 30 }];
+  const desired = [{ url: "https://kept.example.com", name: "kept", emailAlerts: true, policyId: null, checkFrequency: 30 }];
   const live = [
     { id: "1", url: "https://kept.example.com", name: "kept", checkFrequency: 30 },
     { id: "2", url: "https://hand-added.example.com", name: "manual" },
@@ -162,7 +195,16 @@ test("createBetterStackClient.listMonitors normalizes the Better Stack payload s
         data: [
           {
             id: "42",
-            attributes: { url: "https://a.example.com", pronounceable_name: "a", check_frequency: 30, email: "a@b.com" },
+            // `email` is a boolean in Better Stack's API — a switch, not a
+            // recipient. Fixturing it as an address is what let the
+            // string-typed payload bug survive a green suite (refs #403).
+            attributes: {
+              url: "https://a.example.com",
+              pronounceable_name: "a",
+              check_frequency: 30,
+              email: true,
+              policy_id: "pol-1",
+            },
           },
         ],
       },
@@ -171,7 +213,7 @@ test("createBetterStackClient.listMonitors normalizes the Better Stack payload s
   const client = createBetterStackClient({ token: "tok", fetchImpl });
   const monitors = await client.listMonitors();
   assert.deepEqual(monitors, [
-    { id: "42", url: "https://a.example.com", name: "a", checkFrequency: 30, alertEmail: "a@b.com" },
+    { id: "42", url: "https://a.example.com", name: "a", checkFrequency: 30, emailAlerts: true, policyId: "pol-1" },
   ]);
   assert.equal(calls[0].url, "https://uptime.betterstack.com/api/v2/monitors");
 });
@@ -209,7 +251,7 @@ function fakeClient({ live = [] } = {}) {
 test("applyMonitorConfig dry-run computes the plan without calling create/update", async () => {
   const client = fakeClient({ live: [] });
   const result = await applyMonitorConfig({
-    config: { monitors: [{ url: "https://x.example.com", name: "x", alertEmail: null, checkFrequency: 30 }] },
+    config: { monitors: [{ url: "https://x.example.com", name: "x", emailAlerts: true, policyId: null, checkFrequency: 30 }] },
     client,
     dryRun: true,
   });
@@ -221,7 +263,7 @@ test("applyMonitorConfig dry-run computes the plan without calling create/update
 test("applyMonitorConfig --apply issues create for new monitors", async () => {
   const client = fakeClient({ live: [] });
   const result = await applyMonitorConfig({
-    config: { monitors: [{ url: "https://x.example.com", name: "x", alertEmail: null, checkFrequency: 30 }] },
+    config: { monitors: [{ url: "https://x.example.com", name: "x", emailAlerts: true, policyId: null, checkFrequency: 30 }] },
     client,
     dryRun: false,
   });
@@ -229,21 +271,112 @@ test("applyMonitorConfig --apply issues create for new monitors", async () => {
   assert.equal(client.created.length, 1);
 });
 
-test("applyMonitorConfig falls back to defaultAlertEmail when an entry sets none", async () => {
-  const client = fakeClient({ live: [] });
-  await applyMonitorConfig({
-    config: { monitors: [{ url: "https://x.example.com", name: "x", alertEmail: null, checkFrequency: 30 }] },
+test("a created monitor sends Better Stack's `email` as a boolean, never an address", async () => {
+  const { fetchImpl, calls } = fakeFetch({
+    "POST https://uptime.betterstack.com/api/v2/monitors": { status: 201, body: { data: { id: "9" } } },
+  });
+  const client = createBetterStackClient({ token: "tok", fetchImpl });
+  await client.createMonitor({
+    url: "https://x.example.com",
+    name: "x",
+    emailAlerts: true,
+    policyId: null,
+    checkFrequency: 30,
+  });
+  const body = JSON.parse(calls[0].body);
+  assert.equal(typeof body.email, "boolean", "`email` is a boolean switch in Better Stack's API");
+  assert.equal(body.email, true);
+  assert.ok(!("policy_id" in body), "no escalation policy is sent when the entry names none");
+});
+
+test("emailAlerts:false switches e-mail alerts off rather than omitting the field", async () => {
+  const { fetchImpl, calls } = fakeFetch({
+    "POST https://uptime.betterstack.com/api/v2/monitors": { status: 201, body: { data: { id: "9" } } },
+  });
+  const client = createBetterStackClient({ token: "tok", fetchImpl });
+  await client.createMonitor({
+    url: "https://x.example.com",
+    name: "x",
+    emailAlerts: false,
+    policyId: null,
+    checkFrequency: 30,
+  });
+  assert.equal(JSON.parse(calls[0].body).email, false);
+});
+
+test("policyId maps to Better Stack's policy_id — the field that decides who is alerted", async () => {
+  const { fetchImpl, calls } = fakeFetch({
+    "POST https://uptime.betterstack.com/api/v2/monitors": { status: 201, body: { data: { id: "9" } } },
+  });
+  const client = createBetterStackClient({ token: "tok", fetchImpl });
+  await client.createMonitor({
+    url: "https://x.example.com",
+    name: "x",
+    emailAlerts: true,
+    policyId: "pol-7",
+    checkFrequency: 30,
+  });
+  const body = JSON.parse(calls[0].body);
+  assert.equal(body.policy_id, "pol-7");
+  assert.equal(typeof body.email, "boolean");
+});
+
+test("no payload ever carries an address in `email`, even from a legacy alertEmail config", async () => {
+  const { fetchImpl, calls } = fakeFetch({
+    "POST https://uptime.betterstack.com/api/v2/monitors": { status: 201, body: { data: { id: "9" } } },
+  });
+  const config = parseMonitorConfig([{ url: "https://x.example.com", alertEmail: "oncall@example.com" }]);
+  const client = createBetterStackClient({ token: "tok", fetchImpl });
+  await applyMonitorConfig({ config, client: { ...client, listMonitors: async () => [] }, dryRun: false });
+  const body = JSON.parse(calls[0].body);
+  assert.equal(typeof body.email, "boolean");
+  assert.ok(
+    !JSON.stringify(body).includes("oncall@example.com"),
+    "the retired address never reaches the Better Stack payload"
+  );
+});
+
+test("a converged monitor reports unchanged and issues no update (no per-run PATCH churn)", async () => {
+  // Live read-back carries the boolean `email`; desired carries the boolean
+  // `emailAlerts`. Pre-#403 these were a boolean vs an address, so every
+  // monitor read as drifted on every apply.
+  const client = fakeClient({
+    live: [
+      { id: "1", url: "https://x.example.com", name: "x", checkFrequency: 30, emailAlerts: true, policyId: "pol-1" },
+    ],
+  });
+  const result = await applyMonitorConfig({
+    config: {
+      monitors: [
+        { url: "https://x.example.com", name: "x", emailAlerts: true, policyId: "pol-1", checkFrequency: 30 },
+      ],
+    },
     client,
     dryRun: false,
-    defaultAlertEmail: "oncall@example.com",
   });
-  assert.equal(client.created[0].alertEmail, "oncall@example.com");
+  assert.deepEqual(result.unchanged, ["https://x.example.com"]);
+  assert.equal(result.updated.length, 0);
+  assert.equal(client.updated.length, 0, "a converged config issues zero update calls");
+});
+
+test("a drifted emailAlerts switch is still detected as an update", async () => {
+  const client = fakeClient({
+    live: [{ id: "1", url: "https://x.example.com", name: "x", checkFrequency: 30, emailAlerts: false }],
+  });
+  const result = await applyMonitorConfig({
+    config: {
+      monitors: [{ url: "https://x.example.com", name: "x", emailAlerts: true, policyId: null, checkFrequency: 30 }],
+    },
+    client,
+    dryRun: false,
+  });
+  assert.deepEqual(result.updated, ["https://x.example.com"]);
 });
 
 test("applyMonitorConfig issues update for a drifted existing monitor", async () => {
   const client = fakeClient({ live: [{ id: "1", url: "https://x.example.com", name: "old", checkFrequency: 30 }] });
   const result = await applyMonitorConfig({
-    config: { monitors: [{ url: "https://x.example.com", name: "new", alertEmail: null, checkFrequency: 30 }] },
+    config: { monitors: [{ url: "https://x.example.com", name: "new", emailAlerts: true, policyId: null, checkFrequency: 30 }] },
     client,
     dryRun: false,
   });
@@ -266,6 +399,45 @@ test("CLI skip-with-notice: no BETTERSTACK_API_TOKEN exits 0 with a notice, no c
     env: { ...process.env, BETTERSTACK_API_TOKEN: "" },
   });
   assert.match(out, /skipping uptime-monitor apply/);
+  rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("CLI skip-with-notice raises a ::warning:: annotation so an inert apply is visible in the checks UI", () => {
+  tmpDir = mkdtempSync(join(tmpdir(), "uptime-monitors-"));
+  const configPath = join(tmpDir, "monitors.json");
+  writeFileSync(configPath, JSON.stringify([{ url: "https://x.example.com" }]));
+  const out = execFileSync("node", [CLI, "--config", configPath], {
+    encoding: "utf8",
+    env: { ...process.env, BETTERSTACK_API_TOKEN: "" },
+  });
+  assert.match(out, /^::warning title=Uptime monitors not applied::/m);
+  rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("CLI announces UPTIME_ALERT_EMAIL as ignored instead of silently no-oping, and still exits 0", () => {
+  tmpDir = mkdtempSync(join(tmpdir(), "uptime-monitors-"));
+  const configPath = join(tmpDir, "monitors.json");
+  writeFileSync(configPath, JSON.stringify([{ url: "https://x.example.com" }]));
+  // No token: the run short-circuits before any network call, which is enough
+  // to observe that the address is announced rather than quietly accepted.
+  const res = execFileSync("node", [CLI, "--config", configPath, "--alert-email", "oncall@example.com"], {
+    encoding: "utf8",
+    env: { ...process.env, BETTERSTACK_API_TOKEN: "" },
+  });
+  assert.match(res, /skipping uptime-monitor apply/);
+});
+
+test("CLI reports a config's retired alertEmail on stderr and never sends it", async () => {
+  const configPath = join(tmpDir, "legacy.json");
+  writeFileSync(configPath, JSON.stringify([{ url: "https://x.example.com", alertEmail: "oncall@example.com" }]));
+  const { stdout, stderr } = await execFileAsync(
+    "node",
+    [CLI, "--config", configPath, "--dry-run", "--alert-email", "oncall@example.com"],
+    { env: { ...process.env, BETTERSTACK_API_TOKEN: "tok", BETTERSTACK_API_BASE_OVERRIDE: "http://127.0.0.1:9" } }
+  ).catch((err) => err);
+  assert.match(stderr, /DEPRECATED: monitor config entry \[0\] sets "alertEmail"/);
+  assert.match(stderr, /DEPRECATED: --alert-email \/ \$UPTIME_ALERT_EMAIL is ignored/);
+  assert.match(stdout, /::warning title=UPTIME_ALERT_EMAIL is ignored::/);
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
