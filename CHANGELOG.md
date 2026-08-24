@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.4.1...mandrel-platform-v1.4.2) (2026-08-24)
+
+
+### Fixed
+
+* uptime-apply: send Better Stack's `email` as a boolean and expose `policy_id` as the real alert-routing surface ([#403](https://github.com/dsj1984/mandrel-platform/issues/403)) ([#404](https://github.com/dsj1984/mandrel-platform/issues/404)) ([45767f5](https://github.com/dsj1984/mandrel-platform/commit/45767f5a69ae94a5c03420824cb594e2aca5a8da))
+
 ## [1.4.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.4.0...mandrel-platform-v1.4.1) (2026-08-07)
 
 
