@@ -360,6 +360,22 @@ async function main() {
     process.exit(1);
   }
 
+  // Announced before the token check on purpose: "secret provisioned, token
+  // absent" is exactly the state that produced a permanently-green apply a
+  // consumer believed was routing alerts, so that run is the one that most
+  // needs to hear the address is inert (refs #403).
+  if (opts.alertEmail) {
+    process.stdout.write(
+      "::warning title=UPTIME_ALERT_EMAIL is ignored::Better Stack resolves alert recipients from the team roster " +
+        "and escalation policy, not from a per-monitor address. Set a monitor's `policyId` instead, and drop this secret from your caller.\n"
+    );
+    process.stderr.write(
+      "[apply-uptime-monitors] DEPRECATED: --alert-email / $UPTIME_ALERT_EMAIL is ignored — Better Stack's monitor " +
+        "`email` field is a boolean switch, not a recipient. Use a monitor entry's `policyId` (escalation policy) to " +
+        "control who is alerted, and `emailAlerts` to toggle e-mail alerts.\n"
+    );
+  }
+
   // Graceful degradation: no token → skip-with-notice, exit 0. Preserves the
   // pre-existing per-consumer behaviour when Better Stack secrets are not
   // yet provisioned (acceptance criterion — see docs/reusable-workflows.md).
@@ -388,22 +404,6 @@ async function main() {
 
   for (const notice of config.deprecations) {
     process.stderr.write(`[apply-uptime-monitors] DEPRECATED: ${notice}\n`);
-  }
-
-  // `--alert-email` / $UPTIME_ALERT_EMAIL are retained so an existing caller
-  // keeps working — the reusable workflow still declares the secret, because
-  // GitHub rejects a caller that passes a secret the called workflow does not
-  // declare — but the value cannot route anything and is never sent.
-  if (opts.alertEmail) {
-    process.stdout.write(
-      "::warning title=UPTIME_ALERT_EMAIL is ignored::Better Stack resolves alert recipients from the team roster " +
-        "and escalation policy, not from a per-monitor address. Set a monitor's `policyId` instead, and drop this secret from your caller.\n"
-    );
-    process.stderr.write(
-      "[apply-uptime-monitors] DEPRECATED: --alert-email / $UPTIME_ALERT_EMAIL is ignored — Better Stack's monitor " +
-        "`email` field is a boolean switch, not a recipient. Use a monitor entry's `policyId` (escalation policy) to " +
-        "control who is alerted, and `emailAlerts` to toggle e-mail alerts.\n"
-    );
   }
 
   // Test-only escape hatch: point the CLI at a local/offline server instead

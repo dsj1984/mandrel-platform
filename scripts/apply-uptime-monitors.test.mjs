@@ -414,17 +414,22 @@ test("CLI skip-with-notice raises a ::warning:: annotation so an inert apply is 
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("CLI announces UPTIME_ALERT_EMAIL as ignored instead of silently no-oping, and still exits 0", () => {
+test("CLI announces UPTIME_ALERT_EMAIL as ignored instead of silently no-oping, and still exits 0", async () => {
   tmpDir = mkdtempSync(join(tmpdir(), "uptime-monitors-"));
   const configPath = join(tmpDir, "monitors.json");
   writeFileSync(configPath, JSON.stringify([{ url: "https://x.example.com" }]));
-  // No token: the run short-circuits before any network call, which is enough
-  // to observe that the address is announced rather than quietly accepted.
-  const res = execFileSync("node", [CLI, "--config", configPath, "--alert-email", "oncall@example.com"], {
-    encoding: "utf8",
-    env: { ...process.env, BETTERSTACK_API_TOKEN: "" },
-  });
-  assert.match(res, /skipping uptime-monitor apply/);
+  // "Secret provisioned, token absent" is the exact state that produced a
+  // permanently-green apply a consumer believed was routing alerts — so this
+  // run must still say the address is inert, and must still exit 0.
+  const { stdout, stderr } = await execFileAsync(
+    "node",
+    [CLI, "--config", configPath, "--alert-email", "oncall@example.com"],
+    { env: { ...process.env, BETTERSTACK_API_TOKEN: "" } }
+  );
+  assert.match(stderr, /DEPRECATED: --alert-email \/ \$UPTIME_ALERT_EMAIL is ignored/);
+  assert.match(stderr, /policyId/, "the notice names the replacement, not just the removal");
+  assert.match(stdout, /^::warning title=UPTIME_ALERT_EMAIL is ignored::/m);
+  assert.match(stdout, /skipping uptime-monitor apply/);
 });
 
 test("CLI reports a config's retired alertEmail on stderr and never sends it", async () => {
