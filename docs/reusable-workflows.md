@@ -2937,7 +2937,6 @@ jobs:
       apply: ${{ github.event_name == 'push' && 'true' || 'false' }}
     secrets:
       BETTERSTACK_API_TOKEN: ${{ secrets.BETTERSTACK_API_TOKEN }}
-      UPTIME_ALERT_EMAIL: ${{ secrets.UPTIME_ALERT_EMAIL }}
 ```
 
 A ready-to-copy version of this caller ships at
@@ -2959,7 +2958,7 @@ and is materialized into a consumer's `.github/workflows/` by `platform-sync`
 | Secret                 | Required | Purpose                                                                                                  |
 | ----------------------- | -------- | --------------------------------------------------------------------------------------------------------- |
 | `BETTERSTACK_API_TOKEN` | No       | Better Stack API token. **Absent → skip-with-notice** (see below) — the graceful-degradation path for a consumer that hasn't provisioned Better Stack yet. |
-| `UPTIME_ALERT_EMAIL`    | No       | Default alert-contact email applied to any monitor-config entry that doesn't set its own `alertEmail`. A monitor with neither is created with no alert contact. |
+| `UPTIME_ALERT_EMAIL`    | No       | **Deprecated and ignored.** Better Stack types a monitor's `email` field as a boolean (`"Send e-mail alerts."`) — a switch, not a recipient — so this address never routed alerts anywhere. Setting it raises a `::warning::` annotation and changes nothing. It remains *declared* on the shared workflow so a caller still passing it keeps compiling (GitHub rejects a caller that passes a secret the called workflow does not declare); drop it from your caller. See [Who actually gets alerted](#who-actually-gets-alerted). |
 
 ### Skip-with-notice (graceful degradation)
 
@@ -2983,7 +2982,8 @@ A JSON file, either a bare array of monitor entries or an object with a
   {
     "url": "https://api.example.com/health",
     "name": "api",
-    "alertEmail": "oncall@example.com",
+    "emailAlerts": true,
+    "policyId": "12345",
     "checkFrequency": 30
   }
 ]
@@ -2993,18 +2993,33 @@ A JSON file, either a bare array of monitor entries or an object with a
 | ----------------- | -------- | --------------------------------------------------------------------------------------------- |
 | `url`             | yes      | The `http(s)` URL Better Stack probes.                                                       |
 | `name`            | no       | Display name for the monitor. Defaults to the URL's host.                                    |
-| `alertEmail`      | no       | Per-monitor alert-contact email. Falls back to the `UPTIME_ALERT_EMAIL` secret when unset.   |
+| `emailAlerts`     | no       | Boolean — whether Better Stack sends e-mail alerts for this monitor (its `email` field). Defaults to `true`. This is a switch, **not** a recipient. |
+| `policyId`        | no       | Better Stack escalation-policy id (`policy_id`). **This is the field that determines who is alerted.** Omitted → the monitor uses your Better Stack team's default routing. |
 | `checkFrequency`  | no       | Probe interval in seconds. Defaults to `30`.                                                 |
 
+A retired `alertEmail` field is still accepted and type-checked so an existing
+config keeps parsing, but it is **inert**: the apply prints a deprecation
+notice naming `policyId` as its replacement and never sends the address.
+
+### Who actually gets alerted
+
+Better Stack resolves alert recipients from **your Better Stack team roster**
+and the **escalation policy** attached to a monitor — never from an address
+supplied per monitor by this workflow. The Monitors API's `email` field is
+documented as a boolean, `"Send e-mail alerts."`; it decides *whether* e-mail
+goes out, not *to whom*. Repo-side configuration therefore owns the switch
+(`emailAlerts`) and the policy selection (`policyId`); the roster behind that
+policy is owned in the Better Stack dashboard.
+
 **Validation is strict.** An entry missing a valid `url`, or with a
-wrong-typed `name` / `alertEmail` / `checkFrequency`, fails the job with a
-message naming the offending array index — it never silently skips a
-malformed entry.
+wrong-typed `name` / `emailAlerts` / `policyId` / `checkFrequency`, fails the
+job with a message naming the offending array index — it never silently skips
+a malformed entry.
 
 **Diff semantics are additive-only.** The script diffs the desired config
 against Better Stack's *live* monitor list by URL and only ever **creates** a
-missing monitor or **updates** a drifted one (name / alert email / check
-frequency). It never deletes a live monitor absent from the config — a
+missing monitor or **updates** a drifted one (name / e-mail-alert switch /
+escalation policy / check frequency). It never deletes a live monitor absent from the config — a
 monitor an operator created by hand in the Better Stack dashboard is left
 untouched.
 
@@ -3030,7 +3045,8 @@ BETTERSTACK_API_TOKEN=<token> node scripts/apply-uptime-monitors.mjs --config in
 Better Stack v2 monitors contract and invokes the real CLI against it with
 the same argument/env shape `uptime-apply.yml`'s "Apply uptime monitors" step
 constructs (`--config <path> --dry-run`, `BETTERSTACK_API_TOKEN` /
-`UPTIME_ALERT_EMAIL` via env), using an injectable `apiBase` seam
+`UPTIME_ALERT_EMAIL` via env — the latter asserted to be inert), using an
+injectable `apiBase` seam
 (`BETTERSTACK_API_BASE_OVERRIDE`, test-only — never set in a production
 caller) so the exercise runs against a real (local) server rather than only
 mocking the fetch layer. This is the in-repo verification of the caller

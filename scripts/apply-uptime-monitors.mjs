@@ -43,9 +43,12 @@
  *   • --token        Better Stack API token. Defaults to
  *                     $BETTERSTACK_API_TOKEN. Missing token → skip-with-
  *                     notice, exit 0.
- *   • --alert-email  Default alert-contact email applied to any monitor
- *                     entry that does not set its own `alertEmail`. Defaults
- *                     to $UPTIME_ALERT_EMAIL.
+ *   • --alert-email  DEPRECATED and ignored (defaults to $UPTIME_ALERT_EMAIL).
+ *                     Better Stack's monitor `email` field is a boolean
+ *                     ("Send e-mail alerts."), not a recipient — recipients
+ *                     resolve from the team roster and the escalation policy.
+ *                     Accepted only so an existing caller does not break; use
+ *                     a monitor entry's `policyId` to control who is alerted.
  *
  * Exit codes:
  *   0 — plan computed / applied successfully, OR skip-with-notice (no token).
@@ -71,12 +74,24 @@ import { resolve } from "node:path";
  *   {
  *     "url": "https://api.example.com/health",   // required, http(s) URL
  *     "name": "api",                              // optional, defaults to url's host
- *     "alertEmail": "oncall@example.com",         // optional, falls back to --alert-email
+ *     "emailAlerts": true,                        // optional, boolean, default true
+ *     "policyId": "12345",                        // optional, Better Stack escalation policy
  *     "checkFrequency": 30                        // optional, seconds, default 30
  *   }
  *
+ * `emailAlerts` maps to Better Stack's `email` field, which the Monitors API
+ * types as a **boolean** ("Send e-mail alerts.") — it is a switch, not a
+ * recipient. Recipients resolve from the Better Stack team roster and the
+ * escalation policy named by `policyId` (`policy_id`), never from a
+ * per-monitor address. The retired `alertEmail` field is still accepted and
+ * type-checked so an existing config keeps parsing, but it is inert: it is
+ * reported in `deprecations[]` and never reaches the API payload.
+ *
  * @param {unknown} raw  Parsed JSON.
- * @returns {{ monitors: Array<{url:string, name:string, alertEmail:string|null, checkFrequency:number}> }}
+ * @returns {{
+ *   monitors: Array<{url:string, name:string, emailAlerts:boolean, policyId:string|null, checkFrequency:number}>,
+ *   deprecations: string[]
+ * }}
  * @throws {Error} with a message naming the offending index/field on invalid input.
  */
 export function parseMonitorConfig(raw) {
@@ -86,9 +101,18 @@ export function parseMonitorConfig(raw) {
       "monitor config must be a JSON array of monitor entries, or an object with a `monitors` array."
     );
   }
-  return {
-    monitors: list.map((entry, i) => validateMonitorEntry(entry, i)),
-  };
+  const deprecations = [];
+  const monitors = list.map((entry, i) => {
+    if (entry && typeof entry === "object" && entry.alertEmail !== undefined) {
+      deprecations.push(
+        `monitor config entry [${i}] sets "alertEmail" — that field is ignored. ` +
+          `Better Stack types the monitor's \`email\` field as a boolean (an on/off switch), not a recipient. ` +
+          `Use "emailAlerts" to toggle e-mail alerts and "policyId" to choose the escalation policy that decides who is alerted.`
+      );
+    }
+    return validateMonitorEntry(entry, i);
+  });
+  return { monitors, deprecations };
 }
 
 function validateMonitorEntry(entry, index) {
@@ -110,13 +134,20 @@ function validateMonitorEntry(entry, index) {
   if (entry.alertEmail !== undefined && typeof entry.alertEmail !== "string") {
     throw new Error(`monitor config entry [${index}] "alertEmail" must be a string when present.`);
   }
+  if (entry.emailAlerts !== undefined && typeof entry.emailAlerts !== "boolean") {
+    throw new Error(`monitor config entry [${index}] "emailAlerts" must be a boolean when present.`);
+  }
+  if (entry.policyId !== undefined && typeof entry.policyId !== "string") {
+    throw new Error(`monitor config entry [${index}] "policyId" must be a string when present.`);
+  }
   if (entry.checkFrequency !== undefined && !(Number.isInteger(entry.checkFrequency) && entry.checkFrequency > 0)) {
     throw new Error(`monitor config entry [${index}] "checkFrequency" must be a positive integer (seconds) when present.`);
   }
   return {
     url: entry.url,
     name: entry.name ?? host,
-    alertEmail: entry.alertEmail ?? null,
+    emailAlerts: entry.emailAlerts ?? true,
+    policyId: entry.policyId ?? null,
     checkFrequency: entry.checkFrequency ?? DEFAULT_CHECK_FREQUENCY_SECONDS,
   };
 }
@@ -163,7 +194,13 @@ function normalizeUrl(url) {
 function monitorNeedsUpdate(live, desired) {
   if (live.name !== undefined && live.name !== desired.name) return true;
   if (live.checkFrequency !== undefined && live.checkFrequency !== desired.checkFrequency) return true;
-  if (live.alertEmail !== undefined && desired.alertEmail !== null && live.alertEmail !== desired.alertEmail) return true;
+  // Both sides are booleans: the live read-back maps Better Stack's boolean
+  // `email` attribute, and `emailAlerts` normalizes to a boolean at parse.
+  // Comparing a boolean against a configured address (the pre-#403 shape)
+  // read as drift on every beat and issued a redundant PATCH per monitor
+  // per apply.
+  if (live.emailAlerts !== undefined && live.emailAlerts !== desired.emailAlerts) return true;
+  if (live.policyId !== undefined && desired.policyId !== null && live.policyId !== desired.policyId) return true;
   return false;
 }
 
@@ -209,7 +246,8 @@ export function createBetterStackClient({ token, fetchImpl = fetch, apiBase = BE
         url: m.attributes?.url ?? "",
         name: m.attributes?.pronounceable_name,
         checkFrequency: m.attributes?.check_frequency,
-        alertEmail: m.attributes?.email,
+        emailAlerts: m.attributes?.email,
+        policyId: m.attributes?.policy_id,
       }));
     },
     async createMonitor(entry) {
@@ -231,7 +269,11 @@ function toBetterStackPayload(entry) {
     url: entry.url,
     pronounceable_name: entry.name,
     check_frequency: entry.checkFrequency,
-    ...(entry.alertEmail ? { email: entry.alertEmail } : {}),
+    // `email` is a boolean in Better Stack's Monitors API ("Send e-mail
+    // alerts.") — always send the switch, never an address. `policy_id` is
+    // the field that actually determines who is alerted.
+    email: entry.emailAlerts,
+    ...(entry.policyId ? { policy_id: entry.policyId } : {}),
   };
 }
 
@@ -245,14 +287,10 @@ function toBetterStackPayload(entry) {
  * @param {{monitors: Array}} opts.config
  * @param {ReturnType<typeof createBetterStackClient>} opts.client
  * @param {boolean} opts.dryRun
- * @param {string|null} [opts.defaultAlertEmail]
  * @returns {Promise<{created: string[], updated: string[], unchanged: string[], dryRun: boolean}>}
  */
-export async function applyMonitorConfig({ config, client, dryRun, defaultAlertEmail = null }) {
-  const desired = config.monitors.map((m) => ({
-    ...m,
-    alertEmail: m.alertEmail ?? defaultAlertEmail,
-  }));
+export async function applyMonitorConfig({ config, client, dryRun }) {
+  const desired = config.monitors;
   const live = await client.listMonitors();
   const { toCreate, toUpdate, unchanged } = diffMonitors(desired, live);
 
@@ -322,10 +360,33 @@ async function main() {
     process.exit(1);
   }
 
+  // Announced before the token check on purpose: "secret provisioned, token
+  // absent" is exactly the state that produced a permanently-green apply a
+  // consumer believed was routing alerts, so that run is the one that most
+  // needs to hear the address is inert (refs #403).
+  if (opts.alertEmail) {
+    process.stdout.write(
+      "::warning title=UPTIME_ALERT_EMAIL is ignored::Better Stack resolves alert recipients from the team roster " +
+        "and escalation policy, not from a per-monitor address. Set a monitor's `policyId` instead, and drop this secret from your caller.\n"
+    );
+    process.stderr.write(
+      "[apply-uptime-monitors] DEPRECATED: --alert-email / $UPTIME_ALERT_EMAIL is ignored — Better Stack's monitor " +
+        "`email` field is a boolean switch, not a recipient. Use a monitor entry's `policyId` (escalation policy) to " +
+        "control who is alerted, and `emailAlerts` to toggle e-mail alerts.\n"
+    );
+  }
+
   // Graceful degradation: no token → skip-with-notice, exit 0. Preserves the
   // pre-existing per-consumer behaviour when Better Stack secrets are not
   // yet provisioned (acceptance criterion — see docs/reusable-workflows.md).
   if (!opts.token) {
+    // Annotation-level, not stdout-only: a consumer can otherwise sit on a
+    // permanently-green `uptime-apply` for weeks with zero live monitors and
+    // never notice the apply is inert (refs #403).
+    process.stdout.write(
+      "::warning title=Uptime monitors not applied::BETTERSTACK_API_TOKEN is not provisioned — " +
+        "this uptime-apply run created and updated nothing. Provision the secret to activate uptime monitoring.\n"
+    );
     process.stdout.write(
       "⏭️  apply-uptime-monitors: BETTERSTACK_API_TOKEN not provided — skipping uptime-monitor apply (Better Stack not provisioned for this consumer yet).\n"
     );
@@ -339,6 +400,10 @@ async function main() {
   } catch (err) {
     process.stderr.write(`[apply-uptime-monitors] ERROR: invalid monitor config: ${err.message}\n`);
     process.exit(1);
+  }
+
+  for (const notice of config.deprecations) {
+    process.stderr.write(`[apply-uptime-monitors] DEPRECATED: ${notice}\n`);
   }
 
   // Test-only escape hatch: point the CLI at a local/offline server instead
@@ -355,7 +420,6 @@ async function main() {
       config,
       client,
       dryRun: opts.dryRun,
-      defaultAlertEmail: opts.alertEmail,
     });
     const verb = result.dryRun ? "would create" : "created";
     const verbUpdate = result.dryRun ? "would update" : "updated";

@@ -24,7 +24,9 @@
 #         monitor-config: infra/uptime/monitors.json
 #       secrets:
 #         BETTERSTACK_API_TOKEN: ${{ secrets.BETTERSTACK_API_TOKEN }}
-#         UPTIME_ALERT_EMAIL: ${{ secrets.UPTIME_ALERT_EMAIL }}
+#         # UPTIME_ALERT_EMAIL is deprecated and ignored — alert recipients
+#         # come from the Better Stack team roster and the escalation policy
+#         # named by a monitor entry's `policyId`, never from this address.
 #
 # Graceful degradation (acceptance criterion): when BETTERSTACK_API_TOKEN is
 # not provisioned on the caller, the job still runs (never `if:`-skipped —
@@ -43,8 +45,9 @@ on:
         description: >
           Path (relative to the caller repo root) to the JSON monitor-config
           file. See scripts/apply-uptime-monitors.mjs's docblock for the
-          schema (a bare array of {url, name?, alertEmail?, checkFrequency?}
-          entries, or an object with a `monitors` array).
+          schema (a bare array of
+          {url, name?, emailAlerts?, policyId?, checkFrequency?} entries, or
+          an object with a `monitors` array).
         required: true
         type: string
       apply:
@@ -72,10 +75,17 @@ on:
         required: false
       UPTIME_ALERT_EMAIL:
         description: >
-          Default alert-contact email applied to any monitor-config entry
-          that does not set its own `alertEmail`. Optional — a monitor entry
-          with no alertEmail and no default simply ships with no alert
-          contact configured.
+          DEPRECATED and ignored. Better Stack types a monitor's `email`
+          field as a boolean ("Send e-mail alerts.") — it is an on/off
+          switch, not a recipient. Alert recipients resolve from the Better
+          Stack team roster and the escalation policy, so this address never
+          routed anything. Use a monitor-config entry's `emailAlerts`
+          (boolean) to toggle e-mail alerts and `policyId` to name the
+          escalation policy that decides who is alerted. This secret stays
+          declared so an existing caller that still passes it keeps
+          compiling — GitHub rejects a caller that passes a secret the
+          called workflow does not declare — and the apply raises a warning
+          annotation when it is set. Drop it from your caller.
         required: false
 
 permissions:
