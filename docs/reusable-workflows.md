@@ -2814,6 +2814,38 @@ issue and open a second one, which is why neither is a caller input.
 | `unchanged-behavior` | no       | `'noop'` | `noop` writes nothing on an unchanged set; `refresh` silently rewrites the body.              |
 | `comment-on-change`  | no       | `'false'`| `true` also comments when the failing set changes, on top of the body update.                 |
 
+### Outputs
+
+| Output         | Value                                                                                          |
+| -------------- | ---------------------------------------------------------------------------------------------- |
+| `issue-number` | Decimal number of the tracked issue, or empty when no tracked issue exists.                     |
+| `action-taken` | Exactly one of `opened`, `updated`, `closed`, `noop`.                                            |
+
+> **`issue-number` is populated on an unchanged `noop`.** That is the point of
+> the pair, not an accident of it. `noop` covers two different worlds — "nothing
+> is failing, so there is no issue" and "the issue exists and already reflects
+> the failing set" — and they are only distinguishable downstream when the
+> second one still reports its number. A caller that wants to assign, label or
+> link the tracked issue reads `issue-number` and gets the same answer on every
+> run, whether or not this run wrote anything.
+
+`action-taken` is the public past-tense vocabulary. It is mapped from the
+internal `create` / `update` / `close` / `noop` verdict rather than being it: an
+unrecognised verdict degrades to `noop` rather than emitting a fifth word a
+caller's `if:` has never heard of. Under `dry-run: true` nothing is written to
+the tracker, but both outputs still report the verdict that *would* have run —
+that is what makes a dry run inspectable.
+
+On `opened` the number is parsed from the URL `gh issue create` prints. A
+payload the parser cannot read yields `opened` with an **empty** `issue-number`
+and a `::warning::` — never a failure, because the issue was created either way
+and throwing would discard a real write. For the same reason, a missing
+`$GITHUB_OUTPUT` skips the write instead of failing the run: these outputs are
+additive, and a caller that ignores them is the normal case.
+
+`osv-track-issue` exposes both outputs under the same two names, forwarded from
+the shared core it executes.
+
 > **`cancelled` and `skipped` are not failures.** Only a `job-results` entry
 > whose `result` is exactly `failure` counts. A self-hosted fleet going down
 > produces a wall of `cancelled` jobs, and raising an issue for those is
@@ -2848,7 +2880,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: dsj1984/mandrel-platform/.github/actions/track-issue@<sha> # <tag>
+      - id: track
+        uses: dsj1984/mandrel-platform/.github/actions/track-issue@<sha> # <tag>
         with:
           marker: acme:nightly-tracker
           title: Nightly suite failures
@@ -2858,10 +2891,29 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           unchanged-behavior: refresh
           github-token: ${{ github.token }}
+
+      # Read the identity off the action — never re-discover it with a
+      # `gh issue list`, which loses the race against the create above.
+      - name: Page the on-call owner
+        if: steps.track.outputs.issue-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ steps.track.outputs.issue-number }}
+          TAKEN: ${{ steps.track.outputs.action-taken }}
+        run: |
+          set -euo pipefail
+          echo "tracker ${TAKEN} issue #${ISSUE}"
+          gh issue edit "${ISSUE}" --repo "${GITHUB_REPOSITORY}" --add-assignee "@me"
 ```
 
 `if: always()` matters: a tracker job that is itself skipped when an upstream
 job fails can never file — or close — anything.
+
+The `if:` on the second step guards the one case where there is nothing to act
+on: an empty `issue-number` means no tracked issue exists at all. It fires on a
+`noop` whose set was merely unchanged, which is usually what a caller wants —
+the assignment is idempotent, and skipping it there would leave a long-lived
+issue unassigned forever just because the run that opened it was not this one.
 
 ### Compatibility posture for existing `osv-track-issue` consumers
 
@@ -2884,6 +2936,10 @@ The extraction is deliberately non-breaking at every level:
    undiscoverable and open a second one. They are asserted as literals in
    [`scripts/osv-track-issue.test.mjs`](../scripts/osv-track-issue.test.mjs),
    not derived from the module under test.
+5. **`issue-number` / `action-taken` are purely additive.** Outputs are opt-in
+   at the point of reading — a consumer that never references
+   `steps.<id>.outputs.*` sees no behavioural change, and a run with no
+   `$GITHUB_OUTPUT` to write to skips the write rather than failing.
 
 > **The pin-freshness guard follows the shared core.** Because nothing `uses:`
 > the generic action, a rewrite of `track-issue.mjs` would otherwise leave every

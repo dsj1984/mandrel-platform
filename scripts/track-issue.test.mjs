@@ -11,6 +11,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   DEFAULT_CLOSE_COMMENT,
@@ -25,8 +28,14 @@ import {
   findTrackingIssue,
   markerKey,
   markerLine,
+  main,
+  parseIssueNumberFromUrl,
+  planTrackerRun,
   renderEnvEntry,
   resolveConfig,
+  resolveTrackerOutputs,
+  writeGithubEnv,
+  writeGithubOutput,
 } from "../.github/actions/track-issue/track-issue.mjs";
 
 const MARKER = "acme:nightly-tracker";
@@ -372,4 +381,275 @@ test("findTrackingIssue surfaces a gh failure rather than reporting no issue", (
     () => findTrackingIssue({ repo: "acme/app", labels: [], marker: MARKER }, runner),
     /gh issue list failed/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Composite outputs (Story #412)
+//
+// The tracker's whole purpose is to notify someone, and a caller that wants to
+// assign or link the issue previously had to re-discover it with a `gh issue
+// list` that races the create this action just made. These pin the pure
+// verdict → output mapping that removes the race.
+// ---------------------------------------------------------------------------
+
+/** The public vocabulary, written as literals — never derived from the module
+ *  under test, or a rename would silently redefine the contract it asserts. */
+const PUBLIC_ACTIONS = ["opened", "updated", "closed", "noop"];
+
+test("every state-table row maps to its public action and the right number", () => {
+  const existing = { number: 4242, body: "…" };
+
+  // create → opened, number parsed from the URL gh printed.
+  assert.deepEqual(
+    resolveTrackerOutputs({
+      verdict: { action: "create" },
+      existing: null,
+      createdUrl: "https://github.com/acme/app/issues/77\n",
+    }),
+    { issueNumber: "77", actionTaken: "opened" },
+  );
+
+  // update → updated, the live issue's number.
+  assert.deepEqual(resolveTrackerOutputs({ verdict: { action: "update" }, existing }), {
+    issueNumber: "4242",
+    actionTaken: "updated",
+  });
+
+  // close → closed. The number still reports: the caller may want to link the
+  // issue it just closed.
+  assert.deepEqual(resolveTrackerOutputs({ verdict: { action: "close" }, existing }), {
+    issueNumber: "4242",
+    actionTaken: "closed",
+  });
+
+  // same-digest noop → noop, WITH the number. This is the load-bearing row:
+  // without it, "issue exists, set unchanged" is indistinguishable from
+  // "nothing failing, no issue" — the exact ambiguity the outputs remove.
+  assert.deepEqual(resolveTrackerOutputs({ verdict: { action: "noop" }, existing }), {
+    issueNumber: "4242",
+    actionTaken: "noop",
+  });
+
+  // empty-set-with-no-issue noop → noop, and empty is the ONLY case that is.
+  assert.deepEqual(resolveTrackerOutputs({ verdict: { action: "noop" }, existing: null }), {
+    issueNumber: "",
+    actionTaken: "noop",
+  });
+});
+
+test("action-taken only ever emits the four public past-tense values", () => {
+  for (const action of ["create", "update", "close", "noop"]) {
+    const { actionTaken } = resolveTrackerOutputs({
+      verdict: { action },
+      existing: { number: 1 },
+      createdUrl: "https://github.com/acme/app/issues/1",
+    });
+    assert.ok(
+      PUBLIC_ACTIONS.includes(actionTaken),
+      `${action} produced ${actionTaken}, which is not a public output value`,
+    );
+    // The internal imperative verdict names must not leak out as-is; only
+    // `noop` is deliberately spelled the same in both vocabularies.
+    if (action !== "noop") assert.notEqual(actionTaken, action);
+  }
+
+  // An unrecognised verdict degrades to the quietest value rather than
+  // emitting a fifth word a caller's `if:` has never heard of.
+  assert.equal(resolveTrackerOutputs({ verdict: { action: "reopen" } }).actionTaken, "noop");
+  assert.equal(resolveTrackerOutputs({}).actionTaken, "noop");
+});
+
+test("the created issue number is parsed from the gh issue create URL", () => {
+  assert.equal(parseIssueNumberFromUrl("https://github.com/acme/app/issues/512\n"), "512");
+  // gh is free to print chatter before the URL; the URL is always last.
+  assert.equal(
+    parseIssueNumberFromUrl("Creating issue in acme/app\nhttps://github.com/acme/app/issues/9"),
+    "9",
+  );
+});
+
+test("an unparseable create URL yields opened with an empty number, never a throw", () => {
+  // A successful create whose URL we cannot read is degraded, not failed — the
+  // issue exists, so throwing here would discard a real write.
+  for (const payload of ["", "   ", "not a url", "https://github.com/acme/app/pull/3", null]) {
+    const outputs = resolveTrackerOutputs({
+      verdict: { action: "create" },
+      existing: null,
+      createdUrl: payload,
+    });
+    assert.deepEqual(outputs, { issueNumber: "", actionTaken: "opened" });
+  }
+});
+
+test("writeGithubOutput reuses renderEnvEntry's heredoc escaping", () => {
+  const dir = mkdtempSync(join(tmpdir(), "track-issue-out-"));
+  const file = join(dir, "gh-output");
+  const entries = [
+    ["issue-number", "77"],
+    ["action-taken", "opened"],
+    ["detail", "line one\nline two"],
+  ];
+
+  writeGithubOutput(entries, file);
+
+  assert.equal(
+    readFileSync(file, "utf8"),
+    entries.map(([k, v]) => renderEnvEntry(k, v)).join(""),
+  );
+  // The multi-line value must be the heredoc form, not a truncated KEY=value.
+  assert.match(readFileSync(file, "utf8"), /detail<<detail_EOF_7f3a\nline one\nline two\n/);
+});
+
+test("an unset GITHUB_OUTPUT skips the write and returns, where GITHUB_ENV throws", () => {
+  // Outputs are additive — a caller that ignores them is the normal case — so
+  // a missing $GITHUB_OUTPUT must never fail an otherwise-healthy tracker run.
+  for (const missing of [undefined, "", null]) {
+    assert.doesNotThrow(() => writeGithubOutput([["issue-number", "77"]], missing));
+    assert.equal(writeGithubOutput([["issue-number", "77"]], missing), undefined);
+  }
+
+  // The asymmetry is deliberate: the next step of the composite cannot run
+  // without the $GITHUB_ENV hand-off, so that one still fails loudly.
+  assert.throws(() => writeGithubEnv([["K", "v"]], undefined), /GITHUB_ENV is not set/);
+});
+
+test("a dry run performs no tracker write and still reports the would-be verdict", () => {
+  const env = {
+    TRACK_MARKER: MARKER,
+    TRACK_REPO: "acme/app",
+    TRACK_FAILED_ITEMS: JSON.stringify(["a", "b"]),
+  };
+  const dry = resolveConfig({ ...env, TRACK_DRY_RUN: "true" });
+  const live = resolveConfig(env);
+  assert.equal(dry.dryRun, true);
+  assert.equal(live.dryRun, false);
+
+  // `main()` branches on planTrackerRun().writesToTracker, and every gh
+  // create/edit/close/comment lives beyond that branch — so `false` here IS
+  // "no tracker write", asserted rather than merely read off the source.
+  const existing = issueWithDigest(31, "stale-digest");
+  const verdict = decideVerdict(
+    existing,
+    { failedCount: dry.failedItems.length, digest: dry.digest },
+    { digestPrefix: dry.digestPrefix, unchangedBehavior: dry.unchangedBehavior },
+  );
+  assert.equal(verdict.action, "update");
+
+  const planned = planTrackerRun(dry, { verdict, existing });
+  assert.equal(planned.writesToTracker, false, "a dry run must never reach the gh mutations");
+  assert.deepEqual(
+    planned.outputs,
+    { issueNumber: "31", actionTaken: "updated" },
+    "a dry run is not a quiet run — it reports the verdict it declined to perform",
+  );
+
+  // The same inputs without dry-run DO write, so the flag is what gates it.
+  assert.equal(planTrackerRun(live, { verdict, existing }).writesToTracker, true);
+
+  // A dry run over an unchanged set still surfaces the live issue number.
+  const unchangedIssue = issueWithDigest(31, dry.digest);
+  const unchanged = decideVerdict(
+    unchangedIssue,
+    { failedCount: dry.failedItems.length, digest: dry.digest },
+    { digestPrefix: dry.digestPrefix },
+  );
+  assert.equal(unchanged.action, "noop");
+  assert.deepEqual(planTrackerRun(dry, { verdict: unchanged, existing: unchangedIssue }), {
+    writesToTracker: false,
+    outputs: { issueNumber: "31", actionTaken: "noop" },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC-6 — the dry-run guarantee is BEHAVIOURAL, so it is asserted of main()
+//
+// `planTrackerRun` returning `writesToTracker: false` only proves the plan SAYS
+// not to write. It does not prove main() obeys the plan: replacing the branch
+// with `if (false)` leaves that assertion green while a dry run performs real
+// gh create/edit/close calls. The only way to assert "no tracker write" is to
+// hand main() a runner and observe that no mutation reaches it.
+// ---------------------------------------------------------------------------
+
+/** gh subcommands that WRITE to the tracker. `issue list` is a read. */
+const MUTATIONS = ["create", "edit", "close", "comment"];
+const isMutation = (args) => args[0] === "issue" && MUTATIONS.includes(args[1]);
+
+/** A recording `gh` runner that answers the lookup with one marked issue. */
+function fakeRunner(issue) {
+  const calls = [];
+  const runner = (args) => {
+    calls.push(args);
+    if (args[0] === "issue" && args[1] === "list") return JSON.stringify(issue ? [issue] : []);
+    return "https://github.com/acme/app/issues/999\n";
+  };
+  runner.calls = calls;
+  runner.mutations = () => calls.filter(isMutation);
+  return runner;
+}
+
+const dryRunEnv = (githubOutput) => ({
+  TRACK_MARKER: MARKER,
+  TRACK_REPO: "acme/app",
+  TRACK_FAILED_ITEMS: JSON.stringify(["a", "b"]),
+  TRACK_DRY_RUN: "true",
+  GITHUB_OUTPUT: githubOutput,
+});
+
+test("a dry run leaves the injected runner with ZERO mutation calls", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "track-issue-dry-")), "gh-output");
+  const existing = issueWithDigest(31, "stale-digest");
+  const runner = fakeRunner(existing);
+
+  assert.equal(main(dryRunEnv(file), runner), 0);
+
+  // The runner IS wired — the lookup reached it — so "no mutations" is a real
+  // observation about this run, not a vacuous assertion about a dead seam.
+  assert.ok(runner.calls.length >= 1, "the runner never saw the issue lookup");
+  assert.deepEqual(runner.calls.filter((a) => a[0] === "issue" && a[1] === "list").length, 1);
+  assert.deepEqual(
+    runner.mutations(),
+    [],
+    "a dry run must not create, edit, close or comment on anything",
+  );
+
+  // …and it still publishes the verdict it declined to perform.
+  assert.equal(readFileSync(file, "utf8"), "issue-number=31\naction-taken=updated\n");
+});
+
+test("the same run without dry-run DOES reach the tracker — the flag is what gates it", () => {
+  // The differential: if this did not mutate, the test above would prove
+  // nothing about dry-run in particular.
+  const file = join(mkdtempSync(join(tmpdir(), "track-issue-live-")), "gh-output");
+  const existing = issueWithDigest(31, "stale-digest");
+  const runner = fakeRunner(existing);
+  const { TRACK_DRY_RUN, ...live } = dryRunEnv(file);
+  assert.equal(TRACK_DRY_RUN, "true");
+
+  assert.equal(main(live, runner), 0);
+
+  const mutations = runner.mutations();
+  assert.equal(mutations.length, 1);
+  assert.deepEqual(mutations[0].slice(0, 3), ["issue", "edit", "31"]);
+  assert.equal(readFileSync(file, "utf8"), "issue-number=31\naction-taken=updated\n");
+});
+
+test("a dry run over an empty failing set never closes the live issue", () => {
+  // The most expensive dry-run defect: silently closing a tracked issue whose
+  // failures are still real. Asserted on the runner, not on a plan object.
+  const file = join(mkdtempSync(join(tmpdir(), "track-issue-dry-")), "gh-output");
+  const existing = issueWithDigest(31, "d1");
+  const runner = fakeRunner(existing);
+
+  assert.equal(main({ ...dryRunEnv(file), TRACK_FAILED_ITEMS: "[]" }, runner), 0);
+
+  assert.deepEqual(runner.mutations(), []);
+  assert.equal(readFileSync(file, "utf8"), "issue-number=31\naction-taken=closed\n");
+});
+
+test("a dry run with no GITHUB_OUTPUT still runs clean and writes nothing", () => {
+  const runner = fakeRunner(issueWithDigest(31, "stale-digest"));
+  const { GITHUB_OUTPUT, ...noOutput } = dryRunEnv("/unused");
+  assert.equal(GITHUB_OUTPUT, "/unused");
+  assert.equal(main(noOutput, runner), 0);
+  assert.deepEqual(runner.mutations(), []);
 });

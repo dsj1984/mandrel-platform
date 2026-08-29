@@ -121,10 +121,28 @@ inputs:
     required: false
     default: 'false'
 
+outputs:
+  issue-number:
+    description: >
+      Decimal number of the tracked issue this run resolved to, or empty when
+      no tracked issue exists. Populated on `opened`, `updated`, `closed` AND
+      on an unchanged `noop` — a caller that wants to assign, label or link the
+      issue must not have to re-discover it through a `gh issue list` that
+      loses the race against the create this action just made.
+    value: ${{ steps.track-issue.outputs.issue-number }}
+  action-taken:
+    description: >
+      What this run did: `opened`, `updated`, `closed` or `noop`. Note that
+      `noop` alone is ambiguous — it covers both "nothing is failing, so there
+      is no issue" and "the issue exists and already reflects the failing set";
+      `issue-number` is what tells them apart.
+    value: ${{ steps.track-issue.outputs.action-taken }}
+
 runs:
   using: composite
   steps:
     - name: Upsert tracked issue
+      id: track-issue
       shell: bash
       env:
         TRACK_MARKER: ${{ inputs.marker }}
