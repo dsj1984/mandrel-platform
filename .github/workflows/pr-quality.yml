@@ -189,15 +189,26 @@ on:
       # EMPTY on merge_group / push (the precise events where the full-matrix
       # re-run cost bites), so supplying the derived base is what makes
       # affected-only scoping work in the merge queue and on push-to-main. The
-      # consumer's turbo tasks MUST run with `--affected` for the scoping to
-      # take effect (documented in docs/reusable-workflows.md); a task without
-      # `--affected` — or a non-turbo task — ignores the env vars, so enabling
-      # this input can never CHANGE such a task's result. It only narrows what
-      # an already-`--affected` task runs.
+      # consumer's turbo task must GATE `--affected` on the base this workflow
+      # exports — `turbo run <tier> ${TURBO_SCM_BASE:+--affected}` — so the flag
+      # appears only on runs that supplied one (documented in
+      # docs/reusable-workflows.md); a task without `--affected` — or a
+      # non-turbo task — ignores the env vars, so enabling this input can never
+      # CHANGE such a task's result. It only narrows what an
+      # already-`--affected` task runs.
       #
-      # SAFE BY CONSTRUCTION. turbo falls back to running ALL packages when the
-      # git checkout is too shallow to resolve the base, so the worst case is a
-      # full run (today's behaviour) — never a MISSED task. When true, each
+      # THE FULL-RUN FALLBACK IS SCOPED TO AN UNRESOLVABLE BASE. turbo falls
+      # back to running ALL packages only when it CANNOT RESOLVE the base (e.g.
+      # the git checkout is too shallow), so that case degrades to a full run
+      # (today's behaviour) and skips nothing. A base turbo resolves to an
+      # EMPTY range is NOT that case, which is why `--affected` must never be
+      # baked in unconditionally: when this input is false (the default) the
+      # TURBO_SCM_* vars are never exported, so turbo uses its own documented
+      # default base of `main` — and on a push to `main`, `main...HEAD` is
+      # empty. turbo resolves that base perfectly well, schedules ZERO tasks and
+      # exits 0: a silent no-op that reads as a pass (measured on turbo 2.9.17),
+      # emptying the very whole-tree run the coverage-floor remedy in
+      # docs/reusable-workflows.md tells consumers to keep. When true, each
       # diff-scoped tier's checkout deepens to full history (fetch-depth: 0) so
       # the base is resolvable; when false the checkout stays shallow, exactly
       # as today.
@@ -209,9 +220,15 @@ on:
           exported to each tier so a turbo `--affected` task runs only the
           packages the event introduced — cutting merge-queue / strict-required
           re-run cost, especially on merge_group / push where turbo's own
-          GITHUB_BASE_REF auto-detection is empty. The consumer's turbo tasks
-          must use `--affected`. turbo falls back to a full run when it cannot
-          resolve the base, so this can never miss a task. Default false is
+          GITHUB_BASE_REF auto-detection is empty. Gate the flag on the
+          exported base in the consumer's task — `turbo run <tier>
+          ${TURBO_SCM_BASE:+--affected}` — so `--affected` appears only on runs
+          where this workflow supplied a base. turbo falls back to a full run
+          only when it cannot RESOLVE the base; a base it resolves to an EMPTY
+          range is not covered. An unconditional `--affected` with TURBO_SCM_*
+          unset falls back to turbo's own default base of `main`, and on a push
+          to `main` that range is empty — so turbo schedules zero tasks and
+          exits 0, a silent no-op that reads as a pass. Default false is
           byte-for-byte today's behaviour.
         required: false
         type: boolean
@@ -935,8 +952,11 @@ jobs:
       # drifts past the fork point once main advances), merge_group / push use
       # the derived base directly (already the exact fork point). An explicit
       # `affected-base` input overrides the base. When no ranged base is
-      # resolvable the env vars are left UNSET, so turbo uses its own default
-      # (which degrades to a full run) — never a missed task.
+      # resolvable the env vars are left UNSET, so turbo falls back to its OWN
+      # default base of `main` — which is a full run only where `main...HEAD`
+      # is a non-empty range, NOT unconditionally. Consumers gate the flag as
+      # `${TURBO_SCM_BASE:+--affected}` (see the `affected` input above) so a
+      # run with no exported base is a full run rather than zero tasks.
       - &resolve-affected
         name: Resolve affected SCM base/head (turbo)
         if: ${{ inputs.affected }}

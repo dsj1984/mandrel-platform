@@ -105,7 +105,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `shard-matrix`     | string  | `'[1]'`          | JSON-encoded array of shard indices driving the test matrix (unit, contract, e2e) — e.g. `'[1,2,3]'` for 3 shards. The only sharding input: each test invocation's `--shard=<n>/<total>` denominator is derived from the matrix size, so a mismatched second input cannot under- or over-run the suite. |
 | `fail-fast`        | boolean | `false`          | **Opt-in.** Cancel the entire run on the first tier-job failure, freeing runner capacity that cannot change the outcome. Default `false` is byte-for-byte today's run-to-completion behaviour. Requires `actions: write` on the caller's token. See [Fail-fast run cancellation](#fail-fast-run-cancellation-fail-fast). |
 | `cancelled-policy` | string  | `strict`         | How `ci-required` treats a cancelled tier. `strict` (default) fails on any cancelled tier — byte-for-byte today's behaviour. `provenance-aware` additionally lets a **superseded** run's cancels pass; fail-fast, infra (`never-started`), config (`timed-out`) and unclassifiable cancels still fail. Both policies report each cancelled tier's inferred provenance. See [Cancelled-tier provenance](#cancelled-tier-provenance-cancelled-policy). |
-| `affected`         | boolean | `false`          | **Opt-in.** Run the diff-scoped tiers (lint, typecheck, unit, contract, e2e) affected-only — turbo `--affected` scoped to the packages the event introduced, cutting merge-queue / strict-required re-run cost. Exports `TURBO_SCM_BASE` / `TURBO_SCM_HEAD` (derived event-agnostically, Story #314) and deepens the checkout to full history. The consumer's turbo tasks must use `--affected`. Default `false` is byte-for-byte today's behaviour. See [Affected-only tier execution](#affected-only-tier-execution-affected). |
+| `affected`         | boolean | `false`          | **Opt-in.** Run the diff-scoped tiers (lint, typecheck, unit, contract, e2e) affected-only — turbo `--affected` scoped to the packages the event introduced, cutting merge-queue / strict-required re-run cost. Exports `TURBO_SCM_BASE` / `TURBO_SCM_HEAD` (derived event-agnostically, Story #314) and deepens the checkout to full history. Your turbo task must **gate** the flag on the exported base — `turbo run <tier> ${TURBO_SCM_BASE:+--affected}` — never bake `--affected` in unconditionally: with `TURBO_SCM_*` unset turbo falls back to its own default `main...HEAD` base, which is empty on a push to `main`, so it schedules zero tasks and exits `0`. Read [Affected-only tier execution](#affected-only-tier-execution-affected) for that precondition before enabling this. Default `false` is byte-for-byte today's behaviour. |
 | `affected-base`    | string  | `''`             | Optional base git ref/SHA that overrides the event-derived `TURBO_SCM_BASE` in affected mode (e.g. `'origin/main'`). Empty (default) uses the event-agnostic derivation. Ignored when `affected` is `false`. |
 | `enable-lint`      | boolean | `true`           | Set `false` to skip the lint + format-check tier.                                                                                              |
 | `enable-typecheck` | boolean | `true`           | Set `false` to skip the typecheck tier.                                                                                                        |
@@ -613,13 +613,19 @@ How it works:
   exact events where the full-matrix re-run cost bites. Supplying the derived
   base via these env vars is what makes affected scoping work in the merge
   queue and on push-to-main.
-- **The consumer's turbo tasks must use `--affected`.** This workflow exports
-  the SCM base/head onto the tier's environment; it does not rewrite your
-  opaque `pnpm run <tier>` command. A task that runs `turbo run <tier>
-  --affected` picks the env vars up automatically; a task **without**
-  `--affected` (or a non-turbo task) ignores them entirely — so enabling this
-  input can never *change* such a task's result, only narrow what an already
-  `--affected` task runs.
+- **Gate the flag on the exported base: `turbo run <tier>
+  ${TURBO_SCM_BASE:+--affected}`.** This workflow exports the SCM base/head
+  onto the tier's environment; it does not rewrite your opaque
+  `pnpm run <tier>` command, so the flag is yours to add. Write it as the
+  `${TURBO_SCM_BASE:+--affected}` parameter expansion: it expands to
+  `--affected` only on runs where this workflow exported a base, and to
+  nothing otherwise — so one script is affected-scoped here and a full run
+  everywhere else. A task **without** `--affected` (or a non-turbo task)
+  ignores the env vars entirely — so enabling this input can never *change*
+  such a task's result, only narrow what an already-`--affected` task runs.
+  Do **not** bake `--affected` in unconditionally: with the vars unset it does
+  not degrade to a full run — see *The full-run fallback covers an
+  unresolvable base only* under **Semantics and caveats**, below.
 - **Full history is fetched only in affected mode.** Each diff-scoped tier's
   checkout deepens to `fetch-depth: 0` when `affected: true` (turbo and the
   range resolver need the base commit reachable); when `false` the checkout
@@ -630,11 +636,23 @@ Semantics and caveats:
 - **Default off, unchanged behaviour.** With the input unset (or `false`) every
   tier runs its full command set, the checkout stays shallow, and none of the
   affected-mode steps run. Byte-for-byte identical to before the input existed.
-- **Safe by construction — never a missed task.** turbo falls back to treating
-  **all** packages as changed when the checkout is too shallow to resolve the
-  base, so the worst case is a full run (today's behaviour), never a skipped
-  task. When no ranged base is resolvable the env vars are left unset and turbo
-  uses its own default.
+- **The full-run fallback covers an _unresolvable_ base only — not an empty
+  range.** turbo falls back to treating **all** packages as changed when it
+  **cannot resolve** the base (e.g. the checkout is too shallow), so *that*
+  case degrades to a full run (today's behaviour), never a skipped task. When
+  no ranged base is resolvable the env vars are left unset and turbo uses its
+  own default. That fallback does **not** cover a base turbo resolves to an
+  **empty** range, and an unconditional `--affected` walks straight into one:
+  with `affected: false` (the default — and the state of a whole-tree
+  push-to-`main` run) the `TURBO_SCM_*` vars are never exported, so turbo
+  falls back to its own default base of `main` (the mechanism stated under
+  *Exported as `TURBO_SCM_BASE` / `TURBO_SCM_HEAD`*, above). On a push to
+  `main`, `main...HEAD` is empty — turbo resolves that base perfectly well,
+  schedules **zero** tasks and exits `0`. It is a silent no-op that reads as a
+  pass (measured on turbo 2.9.17), and the run it empties is precisely the
+  whole-tree one the coverage-floor reconciliation below tells you to keep.
+  Gating the flag as `turbo run <tier> ${TURBO_SCM_BASE:+--affected}` closes
+  this: the flag cannot appear on a run that supplied no base.
 - **A tier with no affected work passes green, never `cancelled`.** When the
   event touched no package a tier depends on, turbo runs zero tasks and exits
   `0` — the tier reports `success`, and `ci-required` counts `success` /
@@ -650,9 +668,13 @@ Semantics and caveats:
   visible `::notice::` is emitted (never a silent skip). The floor stays
   authoritative on **non-affected (full) runs** — a consumer that wants a hard
   whole-repo floor keeps a non-affected required check (or a scheduled full
-  run) to assert it. Re-deriving a subset-scoped floor was rejected: its
-  meaning would drift per run (which packages changed), making a single
-  configured threshold unpredictable.
+  run) to assert it. For that fallback to actually assert anything, the turbo
+  task it runs must leave `--affected` off when no base was exported (the
+  `${TURBO_SCM_BASE:+--affected}` shape above) — a baked-in `--affected`
+  schedules zero tasks on that very run, so the floor would be measured over
+  nothing. Re-deriving a subset-scoped floor was rejected: its meaning would
+  drift per run (which packages changed), making a single configured threshold
+  unpredictable.
 - **`affected-base` override.** Set `affected-base` (e.g. `'origin/main'`) to
   replace the event-derived `TURBO_SCM_BASE` with a fixed ref; the head stays
   the derived commit under test. Ignored when `affected` is `false`. The value
@@ -673,8 +695,11 @@ Semantics and caveats:
     required check silently loses the whole-repo coverage floor (the floor is
     bypassed on affected runs, above). This is the documented reconciliation,
     not a regression: keep a non-affected required check (or a scheduled full
-    run) when a hard whole-repo floor must always assert. The visible
-    `::notice::` on every bypassed run keeps the trade-off from being silent.
+    run) when a hard whole-repo floor must always assert — and gate that run's
+    turbo flag as `${TURBO_SCM_BASE:+--affected}`, since a baked-in
+    `--affected` empties it to zero tasks (see the fallback caveat above). The
+    visible `::notice::` on every bypassed run keeps the trade-off from being
+    silent.
 
 ### Security tier (`enable-security` / `enable-sast`)
 
