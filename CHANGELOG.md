@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.4.2...mandrel-platform-v1.5.0) (2026-08-29)
+
+
+### Added
+
+* make the wrangler-baseline gate run for pnpm and monorepo consumers (symlink-safe entry guard, config-path input, JSONC + advisory-mode parse policy) ([#407](https://github.com/dsj1984/mandrel-platform/issues/407)) ([#408](https://github.com/dsj1984/mandrel-platform/issues/408)) ([9e04147](https://github.com/dsj1984/mandrel-platform/commit/9e04147f264f365c40d6692eca72d4b1862be7dd))
+* track-issue: expose issue-number / action-taken as composite outputs so callers never re-discover the tracked issue ([#412](https://github.com/dsj1984/mandrel-platform/issues/412)) ([#417](https://github.com/dsj1984/mandrel-platform/issues/417)) ([6800b42](https://github.com/dsj1984/mandrel-platform/commit/6800b42d9d74602d95f9e9879a0f1689b71051e8))
+
+
+### Fixed
+
+* make the reusable-workflow self-checkout pin real and fail-closed, and ship scripts/lib/ with the scripts that import it ([#415](https://github.com/dsj1984/mandrel-platform/issues/415)) ([#416](https://github.com/dsj1984/mandrel-platform/issues/416)) ([beb5198](https://github.com/dsj1984/mandrel-platform/commit/beb51986caec1950a89aa249ddafc61dce02d6a0))
+* scope the `affected` full-run fallback to an unresolvable base, not an empty range (refs [#413](https://github.com/dsj1984/mandrel-platform/issues/413)) ([#418](https://github.com/dsj1984/mandrel-platform/issues/418)) ([f2708e8](https://github.com/dsj1984/mandrel-platform/commit/f2708e8f740dfc9fd1a86848068d5b04aed4165d))
+
 ## [1.4.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.4.1...mandrel-platform-v1.4.2) (2026-08-24)
 
 
