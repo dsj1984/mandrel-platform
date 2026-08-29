@@ -6,7 +6,7 @@
  * (Story #231). Extracted from the workflow's former ~140-line inline bash so
  * the probe is unit-testable and reviewed as code, not as a YAML diff. The
  * workflow sparse-checks this script out of dsj1984/mandrel-platform at
- * `github.job_workflow_sha` — the exact commit the caller's
+ * `job.workflow_sha` — the exact commit the caller's
  * `deploy-cloudflare.yml@<ref>` pin resolved to — so the script version
  * always travels in lockstep with the workflow pin (same model as
  * `uptime-apply.yml` → `apply-uptime-monitors.mjs`).

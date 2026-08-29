@@ -605,7 +605,7 @@ How it works:
   use (Story #314): `pull_request` → the **merge base** of `base..head` (the
   base tip drifts past the fork point once `main` advances); `merge_group` →
   `merge_group.base_sha`; `push` → `event.before`. Each tier side-checks-out
-  that one script at the resolved `job_workflow_sha`, so gitleaks, SAST, and
+  that one script at the resolved `job.workflow_sha`, so gitleaks, SAST, and
   affected mode cannot drift apart.
 - **Exported as `TURBO_SCM_BASE` / `TURBO_SCM_HEAD`.** turbo `--affected`
   compares `main...HEAD` by default and **auto-detects `GITHUB_BASE_REF` on
@@ -875,7 +875,7 @@ default over the narrower `p/ci`).
 A consumer's `pr-quality.yml@<ref>` call gets the ruleset snapshot that
 shipped with the **exact resolved commit** its pin points to: the SAST job
 checks out `dsj1984/mandrel-platform` a second time (sparse, `.semgrep/`
-only) at `github.job_workflow_sha` — the same resolved-ref
+only) at `job.workflow_sha` — the same resolved-ref
 single-source-of-truth primitive already used by `deploy-cloudflare.yml`'s
 `deploy-summary` job (Story #110) — so "which workflow ran" and "which
 ruleset it scanned with" can never drift apart.
@@ -884,13 +884,30 @@ The same side-checkout mechanism also delivers `pr-quality.yml`'s gate
 *scripts* (Story #230): the
 [coverage threshold gate](#coverage-threshold-gate-coverage-threshold) and the
 [destructive-migration guard](#destructive-migration-guard-enable-migration-guard)
-each sparse-checkout `scripts/` at `github.job_workflow_sha` (into
+each sparse-checkout `scripts/` at `job.workflow_sha` (into
 `_mandrel-platform-scripts/`) and run the platform's unit-tested
 `check-coverage-threshold.mjs` / `check-destructive-migration.mjs` directly,
 instead of carrying inline re-implementations in the workflow YAML. A script
 fetched at the resolved workflow SHA is exactly as version-locked as inline
 YAML — the consumer always runs the script that shipped with the workflow
 version it pinned — with zero drift risk and real unit-test coverage.
+
+> **The pin fails closed (Story #415).** Every platform side-checkout is
+> preceded by a `Resolve platform ref` step that reads `job.workflow_sha` and
+> asserts it is a 40-hex commit. If it cannot be resolved, that step **fails
+> the job** — it never hands `actions/checkout` an empty `ref:`, because an
+> omitted `ref:` makes checkout fall back to this repo's **default branch**,
+> which would run platform code the caller never pinned while everything still
+> looked green. This replaced `github.job_workflow_…sha`, an OIDC token *claim*
+> that is not a `github`-context property at all and so always evaluated to the
+> empty string: for the whole life of the mechanism before #415, every consumer
+> ran these scripts from `main` regardless of the SHA it pinned.
+>
+> The side-checkouts are also `sparse-checkout-cone-mode: false`, which makes
+> each file list **exhaustive** — a listed script's `./lib/*` imports are *not*
+> fetched with it. Any list naming a `scripts/*.mjs` file therefore names
+> `scripts/lib/` too. `scripts/check-workflow-platform-checkout.mjs` enforces
+> both rules in `ci-required`.
 
 **Bumping the ruleset is a reviewable PR**, mirroring the
 [action-pin ratchet](#the-action-pin-ratchet)'s "bump is a PR" discipline and
@@ -1754,7 +1771,7 @@ signal on changed files is sufficient for the gate.
 > unit-tested in `scripts/check-destructive-migration.mjs` /
 > `scripts/check-destructive-migration.test.mjs` on the platform repo, and the
 > `migration-guard` job runs that script **directly** — fetched via the
-> [`job_workflow_sha` side-checkout](#sast-ruleset-provenance-and-update-process)
+> [`job.workflow_sha` side-checkout](#sast-ruleset-provenance-and-update-process)
 > mechanism, so the
 > consumer always runs the script version that shipped with the workflow it
 > pinned. An opt-in consumer needs **no** consumer-side script copy to inherit
@@ -1781,7 +1798,7 @@ unchanged).
   (the same one uploaded as the unit artifact); no extra dependency or
   consumer-side script is required. The gate logic itself is the platform's
   unit-tested `scripts/check-coverage-threshold.mjs`, fetched via the
-  [`job_workflow_sha` side-checkout](#sast-ruleset-provenance-and-update-process)
+  [`job.workflow_sha` side-checkout](#sast-ruleset-provenance-and-update-process)
   mechanism — nothing is added to your repo.
 - **Fails closed on missing data.** If the floor is set but **no**
   `coverage-summary.json` is found under any `**/coverage/` directory, the gate
@@ -2054,7 +2071,7 @@ the same way in the command it supplies.
 > live as versioned, unit-tested platform scripts —
 > `scripts/deploy-boot-smoke.mjs` and `scripts/deploy-worker-secrets.mjs` —
 > sparse-checked out of `dsj1984/mandrel-platform` at
-> `github.job_workflow_sha` (the exact commit the caller's
+> `job.workflow_sha` (the exact commit the caller's
 > `deploy-cloudflare.yml@<ref>` pin resolved to), so the script version
 > always travels in lockstep with the workflow pin. Same model as
 > [`uptime-apply.yml`](#uptime-applyyml) → `apply-uptime-monitors.mjs`. The
@@ -2447,7 +2464,7 @@ why the in-pipeline provisioning is the durable fix here.
 > (`if: always() && needs.deploy.result != 'skipped'` — it runs on every
 > **attempted** deploy outcome but not for an all-skipped chain, Story #237)
 > emits the **runtime-resolved** ref of this reusable workflow into
-> `GITHUB_STEP_SUMMARY`: `github.job_workflow_sha` (the exact 40-hex commit the
+> `GITHUB_STEP_SUMMARY`: `job.workflow_sha` (the exact 40-hex commit the
 > caller's `uses: …/deploy-cloudflare.yml@<ref>` pin resolved to) and
 > `github.workflow_ref` (the full ref path). This is the **single source of
 > truth** for the executed pin.
@@ -3113,7 +3130,7 @@ implementation: config parsing/validation, the live-diff, and the Better
 Stack API client are all pure, unit-tested functions (see
 `scripts/apply-uptime-monitors.test.mjs`), and the workflow above is a thin
 wrapper that checks out the pinned script (sparse checkout at
-`github.job_workflow_sha`, the same resolved-ref pattern the SAST tier and
+`job.workflow_sha`, the same resolved-ref pattern the SAST tier and
 `deploy-cloudflare.yml`'s deploy-summary job already use) and invokes it
 against the caller's monitor-config file. A future non-workflow consumer (or
 a local dry-run) can invoke the same script directly:
