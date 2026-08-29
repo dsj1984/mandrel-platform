@@ -738,6 +738,25 @@ on:
         type: boolean
         default: false
 
+      # Explicit config path for consumers whose Worker config is not at the
+      # repo root. The check auto-detects wrangler.jsonc/.json/.toml beside the
+      # working directory only — a monorepo whose only Worker config lives at
+      # apps/web/wrangler.jsonc matched nothing and reported "nothing to check"
+      # (a silent pass), with no consumer-side way to correct it. Deliberately
+      # NOT recursive auto-detection: a repo with several Worker configs would
+      # need a policy for which one to check, and silently picking the first is
+      # the same silent-no-op class this input exists to remove.
+      wrangler-baseline-config-file:
+        description: >
+          Path (relative to the repo root) of the wrangler config to check,
+          for consumers whose Worker config is not at the root — e.g.
+          "apps/web/wrangler.jsonc". Empty (default) keeps the existing
+          root auto-detection of wrangler.jsonc / wrangler.json /
+          wrangler.toml.
+        required: false
+        type: string
+        default: ''
+
       # Staleness window (days) for the compatibility_date rule. Renovate's
       # shared preset bumps compatibility_date whenever wrangler itself is
       # bumped, but a Worker that goes untouched by that bump for a long
@@ -1009,6 +1028,7 @@ jobs:
         env:
           MAX_AGE_DAYS: ${{ inputs.wrangler-baseline-max-age-days }}
           FAIL_ON_VIOLATION: ${{ inputs.wrangler-baseline-fail-on-violation }}
+          CONFIG_FILE: ${{ inputs.wrangler-baseline-config-file }}
         run: |
           set -euo pipefail
           if [ -f "node_modules/mandrel-platform/scripts/check-wrangler-baseline.mjs" ]; then
@@ -1028,6 +1048,23 @@ jobs:
           args=(--max-age-days "${MAX_AGE_DAYS}")
           if [ "${FAIL_ON_VIOLATION}" != "true" ]; then
             args+=(--warn-only)
+          fi
+          # Only forward --file when the consumer set one; empty keeps the
+          # script's own root auto-detection, so existing callers are unchanged.
+          # A configured-but-missing path is a consumer misconfiguration rather
+          # than "no Worker here", so it must not fall through to auto-detect
+          # and silently check some other file. Same escalation shape as the
+          # missing-script branch above: blocking errors, advisory warns.
+          if [ -n "${CONFIG_FILE}" ]; then
+            if [ -f "${CONFIG_FILE}" ]; then
+              args+=(--file "${CONFIG_FILE}")
+            elif [ "${FAIL_ON_VIOLATION}" = "true" ]; then
+              echo "::error::wrangler-baseline-config-file is set to '${CONFIG_FILE}', but no such file exists, and wrangler-baseline-fail-on-violation=true — the blocking baseline gate cannot run."
+              exit 1
+            else
+              echo "::warning::wrangler-baseline-config-file is set to '${CONFIG_FILE}', but no such file exists — skipping (fix the path to enable this check)."
+              exit 0
+            fi
           fi
           node "${script}" "${args[@]}"
 
