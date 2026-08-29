@@ -67,6 +67,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isDirectInvocation } from './lib/entry-guard.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
 
@@ -338,9 +340,9 @@ export function runCli(argv, { log = console.log, err = console.error } = {}) {
   return 0;
 }
 
-// Only run when executed directly, not when imported by the test suite.
-const invokedDirectly =
-  process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (invokedDirectly) {
+// Direct-invocation guard — symlink-safe via the shared seam (Story #407):
+// comparing an unresolved argv[1] against a realpath-resolved
+// import.meta.url silently never matches under pnpm's symlinked node_modules.
+if (isDirectInvocation(import.meta.url)) {
   process.exit(runCli(process.argv.slice(2)));
 }

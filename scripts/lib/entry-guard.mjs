@@ -5,9 +5,11 @@
  * by the `scripts/*.mjs` CLIs. Each of those scripts had grown its own guard,
  * and they had drifted into three mutually incompatible spellings:
  *
- *   1. `resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)`
- *   2. `import.meta.url === \`file://${process.argv[1]}\``
- *   3. `resolve(process.argv[1]).endsWith('<name>.mjs')`
+ *   1. an identity comparison of the resolved `argv[1]` against the resolved
+ *      pathname of `import.meta.url`;
+ *   2. a string comparison of `import.meta.url` against a `file:` URL built by
+ *      interpolating `argv[1]`;
+ *   3. a suffix test — the resolved `argv[1]` ending with the script basename.
  *
  * Spellings 1 and 2 are both broken under pnpm, and broken in the most
  * dangerous possible way — silently. `import.meta.url` is **realpath-resolved**

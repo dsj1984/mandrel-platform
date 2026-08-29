@@ -34,6 +34,8 @@
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { isDirectInvocation } from './lib/entry-guard.mjs';
+
 const WORKFLOW_DIRS = ['.github/workflows', 'templates/workflows'];
 
 /**
@@ -166,7 +168,9 @@ function main() {
   return 1;
 }
 
-// Run only as a CLI, not when imported by the test suite.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Direct-invocation guard — symlink-safe via the shared seam (Story #407):
+// comparing an unresolved argv[1] against a realpath-resolved
+// import.meta.url silently never matches under pnpm's symlinked node_modules.
+if (isDirectInvocation(import.meta.url)) {
   process.exit(main());
 }

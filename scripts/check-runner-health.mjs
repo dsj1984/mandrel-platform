@@ -55,6 +55,8 @@ import { resolve } from "node:path";
 
 import { defaultGhRunner, ghApiJson, isNotFound } from "./lib/gh-json.mjs";
 
+import { isDirectInvocation } from './lib/entry-guard.mjs';
+
 // ---------------------------------------------------------------------------
 // Arg parsing
 // ---------------------------------------------------------------------------
@@ -461,9 +463,9 @@ export function runCli({
   return 0;
 }
 
-// Direct-invocation guard (matches the repo's other scripts/*.mjs entry style).
-const invokedDirectly =
-  process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (invokedDirectly) {
+// Direct-invocation guard — symlink-safe via the shared seam (Story #407):
+// comparing an unresolved argv[1] against a realpath-resolved
+// import.meta.url silently never matches under pnpm's symlinked node_modules.
+if (isDirectInvocation(import.meta.url)) {
   process.exit(runCli());
 }
