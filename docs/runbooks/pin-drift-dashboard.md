@@ -55,7 +55,7 @@ A **stale pin literal** is never suppressed by the `minimumReleaseAge` hold
 (below) — it lags the consumer's *own* `uses:` pin, not the platform release,
 so the hold window is irrelevant. The fix is to **adopt the resolved-ref step
 summary** `deploy-cloudflare.yml` now emits: its final `deploy-summary` job
-echoes the runtime-resolved `github.job_workflow_sha` (and
+echoes the runtime-resolved `job.workflow_sha` (and
 `github.workflow_ref`) into `GITHUB_STEP_SUMMARY` as the single source of
 truth, so a consumer reads the resolved pin off the job summary instead of
 hand-maintaining a `deploy-cloudflare.yml@<sha>` literal that then drifts.

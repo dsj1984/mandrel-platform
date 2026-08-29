@@ -876,21 +876,51 @@ jobs:
       # behaves byte-for-byte as before. `&checkout-range` side-checks-out ONLY
       # `resolve-diff-range.sh` (Story #314's single event-agnostic base/head
       # derivation) from THIS repo at the exact SHA the caller pinned
-      # (`job_workflow_sha`) — the same mechanism the security tier uses — so
+      # (`job.workflow_sha`) — the same mechanism the security tier uses — so
       # every diff-scoped tier sources ONE canonical derivation rather than
       # duplicating it. It must run BEFORE `&resolve-affected` (which sources
       # it) and therefore before the tier's own command step.
+      - &resolve-range-ref
+        name: Resolve platform ref (diff-range checkout)
+        if: ${{ inputs.affected }}
+        id: range-ref
+        shell: bash
+        env:
+          # `job.workflow_sha` is the commit of the workflow FILE that defines
+          # this job — for a reusable workflow, exactly what the caller's
+          # `uses: …@<ref>` pin resolved to.
+          #
+          # It replaces the old resolved-ref spelling (Story #415), which
+          # never worked: that name is an OIDC token CLAIM, not a
+          # github-context property, so the expression — escape hatch or not —
+          # always evaluated to the EMPTY STRING. `actions/checkout` omits an
+          # empty input, fell back to this repo's default branch, and every
+          # consumer silently ran platform scripts from `main` instead of the
+          # SHA they pinned. Asserting the value here is what makes the pin
+          # real: an unresolvable ref STOPS the job rather than promoting it.
+          #
+          # actionlint 1.7.12 does not model the `job` context's `workflow_*`
+          # fields either; the narrowly-scoped ignore in
+          # `.github/actionlint.yaml` covers exactly that one diagnostic.
+          PLATFORM_SHA: ${{ job.workflow_sha }}
+          # Diagnostic only — names the CALLER whose run hit this, so a report
+          # is actionable without a second round trip.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
+            exit 1
+          fi
+          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
+
       - &checkout-range
         name: Checkout diff-range resolver (mandrel-platform@resolved-sha)
         if: ${{ inputs.affected }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          # `job_workflow_sha` is a valid runtime github-context field that
-          # actionlint's pinned context type model does not list, so it is read
-          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`) —
-          # same pattern as the security tier's diff-range side-checkout.
-          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          ref: ${{ steps.range-ref.outputs.sha }}
           sparse-checkout: |
             scripts/resolve-diff-range.sh
           sparse-checkout-cone-mode: false
@@ -1252,6 +1282,8 @@ jobs:
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
       # anchors for the full rationale.
+      - *resolve-range-ref
+
       - *checkout-range
 
       - *resolve-affected
@@ -1299,6 +1331,8 @@ jobs:
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
       # anchors for the full rationale.
+      - *resolve-range-ref
+
       - *checkout-range
 
       - *resolve-affected
@@ -1323,10 +1357,10 @@ jobs:
       #
       # The gate logic is the platform's own unit-tested
       # scripts/check-coverage-threshold.mjs, delivered via a sparse
-      # side-checkout of mandrel-platform at `github.job_workflow_sha` — the
+      # side-checkout of mandrel-platform at `job.workflow_sha` — the
       # same resolved-ref mechanism the SAST vendored-ruleset step below uses
       # (Story #230; replaces the inlined heredoc copy whose drift #163
-      # documented). A script fetched at `job_workflow_sha` is exactly as
+      # documented). A script fetched at `job.workflow_sha` is exactly as
       # version-locked as inline YAML: the consumer always runs the script
       # that shipped with the workflow version it pinned, with zero drift risk.
       #
@@ -1342,16 +1376,32 @@ jobs:
       # keeps a non-affected required check (or a scheduled full run) for it. A
       # visible `::notice::` is emitted (step below) whenever a set floor is
       # skipped for this reason, so the bypass is never silent.
+      - name: Resolve platform ref (coverage gate scripts)
+        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
+        id: gate-scripts-ref
+        shell: bash
+        env:
+          # Fail-closed resolve of this reusable workflow's own commit — full
+          # rationale on the first "Resolve platform ref" step in this file
+          # (Story #415).
+          PLATFORM_SHA: ${{ job.workflow_sha }}
+          # Diagnostic only — names the CALLER whose run hit this, so a report
+          # is actionable without a second round trip.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
+            exit 1
+          fi
+          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout gate scripts (mandrel-platform@resolved-sha)
         if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          # `job_workflow_sha` is a valid runtime github-context field that
-          # actionlint's pinned context type model does not list, so it is
-          # read through the `fromJSON(toJSON(github))` escape hatch (typed
-          # `any`) — same pattern as the SAST vendored-ruleset checkout.
-          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          ref: ${{ steps.gate-scripts-ref.outputs.sha }}
           sparse-checkout: |
             scripts
           sparse-checkout-cone-mode: false
@@ -1424,6 +1474,8 @@ jobs:
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
       # anchors for the full rationale.
+      - *resolve-range-ref
+
       - *checkout-range
 
       - *resolve-affected
@@ -1476,6 +1528,8 @@ jobs:
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
       # anchors for the full rationale.
+      - *resolve-range-ref
+
       - *checkout-range
 
       - *resolve-affected
@@ -1601,7 +1655,7 @@ jobs:
   # The gate logic is the platform's own unit-tested
   # scripts/check-destructive-migration.mjs (see its sibling
   # check-destructive-migration.test.mjs), delivered via a sparse
-  # side-checkout of mandrel-platform at `github.job_workflow_sha` — the same
+  # side-checkout of mandrel-platform at `job.workflow_sha` — the same
   # resolved-ref mechanism the SAST vendored-ruleset step below uses (Story
   # #230; replaces a ~120-line in-workflow bash re-implementation of the same
   # contract). A consumer still needs no consumer-side script copy to inherit
@@ -1643,17 +1697,32 @@ jobs:
 
       # Fetch the tested gate script at the exact SHA the caller's
       # `uses: …/pr-quality.yml@<ref>` pin resolved to — the same
-      # `job_workflow_sha` side-checkout mechanism the SAST vendored-ruleset
+      # resolved-platform-SHA side-checkout mechanism the SAST vendored-ruleset
       # step uses (full rationale on that step, in the security job below).
+      - name: Resolve platform ref (migration guard scripts)
+        id: gate-scripts-ref
+        shell: bash
+        env:
+          # Fail-closed resolve of this reusable workflow's own commit — full
+          # rationale on the first "Resolve platform ref" step in this file
+          # (Story #415).
+          PLATFORM_SHA: ${{ job.workflow_sha }}
+          # Diagnostic only — names the CALLER whose run hit this, so a report
+          # is actionable without a second round trip.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
+            exit 1
+          fi
+          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout gate scripts (mandrel-platform@resolved-sha)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          # `job_workflow_sha` is a valid runtime github-context field that
-          # actionlint's pinned context type model does not list, so it is
-          # read through the `fromJSON(toJSON(github))` escape hatch (typed
-          # `any`) — same pattern as the SAST vendored-ruleset checkout.
-          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          ref: ${{ steps.gate-scripts-ref.outputs.sha }}
           sparse-checkout: |
             scripts
           sparse-checkout-cone-mode: false
@@ -1843,22 +1912,37 @@ jobs:
 
       # Story #314: fetch the single event-agnostic diff-range derivation
       # (`scripts/resolve-diff-range.sh`) from THIS reusable workflow at the
-      # exact resolved SHA the caller pinned (`job_workflow_sha`), so both the
+      # exact resolved SHA the caller pinned (`job.workflow_sha`), so both the
       # secret-scan-range resolver (below) and the SAST-baseline resolver source
       # ONE canonical base/head derivation rather than duplicating it. It lives
       # in THIS repo's `scripts/`, not the consumer's checkout, so — like the
       # Semgrep lockfile / vendored ruleset — it comes from a dedicated
       # side-checkout. Unconditional within the job (no `enable-sast` gate): the
       # gitleaks sub-step consumes it even when SAST is disabled.
+      - name: Resolve platform ref (security tier)
+        id: platform-ref
+        shell: bash
+        env:
+          # Fail-closed resolve of this reusable workflow's own commit — full
+          # rationale on the first "Resolve platform ref" step in this file
+          # (Story #415).
+          PLATFORM_SHA: ${{ job.workflow_sha }}
+          # Diagnostic only — names the CALLER whose run hit this, so a report
+          # is actionable without a second round trip.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
+            exit 1
+          fi
+          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout diff-range resolver (mandrel-platform@resolved-sha)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          # `job_workflow_sha` is a valid runtime github-context field that
-          # actionlint's pinned context type model does not list, so it is read
-          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`) —
-          # same pattern as the Semgrep lockfile / vendored-ruleset checkouts.
-          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          ref: ${{ steps.platform-ref.outputs.sha }}
           sparse-checkout: |
             scripts/resolve-diff-range.sh
           sparse-checkout-cone-mode: false
@@ -1938,7 +2022,7 @@ jobs:
           allow-default-rule-replacement: ${{ inputs.secret-scan-allow-default-rule-replacement }}
 
       # M7: fetch THIS reusable workflow's hash-pinned Semgrep lockfile at the
-      # exact resolved SHA the caller pinned (`job_workflow_sha`), so the SAST
+      # exact resolved SHA the caller pinned (`job.workflow_sha`), so the SAST
       # step installs Semgrep + its full transitive closure via
       # `pip install --require-hashes` rather than a top-pin-only PyPI resolve
       # whose ~40 transitives float at run time. The lockfile lives in THIS
@@ -1951,11 +2035,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          # `job_workflow_sha` is a valid runtime github-context field that
-          # actionlint's pinned context type model does not list, so it is
-          # read through the `fromJSON(toJSON(github))` escape hatch (typed
-          # `any`) — same pattern as the vendored-ruleset checkout below.
-          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          ref: ${{ steps.platform-ref.outputs.sha }}
           sparse-checkout: |
             scripts/semgrep-requirements.txt
           sparse-checkout-cone-mode: false
@@ -1964,13 +2044,13 @@ jobs:
 
       # Check out THIS reusable workflow's own repo (mandrel-platform) at the
       # exact SHA the caller's `uses: …/pr-quality.yml@<ref>` pin resolved to
-      # (`github.job_workflow_sha` — the same resolved-ref single-source-of-
+      # (`job.workflow_sha` — the same resolved-ref single-source-of-
       # truth primitive `deploy-summary` echoes in deploy-cloudflare.yml,
       # Story #110), into a side directory `_mandrel-platform-sast/`. The
       # caller's own checkout (above) never contains `.semgrep/rules.json` —
       # that file lives in THIS repo, not the consumer's — so the vendored
       # ruleset has to come from a second, explicit checkout rather than the
-      # primary one. Resolving via `job_workflow_sha` (not a hand-maintained
+      # primary one. Resolving via `job.workflow_sha` (not a hand-maintained
       # ref literal) means a consumer always gets the ruleset snapshot that
       # shipped with the exact pr-quality.yml version it pinned — no drift
       # between "which workflow ran" and "which ruleset it scanned with".
@@ -1979,14 +2059,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          # `job_workflow_sha` is the resolved 40-hex commit of THIS reusable
-          # workflow (the value the caller's `@<ref>` pin resolved to). It is
-          # a valid runtime github-context field, but actionlint's pinned
-          # context type model does not list it, so it is read through the
-          # `fromJSON(toJSON(github))` escape hatch (typed `any`) to keep the
-          # workflow lint-clean — same pattern as deploy-summary in
-          # deploy-cloudflare.yml (Story #110).
-          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          ref: ${{ steps.platform-ref.outputs.sha }}
           sparse-checkout: |
             .semgrep
           sparse-checkout-cone-mode: false
@@ -2082,7 +2155,7 @@ jobs:
           set -euo pipefail
 
           # M7: hash-pinned lockfile, side-checked-out at the resolved
-          # job_workflow_sha above. On a Linux runner (the default ubuntu-latest
+          # resolved platform SHA above. On a Linux runner (the default ubuntu-latest
           # and every linux self-hosted runner) Semgrep + its FULL transitive
           # closure install via `pip install --require-hashes -r`, so a
           # hijacked transitive can no longer alter or disable this fleet-wide
@@ -2321,21 +2394,38 @@ jobs:
           persist-credentials: false
 
       # Side-check-out ONLY the canonical diff-range derivation from THIS repo
-      # at the exact SHA the caller pinned (`job_workflow_sha`) — the same
+      # at the exact SHA the caller pinned (`job.workflow_sha`) — the same
       # mechanism the security and affected-mode tiers use. Reusing
       # `resolve-diff-range.sh` is what keeps a SECOND event → base/head
       # classification from existing; the `&checkout-range` anchor itself is
       # gated on `inputs.affected` (a different toggle), so this tier needs
       # its own copy rather than the alias.
+      - name: Resolve platform ref (OSV diff-range)
+        if: ${{ inputs.osv-scan-mode != 'full' }}
+        id: osv-range-ref
+        shell: bash
+        env:
+          # Fail-closed resolve of this reusable workflow's own commit — full
+          # rationale on the first "Resolve platform ref" step in this file
+          # (Story #415).
+          PLATFORM_SHA: ${{ job.workflow_sha }}
+          # Diagnostic only — names the CALLER whose run hit this, so a report
+          # is actionable without a second round trip.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
+            exit 1
+          fi
+          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout diff-range resolver (mandrel-platform@resolved-sha)
         if: ${{ inputs.osv-scan-mode != 'full' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: dsj1984/mandrel-platform
-          # `job_workflow_sha` is a valid runtime github-context field that
-          # actionlint's pinned context type model does not list, so it is read
-          # through the `fromJSON(toJSON(github))` escape hatch (typed `any`).
-          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          ref: ${{ steps.osv-range-ref.outputs.sha }}
           sparse-checkout: |
             scripts/resolve-diff-range.sh
           sparse-checkout-cone-mode: false
