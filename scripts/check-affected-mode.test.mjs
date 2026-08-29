@@ -7,7 +7,7 @@
  * `scripts/resolve-diff-range.sh` has solid unit coverage
  * (`resolve-diff-range.test.mjs`), but the affected-mode *wiring* inside the
  * reusable workflow was only covered indirectly by anchor-expansion checks.
- * This suite pins the three invariants that keep the affected-mode design
+ * This suite pins the four invariants that keep the affected-mode design
  * correct, modelled on the sibling `check-ci-required-aggregator.test.mjs`
  * (read the real workflow, extract blocks by indentation, assert):
  *
@@ -24,6 +24,12 @@
  *      `affected-base` override is rejected before the `$GITHUB_ENV` write, so
  *      it can never inject a second env line; a single-line override exports
  *      exactly `TURBO_SCM_BASE` / `TURBO_SCM_HEAD` and nothing else.
+ *   4. DOCUMENTED PRECONDITION (Story #413) — neither `.github/workflows/
+ *      pr-quality.yml` nor `docs/reusable-workflows.md` claims affected mode
+ *      can never miss a task (true only of an UNRESOLVABLE base), and both
+ *      give the conditional consumer shape `turbo run <tier>
+ *      ${TURBO_SCM_BASE:+--affected}` — the gate that stops a baked-in
+ *      `--affected` from scheduling zero tasks on a push-to-`main` run.
  *
  * The `run:` script is executed against real bash with a stubbed
  * `resolve-diff-range.sh` (the sourced derivation), so no git repo is needed;
@@ -180,3 +186,50 @@ test("single-line affected-base override exports exactly TURBO_SCM_BASE and TURB
   const nonEmpty = r.envLines.split("\n").filter((l) => l.trim() !== "");
   assert.equal(nonEmpty.length, 2, `expected exactly two env lines, got: ${JSON.stringify(nonEmpty)}`);
 });
+
+// ---------------------------------------------------------------------------
+// 4. DOCUMENTED PRECONDITION (Story #413) — the `affected` input's safety claim
+//
+// The old prose promised affected mode "can never miss a task", which is true
+// only of the UNRESOLVABLE-base case. A `--affected` baked unconditionally into
+// a consumer's package script hits the resolvable-but-EMPTY case instead: with
+// `affected: false` the TURBO_SCM_* vars are never exported, turbo falls back
+// to its own default base of `main`, and on a push to `main` that range is
+// empty — zero tasks scheduled, exit 0, a silent no-op that reads as a pass.
+// These assertions pin the correction in both consumer-facing surfaces so the
+// absolute claim cannot return and the conditional shape cannot be dropped.
+// ---------------------------------------------------------------------------
+
+const DOCS = "docs/reusable-workflows.md";
+
+/** The safe consumer shape: `--affected` only when a base was exported. */
+const CONDITIONAL_FORM = "${TURBO_SCM_BASE:+--affected}";
+
+/** Absolute claims that over-promise the fallback. Retired — must not return. */
+const ABSOLUTE_CLAIMS = ["so this can never miss a task", "never a missed task"];
+
+for (const [label, relPath] of [
+  ["the reusable workflow", WORKFLOW],
+  ["the consumer documentation", DOCS],
+]) {
+  test(`${label} states the affected-mode precondition conditionally, not absolutely`, () => {
+    const text = readFileSync(join(repoRoot, relPath), "utf8");
+    // Case-insensitive: the claim is retired as a claim, not as a casing.
+    const haystack = text.toLowerCase();
+
+    for (const claim of ABSOLUTE_CLAIMS) {
+      assert.ok(
+        !haystack.includes(claim),
+        `${relPath} still claims "${claim}" — the full-run fallback covers an ` +
+          "unresolvable base only, not a base that resolves to an empty range"
+      );
+    }
+
+    assert.ok(
+      text.includes(CONDITIONAL_FORM),
+      `${relPath} must recommend \`turbo run <tier> ${CONDITIONAL_FORM}\` — gating ` +
+        "the flag on the exported base is what keeps a push-to-`main` run from " +
+        "silently scheduling zero tasks"
+    );
+  });
+}
