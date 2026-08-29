@@ -137,6 +137,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-wrangler-baseline-check` | boolean | `true` | Enable the wrangler.toml/wrangler.jsonc baseline check (env.\* split, logpush, Analytics Engine binding, compatibility_date staleness) as a step in the `lint` tier. A consumer with no wrangler config is a no-op pass. See [Wrangler-baseline check](#wrangler-baseline-check-enable-wrangler-baseline-check). |
 | `wrangler-baseline-fail-on-violation` | boolean | `false` | When `true`, an un-excepted violation fails the `lint` tier (and therefore `ci-required`). Default `false` is the **advisory rollout** posture — violations are reported but never block until the fleet is clean. |
 | `wrangler-baseline-max-age-days` | number | `90` | Maximum age (days) of `compatibility_date` before the check flags it stale. |
+| `wrangler-baseline-config-file` | string | `''` | Path of the wrangler config to check, for a consumer whose Worker config is not at the repo root (e.g. `apps/web/wrangler.jsonc`). Empty keeps root auto-detection. See [Non-root Worker configs](#non-root-worker-configs-wrangler-baseline-config-file). |
 
 > **Sharding.** `shard-matrix` is the single sharding control: the JSON array
 > of indices the test-job matrix iterates. Each shard runs
@@ -1478,7 +1479,8 @@ Node script (no TOML/JSONC library; both formats are parsed with small,
 purpose-built parsers scoped to wrangler's actual shape) — runs as a step in
 the `lint` job, after `setup-toolchain` but requiring nothing from it beyond
 Node itself. It auto-detects `wrangler.jsonc` (preferred), `wrangler.json`,
-then `wrangler.toml` at the consumer's repo root. **A consumer with no
+then `wrangler.toml` at the consumer's repo root, or checks the explicit
+path given by `wrangler-baseline-config-file`. **A consumer with no
 wrangler config at all is a no-op pass** — not every mandrel-platform
 consumer is a Cloudflare Worker.
 
@@ -1487,6 +1489,31 @@ package first (`node_modules/mandrel-platform/scripts/check-wrangler-baseline.mj
 via the existing `exports["./scripts/*"]` surface every consumer already gets
 through its `mandrel-platform` devDependency), falling back to this repo's
 own `scripts/` checkout path when the caller is mandrel-platform itself.
+
+#### Non-root Worker configs (`wrangler-baseline-config-file`)
+
+Auto-detection probes the repo root only — it does not recurse. A monorepo
+whose only Worker config lives at `apps/web/wrangler.jsonc` therefore matched
+nothing and reported "no wrangler config found — nothing to check", which in a
+CI log is indistinguishable from a clean pass. Point the check at the file:
+
+```yaml
+with:
+  wrangler-baseline-config-file: apps/web/wrangler.jsonc
+```
+
+The path is relative to the repo root. When it is set but names a file that
+does not exist, the step does **not** fall back to auto-detection — that would
+silently check a different file than the one configured. It escalates the same
+way a missing check script does: `::error::` and a failed step under
+`wrangler-baseline-fail-on-violation: true`, `::warning::` and a skip
+otherwise.
+
+Detection is deliberately not recursive. A repo with several Worker configs
+would need a policy for which one the gate checks, and silently picking the
+first is the same silent-pass failure this input exists to remove. A consumer
+with several Workers should call the workflow once per config, or run the
+script directly for each.
 
 #### Advisory-first rollout (`wrangler-baseline-fail-on-violation`)
 

@@ -11,9 +11,17 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  symlinkSync,
+  rmSync,
+} from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, test } from 'node:test';
 import {
   parseArgv,
@@ -451,4 +459,253 @@ test('runCli --help prints usage and exits 0 without touching the filesystem', (
   const exit = runCli({ argv: ['--help'], cwd: tmpDir, stdout: streams.stdout, stderr: streams.stderr });
   assert.equal(exit, 0);
   assert.match(streams.out, /check-wrangler-baseline\.mjs/);
+});
+
+// ---------------------------------------------------------------------------
+// JSONC tolerance — trailing commas, and string contents left alone (#407)
+// ---------------------------------------------------------------------------
+
+test('parseJsonc tolerates trailing commas in objects and arrays', () => {
+  const text = `{
+  "name": "web",
+  "analytics_engine_datasets": [
+    { "binding": "AE", "dataset": "events", },
+  ],
+}`;
+  assert.deepEqual(parseJsonc(text), {
+    name: 'web',
+    analytics_engine_datasets: [{ binding: 'AE', dataset: 'events' }],
+  });
+});
+
+test('parseJsonc tolerates a trailing comma separated by a comment', () => {
+  const text = '{ "a": [1, 2, /* done */ ], }';
+  assert.deepEqual(parseJsonc(text), { a: [1, 2] });
+});
+
+test('parseJsonc leaves string contents byte-identical', () => {
+  // Each of these would be corrupted by a regex-based comment/comma stripper:
+  // `,}` and `,]` look like trailing commas, and `//` looks like a comment
+  // even when it is not preceded by a scheme colon.
+  const text = JSON.stringify({
+    braces: 'a,} b,] c',
+    slashes: 'a//b',
+    url: 'https://example.com/x',
+    block: 'a/*b*/c',
+  });
+  assert.deepEqual(parseJsonc(text), {
+    braces: 'a,} b,] c',
+    slashes: 'a//b',
+    url: 'https://example.com/x',
+    block: 'a/*b*/c',
+  });
+});
+
+test('parseJsonc still strips real comments outside strings', () => {
+  const text = `{
+  // line comment
+  "logpush": true, /* block */
+  "name": "x"
+}`;
+  assert.deepEqual(parseJsonc(text), { logpush: true, name: 'x' });
+});
+
+test('parseJsonc reports parse-error positions against the original offsets', () => {
+  // Comments and trailing commas are blanked in place, never deleted, so a
+  // position in the error message still points at the operator's file.
+  const text = '{\n  // a comment\n  "a": 1\n  "b": 2\n}';
+  assert.throws(
+    () => parseJsonc(text),
+    (err) => /position (2[0-9]|3[0-9])/.test(err.message),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Advisory mode is a promise about exit codes, not about findings (#407)
+// ---------------------------------------------------------------------------
+
+test('runCli exits 0 on an unparseable config with --warn-only', () => {
+  writeFileSync(join(tmpDir, 'wrangler.jsonc'), '{ not valid json');
+  const streams = noopStreams();
+  const exit = runCli({
+    argv: ['--warn-only'],
+    cwd: tmpDir,
+    stdout: streams.stdout,
+    stderr: streams.stderr,
+  });
+  assert.equal(exit, 0, 'advisory mode must never hard-fail on config content');
+  assert.match(streams.err, /failed to parse/);
+});
+
+test('runCli --json emits a parseError envelope instead of dying silently', () => {
+  writeFileSync(join(tmpDir, 'wrangler.jsonc'), '{ not valid json');
+  const streams = noopStreams();
+  const exit = runCli({
+    argv: ['--json', '--warn-only'],
+    cwd: tmpDir,
+    stdout: streams.stdout,
+    stderr: streams.stderr,
+  });
+  assert.equal(exit, 0);
+  const envelope = JSON.parse(streams.out);
+  assert.equal(envelope.kind, 'wrangler-baseline-report');
+  assert.equal(envelope.found, true);
+  assert.ok(envelope.parseError, 'the envelope names why the config was unusable');
+});
+
+test('runCli reads a trailing-comma wrangler.jsonc end to end', () => {
+  writeFileSync(
+    join(tmpDir, 'wrangler.jsonc'),
+    `{
+  "compatibility_date": "2026-06-15",
+  "logpush": true,
+  "env": { "production": { "logpush": true, }, },
+  "analytics_engine_datasets": [{ "binding": "AE", "dataset": "events", },],
+}`,
+  );
+  const streams = noopStreams();
+  const exit = runCli({
+    argv: [],
+    cwd: tmpDir,
+    stdout: streams.stdout,
+    stderr: streams.stderr,
+    now: new Date('2026-07-01T00:00:00Z'),
+  });
+  assert.equal(exit, 0, streams.out + streams.err);
+});
+
+// ---------------------------------------------------------------------------
+// The consumer end state reported in #406 (Turborepo + declared exception)
+// ---------------------------------------------------------------------------
+
+test('runCli renders a declared exception as EXCEPTED while still reporting a real violation', () => {
+  // domio's shape: the Worker config lives outside the repo root, uses
+  // trailing commas throughout, declares an analytics-engine opt-out, and has
+  // a genuinely stale compatibility_date.
+  mkdirSync(join(tmpDir, 'apps', 'web'), { recursive: true });
+  writeFileSync(
+    join(tmpDir, 'apps', 'web', 'wrangler.jsonc'),
+    `{
+  // Worker config for the web app
+  "name": "web",
+  "compatibility_date": "2025-01-01",
+  "logpush": true,
+  "env": { "production": { "logpush": true, }, },
+  "mandrel": {
+    "wranglerBaselineExceptions": {
+      "analytics-engine": "no telemetry sink for this static-asset Worker",
+    },
+  },
+}`,
+  );
+  const streams = noopStreams();
+  const exit = runCli({
+    argv: ['--file', 'apps/web/wrangler.jsonc', '--json'],
+    cwd: tmpDir,
+    stdout: streams.stdout,
+    stderr: streams.stderr,
+    now: new Date('2026-08-29T00:00:00Z'),
+  });
+
+  const envelope = JSON.parse(streams.out);
+  const analytics = envelope.findings.find((f) => f.id === 'analytics-engine');
+  assert.equal(analytics.excepted, true, 'the declared opt-out is honoured');
+  assert.ok(
+    !envelope.violations.some((v) => v.id === 'analytics-engine'),
+    'an excepted rule is absent from violations',
+  );
+  assert.ok(
+    envelope.violations.some((v) => v.id === 'compat-date-stale'),
+    'a genuine staleness violation is still reported',
+  );
+  assert.equal(exit, 1, 'a real un-excepted violation still fails in blocking mode');
+});
+
+// ---------------------------------------------------------------------------
+// Direct-invocation guard — spawned as a SUBPROCESS through a symlink (#407)
+//
+// Every other test here imports runCli, which is exactly why the guard bug
+// survived: the guard line only runs when the file is the process entry point.
+// These cases spawn it the way a pnpm consumer's CI does.
+// ---------------------------------------------------------------------------
+
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+/**
+ * Spawn the CLI at `scriptPath` with `cwd`, returning the child result.
+ *
+ * @param {string} scriptPath Path to invoke (possibly through a symlink).
+ * @param {string[]} args CLI args.
+ * @param {string} cwd Working directory for the child.
+ */
+function runScript(scriptPath, args, cwd) {
+  return spawnSync(process.execPath, [scriptPath, ...args], {
+    cwd,
+    encoding: 'utf-8',
+  });
+}
+
+test('the CLI runs when invoked through a pnpm-style symlinked node_modules', () => {
+  // node_modules/mandrel-platform -> <repo root>, the shape pnpm installs.
+  const nodeModules = join(tmpDir, 'node_modules');
+  mkdirSync(nodeModules, { recursive: true });
+  symlinkSync(REPO_ROOT, join(nodeModules, 'mandrel-platform'), 'dir');
+  writeFileSync(join(tmpDir, 'wrangler.json'), '{"compatibility_date": "2020-01-01"}');
+
+  const linked = join(
+    nodeModules,
+    'mandrel-platform',
+    'scripts',
+    'check-wrangler-baseline.mjs',
+  );
+  const result = runScript(linked, ['--max-age-days', '90'], tmpDir);
+
+  assert.notEqual(
+    result.stdout.trim(),
+    '',
+    'a symlinked invocation must produce output, not a silent pass',
+  );
+  assert.match(result.stdout, /wrangler-baseline/);
+  assert.equal(result.status, 1, 'a violating config exits non-zero in blocking mode');
+});
+
+test('a symlinked invocation honours --warn-only rather than exiting silently', () => {
+  const nodeModules = join(tmpDir, 'node_modules');
+  mkdirSync(nodeModules, { recursive: true });
+  symlinkSync(REPO_ROOT, join(nodeModules, 'mandrel-platform'), 'dir');
+  writeFileSync(join(tmpDir, 'wrangler.json'), '{"compatibility_date": "2020-01-01"}');
+
+  const linked = join(
+    nodeModules,
+    'mandrel-platform',
+    'scripts',
+    'check-wrangler-baseline.mjs',
+  );
+  const result = runScript(linked, ['--max-age-days', '90', '--warn-only'], tmpDir);
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /violation/i, 'advisory mode still reports the findings');
+});
+
+test('the CLI still runs when invoked through its real path', () => {
+  writeFileSync(join(tmpDir, 'wrangler.json'), '{"compatibility_date": "2020-01-01"}');
+  const direct = join(REPO_ROOT, 'scripts', 'check-wrangler-baseline.mjs');
+  const result = runScript(direct, ['--max-age-days', '90'], tmpDir);
+  assert.match(result.stdout, /wrangler-baseline/);
+  assert.equal(result.status, 1);
+});
+
+test('importing the module does not execute the CLI', () => {
+  // The guard must be false when the entry point is some other script.
+  const probe = join(tmpDir, 'probe.mjs');
+  const target = join(REPO_ROOT, 'scripts', 'check-wrangler-baseline.mjs');
+  writeFileSync(
+    probe,
+    `await import(${JSON.stringify(pathToFileURL(target).href)});\nconsole.log('IMPORT-OK');\n`,
+  );
+  writeFileSync(join(tmpDir, 'wrangler.json'), '{"compatibility_date": "2020-01-01"}');
+  const result = runScript(probe, [], tmpDir);
+  assert.equal(result.status, 0, 'an import must not exit(1) via the CLI');
+  assert.match(result.stdout, /IMPORT-OK/);
+  assert.doesNotMatch(result.stdout, /wrangler-baseline/);
 });

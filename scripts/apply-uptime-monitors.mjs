@@ -61,6 +61,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { isDirectInvocation } from './lib/entry-guard.mjs';
+
 // ---------------------------------------------------------------------------
 // Monitor config schema (pure validation — no I/O)
 // ---------------------------------------------------------------------------
@@ -436,7 +438,9 @@ async function main() {
   }
 }
 
-// Only run the CLI when invoked directly, not when imported by the self-test.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Direct-invocation guard — symlink-safe via the shared seam (Story #407):
+// comparing an unresolved argv[1] against a realpath-resolved
+// import.meta.url silently never matches under pnpm's symlinked node_modules.
+if (isDirectInvocation(import.meta.url)) {
   main();
 }

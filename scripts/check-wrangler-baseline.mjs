@@ -63,6 +63,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
+import { isDirectInvocation } from './lib/entry-guard.mjs';
+
 // ---------------------------------------------------------------------------
 // CLI argument parsing
 // ---------------------------------------------------------------------------
@@ -153,13 +155,114 @@ export function resolveConfigPath(explicitFile, cwd = process.cwd()) {
 // ---------------------------------------------------------------------------
 
 /**
- * Parse JSON tolerating `//` line comments and block comments (jsonc).
+ * Skip past a JSON string literal, honouring backslash escapes.
+ *
+ * @param {string} text Full document.
+ * @param {number} start Index of the opening quote.
+ * @returns {number} Index just past the closing quote (or `text.length`).
+ */
+function skipString(text, start) {
+  let i = start + 1;
+  while (i < text.length) {
+    if (text[i] === '\\') {
+      i += 2;
+      continue;
+    }
+    if (text[i] === '"') return i + 1;
+    i += 1;
+  }
+  return i;
+}
+
+/**
+ * Blank out `//` line comments and block comments, leaving every other byte —
+ * string-literal contents included — untouched.
+ *
+ * Character-scanned rather than regex-replaced. A regex stripping `//` to
+ * end-of-line cannot tell a comment from the `//` inside a string: the
+ * previous `(^|[^:])//` guard special-cased the scheme colon in
+ * `"https://…"`, but `"a//b"` still lost its tail. Comment bytes are replaced
+ * with spaces (newlines preserved) rather than deleted, so every offset is
+ * unchanged and a `JSON.parse` error still reports the position it actually
+ * occupies in the file the operator is looking at.
+ *
+ * @param {string} text
+ * @returns {string} Same length as `text`, comments blanked.
+ */
+function blankComments(text) {
+  const out = text.split('');
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '"') {
+      i = skipString(text, i);
+      continue;
+    }
+    if (text[i] === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') {
+        out[i] = ' ';
+        i += 1;
+      }
+      continue;
+    }
+    if (text[i] === '/' && text[i + 1] === '*') {
+      out[i] = ' ';
+      out[i + 1] = ' ';
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
+        if (text[i] !== '\n') out[i] = ' ';
+        i += 1;
+      }
+      if (i < text.length) {
+        out[i] = ' ';
+        out[i + 1] = ' ';
+        i += 2;
+      }
+      continue;
+    }
+    i += 1;
+  }
+  return out.join('');
+}
+
+/**
+ * Blank out trailing commas — a `,` whose next significant character closes
+ * its object or array. Legal JSONC, rejected by `JSON.parse`.
+ *
+ * Runs AFTER {@link blankComments} so a comment sitting between the comma and
+ * its closing brace (`[1, /* note *\/ ]`) cannot hide the trailing comma. Like
+ * that pass it substitutes spaces rather than deleting, preserving offsets.
+ *
+ * @param {string} text Comment-blanked document.
+ * @returns {string} Same length as `text`, trailing commas blanked.
+ */
+function blankTrailingCommas(text) {
+  const out = text.split('');
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '"') {
+      i = skipString(text, i);
+      continue;
+    }
+    if (text[i] === ',') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j += 1;
+      if (text[j] === '}' || text[j] === ']') out[i] = ' ';
+    }
+    i += 1;
+  }
+  return out.join('');
+}
+
+/**
+ * Parse JSON tolerating what the `.jsonc` extension names: `//` line comments,
+ * block comments, and trailing commas in objects and arrays. String-literal
+ * contents pass through byte-identical.
+ *
  * @param {string} text
  * @returns {any}
  */
 export function parseJsonc(text) {
-  const stripped = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-  return JSON.parse(stripped);
+  return JSON.parse(blankTrailingCommas(blankComments(text)));
 }
 
 /**
@@ -489,8 +592,21 @@ export function runCli({
     const text = readFileSync(configPath, 'utf-8');
     config = parseWranglerConfig(configPath, text);
   } catch (err) {
-    stderr.write(`[wrangler-baseline] ❌ failed to parse ${configPath}: ${err instanceof Error ? err.message : String(err)}\n`);
-    return 1;
+    // Advisory mode is a promise about EXIT CODES, not about which findings
+    // are reachable: under --warn-only nothing in the consumer's config may
+    // turn the gate red. A parse failure used to return 1 here, ahead of the
+    // warnOnly branch below, so an advisory-mode consumer with a legal
+    // trailing-comma .jsonc got a hard red on a gate that had opted out of
+    // blocking (Story #407). Route it through the same policy as violations.
+    const detail = err instanceof Error ? err.message : String(err);
+    const marker = warnOnly ? '⚠️ ' : '❌';
+    stderr.write(`[wrangler-baseline] ${marker} failed to parse ${configPath}: ${detail}\n`);
+    if (json) {
+      stdout.write(
+        `${JSON.stringify({ kind: 'wrangler-baseline-report', found: true, file: configPath, parseError: detail, violations: [] })}\n`,
+      );
+    }
+    return warnOnly ? 0 : 1;
   }
 
   const report = evaluateBaseline(config, maxAgeDays, now);
@@ -507,8 +623,10 @@ export function runCli({
   return 0;
 }
 
-// Direct-invocation guard (matches the repo's other scripts/*.mjs entry style).
-const invokedDirectly = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (invokedDirectly) {
+// Direct-invocation guard — symlink-safe via the shared seam. The previous
+// spelling compared a realpath-resolved `import.meta.url` against an
+// unresolved `process.argv[1]`, which never matched under pnpm's symlinked
+// node_modules: the CLI silently never ran (Story #407).
+if (isDirectInvocation(import.meta.url)) {
   process.exit(runCli());
 }
