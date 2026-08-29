@@ -15,8 +15,7 @@
  * `HUMAN_INTENT_FIELDS` table here, and each field's heading is the exact
  * section name the parser maps (`goal` → `## Goal`, etc.). The CI
  * conformance lint (`lint-issue-body.js`) runs the real `parse()` against
- * human-opened issues so the form and the parser cannot silently drift —
- * the same model `ci-workflow-template.js` follows for `ci.yml`.
+ * human-opened issues so the form and the parser cannot silently drift.
  *
  * ## Form fields ⊆ body schema
  *
@@ -70,9 +69,8 @@ export const STORY_FORM_RELATIVE_PATH = `${ISSUE_TEMPLATE_RELATIVE_DIR}/story.ym
  * generated YAML uses it verbatim as the field `label` so GitHub's
  * `### {label}` render produces a heading the parser recognises.
  *
- * Machine-managed body fields (`wide`, `reason_to_exist`,
- * `estimated_test_files`, `depends_on` meta) are intentionally absent —
- * the runtime fills those. `depends_on` is exposed as a free-text input
+ * Machine-managed body fields (`wide`, `reason_to_exist`, `depends_on`
+ * meta) are intentionally absent — the runtime fills those. `depends_on` is exposed as a free-text input
  * that serializes to the `blocked by #N` footer `parse()` already reads.
  *
  * @type {Array<{
@@ -367,7 +365,7 @@ jobs:
 
 /**
  * Write (or refresh) the Story issue form into a project checkout. Idempotent at
- * the byte level — mirrors {@link ensureCiWorkflow}'s contract:
+ * the byte level:
  *
  * - file absent → `created`
  * - byte-identical → `unchanged`

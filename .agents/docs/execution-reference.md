@@ -11,11 +11,11 @@ links here from the sections that used to inline this content.
 
 ## Friction telemetry
 
-Reference mechanics behind the friction-telemetry MUST in
-[`instructions.md` § 1.H](../instructions.md). The always-loaded core keeps the
-MUST, the command, and the when-to-fire triggers; the detail below is consulted
-only when reasoning about **where** a friction record lands and **how** it is
-validated.
+Reference mechanics behind the optional friction-telemetry tool pointed at
+from [`instructions.md` § 1.H](../instructions.md). Capture is a **tool, not a
+mandate** — reach for `diagnose-friction.js` when a wrapped command's failure
+shape is worth attributing; the detail below is consulted only when reasoning
+about **where** a friction record lands and **how** it is validated.
 
 - **Canonical record + schema validation**: `diagnose-friction.js` appends one
   `kind: friction` record, validated write-time against
@@ -62,10 +62,10 @@ Unrecognized `AGENT_LOG_LEVEL` values fall back to `info`. There is no
 `debug` level alias.
 
 This is a diagnostic knob: set it when you need quieter script embedding
-(`silent`) or a deeper trace (`verbose`). The friction-telemetry MUST it sits
-under — capture friction as a local NDJSON signal via `diagnose-friction.js` —
-stays in [`instructions.md` § 1.H](../instructions.md); its record-landing and
-schema mechanics are in [§ Friction telemetry](#friction-telemetry) above.
+(`silent`) or a deeper trace (`verbose`). This table is the SSOT for the
+levels; the optional friction-capture tool it sits beside is pointed at from
+[`instructions.md` § 1.H](../instructions.md), and that tool's record-landing
+and schema mechanics are in [§ Friction telemetry](#friction-telemetry) above.
 
 ---
 
@@ -85,11 +85,10 @@ over-ceiling envelope or an over-budget Story count.
 > before shipping the raw seed anyway. The schema now **rejects**
 > `planning.context`, so a config carrying it fails loudly rather than silently
 > capping nothing. The ceiling below is the replacement and the only live bound
-> on planner-context size. Separately, `elideEnvelope` in
-> `lib/orchestration/context-envelope.js` — which this section used to credit
-> with limiting hydrated prompt size — has no production caller either (it is
-> carried in `baselines/dead-exports-production.json`). Only `estimateTokens`
-> from that module is live.
+> on planner-context size. Separately, the `ContextEnvelope` SDK this section
+> used to credit with limiting hydrated prompt size had no production caller
+> and was deleted in Story #5005; only its `estimateTokens` helper survived,
+> re-homed in `lib/orchestration/spec-spill.js`.
 
 ### Planner-context envelope (`/plan`)
 

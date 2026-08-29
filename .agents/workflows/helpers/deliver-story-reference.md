@@ -139,19 +139,18 @@ and the `rules/security-baseline.md` MUSTs all run exactly as for a
 full-ceremony Story. The lite route's `preserves` field is the machine-readable
 record of those non-negotiables; there is no lite-specific gate bypass.
 
-**Deliver derives the route from the Story body's shape — and the
-dispatch mode from the run.** Persist stamps a lite cohort's Stories with the
-`route::lite` label as a _human-visible hint only_ (and ledgers the authored
-verdict — recorded reason plus per-Story shape evidence — on the
-`story-plan-state` checkpoint); the label is never the control signal.
-`/deliver` computes the route from the fetched Story body via
-`resolveStoryDispatchMode` (`lib/orchestration/complexity-gate.js`) — the same
-shape taxonomy `deriveChangeLevel` applies to the landed diff at close:
-`changes[]` count, acceptance count, creates-vs-refactors mix, sensitive-path
-classes. A footprint intersecting a sensitive-path class derives `full` —
-sensitivity wins, and the Story keeps its fresh acceptance critic.
+**Ceremony comes from the landed diff; the dispatch mode comes from the
+run.** Persist stamps a lite cohort's Stories with the `route::lite` label as a
+_human-visible hint only_ (and ledgers the authored verdict — recorded reason
+plus per-Story shape evidence — on the `story-plan-state` checkpoint); the
+label is never the control signal. Ceremony is resolved from the **derived
+change level** (`deriveChangeLevel` over the computed change set — digest § 3),
+not from a body-shape read: a footprint intersecting a sensitive-path class
+derives `high`, so the Story keeps its fresh acceptance critic. The light path
+is the one caller that reads the authored body's shape, through
+`deriveStoryShape` (`lib/orchestration/complexity-gate.js`).
 
-That derived route sets ceremony. It does **not** set the dispatch mode,
+That derived level sets ceremony. It does **not** set the dispatch mode,
 because `inline` names one indivisible resource — the router's own session —
 and only run topology can say whether it is free: a **single-Story run**
 executes inline, and every Story of a multi-Story run dispatches as a
@@ -159,6 +158,63 @@ executes inline, and every Story of a multi-Story run dispatches as a
 cheap, it does not conjure a second session for a sibling. Inline
 execution changes the isolation only: the engine, every script gate, and the
 terminal envelope are byte-identical either way.
+
+---
+
+## Declared dependency edges — what actually gates dispatch
+
+`resolve-stories.js` builds each `dag[].dependsOn` from the **union of two
+declared-edge channels**, and nothing else: the Story body's footer block and
+the issue's native GitHub `blocked_by` relations. Both are read strictly — an
+edge the resolver cannot read is never quietly reported as an edge that does
+not exist.
+
+**The body channel is footer-scoped.** Only a `blocked by #N` line standing
+alone inside the `---` footer block declares an edge:
+
+```markdown
+## Goal
+
+…
+
+---
+
+blocked by #42
+```
+
+Prose elsewhere in the body declares **nothing**, and this is a deliberate,
+user-visible change from the whole-body scan that preceded it. A sentence
+merely mentioning a blocker — an example, a changelog note, an acceptance
+criterion quoting the phrase — used to mint a real dispatch gate that withheld
+the Story until an unrelated issue closed. `plan-persist` has always
+serialized the canonical footer form, so no machine-authored body is affected;
+only a **hand-written prose edge** stops gating, and the fix is to move it into
+the footer block. The loose spellings never reached the footer grammar either:
+`depends on #N`, `Blocked by: #N`, and `blocked by #N once X lands` all declare
+nothing. One grammar serves both readers — the body parser and the
+dispatch-edge parser share it — so what a Story body round-trips and what gates
+dispatch cannot drift apart.
+
+**The native channel fails loud.** The read paginates to exhaustion (a
+first-page read silently truncated a Story's gates at GitHub's 30-item
+default), and **a 404 is not an empty result**. An issue with no dependencies
+answers `200 []`; a 404 is how GitHub also answers a token that cannot see the
+dependencies API, so treating it as "no edges" erased every native edge in the
+run under a mis-scoped token, silently, with a clean exit code. Any non-OK
+read now fails the resolution naming the Story — check the token's scopes
+first. The one degrade that is scoped rather than fatal is a **cross-repo
+edge**: another repository's issue number cannot be matched against this
+repo's same-numbered issue without risking a false match, so that edge is
+dropped with a warning naming the Story, and its siblings resolve normally.
+
+**Edges are monotone — retraction is not built.** Both channels only ever
+_add_ a gate for the current resolution. Removing a `blocked by` footer line
+or deleting a native relation makes the edge absent from the **next** resolve,
+but nothing reconciles an edge that a previous run already acted on, and the
+write path never deletes a native relation it did not need. In practice that
+means: re-resolve after editing edges, and treat a stale gate as a body/issue
+edit plus a fresh `resolve-stories.js` run, never as something delivery
+un-declares on your behalf. This is a known limitation, not an oversight.
 
 ---
 
@@ -177,11 +233,33 @@ runs maker-blind at Story-scope review inside the close subprocess. The
 dispatch step produces `checklistPath` from the Story's predicted footprint
 before it spawns the worker — see [`/deliver`](../deliver.md).
 
-**Pre-eval full-suite discipline (spine step 5).** Repo-invariant guards —
+**Pre-eval full-suite discipline (spine step 1.3).** Repo-invariant guards —
 drift-guard and schema tests living outside the Story's scoped greps — are
 the failure class that actually bounces deliveries: close-validation
 discovers them only after the whole close pipeline has run, at several times
 the cost of one pre-eval full-suite run.
+
+**Run it so close can credit it.** Close skips a gate that already passed at
+the current HEAD, but a bare `npm test` deposits no such record — the suite
+then runs twice per delivery, once here and once in the close gate chain.
+Pick the invocation by the same predicate `close-validation/gates.js` uses to
+choose its test gate:
+
+```bash
+# CRAP gate enabled (default) + a `test:coverage` script — writes the stamp
+# the close `coverage-capture` gate reads:
+node <main-repo>/.agents/scripts/coverage-capture.js --cwd <workCwd>
+# otherwise — the evidence record the close `test` gate reads. <workCwd> must
+# be ABSOLUTE and the runner exactly `npm test`: both sides hash
+# {cmd, args, cwd}, so a relative path or a wrapper misses the credit.
+node <main-repo>/.agents/scripts/evidence-gate.js --standalone \
+  --scope-id <storyId> --gate test --worktree <workCwd> -- npm test
+```
+
+The credit expires the moment it stops describing the tree: evidence is keyed
+on HEAD, the capture stamp on a content digest of `crap.targetDirs`. A
+self-eval fix — or any commit — invalidates it and close re-runs the suite for
+real, so this never trades away the gate.
 
 **Conflict with `main` mid-implementation** → resolve as you would any branch
 rebase. There is no `epic/<id>` intermediate, so the rebase base is `main`
@@ -200,8 +278,8 @@ critic (the redundant pre-pass buys no measurable quality and roughly
 triples the acceptance-block cost). `acceptance-eval.js` is the
 deterministic **scorer** of that one authored verdict — schema validation,
 round cap, proceed / redraft / block — not an independent additional pass
-over the criteria. The M4-B floor holds: one verdict per cluster, the
-cluster count owned by `acceptance-clusters.js` alone.
+over the criteria. The M4-B floor holds: one verdict per cluster, with the
+cluster count owned by the dispatching caller and never by routing.
 
 **One round = N cluster critics → ONE merged verdict → ONE gate call.** The
 clusters are how a round is _authored_; they are not how it is _scored_.
@@ -279,7 +357,9 @@ floor forces `fresh`). Review depth reads the same derived level via
 `review-depth.js` inside close, so the two decisions cannot disagree.
 
 **Inline-dispatch override.** When the Story dispatches
-`inline` (`resolveStoryDispatchMode` → `inline`, i.e. a single-Story run), run
+`inline` (`resolveStoryDispatchMode` → `inline`, which is exactly a
+single-Story run — the function reads the resolved set size and nothing
+else), run
 every acceptance critic **inline** — do not spawn fresh-context critic
 sub-agents regardless of what the profile would otherwise resolve. The self-eval rigor
 (scoring each `acceptance[]` item against the one computed change set, with
@@ -393,6 +473,16 @@ judgment that help text cannot carry.
   wants the PR left at `agent::closing` for a human land (or a wrapper that
   will invoke `single-story-confirm-merge.js` itself). Reports `pending` —
   the work is not done, nothing is broken, and one named command finishes it.
+- `--override-review-block "<reason>"` — when the Story-scope review's
+  **critical** blocker is one you have read and judged wrong (a false positive,
+  or a finding the ratchet correctly exempts). It is the only sanctioned way
+  past that halt: reach for it instead of merging the PR by hand, because a
+  hand-merge bypasses the gate and records nothing. The reason is mandatory and
+  is written to three places (Story comment, PR comment, a
+  `review-block-overridden` friction signal), and the terminal envelope reports
+  `gates.codeReview: "overridden"` rather than `"passed"`. If you find yourself
+  reaching for it twice for the same shape of finding, the gate is
+  miscalibrated — fix the gate, not the run.
 - `--max-wait-seconds <n>` — from a headless caller with no host
   tool-invocation ceiling, to keep single-block semantics
   without editing the consumer's config.

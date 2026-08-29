@@ -72,8 +72,6 @@ const KEY_MEANINGS = Object.freeze({
     'Root for gitignored scratch output (per-run state, mirrors, logs).',
   'project.docsContextFiles':
     'Authoritative files an agent must read before starting any task.',
-  'project.commands.lintBaseline':
-    'Lint command the close-validation chain runs.',
   'project.commands.test': 'Test command the close-validation chain runs.',
   'project.commands.typecheck':
     'Typecheck command (null disables the typecheck gate).',
@@ -136,8 +134,6 @@ const KEY_MEANINGS = Object.freeze({
   // delivery.*
   'delivery.execution.timeoutMs':
     'Per-execution timeout for orchestrated delivery steps.',
-  'delivery.lease.ttlMs':
-    'Time-to-live for the delivery lease before a stale claim is reclaimable.',
   'delivery.ci.watch.pollIntervalMs':
     'Poll cadence (ms) for the merge/CI watch loop.',
   'delivery.ci.watch.maxPolls':
@@ -147,7 +143,7 @@ const KEY_MEANINGS = Object.freeze({
   'delivery.ci.autoMerge':
     'Merge posture: trust-ci merges on green checks; strict also requires a clean review gate.',
   'delivery.docsFreshness.paths':
-    'Docs whose freshness is checked at delivery time.',
+    'Docs the audit-documentation lens folds into its target set.',
   'delivery.deliverRunner.concurrencyCap':
     'Maximum Stories dispatched in parallel within one wave. Default 3 — conservative by design to keep host-quota consumption predictable. Operators running wide waves with adequate parallel-agent quota should raise this to reduce wall-clock time proportionally.',
   'delivery.worktreeIsolation.enabled':
@@ -202,8 +198,6 @@ const KEY_MEANINGS = Object.freeze({
     'Whether a dedicated refactor stage runs during delivery.',
   'delivery.acceptanceEval.maxRounds':
     'Redraft rounds the per-Story acceptance self-eval loop runs before escalating to agent::blocked (default 2; clamped to a hard ceiling that cannot be disabled).',
-  'delivery.acceptanceEval.clusterCeiling':
-    'Max acceptance criteria one single-delivery acceptance critic scores per fresh-context pass; the Story ACs are split into ceil(totalACs / clusterCeiling) maker-blind critic clusters (default 4; clamped to [1, 8]).',
 
   // qa.*
   'qa.featureRoot': 'Root directory holding the QA harness .feature files.',
@@ -257,6 +251,10 @@ const PREFIX_MEANINGS = Object.freeze([
     'QA harness deployment target (baseUrl, per-environment sign-in seam, allowWrites gate).',
   ],
   ['qa.personas', 'QA harness persona / credential mapping.'],
+  [
+    'qa.gherkinLint',
+    'Static Gherkin corpus gate: per-scope feature/step roots plus the exemption-tag and step-waiver escapes.',
+  ],
 ]);
 
 /**

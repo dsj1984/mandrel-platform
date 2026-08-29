@@ -130,6 +130,16 @@ jobs:
       - name: Lint gh CLI flag combinations
         run: node scripts/check-workflow-gh-flags.mjs
 
+      # Catches the two ways a reusable workflow's side-checkout of THIS repo
+      # goes wrong silently at runtime (Story #415): a `ref:` that resolves to
+      # empty — so actions/checkout falls back to the default branch and the
+      # caller's pin is decorative — and an exhaustive sparse list that fetches
+      # a script without the `scripts/lib/` helpers it imports. Neither is
+      # visible to actionlint, shellcheck or any unit test; both surface only on
+      # a consumer's runner, which is where the outage happened.
+      - name: Lint platform side-checkouts
+        run: node scripts/check-workflow-platform-checkout.mjs
+
       # Release-type advisory (Story #368). Merges here are SQUASH, so the
       # pull-request title becomes the commit subject release-please reads —
       # and `ci`/`chore`/`docs`/`test`/`build`/`style` are configured hidden in

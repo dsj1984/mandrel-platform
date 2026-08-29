@@ -58,7 +58,7 @@
  *      that has no canonical pin to track at all (`orphan`). A stale literal is
  *      a real configuration error and is never suppressed by the
  *      `minimumReleaseAge` hold. The fix is to adopt the resolved-ref step
- *      summary `deploy-cloudflare.yml` now emits (its `github.job_workflow_sha`
+ *      summary `deploy-cloudflare.yml` now emits (its `job.workflow_sha`
  *      single source of truth) rather than maintaining the literal by hand.
  *
  * Data-driven: a new consumer is one object in pin-drift-consumers.json.

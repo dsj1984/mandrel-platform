@@ -54,7 +54,6 @@ import {
 import { getStoryBranch, gitSpawn, gitSync } from './lib/git-utils.js';
 import { Logger } from './lib/Logger.js';
 import { TYPE_LABELS } from './lib/label-constants.js';
-import { setActiveStoryEnv } from './lib/observability/active-story-env.js';
 import { emitTerseResult } from './lib/observability/terse-result.js';
 import {
   executeFastForward,
@@ -492,10 +491,9 @@ export function seedStoryBranch({ cwd, storyBranch, baseBranch, progress }) {
 }
 
 /**
- * Provision a worktree (or check out the branch in single-tree mode), then
- * record the active-story environment markers. Returns the resolved
- * `workCwd`, `worktreeCreated`, and `installStatus`. Exported for testing
- * (owns the worktree/single-tree routing + setActiveStoryEnv call).
+ * Provision a worktree (or check out the branch in single-tree mode).
+ * Returns the resolved `workCwd`, `worktreeCreated`, and `installStatus`.
+ * Exported for testing (owns the worktree/single-tree routing).
  *
  * @param {object} opts
  * @param {object} opts.runtime
@@ -541,23 +539,6 @@ export async function provisionWorktree({
     gitSync(cwd, 'checkout', storyBranch);
   }
 
-  try {
-    // v2 Stories are standalone — no parent Epic. The helper omits
-    // CC_EPIC_ID from env + file; the trace hook keys its standalone-trace
-    // branch on CC_EPIC_ID being absent.
-    setActiveStoryEnv({
-      storyId,
-      workCwd,
-      logger: {
-        warn: (m) => progress('ENV', `⚠️ ${m}`),
-      },
-    });
-  } catch (err) {
-    Logger.error(
-      `[single-story-init] ⚠️ Failed to set active-Story env: ${err?.message ?? err}`,
-    );
-  }
-
   return { workCwd, worktreeCreated, installStatus };
 }
 
@@ -572,13 +553,11 @@ export async function runSingleStoryInit({
   injectedConfig,
   injectedSweep,
   // Story #3483: lets tests drive the lease preflight deterministically.
-  // `injectedAcquireLease` swaps the guard; `leaseNow` injects the clock the
-  // fail-closed liveness check evaluates against (audit #3513). `steal`
-  // forcibly transfers a foreign claim — the standalone path has no Epic
-  // heartbeat ledger, so a foreign assignee blocks unless stolen.
+  // `injectedAcquireLease` swaps the guard. `steal` forcibly transfers a
+  // foreign claim — the lease fails closed (audit #3513), so a foreign
+  // assignee blocks unless stolen.
   injectedAcquireLease,
   steal = false,
-  leaseNow,
   injectedVerifyRemote,
   // Story #4620: swap the git-touching provisioning steps so the
   // early-flip-then-rollback ordering is unit-testable without a real worktree.
@@ -652,13 +631,12 @@ export async function runSingleStoryInit({
     `Standalone Story: "${story.title}" → branch ${storyBranch} from ${baseBranch}.`,
   );
 
-  // Story #3483 — lease preflight. Take an exclusive, time-bounded claim on
-  // the Story ticket before any git mutation so two concurrent standalone
-  // runs cannot both drive the same Story. The standalone path has no Epic
-  // heartbeat ledger, so the guard fails closed (audit #3513): a foreign
-  // assignee is treated as a live claim and aborts init (naming the current
-  // owner) unless --steal forcibly transfers it. Unclaimed / self-held claims
-  // proceed. Skipped under --dry-run (no assignee mutation).
+  // Story #3483 — lease preflight. Take an exclusive claim on the Story
+  // ticket before any git mutation so two concurrent standalone runs cannot
+  // both drive the same Story. The guard fails closed (audit #3513): a
+  // foreign assignee aborts init (naming the current owner) unless --steal
+  // forcibly transfers it. Unclaimed / self-held claims proceed. Skipped
+  // under --dry-run (no assignee mutation).
   let workCwd = cwd;
   let worktreeCreated = false;
   let installStatus = { status: 'skipped', reason: 'dry-run' };
@@ -670,7 +648,6 @@ export async function runSingleStoryInit({
       storyId,
       config,
       steal: stealRequested,
-      now: leaseNow,
     });
     progress(
       'LEASE',

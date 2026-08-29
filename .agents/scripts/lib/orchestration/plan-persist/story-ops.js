@@ -17,6 +17,10 @@
 
 import { createHash } from 'node:crypto';
 import { applyBlockedByDependencies } from '../../../providers/github/blocked-by-add.js';
+import {
+  normalizeOwnedProvenance,
+  ownedProvenanceSource,
+} from '../../findings/provenance-field.js';
 import { carryProvenanceFooters } from '../../findings/route-finding.js';
 import { Logger } from '../../Logger.js';
 import { AGENT_LABELS, TYPE_LABELS } from '../../label-constants.js';
@@ -273,7 +277,6 @@ function bodyObjectFromTicket(ticket) {
     wide: ticket.wide ?? null,
     reason_to_exist: ticket.reason_to_exist ?? null,
     depends_on: ticket.depends_on ?? [],
-    estimated_test_files: ticket.estimated_test_files ?? null,
   }).body;
 }
 
@@ -320,8 +323,12 @@ function syncContractFieldFromTopLevel(ticket, bodyObject, field) {
  * bookkeeping for the `--tickets` source issues, not part of the Story's
  * executable body, so it is deliberately not serialized into the markdown.
  *
+ * `provenance` is likewise top-level-only (Story #5045) — it names the audit
+ * identities *this* Story owns, and is stamped into the body as footers rather
+ * than serialized as a section.
+ *
  * @param {object} ticket
- * @returns {{ slug: string, title: string, bodyObject: object, depends_on: string[], labels: string[], supersedes: Array<{ id: number, note: string|null }> }}
+ * @returns {{ slug: string, title: string, bodyObject: object, depends_on: string[], labels: string[], supersedes: Array<{ id: number, note: string|null }>, provenance: { fingerprints: string[], semanticKeys: string[] }|null }}
  */
 export function normalizeStoryTicket(ticket) {
   if (!ticket || typeof ticket !== 'object') {
@@ -346,8 +353,22 @@ export function normalizeStoryTicket(ticket) {
   const depends_on = normalizeDependsOn(ticket, bodyObject);
   const supersedes = normalizeSupersedes(ticket, slug);
   const labels = sanitizeAuthoredLabels(ticket.labels, slug);
+  let provenance;
+  try {
+    provenance = normalizeOwnedProvenance(ticket.provenance, slug);
+  } catch (err) {
+    throw new Error(`[plan-persist] ${err.message}`);
+  }
 
-  return { slug, title, bodyObject, depends_on, labels, supersedes };
+  return {
+    slug,
+    title,
+    bodyObject,
+    depends_on,
+    labels,
+    supersedes,
+    provenance,
+  };
 }
 
 /**
@@ -389,24 +410,59 @@ export function foldSpecIntoStoryBody(bodyObject, slug, opts = {}) {
   return { bodyObject: next };
 }
 
+/**
+ * Resolve the provenance source one Story is stamped from (Story #5045).
+ *
+ * Two channels, and the precedence between them is the whole contract:
+ *
+ * - **Attributed** — the Story authored a `provenance` field naming the audit
+ *   identities *it* owns. Exactly those are stamped. This is what makes the
+ *   footers answer "which Story tracks this finding?" instead of "which sweep
+ *   planned it?": under the union every sibling carried every key, so the next
+ *   sweep's confirmation pass could only pick an arbitrary open Story, and a
+ *   key whose owner had since closed was masked by any open neighbour.
+ * - **Union fallback** — no `provenance` field, so the whole seed's footers are
+ *   carried, exactly as before. This is **not** dead weight to be tidied away:
+ *   hand-carried provenance is the failure Stories #4626 / #4877 measured, and
+ *   the union is what closed it. Attribution is additive and recall-safe;
+ *   deleting the fallback would re-open that hole for every plan that does not
+ *   attribute.
+ *
+ * @param {{ fingerprints: string[], semanticKeys: string[] }|null} provenance
+ * @param {object} opts Assembly options carrying `provenanceSource`.
+ * @returns {string}
+ */
+function resolveProvenanceSource(provenance, opts) {
+  if (provenance !== null) return ownedProvenanceSource(provenance);
+  return opts.provenanceSource ?? '';
+}
+
 function assembleOnePlanStory(ticket, opts) {
-  const { slug, title, bodyObject, depends_on, labels, supersedes } =
-    normalizeStoryTicket(ticket);
+  const {
+    slug,
+    title,
+    bodyObject,
+    depends_on,
+    labels,
+    supersedes,
+    provenance,
+  } = normalizeStoryTicket(ticket);
   const { bodyObject: folded } = foldSpecIntoStoryBody(bodyObject, slug, {
     sharedSpec: opts.sharedSpec ?? null,
   });
   // Body first: the fingerprint is an identity over the *assembled* content,
   // so it cannot be computed until that content exists.
   const serialized = serializeStoryBody({ ...folded, depends_on });
-  // Carry audit dedup provenance out of the seed this plan was authored from
-  // (Story #4877). The audit sweep's Single-plan path stamps the
-  // `audit-fingerprints` / `audit-semantic-keys` footers into the seed it hands
-  // `/plan`; without this the persisted Story carries no provenance and the
-  // next sweep re-files work it already planned. Mechanical on purpose — the
-  // authoring agent is not asked to notice HTML comments in a one-pager. A
-  // non-audit seed carries no footers, so this is a no-op there.
+  // Carry audit dedup provenance into the persisted body (Story #4877). The
+  // audit sweep's Single-plan path stamps the `audit-fingerprints` /
+  // `audit-semantic-keys` footers into the seed it hands `/plan`; without this
+  // the persisted Story carries no provenance and the next sweep re-files work
+  // it already planned. Mechanical on purpose — the authoring agent is not
+  // asked to notice HTML comments in a one-pager. A non-audit seed carries no
+  // footers, so this is a no-op there. Which identities reach *this* Story is
+  // `resolveProvenanceSource`'s call (Story #5045).
   const { body } = carryProvenanceFooters({
-    from: opts.provenanceSource ?? '',
+    from: resolveProvenanceSource(provenance, opts),
     into: serialized,
   });
   const fingerprint = planStoryFingerprint({ slug, title, body });
@@ -616,13 +672,30 @@ function renderStoryBodyForCreate(story, idBySlug) {
   const dependencyRefs = story.depends_on.map(
     (slug) => `#${idBySlug.get(slug)}`,
   );
-  const base =
-    dependencyRefs.length === 0
-      ? story.body
-      : serializeStoryBody(
-          { ...story.bodyObject, depends_on: dependencyRefs },
-          { includeFooter: true },
-        );
+  let base = story.body;
+  if (dependencyRefs.length > 0) {
+    // Re-serializing from `bodyObject` is what resolves the sibling slugs to
+    // real issue ids — but `bodyObject` never held the provenance footers
+    // (`assembleOnePlanStory` appends those to the body *string*), so this
+    // branch drops them unless the carry is re-applied. That is the exact
+    // loss site Story #4935 diagnosed, #4939 fixed, and #4956 reverted
+    // wholesale hours later; Story #5056 restored it with a persist-side
+    // regression test that reads the POSTed body.
+    //
+    // `from: story.body` — not the seed — is load-bearing: it re-carries the
+    // identities *this* Story was stamped with under Story #5045 attribution
+    // rather than reintroducing the whole seed's union. `carryProvenanceFooters`
+    // is additive, union-preserving and idempotent, so re-applying is safe by
+    // construction.
+    const reserialized = serializeStoryBody(
+      { ...story.bodyObject, depends_on: dependencyRefs },
+      { includeFooter: true },
+    );
+    base = carryProvenanceFooters({
+      from: story.body,
+      into: reserialized,
+    }).body;
+  }
   return `${base}\n\n${planFingerprintMarker(story.fingerprint)}`;
 }
 

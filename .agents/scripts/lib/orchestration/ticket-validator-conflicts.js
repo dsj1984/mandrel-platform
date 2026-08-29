@@ -1,3 +1,4 @@
+import { resolveListValue } from '../config/shared.js';
 import { parse as parseStoryBody } from '../story-body/story-body.js';
 import { collectStoryAssumptionEntries } from './file-assumptions.js';
 import { computeStoryReachability } from './story-reachability.js';
@@ -108,8 +109,11 @@ const DEFAULT_POLICY = Object.freeze({
  * Patterns support two shapes:
  *   - exact path  — `lib/orchestration/lifecycle/listeners/index.js`
  *   - `**` suffix — `**\/listeners/index.js` (matches any depth)
+ *
+ * Module-private since `resolveConflictPolicy` became the one production
+ * reader; tests reach it through `_internal`.
  */
-export const DEFAULT_REGISTRY_PATTERNS = Object.freeze([
+const DEFAULT_REGISTRY_PATTERNS = Object.freeze([
   'lib/orchestration/lifecycle/listeners/index.js',
   '**/listeners/index.js',
   '**/handlers/index.js',
@@ -760,6 +764,117 @@ export function computeConflictFindings({ stories, policy } = {}) {
     }),
     ...computeMissingBddScaffoldFindings(storyList, reach, bddScaffoldSeverity),
   ];
+}
+
+/**
+ * Resolve the config-derived half of the conflict policy from
+ * `config.planning` — the severity flags, the fan-out threshold, and the
+ * registry patterns, in one place.
+ *
+ * Two passes consume `planning.*` and must not disagree: the raw
+ * pre-assembly pass (`persist-helpers.validateTickets`, which attaches its
+ * production `fanOutCounter` on top of this) and the post-assembly pass
+ * (`computeAssembledConflictFindings`, which forces `fanOutCounter: null`).
+ * Under Story #5045 each resolved its own copy, and the copies had already
+ * drifted — `failOnMissingBddScaffold` reached only the assembled pass,
+ * `failOnLargeFanOut` / `largeFanOutThreshold` / `crossCuttingRegistries`
+ * only the raw one — so a knob set in config silently applied on one of the
+ * two passes. A knob read here reaches both; that is the contract.
+ *
+ * `fanOutCounter` is deliberately absent: it is probe machinery, not
+ * config, and each caller owns its own.
+ *
+ * @param {object} [config] Resolved config carrying `planning.*`.
+ * @returns {object} A `computeConflictFindings` policy (no `fanOutCounter`).
+ */
+export function resolveConflictPolicy(config) {
+  const planning = config?.planning;
+  const policy = {
+    failOnSharedEditors: planning?.failOnSharedEditors === true,
+    requireExplicitCrossStoryDeps:
+      planning?.requireExplicitCrossStoryDeps === true,
+    failOnRegistryConflicts: planning?.failOnRegistryConflicts === true,
+    failOnLargeFanOut: planning?.failOnLargeFanOut === true,
+    failOnMissingBddScaffold: planning?.failOnMissingBddScaffold === true,
+  };
+  if (Number.isFinite(planning?.largeFanOutThreshold)) {
+    policy.largeFanOutThreshold = planning.largeFanOutThreshold;
+  }
+  if (planning?.crossCuttingRegistries !== undefined) {
+    policy.registries = resolveListValue(
+      DEFAULT_REGISTRY_PATTERNS,
+      planning.crossCuttingRegistries,
+    );
+  }
+  return policy;
+}
+
+/**
+ * Re-run the cross-Story conflict passes over the **assembled** Story bodies —
+ * the artifact persist actually writes (Story #5045).
+ *
+ * `validateTickets` runs before `assemblePlanStories`, over the raw
+ * `stories.json` payload, so plan-time conflict analysis never saw what got
+ * persisted. That is not a cosmetic ordering nit: the canonical authoring shape
+ * carries `acceptance[]` / `verify[]` at the ticket's **top level**, and it is
+ * assembly's `syncContractFieldFromTopLevel` that folds them into the body.
+ * `indexConsumers` scans `body.acceptance` / `body.verify` for producer paths —
+ * so on the real payload it scanned two empty arrays, and every
+ * `implicit-cross-story-dep` and `missing-bdd-scaffold` finding was silently
+ * unreachable. Running the passes again over the serialized bodies restores
+ * them.
+ *
+ * **The fan-out pass is deliberately not re-run.** It is a `git grep` per
+ * deleted path and its inputs (`changes[]` deletes) are identical on both
+ * sides, so re-probing would double the git cost for a byte-identical answer;
+ * `enforceFanOutGate` already owns that class over the raw payload.
+ *
+ * @param {object} args
+ * @param {Array<{ slug: string, title?: string, body: string, depends_on?: string[] }>} args.stories
+ *   Assembled Stories — `body` is the serialized, footer-stamped markdown.
+ * @param {object} [args.config] Resolved config; `planning.*` supplies the
+ *   policy via {@link resolveConflictPolicy} — the same resolver the raw
+ *   pass uses, so a knob cannot apply on only one of the two passes.
+ * @returns {ConflictFinding[]}
+ */
+export function computeAssembledConflictFindings({ stories, config } = {}) {
+  return computeConflictFindings({
+    stories: (Array.isArray(stories) ? stories : []).map((story) => ({
+      slug: story.slug,
+      title: story.title,
+      body: story.body,
+      depends_on: Array.isArray(story.depends_on) ? story.depends_on : [],
+    })),
+    policy: {
+      ...resolveConflictPolicy(config),
+      fanOutCounter: null,
+    },
+  });
+}
+
+/**
+ * Stable identity for one conflict finding, so the post-assembly pass can be
+ * diffed against the raw pass and only the genuinely-new findings reported
+ * (Story #5045). Without it the two passes announce the same shared-editor
+ * collision twice per run, which is how a warning channel gets discounted.
+ *
+ * The separator is written as the `\u0000` escape and never as a raw byte — a
+ * literal NUL would make git classify this file as binary and drop its diffs.
+ *
+ * @param {object} finding
+ * @returns {string}
+ */
+export function conflictFindingKey(finding) {
+  return [
+    finding?.kind ?? '',
+    finding?.path ?? finding?.registryPath ?? '',
+    Array.isArray(finding?.storySlugs)
+      ? [...finding.storySlugs].sort().join(',')
+      : (finding?.storySlug ?? ''),
+    finding?.producer?.storySlug ?? '',
+    finding?.consumer?.storySlug ?? '',
+    finding?.consumer?.sourceField ?? '',
+  ].join('\u0000');
 }
 
 /**

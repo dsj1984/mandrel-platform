@@ -485,7 +485,7 @@ test("formatVerdict renders a skip line for the disabled gate", () => {
 //
 // The workflow's "Coverage threshold gate" step no longer embeds a copy of
 // this script (Story #230): it sparse-side-checkouts mandrel-platform at
-// `github.job_workflow_sha` into `_mandrel-platform-scripts/` and runs
+// `job.workflow_sha` into `_mandrel-platform-scripts/` and runs
 // `scripts/check-coverage-threshold.mjs` directly. These tests exercise that
 // exact invocation shape — the real script, run from the side-checkout path,
 // with the workflow's `--threshold` / `--metric` args and the consumer

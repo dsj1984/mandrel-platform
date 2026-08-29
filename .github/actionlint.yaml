@@ -1,0 +1,24 @@
+# actionlint configuration.
+#
+# WHY THIS FILE EXISTS (Story #415)
+# ---------------------------------
+# A reusable workflow that side-checks-out THIS repository must pin that
+# checkout to the exact commit the caller's `uses: …@<ref>` pin resolved to.
+# The only expression that yields it is the `job` context's `workflow_sha`.
+#
+# actionlint 1.7.12 pins a context type model that predates the `job` context's
+# `workflow_*` fields, so a correct `${{ job.workflow_sha }}` is reported as an
+# undefined property. The previous workaround read the value through a
+# `fromJSON(toJSON(github))` escape hatch, which silenced the lint by typing the
+# expression `any` — and hid the fact that the field being read did not exist at
+# all, so every one of those pins resolved to an EMPTY string and `actions/
+# checkout` silently fell back to this repo's default branch.
+#
+# A narrowly-worded ignore is the safer trade: it suppresses exactly one
+# diagnostic for one property name, and every other undefined-property error in
+# every workflow still fails the lint. Delete this entry once the pinned
+# actionlint version models the `job` context's `workflow_*` fields.
+paths:
+  .github/workflows/**.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type .*check_run_id'

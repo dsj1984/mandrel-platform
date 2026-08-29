@@ -15,11 +15,11 @@
  */
 
 import posix from 'node:path/posix';
-import { resolveListValue } from '../../config/shared.js';
 import { gitSpawn } from '../../git-utils.js';
 import { validateTaskBodies } from '../task-body-validator.js';
 import { validateAndNormalizeTickets } from '../ticket-validator.js';
-import { DEFAULT_REGISTRY_PATTERNS } from '../ticket-validator-conflicts.js';
+import { resolveConflictPolicy } from '../ticket-validator-conflicts.js';
+import { normalizeVerifyTiers } from '../verify-tier-repair.js';
 
 /**
  * Extensions an import specifier may elide. Probed longest-path-first when
@@ -176,30 +176,6 @@ export function makeDefaultFanOutCounter({ baseBranchRef, cwd, git } = {}) {
 }
 
 /**
- * Resolve the cross-Story conflict-finding policy from `_config.planning`.
- */
-function resolveConflictPolicy(cfg) {
-  const planning = cfg?.planning;
-  const policy = {
-    failOnSharedEditors: planning?.failOnSharedEditors === true,
-    requireExplicitCrossStoryDeps:
-      planning?.requireExplicitCrossStoryDeps === true,
-    failOnRegistryConflicts: planning?.failOnRegistryConflicts === true,
-    failOnLargeFanOut: planning?.failOnLargeFanOut === true,
-  };
-  if (Number.isFinite(planning?.largeFanOutThreshold)) {
-    policy.largeFanOutThreshold = planning.largeFanOutThreshold;
-  }
-  if (planning?.crossCuttingRegistries !== undefined) {
-    policy.registries = resolveListValue(
-      DEFAULT_REGISTRY_PATTERNS,
-      planning.crossCuttingRegistries,
-    );
-  }
-  return policy;
-}
-
-/**
  * Resolve the ref the persist gates probe against.
  *
  * The canonical resolved config carries the base branch at
@@ -240,6 +216,11 @@ export function validateTickets(tickets, config, opts = {}) {
     // process.cwd(), which is only the repo root by coincidence.
     cwd: opts.cwd,
   });
+  // Repair before judging (Story #5005): a `verify[]` entry whose tier the
+  // validator can already infer is auto-corrected rather than rejected, so a
+  // mechanically-fixable formality no longer costs a re-authoring round. An
+  // uninferable entry survives untouched and still hard-errors below.
+  normalizeVerifyTiers(validated);
   validateTaskBodies(validated);
   return validated;
 }

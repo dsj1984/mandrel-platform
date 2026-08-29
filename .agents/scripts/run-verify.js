@@ -6,8 +6,8 @@
  * locally, without epic-scoped MI projection or push semantics.
  *
  * Order: audit (SCA) → lint (includes docs:check + the arch-cycles ratchet) →
- * full test suite → unified baselines → the dead-exports and context-budget
- * ratchets.
+ * full test suite → unified baselines → the standalone ratchets
+ * (dead-exports ×2, context-budget, cyclomatic, schema-references).
  *
  * The `audit` step runs `npm audit --audit-level=high`, matching CI's
  * "Dependency Vulnerability Audit (SCA)" gate so a local green no longer hides
@@ -27,42 +27,60 @@
  * full-tree scan in check-dead-exports.js) to a command that already carries
  * the full test suite.
  *
- * A handful of CI gates cannot be reproduced by this command (action pinning,
- * TruffleHog secret scan, the BASELINE_SCOPE=full push-scoped maintainability
- * run) — those are catalogued in docs/ci-contract.md.
+ * Story #5004 closed the last two mirror gaps that were pure omission.
+ * `check-cyclomatic.js` (#4923) and `check-schema-references.js` (#4938) were
+ * each added to the `baselines` job's standalone-ratchet slot without ever
+ * being added here, so a green `verify` still hid both. Like their neighbours
+ * they are pure-Node and cost milliseconds.
+ *
+ * Still NOT mirrored: `check-workflow-citations.js` and
+ * `check-baseline-scope.js` run in CI's `baselines` job only —
+ * `.agents/rules/known-tooling-behavior.md` entry 2 carries the current
+ * coverage table. (`prune-baseline-orphans.js --check` used to sit in that
+ * list; it no longer runs in CI at all — the un-attributed duplicate of the
+ * scope gate's `extra` direction reds every open PR on inherited rows.) Nor are the CI gates this command structurally cannot
+ * reproduce (action pinning, TruffleHog secret scan) — those are catalogued
+ * in docs/ci-contract.md. The nightly full-scope re-score
+ * (.github/workflows/baseline-drift.yml) is deliberately outside this
+ * mirror too: it re-scores the whole tree, which is the cost `verify` exists
+ * to avoid paying on every run.
  */
 
 import { spawnSync } from 'node:child_process';
 import { runAsCli } from './lib/cli-utils.js';
 
+/**
+ * A gate step: `node .agents/scripts/<script>` plus any extra args. Seven of
+ * the ten steps share exactly that shape, so spelling it once leaves the list
+ * below readable as what it actually is — a gate *order* — instead of a wall
+ * of spawn tuples.
+ *
+ * @param {string} label reported as `failedStep` when the gate exits non-zero
+ * @param {string} script basename under `.agents/scripts/`
+ * @param {...string} args extra CLI args
+ * @returns {{ label: string, cmd: string, args: string[] }}
+ */
+const gate = (label, script, ...args) => ({
+  label,
+  cmd: 'node',
+  args: [`.agents/scripts/${script}`, ...args],
+});
+
 const STEPS = [
-  {
-    label: 'audit',
-    cmd: 'npm',
-    args: ['audit', '--audit-level=high'],
-  },
+  { label: 'audit', cmd: 'npm', args: ['audit', '--audit-level=high'] },
   { label: 'lint', cmd: 'npm', args: ['run', 'lint'] },
   { label: 'test', cmd: 'npm', args: ['test'] },
-  {
-    label: 'baselines',
-    cmd: 'node',
-    args: ['.agents/scripts/check-baselines.js'],
-  },
-  {
-    label: 'dead-exports',
-    cmd: 'node',
-    args: ['.agents/scripts/check-dead-exports.js'],
-  },
-  {
-    label: 'dead-exports-production',
-    cmd: 'node',
-    args: ['.agents/scripts/check-dead-exports.js', '--production'],
-  },
-  {
-    label: 'context-budget',
-    cmd: 'node',
-    args: ['.agents/scripts/check-context-budget.js'],
-  },
+  gate('baselines', 'check-baselines.js'),
+  // Ordered ahead of the dead-exports pair deliberately. When a new CLI is
+  // missing from knip.json's entry list, both gates fail — but only this one
+  // names the cause. Seeing the ratchet's whole-file diff first is what made
+  // "accept the diff" look like the fix during Story #5012.
+  gate('knip-entries', 'check-knip-entries.js'),
+  gate('dead-exports', 'check-dead-exports.js'),
+  gate('dead-exports-production', 'check-dead-exports.js', '--production'),
+  gate('context-budget', 'check-context-budget.js'),
+  gate('cyclomatic', 'check-cyclomatic.js'),
+  gate('schema-references', 'check-schema-references.js'),
 ];
 
 export function runVerifySteps({

@@ -191,8 +191,8 @@ test("the diff-range resolver is side-checked-out from the pinned platform SHA",
   assert.match(block, /repository:\s*dsj1984\/mandrel-platform/);
   assert.match(
     block,
-    /job_workflow_sha/,
-    "must resolve THIS repo at the SHA the caller pinned, not a floating ref",
+    /ref: \$\{\{ steps\.[A-Za-z0-9_-]+\.outputs\.sha \}\}/,
+    "must resolve THIS repo at the SHA the caller pinned, not a floating ref — and via a fail-closed resolve step, so an unresolvable ref stops the job instead of silently checking out the default branch (Story #415)",
   );
   assert.match(
     block,
