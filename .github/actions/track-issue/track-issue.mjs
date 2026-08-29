@@ -16,7 +16,9 @@
  * The decision is a pure function of (existing issue, failing set), so the
  * idempotence contract is unit-tested without any network access
  * (scripts/track-issue.test.mjs). `main()` only translates the verdict into
- * `gh` CLI calls.
+ * `gh` CLI calls, and takes the same injectable `gh` runner the lookup does —
+ * so the claims that are about BEHAVIOUR rather than about the verdict (a dry
+ * run performing no tracker write, chiefly) are assertable offline too.
  *
  * The issue is discovered by an HTML-comment MARKER in its body, and the
  * change-detection key is a DIGEST embedded as a second marker — so a run over
@@ -507,7 +509,21 @@ function publishOutputs(env, { issueNumber, actionTaken }) {
   );
 }
 
-export function main(env = process.env) {
+/**
+ * Entry point.
+ *
+ * `runner` is the same injectable `gh` seam `findTrackingIssue` already
+ * takes, threaded one level up and defaulting to the real adapter — so a
+ * production caller passes nothing and behaves identically. It exists because
+ * the dry-run guarantee is BEHAVIOURAL: "a dry run performs no tracker write"
+ * is a claim about what this function does, and the only way to assert it is
+ * to hand it a runner and observe that no mutation reaches it.
+ *
+ * @param {Record<string, string|undefined>} [env]
+ * @param {Function} [runner] `gh` adapter; defaults to the real one.
+ * @returns {number} Process exit code.
+ */
+export function main(env = process.env, runner = gh) {
   const cfg = resolveConfig(env);
 
   if (cfg.error !== null) {
@@ -523,7 +539,10 @@ export function main(env = process.env) {
     return 1;
   }
 
-  const existing = findTrackingIssue({ repo: cfg.repo, labels: cfg.labels, marker: cfg.marker });
+  const existing = findTrackingIssue(
+    { repo: cfg.repo, labels: cfg.labels, marker: cfg.marker },
+    runner,
+  );
   const verdict = decideVerdict(
     existing,
     { failedCount: cfg.failedItems.length, digest: cfg.digest },
@@ -554,7 +573,7 @@ export function main(env = process.env) {
     case "create": {
       const args = ["issue", "create", "--title", cfg.title, "--body", body];
       for (const l of cfg.labels) args.push("--label", l);
-      const out = gh(args, { repo });
+      const out = runner(args, { repo });
       console.log(`Opened tracking issue: ${out.trim()}`);
       const outputs = resolveTrackerOutputs({ verdict, existing, createdUrl: out });
       if (outputs.issueNumber === "") {
@@ -568,10 +587,10 @@ export function main(env = process.env) {
       return 0;
     }
     case "update": {
-      gh(["issue", "edit", String(existing.number), "--body", body], { repo });
+      runner(["issue", "edit", String(existing.number), "--body", body], { repo });
       console.log(`Updated tracking issue #${existing.number} (${verdict.reason}).`);
       if (cfg.commentOnChange && verdict.changed) {
-        gh(
+        runner(
           [
             "issue",
             "comment",
@@ -586,8 +605,8 @@ export function main(env = process.env) {
       return 0;
     }
     case "close": {
-      gh(["issue", "comment", String(existing.number), "--body", cfg.closeComment], { repo });
-      gh(["issue", "close", String(existing.number), "--reason", "completed"], { repo });
+      runner(["issue", "comment", String(existing.number), "--body", cfg.closeComment], { repo });
+      runner(["issue", "close", String(existing.number), "--reason", "completed"], { repo });
       console.log(`Closed tracking issue #${existing.number} — failing set cleared.`);
       publishOutputs(env, resolveTrackerOutputs({ verdict, existing }));
       return 0;

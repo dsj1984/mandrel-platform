@@ -28,6 +28,7 @@ import {
   findTrackingIssue,
   markerKey,
   markerLine,
+  main,
   parseIssueNumberFromUrl,
   planTrackerRun,
   renderEnvEntry,
@@ -557,4 +558,98 @@ test("a dry run performs no tracker write and still reports the would-be verdict
     writesToTracker: false,
     outputs: { issueNumber: "31", actionTaken: "noop" },
   });
+});
+
+// ---------------------------------------------------------------------------
+// AC-6 — the dry-run guarantee is BEHAVIOURAL, so it is asserted of main()
+//
+// `planTrackerRun` returning `writesToTracker: false` only proves the plan SAYS
+// not to write. It does not prove main() obeys the plan: replacing the branch
+// with `if (false)` leaves that assertion green while a dry run performs real
+// gh create/edit/close calls. The only way to assert "no tracker write" is to
+// hand main() a runner and observe that no mutation reaches it.
+// ---------------------------------------------------------------------------
+
+/** gh subcommands that WRITE to the tracker. `issue list` is a read. */
+const MUTATIONS = ["create", "edit", "close", "comment"];
+const isMutation = (args) => args[0] === "issue" && MUTATIONS.includes(args[1]);
+
+/** A recording `gh` runner that answers the lookup with one marked issue. */
+function fakeRunner(issue) {
+  const calls = [];
+  const runner = (args) => {
+    calls.push(args);
+    if (args[0] === "issue" && args[1] === "list") return JSON.stringify(issue ? [issue] : []);
+    return "https://github.com/acme/app/issues/999\n";
+  };
+  runner.calls = calls;
+  runner.mutations = () => calls.filter(isMutation);
+  return runner;
+}
+
+const dryRunEnv = (githubOutput) => ({
+  TRACK_MARKER: MARKER,
+  TRACK_REPO: "acme/app",
+  TRACK_FAILED_ITEMS: JSON.stringify(["a", "b"]),
+  TRACK_DRY_RUN: "true",
+  GITHUB_OUTPUT: githubOutput,
+});
+
+test("a dry run leaves the injected runner with ZERO mutation calls", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "track-issue-dry-")), "gh-output");
+  const existing = issueWithDigest(31, "stale-digest");
+  const runner = fakeRunner(existing);
+
+  assert.equal(main(dryRunEnv(file), runner), 0);
+
+  // The runner IS wired — the lookup reached it — so "no mutations" is a real
+  // observation about this run, not a vacuous assertion about a dead seam.
+  assert.ok(runner.calls.length >= 1, "the runner never saw the issue lookup");
+  assert.deepEqual(runner.calls.filter((a) => a[0] === "issue" && a[1] === "list").length, 1);
+  assert.deepEqual(
+    runner.mutations(),
+    [],
+    "a dry run must not create, edit, close or comment on anything",
+  );
+
+  // …and it still publishes the verdict it declined to perform.
+  assert.equal(readFileSync(file, "utf8"), "issue-number=31\naction-taken=updated\n");
+});
+
+test("the same run without dry-run DOES reach the tracker — the flag is what gates it", () => {
+  // The differential: if this did not mutate, the test above would prove
+  // nothing about dry-run in particular.
+  const file = join(mkdtempSync(join(tmpdir(), "track-issue-live-")), "gh-output");
+  const existing = issueWithDigest(31, "stale-digest");
+  const runner = fakeRunner(existing);
+  const { TRACK_DRY_RUN, ...live } = dryRunEnv(file);
+  assert.equal(TRACK_DRY_RUN, "true");
+
+  assert.equal(main(live, runner), 0);
+
+  const mutations = runner.mutations();
+  assert.equal(mutations.length, 1);
+  assert.deepEqual(mutations[0].slice(0, 3), ["issue", "edit", "31"]);
+  assert.equal(readFileSync(file, "utf8"), "issue-number=31\naction-taken=updated\n");
+});
+
+test("a dry run over an empty failing set never closes the live issue", () => {
+  // The most expensive dry-run defect: silently closing a tracked issue whose
+  // failures are still real. Asserted on the runner, not on a plan object.
+  const file = join(mkdtempSync(join(tmpdir(), "track-issue-dry-")), "gh-output");
+  const existing = issueWithDigest(31, "d1");
+  const runner = fakeRunner(existing);
+
+  assert.equal(main({ ...dryRunEnv(file), TRACK_FAILED_ITEMS: "[]" }, runner), 0);
+
+  assert.deepEqual(runner.mutations(), []);
+  assert.equal(readFileSync(file, "utf8"), "issue-number=31\naction-taken=closed\n");
+});
+
+test("a dry run with no GITHUB_OUTPUT still runs clean and writes nothing", () => {
+  const runner = fakeRunner(issueWithDigest(31, "stale-digest"));
+  const { GITHUB_OUTPUT, ...noOutput } = dryRunEnv("/unused");
+  assert.equal(GITHUB_OUTPUT, "/unused");
+  assert.equal(main(noOutput, runner), 0);
+  assert.deepEqual(runner.mutations(), []);
 });
