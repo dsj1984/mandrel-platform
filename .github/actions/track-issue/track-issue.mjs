@@ -287,6 +287,28 @@ export function resolveTrackerOutputs({ verdict, existing, createdUrl } = {}) {
 }
 
 /**
+ * Decide what a resolved run actually does: whether it may touch the tracker
+ * at all, and what it publishes either way. Pure — `main()` branches on the
+ * `writesToTracker` this returns rather than re-reading `cfg.dryRun`, so the
+ * dry-run contract is a property of this function and not of `main()`'s
+ * control flow, and is assertable without a network fixture.
+ *
+ * A dry run is not a quiet run: it performs no create/edit/close/comment, but
+ * it still reports the verdict it declined to perform, which is the entire
+ * point of asking for one.
+ *
+ * @param {{dryRun?: boolean}|null|undefined} cfg
+ * @param {{verdict: {action?: string}|null|undefined, existing: {number: number}|null|undefined, createdUrl?: string|null}} run
+ * @returns {{writesToTracker: boolean, outputs: {issueNumber: string, actionTaken: string}}}
+ */
+export function planTrackerRun(cfg, { verdict, existing, createdUrl } = {}) {
+  return {
+    writesToTracker: cfg?.dryRun !== true,
+    outputs: resolveTrackerOutputs({ verdict, existing, createdUrl }),
+  };
+}
+
+/**
  * Compose the tracking-issue body: the two action-owned markers, the caller's
  * intro, an optional run link, then the caller's detail block.
  *
@@ -509,11 +531,12 @@ export function main(env = process.env) {
   );
   console.log(`track-issue: ${verdict.action} — ${verdict.reason}`);
 
-  if (cfg.dryRun) {
+  const plan = planTrackerRun(cfg, { verdict, existing });
+  if (!plan.writesToTracker) {
     console.log(`(dry-run) would ${verdict.action}` + (existing ? ` issue #${existing.number}` : ""));
     // Nothing is written to the tracker, but the outputs still report the
     // verdict that WOULD have run — that is what makes a dry run inspectable.
-    publishOutputs(env, resolveTrackerOutputs({ verdict, existing }));
+    publishOutputs(env, plan.outputs);
     return 0;
   }
 

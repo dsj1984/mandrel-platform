@@ -29,6 +29,7 @@ import {
   markerKey,
   markerLine,
   parseIssueNumberFromUrl,
+  planTrackerRun,
   renderEnvEntry,
   resolveConfig,
   resolveTrackerOutputs,
@@ -511,39 +512,49 @@ test("an unset GITHUB_OUTPUT skips the write and returns, where GITHUB_ENV throw
   assert.throws(() => writeGithubEnv([["K", "v"]], undefined), /GITHUB_ENV is not set/);
 });
 
-test("a dry run reports the verdict that would have run without writing anything", () => {
-  const cfg = resolveConfig({
+test("a dry run performs no tracker write and still reports the would-be verdict", () => {
+  const env = {
     TRACK_MARKER: MARKER,
     TRACK_REPO: "acme/app",
-    TRACK_DRY_RUN: "true",
     TRACK_FAILED_ITEMS: JSON.stringify(["a", "b"]),
-  });
-  assert.equal(cfg.dryRun, true);
+  };
+  const dry = resolveConfig({ ...env, TRACK_DRY_RUN: "true" });
+  const live = resolveConfig(env);
+  assert.equal(dry.dryRun, true);
+  assert.equal(live.dryRun, false);
 
-  // main() returns on cfg.dryRun BEFORE the switch that holds every gh
-  // mutation, so "no tracker write" is structural; what needs asserting is
-  // that the outputs still describe the verdict it declined to perform.
+  // `main()` branches on planTrackerRun().writesToTracker, and every gh
+  // create/edit/close/comment lives beyond that branch — so `false` here IS
+  // "no tracker write", asserted rather than merely read off the source.
   const existing = issueWithDigest(31, "stale-digest");
   const verdict = decideVerdict(
     existing,
-    { failedCount: cfg.failedItems.length, digest: cfg.digest },
-    { digestPrefix: cfg.digestPrefix, unchangedBehavior: cfg.unchangedBehavior },
+    { failedCount: dry.failedItems.length, digest: dry.digest },
+    { digestPrefix: dry.digestPrefix, unchangedBehavior: dry.unchangedBehavior },
   );
   assert.equal(verdict.action, "update");
-  assert.deepEqual(resolveTrackerOutputs({ verdict, existing }), {
-    issueNumber: "31",
-    actionTaken: "updated",
-  });
 
-  // And a dry run over an unchanged set still surfaces the live issue number.
+  const planned = planTrackerRun(dry, { verdict, existing });
+  assert.equal(planned.writesToTracker, false, "a dry run must never reach the gh mutations");
+  assert.deepEqual(
+    planned.outputs,
+    { issueNumber: "31", actionTaken: "updated" },
+    "a dry run is not a quiet run — it reports the verdict it declined to perform",
+  );
+
+  // The same inputs without dry-run DO write, so the flag is what gates it.
+  assert.equal(planTrackerRun(live, { verdict, existing }).writesToTracker, true);
+
+  // A dry run over an unchanged set still surfaces the live issue number.
+  const unchangedIssue = issueWithDigest(31, dry.digest);
   const unchanged = decideVerdict(
-    issueWithDigest(31, cfg.digest),
-    { failedCount: cfg.failedItems.length, digest: cfg.digest },
-    { digestPrefix: cfg.digestPrefix },
+    unchangedIssue,
+    { failedCount: dry.failedItems.length, digest: dry.digest },
+    { digestPrefix: dry.digestPrefix },
   );
   assert.equal(unchanged.action, "noop");
-  assert.deepEqual(
-    resolveTrackerOutputs({ verdict: unchanged, existing: issueWithDigest(31, cfg.digest) }),
-    { issueNumber: "31", actionTaken: "noop" },
-  );
+  assert.deepEqual(planTrackerRun(dry, { verdict: unchanged, existing: unchangedIssue }), {
+    writesToTracker: false,
+    outputs: { issueNumber: "31", actionTaken: "noop" },
+  });
 });
