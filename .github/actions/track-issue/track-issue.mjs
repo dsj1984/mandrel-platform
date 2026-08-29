@@ -218,6 +218,74 @@ export function decideVerdict(existing, signal, options = {}) {
   return { action: "noop", reason: "nothing failing and no tracking issue to close", changed: false };
 }
 
+// ---------------------------------------------------------------------------
+// Verdict → public outputs
+// ---------------------------------------------------------------------------
+
+/**
+ * Internal verdict → the public past-tense vocabulary the action exposes.
+ *
+ * Two vocabularies on purpose: the internal names are imperative because they
+ * name what `main()` is about to DO, while the output names are past-tense
+ * because a caller reads them after the fact. Renaming the internal verdict to
+ * collapse the pair would churn the state machine the whole action is built
+ * around; mapping is the cheaper direction.
+ */
+const ACTION_TAKEN_BY_VERDICT = Object.freeze({
+  create: "opened",
+  update: "updated",
+  close: "closed",
+  noop: "noop",
+});
+
+/**
+ * Recover the issue number from `gh issue create` output.
+ *
+ * Scanned line-by-line from the end rather than assuming the whole payload is
+ * the URL: `gh` is free to prepend progress chatter, and the URL is always the
+ * last thing it prints. An unrecognisable payload yields `""` — the caller
+ * warns, because an empty output is a degraded run, never a failed one.
+ *
+ * @param {string|null|undefined} text
+ * @returns {string} Decimal issue number, or `""` when none is recoverable.
+ */
+export function parseIssueNumberFromUrl(text) {
+  const lines = String(text ?? "")
+    .trim()
+    .split("\n");
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const match = /\/issues\/(\d+)$/.exec(lines[i].trim());
+    if (match) return match[1];
+  }
+  return "";
+}
+
+/**
+ * Pure verdict → `{ issueNumber, actionTaken }` mapping for the composite's
+ * outputs. No network, no filesystem — the whole state table is assertable.
+ *
+ * `issueNumber` carries the number whenever the run resolved to a live tracked
+ * issue, INCLUDING a same-digest `noop`. That is load-bearing: `noop` covers
+ * both "nothing is failing, so there is no issue" and "the issue exists and is
+ * already correct", and the two are only distinguishable downstream when the
+ * second case still reports its number.
+ *
+ * @param {{verdict: {action?: string}|null|undefined, existing: {number: number}|null|undefined, createdUrl?: string|null}} args
+ * @returns {{issueNumber: string, actionTaken: 'opened'|'updated'|'closed'|'noop'}}
+ */
+export function resolveTrackerOutputs({ verdict, existing, createdUrl } = {}) {
+  const action = verdict?.action;
+  const actionTaken = ACTION_TAKEN_BY_VERDICT[action] ?? "noop";
+
+  if (action === "create") {
+    return { issueNumber: parseIssueNumberFromUrl(createdUrl), actionTaken };
+  }
+
+  const number = existing?.number;
+  const issueNumber = number === undefined || number === null ? "" : String(number);
+  return { issueNumber, actionTaken };
+}
+
 /**
  * Compose the tracking-issue body: the two action-owned markers, the caller's
  * intro, an optional run link, then the caller's detail block.
@@ -377,9 +445,45 @@ export function writeGithubEnv(entries, githubEnvPath) {
   appendFileSync(githubEnvPath, entries.map(([k, v]) => renderEnvEntry(k, v)).join(""), "utf8");
 }
 
+/**
+ * Append `KEY=value` entries to the `$GITHUB_OUTPUT` file so the composite can
+ * surface them as action outputs.
+ *
+ * Deliberately asymmetric with `writeGithubEnv`, which throws on an unset
+ * `GITHUB_ENV`: there, the next step of the same composite cannot run without
+ * the hand-off, so failing loudly is correct. Outputs are additive — a caller
+ * that ignores them is the normal case — so an unset `GITHUB_OUTPUT` (a local
+ * run, a harness that does not provide one) SKIPS the write and returns. A
+ * tracker run must never fail over a convenience its caller may not read.
+ *
+ * @param {Array<[string, string]>} entries
+ * @param {string|undefined} githubOutputPath
+ */
+export function writeGithubOutput(entries, githubOutputPath) {
+  if (!githubOutputPath) return;
+  appendFileSync(githubOutputPath, entries.map(([k, v]) => renderEnvEntry(k, v)).join(""), "utf8");
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+/**
+ * Publish the two composite outputs for a resolved run. Never throws on a
+ * missing `$GITHUB_OUTPUT`; see `writeGithubOutput`.
+ *
+ * @param {Record<string, string|undefined>} env
+ * @param {{issueNumber: string, actionTaken: string}} outputs
+ */
+function publishOutputs(env, { issueNumber, actionTaken }) {
+  writeGithubOutput(
+    [
+      ["issue-number", issueNumber],
+      ["action-taken", actionTaken],
+    ],
+    env.GITHUB_OUTPUT,
+  );
+}
 
 export function main(env = process.env) {
   const cfg = resolveConfig(env);
@@ -407,6 +511,9 @@ export function main(env = process.env) {
 
   if (cfg.dryRun) {
     console.log(`(dry-run) would ${verdict.action}` + (existing ? ` issue #${existing.number}` : ""));
+    // Nothing is written to the tracker, but the outputs still report the
+    // verdict that WOULD have run — that is what makes a dry run inspectable.
+    publishOutputs(env, resolveTrackerOutputs({ verdict, existing }));
     return 0;
   }
 
@@ -426,6 +533,15 @@ export function main(env = process.env) {
       for (const l of cfg.labels) args.push("--label", l);
       const out = gh(args, { repo });
       console.log(`Opened tracking issue: ${out.trim()}`);
+      const outputs = resolveTrackerOutputs({ verdict, existing, createdUrl: out });
+      if (outputs.issueNumber === "") {
+        // Degraded, not failed: the issue exists either way, so warn and leave
+        // the number empty rather than throwing away a successful create.
+        console.log(
+          "::warning::could not parse the new issue number from the gh issue create output — the issue-number output is empty.",
+        );
+      }
+      publishOutputs(env, outputs);
       return 0;
     }
     case "update": {
@@ -443,16 +559,21 @@ export function main(env = process.env) {
           { repo },
         );
       }
+      publishOutputs(env, resolveTrackerOutputs({ verdict, existing }));
       return 0;
     }
     case "close": {
       gh(["issue", "comment", String(existing.number), "--body", cfg.closeComment], { repo });
       gh(["issue", "close", String(existing.number), "--reason", "completed"], { repo });
       console.log(`Closed tracking issue #${existing.number} — failing set cleared.`);
+      publishOutputs(env, resolveTrackerOutputs({ verdict, existing }));
       return 0;
     }
     case "noop":
     default:
+      // A same-digest noop still reports the live issue's number — that is the
+      // only thing separating it from the nothing-is-failing noop.
+      publishOutputs(env, resolveTrackerOutputs({ verdict, existing }));
       return 0;
   }
 }

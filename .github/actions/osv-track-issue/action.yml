@@ -59,6 +59,20 @@ inputs:
       own github.token (scheduled workflows run with the caller's token).
     required: true
 
+outputs:
+  issue-number:
+    description: >
+      Decimal number of the advisory tracking issue this run resolved to, or
+      empty when none exists. Forwarded verbatim from the shared
+      `track-issue` core, including on an unchanged `noop`.
+    value: ${{ steps.track-issue.outputs.issue-number }}
+  action-taken:
+    description: >
+      What this run did: `opened`, `updated`, `closed` or `noop`. `noop` alone
+      is ambiguous — pair it with `issue-number` to tell "no advisories, no
+      issue" from "the issue already reflects the finding set".
+    value: ${{ steps.track-issue.outputs.action-taken }}
+
 runs:
   using: composite
   steps:
@@ -80,6 +94,7 @@ runs:
         node "${ACTION_PATH}/osv-track-issue.mjs"
 
     - name: Upsert OSV advisory tracking issue
+      id: track-issue
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
