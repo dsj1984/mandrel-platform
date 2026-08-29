@@ -7,10 +7,10 @@ description: Audit the repository's main documentation for staleness, semantic d
 You are a Staff Engineer & Documentation Steward verifying the repository's prose
 documentation is **up to date and complete**. Prose rots silently: commands get
 renamed, scripts move, workflows change shape, version/topology claims go stale.
-The deterministic gates (`check-doc-links.js`, `check-lifecycle-doc-drift.js`,
-`validate-docs-freshness.js`) catch broken links, generator drift, and
-per-delivery freshness — they cannot tell whether the prose still describes how
-the code actually behaves. That semantic verification is this lens's job. The
+The deterministic gates (`check-doc-links.js` and the generators' `--check`
+mode) catch broken links and generator drift — they cannot tell whether the
+prose still describes how the code actually behaves. That semantic
+verification is this lens's job. The
 shared lens machinery — read-only constraint, scope interpretation, report
 envelope + finding-block skeleton, severity scale, self-cross-check, and
 execution strategy — lives in
@@ -78,7 +78,6 @@ are cheap, exact, and de-duplicate the easy findings:
 
 ```bash
 node .agents/scripts/check-doc-links.js
-node .agents/scripts/check-lifecycle-doc-drift.js
 node .agents/scripts/generate-config-docs.js --check
 node .agents/scripts/generate-lifecycle-docs.js --check
 node .agents/scripts/generate-workflows-doc.js --check
@@ -87,7 +86,7 @@ node .agents/scripts/resolve-doc-tiers.js --json
 
 Fold the results in as findings:
 
-- **Checker failures** (broken links, lifecycle drift) become individual
+- **Checker failures** (broken links, generator drift) become individual
   findings with `Category: Link Integrity` (or `Generator Drift` for the
   lifecycle gate), citing the checker output verbatim.
 - **Generator dirtiness** (any `--check` reporting stale output, including
@@ -211,6 +210,23 @@ findings land as actionable, tracked work rather than a report nobody reads.
 
 Run the deterministic checkers in `--check` mode only; the single write is the
 report artifact. Do not edit any documentation or code.
+
+### Boundary with the ADR lens
+
+**Decision-log semantics belong to [`audit-adrs`](audit-adrs.md)**, not to this
+lens: whether an `Accepted` ADR's claims still match the tree, whether its
+supersede chain resolves, whether the index and the entry bodies agree on a
+status, and whether a directional change landed with no decision recorded. That
+lens reads the whole decisions log as a graph; this one would only ever see the
+decisions file as one more prose doc.
+
+This lens keeps its **generic** coverage of that file — link integrity, command
+and path claims, and the History Bloat / Contradiction / Authority Drift
+categories above — and both lenses may legitimately touch `decisions.md`. When
+a finding turns on an ADR's **status, chain, or decided contract**, leave it to
+`audit-adrs` rather than reporting it here, so the two lenses do not
+double-report the same defect. The History Bloat remediation is unchanged and
+still applies: never prune an ADR by archiving — supersede it in place.
 
 ## Report additions
 

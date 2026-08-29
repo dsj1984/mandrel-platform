@@ -293,7 +293,7 @@ a single vendored manifest that ships inside the bundle:
 
 - **[`runtime-deps.json`](runtime-deps.json)** — the single source of
   truth. Its `dependencies` block lists the **required** packages (`ajv`,
-  `ajv-formats`, `js-yaml`, `minimatch`, `picomatch`, `string-argv`,
+  `ajv-formats`, `js-yaml`, `minimatch`, `picomatch`,
   `typhonjs-escomplex`); its `optionalDependencies` block lists packages
   used behind graceful-degradation paths (`typescript` for TS-source
   scoring in the maintainability engine, `chokidar` for `quality:watch`,
@@ -360,7 +360,6 @@ refused by `/deliver`. The execution-model contract is owned by
 | Every `.agentrc.json` key, default, and override | [`docs/configuration.md`](docs/configuration.md) (under `.agents/`) |
 | Quality-gate runbooks (CRAP, MI, lint, friction) plus the baseline envelope, component model, and writer/reader contract | [`.agents/docs/quality-gates.md`](docs/quality-gates.md) |
 | Slash-command workflow definitions | [`workflows/`](workflows/) |
-| Render the signals span-tree (debug helper) | [`workflows/helpers/signals.md`](workflows/helpers/signals.md) |
 | Role-scoped spawn boot contexts | [`agents/`](agents/) |
 | Domain-agnostic baseline rules | [`rules/`](rules/) |
 | Skill library (core process + stack guardrails) | [`skills/core/`](skills/core/) · [`skills/stack/`](skills/stack/) |
@@ -687,27 +686,24 @@ The lease primitive lives in
 [`scripts/lib/orchestration/ticket-lease.js`](scripts/lib/orchestration/ticket-lease.js).
 Rather than inventing a new state column, the lease rides the ticket's
 existing **assignees** field: the single assignee *is* the lease owner.
-Liveness is decided by the owner's last-heartbeat timestamp compared against
-a configurable TTL (`delivery.lease.ttlMs`).
 
-> **In practice the lease always fails closed.** There is no live heartbeat
-> source — the `story.heartbeat` emitter was structurally inert and has been
-> deleted (A22) — so every guard anchors the owner's heartbeat to *now*,
-> making **any** foreign claim read as live. The **stale-claim reclaim** row
-> below is therefore unreachable in normal operation: a stranded claim is
-> cleared with `--steal`, never by TTL expiry. The TTL and the reclaim branch
-> remain as a seam for a caller that supplies its own `heartbeatAt`.
+> **The lease fails closed.** It shipped with a TTL (`delivery.lease.ttlMs`)
+> that reclaimed a claim whose owner's heartbeat had gone stale — but the
+> `story.heartbeat` emitter was structurally inert and was deleted (A22),
+> after which every guard anchored the heartbeat to *now* so **any** foreign
+> claim read as live. Story #5006 deleted the TTL, the heartbeat parameter
+> and the reclaim branch: a foreign claim now refuses unconditionally, and a
+> stranded one is cleared with `--steal`.
 
-The model has five behaviours, all expressed through `acquireLease` /
+The model has four behaviours, all expressed through `acquireLease` /
 `releaseLease`:
 
 | Behaviour | When it fires | Outcome |
 | --------- | ------------- | ------- |
 | **Acquire by self-assign** | The ticket is unassigned. | The operator is written to `assignees`; the run proceeds (`reason: 'unclaimed'`). |
 | **Re-affirm a self-held claim** | The operator already holds the lease. | No write; the run proceeds (`reason: 'already-held'`). |
-| **Refuse-if-foreign** | A *different* operator holds the lease and their heartbeat is within the TTL (the claim is **live**). | The acquire **fails closed** — the run refuses to start and names the current owner so you know who to coordinate with (`reason: 'held'`). |
-| **Stale-claim reclaim** *(unreachable — see above)* | A foreign claim exists but the caller supplied a `heartbeatAt` older than the TTL. | The lease is reassigned to the operator (`reason: 'reclaimed'`). No shipped caller supplies one, so this never fires today. |
-| **`--steal` override** | A foreign claim is *live* and the operator passes `--steal`. | The live claim is forcibly transferred (`reason: 'stolen'`). This is the **only** way past a live foreign claim. |
+| **Refuse-if-foreign** | A *different* operator holds the lease. | The acquire **fails closed** — the run refuses to start and names the current owner so you know who to coordinate with (`reason: 'held'`). |
+| **`--steal` override** | A foreign claim exists and the operator passes `--steal`. | The claim is forcibly transferred (`reason: 'stolen'`). This is the **only** way past a foreign claim. |
 
 On a clean completion the holder **releases** the lease (clears the
 assignment), but only when it still holds it — a late release on a ticket

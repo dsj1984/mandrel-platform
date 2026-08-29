@@ -44,14 +44,17 @@ From zero to shipped:
    resolves their dependency graph from live state — body edges union native
    GitHub `blocked_by` edges, every blocker checked against its real issue
    state, so a Story whose blocker landed in an earlier plan run is simply
-   ready. `/deliver` owns input resolution and `depends_on` sequencing only;
+   ready. `/deliver` owns input resolution and dispatch order — the declared
+   `depends_on` edges plus a delivery-time file-overlap guard that withholds
+   two Stories whose footprints would race the same path (see
+   [`architecture.md` § Scheduler safety mechanics](../../docs/architecture.md));
    every Story runs through the single v2 delivery engine
    [`helpers/deliver-story`](../workflows/helpers/deliver-story.md) —
    init → implement → acceptance self-eval → ceremony → close → CI watch →
    confirm-merge — which owns its own per-step detail. For a multi-Story run,
-   `/deliver` sequences ready Stories by `depends_on` and runs the per-run
-   epilogue (audit roster · follow-up roll-up · sibling coherence) once after
-   the last Story lands.
+   `/deliver` sequences ready Stories by `depends_on` — plus that footprint
+   guard — and runs the per-run epilogue (audit roster · follow-up roll-up ·
+   sibling coherence) once after the last Story lands.
 
 That is the whole happy path. Everything below is **detail** — branching
 conventions, HITL escalation, audit lenses — that you only need when the
@@ -62,9 +65,9 @@ rather than re-documenting the ceremony they own.
 ## Core Principles
 
 - **Layered state stores with explicit precedence.** Ticket status lives
-  in GitHub Issues and Labels; the lifecycle bus
-  (`temp/run-<id>/lifecycle.ndjson`) is the canonical resume target for
-  in-flight runs; structured comments (`verification-results`, retro) are
+  in GitHub Issues and Labels; the lifecycle ledger
+  (`lifecycle.ndjson`) records merge-terminal outcomes for post-hoc
+  attribution; structured comments (`verification-results`, retro) are
   the operator-visible rollup. The
   stores, their owners, and their conflict-resolution rules are listed in
   [§ State stores](#state-stores) — that matrix is the single source of
@@ -109,7 +112,7 @@ on-disk layout resolved by
 | --- | --- | --- | --- | --- |
 | GitHub labels | `transitionTicketState` via `ticketing.js` | `gh issue edit --add-label / --remove-label`, wrapped in `update-ticket-state.js` | `(ticketId, label-set)` — set-equality before write | Authoritative for current ticket lifecycle state; if a label disagrees with the lifecycle ledger, the **ledger wins on resume** and the label is re-derived. |
 | `verification-results` comment | `lib/orchestration/code-review.js` | `post-structured-comment.js` (upsert by `kind`) | `(storyId, kind='verification-results')` | Authoritative for the Story-scope review + lens findings; critical findings block close. |
-| Lifecycle ledger NDJSON | `LedgerWriter` (`lib/orchestration/lifecycle/ledger-writer.js`, registered as the first listener on every bus event — single append-only writer per run) | Append-only line write to `temp/run-<id>/lifecycle.ndjson` | `(runId, eventId)` — `eventId` is a content hash of `{type, ts, payload}` | **Canonical resume target.** When labels / comments disagree with the ledger, the ledger wins and the others are re-derived. |
+| Lifecycle ledger NDJSON | `appendLedgerEvent` (`lib/orchestration/lifecycle/emit-ledger-event.js`) — a bare `appendFileSync` from the close path; Story #5024 retired the `LedgerWriter` listener that preceded it | Append-only line write to the scope-resolved `lifecycle.ndjson` | `(storyId, event)` — one record per merge-terminal outcome | Records the two merge-terminal outcomes (`merge.unlanded`, `merge.flip-failed`) for post-hoc attribution. Labels remain authoritative for current ticket state. |
 | Validation evidence cache | `evidence-gate.js` | JSON cache file under the run temp tree, keyed by HEAD SHA | `(gate, git rev-parse HEAD)` | Pure cache: a missing entry triggers a re-run; presence is a fast-path skip. Cache eviction is safe. |
 | PR / auto-merge state | `single-story-close.js` (sole authorized caller of `gh pr merge`) | `gh pr merge --auto --squash --delete-branch`; PR open via the close pipeline's `gh pr create` | `(prNumber, head-branch SHA)` — `gh pr list --head` probes before create | GitHub is authoritative for PR + auto-merge arming state; the ledger records the *intent* to arm, GitHub records the outcome. |
 | Worktree cleanup state | `WorktreeManager.reap` (via `single-story-close.js` / `git-cleanup.js`) | `git worktree remove` + on-disk pending-cleanup JSON under the run temp tree | `(storyId, worktree-path)` | Filesystem is authoritative for "is the worktree gone?"; the pending-cleanup JSON only tracks stale-registry entries needing a follow-up sweep. |
@@ -239,7 +242,7 @@ self-eval, ceremony, close, CI watch, confirm-merge, cleanup) lives in the
 | Mode | Entry point | When to use |
 | --- | --- | --- |
 | **Single Story** | `/deliver <storyId>` | Deliver one Story end-to-end; ends with a PR open to `main`. |
-| **Story set** | `/deliver <storyId> [<storyId>…]` | Deliver multiple Stories in `depends_on` order (default concurrency **3**), resolved from live state so edges may point at Stories from earlier plan runs; each lands through its own PR, and the per-run epilogue runs after the set lands. |
+| **Story set** | `/deliver <storyId> [<storyId>…]` | Deliver multiple Stories in `depends_on` order (default concurrency **3**), resolved from live state so edges may point at Stories from earlier plan runs; a delivery-time file-overlap guard additionally withholds two Stories whose footprints would race the same path (`delivery.deliverRunner.footprintGuard`). Each lands through its own PR, and the per-run epilogue runs after the set lands. |
 | **Story worker (internal)** | *helper* `helpers/deliver-story <storyId>` | Per-Story engine invoked internally by `/deliver`; not an operator slash command. |
 
 The single operator-facing entry point is `/deliver`. It performs no

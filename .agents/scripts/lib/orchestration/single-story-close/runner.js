@@ -29,6 +29,7 @@ import { parseCloseOptions, resolveWaitForMerge } from './phases/options.js';
 import { ensurePullRequestWith } from './phases/pull-request.js';
 import { pushStoryBranch } from './phases/push.js';
 import { handleCriticalReviewBlock } from './phases/review-block.js';
+import { handleOverriddenReviewBlock } from './phases/review-override.js';
 import { reapWorktreePhase } from './phases/worktree-reap.js';
 import { runWrongTreeGuardPhase } from './phases/wrong-tree-guard.js';
 
@@ -207,6 +208,8 @@ async function openAndReviewPr({
   storyBranch,
   baseBranch,
   provider,
+  config,
+  overrideReviewBlock,
   injectedGh,
   injectedRunCodeReview,
   setPhase = () => {},
@@ -222,6 +225,8 @@ async function openAndReviewPr({
     cwd,
     storyId,
     storyTitle: story.title,
+    // Scanned for a declared `BREAKING CHANGE:` footer — see pull-request.js.
+    storyBody: story.body,
     storyBranch,
     baseBranch,
     gh: injectedGh,
@@ -249,6 +254,27 @@ async function openAndReviewPr({
   });
   if (reviewOutcome.halted) {
     const criticalCount = reviewOutcome.severity?.critical ?? 0;
+    // The sanctioned override. Checked BEFORE the blocked
+    // transition so an overridden run never touches `agent::blocked`: the
+    // Story is proceeding, and parking it would make the label lie for the
+    // rest of the close.
+    if (overrideReviewBlock) {
+      const override = await handleOverriddenReviewBlock({
+        provider,
+        storyId,
+        prUrl,
+        prNumber,
+        criticalCount,
+        reason: overrideReviewBlock,
+        config,
+      });
+      return {
+        prUrl,
+        prNumber,
+        alreadyMerged: false,
+        reviewOverride: override,
+      };
+    }
     await handleCriticalReviewBlock({
       provider,
       storyId,
@@ -257,10 +283,12 @@ async function openAndReviewPr({
     });
     throw new Error(
       `[single-story-close] Story-scope review reported ${criticalCount} critical blocker(s) on PR ${prUrl}. ` +
-        'Auto-merge was not enabled. Remediate the findings posted to the PR and re-run `/deliver`.',
+        'Auto-merge was not enabled. Remediate the findings posted to the PR and re-run `/deliver`. ' +
+        'If you have reviewed a finding and judged it wrong, re-run with ' +
+        '`--override-review-block "<reason>"` rather than merging by hand.',
     );
   }
-  return { prUrl, prNumber, alreadyMerged: false };
+  return { prUrl, prNumber, alreadyMerged: false, reviewOverride: null };
 }
 
 async function releaseLease({
@@ -296,11 +324,9 @@ async function releaseLease({
  * `runBaseSyncPhase`, and a critical-blocker review halt in
  * `openAndReviewPr`) throw before the clean-close lease release at the
  * tail of `runSingleStoryClose`, stranding the operator's lease
- * indefinitely. The standalone lease does **not** expire by TTL: it is
- * fail-closed by design (`lease-guard-shared.js` anchors `heartbeatAt` to
- * now, so `isClaimLive` is true for any foreign assignee regardless of the
- * configured TTL), so a stranded claim is cleared only by `--steal` or
- * de-assignment. That fail-closed-refuses a different operator who picks up
+ * indefinitely. The standalone lease has **no** TTL to expire by (Story
+ * #5006 deleted it): `acquireLease` refuses any foreign assignee outright,
+ * so a stranded claim is cleared only by `--steal` or de-assignment. That fail-closed-refuses a different operator who picks up
  * the blocked Story — exactly the hand-off case. Releasing here closes
  * that gap.
  *
@@ -383,6 +409,7 @@ export async function runSingleStoryClose({
   noWaitForMerge: noWaitForMergeParam,
   maxWaitSeconds: maxWaitSecondsParam,
   mergeWatchMode: mergeWatchModeParam,
+  overrideReviewBlock: overrideReviewBlockParam,
   injectedProvider,
   injectedConfig,
   injectedNotify,
@@ -402,10 +429,11 @@ export async function runSingleStoryClose({
     noWaitForMergeParam,
     maxWaitSecondsParam,
     mergeWatchModeParam,
+    overrideReviewBlockParam,
   });
   if (!options.storyId) {
     throw new Error(
-      'Usage: node single-story-close.js --story <STORY_ID> [--cwd <main-repo>] [--skip-validation] [--skip-sync] [--no-auto-merge] [--wait-merge|--no-wait-merge] [--max-wait-seconds <n>] [--merge-watch-mode <sync|async>]',
+      'Usage: node single-story-close.js --story <STORY_ID> [--cwd <main-repo>] [--skip-validation] [--skip-sync] [--no-auto-merge] [--wait-merge|--no-wait-merge] [--max-wait-seconds <n>] [--merge-watch-mode <sync|async>] [--override-review-block <reason>]',
     );
   }
 
@@ -730,22 +758,25 @@ async function runClosePipeline({
     leaseArgs,
   );
 
-  const { prUrl, prNumber, alreadyMerged } = await releaseLeaseOnBlock(
-    () =>
-      openAndReviewPr({
-        cwd: options.cwd,
-        worktreePath,
-        story,
-        storyId: options.storyId,
-        storyBranch,
-        baseBranch,
-        provider,
-        injectedGh,
-        injectedRunCodeReview,
-        setPhase,
-      }),
-    leaseArgs,
-  );
+  const { prUrl, prNumber, alreadyMerged, reviewOverride } =
+    await releaseLeaseOnBlock(
+      () =>
+        openAndReviewPr({
+          cwd: options.cwd,
+          worktreePath,
+          story,
+          storyId: options.storyId,
+          storyBranch,
+          baseBranch,
+          provider,
+          config,
+          overrideReviewBlock: options.overrideReviewBlock,
+          injectedGh,
+          injectedRunCodeReview,
+          setPhase,
+        }),
+      leaseArgs,
+    );
   // Reap the per-Story worktree BEFORE the arm (Story #4681). Arming runs
   // `gh pr merge --auto --squash --delete-branch`, which — against an
   // already-mergeable PR — merges immediately and then shells out to local
@@ -843,7 +874,10 @@ async function runClosePipeline({
     gates: {
       validation: options.skipValidation ? 'skipped' : 'passed',
       baseSync: options.skipSync ? 'skipped' : 'passed',
-      codeReview: 'passed',
+      // An overridden blocker reports `overridden`, never
+      // `passed`. The review DID fail; a human authorized shipping anyway, and
+      // the envelope is the machine-readable trail that says so.
+      codeReview: reviewOverride ? 'overridden' : 'passed',
     },
   };
 
