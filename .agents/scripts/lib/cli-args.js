@@ -210,7 +210,6 @@ export function parseSprintArgs(
       'recut-of': { type: 'string' },
       resume: { type: 'boolean', default: false },
       restart: { type: 'boolean', default: false },
-      'no-evidence': { type: 'boolean', default: false },
     },
     allowPositionals: true,
     strict: false,
@@ -254,13 +253,12 @@ export function parseSprintArgs(
       process.env.AGENT_WORKTREE_ROOT ||
       null,
     recutOf: parseTicketId(values['recut-of']),
-    // Story #4253: pre-resolved Epic linkage threaded by the /deliver
+    // Story #4253: pre-resolved Epic linkage threaded by the /mandrel-deliver
     // fan-out so `single-story-init.js` can skip redundant Epic lookups when
     // the parent already threaded Epic context (pre-v2; field retained for
     // CLI compatibility).
     resume: values.resume ?? false,
     restart: values.restart ?? false,
-    noEvidence: values['no-evidence'] ?? false,
   };
 
   parsed.ticketId =

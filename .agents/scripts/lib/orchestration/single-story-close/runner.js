@@ -84,7 +84,7 @@ async function emitTerminal({ terminal, result, config }) {
  * issue as `completed` (the `Closes #<id>` footer firing on merge — the work
  * IS on the base branch) or as `not_planned` (superseded by a re-plan,
  * abandoned — nothing ever merged). Reporting the second as `landed` told
- * `/deliver` that work had reached `main` when no PR ever merged, which would
+ * `/mandrel-deliver` that work had reached `main` when no PR ever merged, which would
  * also satisfy any dependent Story waiting on it. Fail loudly instead: being
  * handed an abandoned Story is an input error only the operator can resolve.
  *
@@ -283,7 +283,7 @@ async function openAndReviewPr({
     });
     throw new Error(
       `[single-story-close] Story-scope review reported ${criticalCount} critical blocker(s) on PR ${prUrl}. ` +
-        'Auto-merge was not enabled. Remediate the findings posted to the PR and re-run `/deliver`. ' +
+        'Auto-merge was not enabled. Remediate the findings posted to the PR and re-run `/mandrel-deliver`. ' +
         'If you have reviewed a finding and judged it wrong, re-run with ' +
         '`--override-review-block "<reason>"` rather than merging by hand.',
     );
@@ -485,6 +485,7 @@ async function resolveAutoMergeOutcome({ alreadyMerged, ...phaseArgs }) {
       autoMergeReason: null,
       localCleanupDeferred: false,
       directMerged: false,
+      advisoryGate: null,
     };
   }
   return await runAutoMergePhase(phaseArgs);
@@ -541,6 +542,7 @@ async function finishWithMergeWait(prCtx, deps) {
     prUrl: prCtx.prUrl,
     autoMergeEnabled: prCtx.autoMergeEnabled,
     autoMergeReason: prCtx.autoMergeReason,
+    advisoryGate: prCtx.advisoryGate,
     provider: deps.provider,
     config: prCtx.config,
     maxWaitSeconds: deps.maxWaitSeconds,
@@ -796,18 +798,23 @@ async function runClosePipeline({
     WorktreeManager,
   });
   setPhase('auto-merge');
+  const ciDelivery = getCiDelivery(config);
   const {
     autoMergeEnabled,
     autoMergeReason,
     localCleanupDeferred,
     directMerged,
+    advisoryGate,
   } = await resolveAutoMergeOutcome({
     alreadyMerged,
     cwd: options.cwd,
     prNumber,
     prUrl,
     noAutoMerge: options.noAutoMerge,
-    autoMergePolicy: getCiDelivery(config).autoMerge,
+    autoMergePolicy: ciDelivery.autoMerge,
+    // Story #5096 — the pre-arm advisory-gate refusal.
+    blockOnAdvisoryFailure: ciDelivery.blockOnAdvisoryFailure,
+    advisoryAllowlist: ciDelivery.advisoryAllowlist,
     gh: injectedGh,
     progress,
   });
@@ -866,6 +873,7 @@ async function runClosePipeline({
     prUrl,
     autoMergeEnabled,
     autoMergeReason,
+    advisoryGate,
     worktreeReaped,
     localCleanupDeferred,
     directMerged,

@@ -15,7 +15,7 @@
  * Epic-hierarchy write surface. It composed the exact `Epic: #N` footer that
  * `pr-base-guard.js` hard-refuses at delivery, so the framework retained the
  * ability to generate work it would then reject; it had no production caller
- * (`/plan` persists through the bare `createIssue` below).
+ * (`/mandrel-plan` persists through the bare `createIssue` below).
  *
  * Public surface: `GitHubProvider.createIssue / getTicket /
  * getTickets / updateTicket / getTicketDependencies / primeTicketCache /
@@ -251,8 +251,8 @@ export class TicketGateway {
 
   /**
    * Create a **bare** issue — no footer composition and no sub-issue link.
-   * Since Story #4545 this is the *only* create path: `/plan` persist and the
-   * `/plan` Phase 4 Epic open (`openEpicFromOnePager`'s `createIssue` port)
+   * Since Story #4545 this is the *only* create path: `/mandrel-plan` persist and the
+   * `/mandrel-plan` Phase 4 Epic open (`openEpicFromOnePager`'s `createIssue` port)
    * both route through it.
    *
    * After the POST, the new issue is added to the configured Project V2
@@ -264,38 +264,43 @@ export class TicketGateway {
    * The POST is wrapped in `withTransientRetry` (Story #4541) so it absorbs
    * the same 502/429/ECONNRESET blips the read surfaces already do. It used
    * to post bare, which made a single transient failure at story *k* of *N*
-   * abort `/plan` persist with `1..k-1` already live on the tracker.
+   * abort `/mandrel-plan` persist with `1..k-1` already live on the tracker.
    *
    * Retry alone is not sufficient for that failure mode — a POST whose
-   * response is lost would double-create on the retry — so the caller
-   * (`plan-persist`'s `createStoryIssues`) carries the idempotency half via
-   * a plan fingerprint it looks up before creating. Retry narrows the
-   * window; the fingerprint closes it.
+   * response is lost would double-create on the retry. Story #5112 closed
+   * that: `findExisting` is consulted **before every retry POST**, and a hit
+   * is adopted instead of re-created, so a response-lost first attempt files
+   * exactly one issue. `/mandrel-plan` persist supplies the plan-fingerprint lookup
+   * its resume path already uses (`plan-persist`'s `createStoryIssues`);
+   * callers with no content identity omit it and keep the pre-#5112
+   * retry-only behaviour.
    *
    * @field-manifest POST /repos/{owner}/{repo}/issues: number, id, node_id,
    *                 html_url
    *
-   * @param {{ title: string, body: string, labels?: string[] }} payload
+   * @param {{
+   *   title: string,
+   *   body: string,
+   *   labels?: string[],
+   *   findExisting?: (() => Promise<object|null>)|null,
+   * }} payload
    * @returns {Promise<{
    *   id: number,
    *   number: number,
    *   internalId: number,
    *   nodeId: string,
    *   url: string,
+   *   adopted: boolean,
    *   boardAdd: { added: boolean, reason?: string },
    * }>}
    */
-  async createIssue({ title, body, labels = [] }) {
-    const result = await withTransientRetry(
-      () =>
-        this._gh.api({
-          method: 'POST',
-          endpoint: `/repos/${this.owner}/${this.repo}/issues`,
-          body: { title, body, labels },
-        }),
-      { label: `createIssue "${title}"`, onRetry: defaultRetryWarn },
-    );
-    const issue = parseApiJson(result);
+  async createIssue({ title, body, labels = [], findExisting = null }) {
+    const { issue, adopted } = await this._createIssueOrAdopt({
+      title,
+      body,
+      labels,
+      findExisting,
+    });
     this._listCache.clear();
 
     const boardAdd = await addIssueToBoard({
@@ -311,8 +316,84 @@ export class TicketGateway {
       internalId: issue.id,
       nodeId: issue.node_id,
       url: issue.html_url,
+      adopted,
       boardAdd,
     };
+  }
+
+  /**
+   * POST one issue and parse the created resource out of the response.
+   *
+   * @param {{ title: string, body: string, labels: string[] }} payload
+   * @returns {Promise<object>}
+   */
+  async _postIssue(payload) {
+    return parseApiJson(
+      await this._gh.api({
+        method: 'POST',
+        endpoint: `/repos/${this.owner}/${this.repo}/issues`,
+        body: payload,
+      }),
+    );
+  }
+
+  /**
+   * Resolve the ambiguity a lost response leaves behind: did attempt 1 land?
+   * `ECONNRESET` after the server committed the create looks exactly like
+   * `ECONNRESET` before it, so the only authority is the server's own state.
+   *
+   * @param {(() => Promise<object|null>)|null} findExisting
+   * @returns {Promise<object|null>} the already-created issue, or `null`.
+   */
+  async _findAlreadyCreated(findExisting) {
+    return typeof findExisting === 'function' ? await findExisting() : null;
+  }
+
+  /**
+   * The idempotent half of {@link TicketGateway#createIssue}: POST once, and
+   * on every subsequent attempt look for an already-created issue *before*
+   * posting again, so a retry adopts rather than duplicates.
+   *
+   * @param {{ title: string, body: string, labels: string[], findExisting: (() => Promise<object|null>)|null }} args
+   * @returns {Promise<{ issue: object, adopted: boolean }>}
+   */
+  async _createIssueOrAdopt({ title, body, labels, findExisting }) {
+    let posts = 0;
+    return withTransientRetry(
+      async () => {
+        if (posts > 0) {
+          const issue = await this._findAlreadyCreated(findExisting);
+          if (issue) return { issue, adopted: true };
+        }
+        posts += 1;
+        const issue = await this._postIssue({ title, body, labels });
+        return { issue, adopted: false };
+      },
+      { label: `createIssue "${title}"`, onRetry: defaultRetryWarn },
+    );
+  }
+
+  /**
+   * Append logins to an issue's assignee set via GitHub's additive assignees
+   * endpoint. No read-before-write and no replace semantics, so it cannot
+   * evict an assignee another run added between our read and our write. A
+   * non-array or empty list is a no-op.
+   *
+   * @param {number} ticketId
+   * @param {string[]|undefined} logins
+   */
+  async _addAssignees(ticketId, logins) {
+    if (!(logins?.length > 0)) return;
+    await withTransientRetry(
+      () =>
+        this._gh.api({
+          method: 'POST',
+          endpoint: `/repos/${this.owner}/${this.repo}/issues/${ticketId}/assignees`,
+          body: { assignees: logins },
+        }),
+      { label: `addAssignees #${ticketId}`, onRetry: defaultRetryWarn },
+    );
+    this.invalidateTicket(ticketId);
   }
 
   /**
@@ -324,7 +405,7 @@ export class TicketGateway {
    *
    * The additive POST goes through `withTransientRetry` (Story #4961) on the
    * same policy as every other call in this file. Story #4952 raised the
-   * `/plan` write loops that reach this endpoint — the `agent::ready` flips
+   * `/mandrel-plan` write loops that reach this endpoint — the `agent::ready` flips
    * and the checkpoint fan-out — off serial, which is precisely what makes
    * GitHub's secondary rate limit likelier; `gh-exec` already classifies that
    * as transient, so the only thing missing was a backoff behind it.
@@ -370,11 +451,23 @@ export class TicketGateway {
    * {@link TicketGateway#_applyLabelMutations}. Both are the write half of the
    * fan-outs Story #4952 raised; the reads in this file were already wrapped.
    *
+   * `mutations.addAssignees` (Story #5112) is the **additive** assignee
+   * write, on the same shape as the additive label POST above: it appends to
+   * the assignee set instead of replacing it. The lease claim
+   * (`lib/orchestration/ticket-lease.js`) needs that — a replacing PATCH
+   * evicts a simultaneous claimer silently, so both runs read a clean
+   * `[self]` on verify and both believe they hold the lease. Appending makes
+   * the collision *observable* as a co-assignment, which is exactly what the
+   * lease's `lost-race` back-out keys on. `mutations.assignees` (replace) is
+   * unchanged and still used by the steal and release paths.
+   *
+   * @field-manifest POST /repos/{owner}/{repo}/issues/{n}/assignees: assignees
    * @field-manifest PATCH /repos/{owner}/{repo}/issues/{n}:
    *                 body, assignees, state, state_reason, labels
    */
   /* node:coverage ignore next */
   async updateTicket(ticketId, mutations) {
+    await this._addAssignees(ticketId, mutations.addAssignees);
     const patch = {};
     if (mutations.body !== undefined) patch.body = mutations.body;
     if (mutations.assignees) patch.assignees = mutations.assignees;

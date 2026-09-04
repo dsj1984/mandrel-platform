@@ -19,7 +19,7 @@
 //
 //   3. No active doc mentions any retired slash command. The retired-command
 //      blocklist is seeded with `agents-bootstrap-github`,
-//      `single-story-plan` (renamed to `/plan`), and `mandrel`
+//      `single-story-plan` (renamed to `/mandrel-plan`), and `mandrel`
 //      (retired in favor of the generated `.agents/docs/workflows.md`
 //      catalog) and takes precedence over the workflow-resolution check —
 //      a retired token is always a non-zero exit even if a stale workflow
@@ -59,6 +59,18 @@ export const RETIRED_COMMANDS = new Set([
   // #4482 — dead workflow surface retired (host-native equivalents).
   'explain',
   'git-merge-pr',
+]);
+
+// Command spellings a *historical* record may still name, keyed by the file
+// allowed to name them. A decisions log that cannot quote the name a command
+// had is a broken record: an ADR describes the world as it was, so freezing
+// its prose is the point. Scoped per-file and per-token rather than
+// allowlisted globally — everywhere else these are simply wrong, and a typo
+// like `/mandrl-plan` must still fail here. Story #5126 renamed `/plan` →
+// `/mandrel-plan` and `/deliver` → `/mandrel-deliver`; the ADRs that decided
+// the Story-only model still name them as they were called then.
+export const SUPERSEDED_COMMAND_SPELLINGS = new Map([
+  ['docs/decisions.md', new Set(['plan', 'deliver'])],
 ]);
 
 // Tokens that look like `/foo` in prose but are not slash commands. Tokens
@@ -325,6 +337,22 @@ function stripAnchorAndQuery(target) {
   return t;
 }
 
+// Percent-decode a link target's path portion (Story #5090). A correctly
+// encoded Markdown destination escapes URL-reserved characters — a
+// file-based router's `[token]` segment is written `%5Btoken%5D`, the form
+// CommonMark renderers require — but the filesystem knows only the decoded
+// name. The decode is one-way and total: a malformed escape (`%zz`) degrades
+// to the raw string instead of throwing `URIError`, so an undecodable target
+// is resolved exactly as it was before.
+function decodeLinkPath(pathOnly) {
+  if (!pathOnly.includes('%')) return pathOnly;
+  try {
+    return decodeURIComponent(pathOnly);
+  } catch {
+    return pathOnly;
+  }
+}
+
 // --- Slash-token extraction ------------------------------------------------
 
 // Tokens look like `/<lowercase-alphanum-with-hyphens>`. We exclude tokens
@@ -363,6 +391,20 @@ export function extractSlashTokens(masked) {
 
 // --- Per-file check --------------------------------------------------------
 
+/**
+ * The slash tokens `relFile` may name without resolving to a workflow: the
+ * global allowlist, plus any superseded spelling this particular file is
+ * allowed to quote.
+ *
+ * @param {string} relFile Repo-relative path of the file being checked.
+ * @returns {Set<string>} Tokens to skip, stored without the leading slash.
+ */
+function slashAllowlistFor(relFile) {
+  const superseded = SUPERSEDED_COMMAND_SPELLINGS.get(relFile);
+  if (!superseded) return SLASH_ALLOWLIST;
+  return new Set([...SLASH_ALLOWLIST, ...superseded]);
+}
+
 export function checkFile(absPath, repoRoot) {
   const violations = [];
   const source = fs.readFileSync(absPath, 'utf8');
@@ -394,8 +436,13 @@ export function checkFile(absPath, repoRoot) {
   // 2. Relative-link resolution.
   for (const { target, line } of extractLinks(masked)) {
     if (isExternalOrInternalAnchor(target)) continue;
-    const pathOnly = stripAnchorAndQuery(target);
-    if (!pathOnly) continue; // pure anchor that survived earlier check
+    const rawPathOnly = stripAnchorAndQuery(target);
+    if (!rawPathOnly) continue; // pure anchor that survived earlier check
+    // Decode AFTER anchor/query stripping — so an escaped `%23` cannot
+    // collapse into an anchor delimiter and truncate the target — and BEFORE
+    // resolution, so the payload-boundary branch below reports the decoded
+    // path rather than the escaped one.
+    const pathOnly = decodeLinkPath(rawPathOnly);
     let resolved;
     if (pathOnly.startsWith('/')) {
       // Treat root-absolute paths as repo-root relative.
@@ -433,14 +480,16 @@ export function checkFile(absPath, repoRoot) {
     }
   }
 
-  // 3. Slash-command resolution. Skip retired hits (already reported) and
-  //    allowlisted tokens. A command is valid if it resolves to a top-level
+  // 3. Slash-command resolution. Skip retired hits (already reported),
+  //    allowlisted tokens, and a superseded spelling in the one file allowed
+  //    to quote it (SUPERSEDED_COMMAND_SPELLINGS). A command is valid if it resolves to a top-level
   //    workflow file OR to a helpers/ module (helpers are not projected into
   //    the `.claude/commands/` tree but are still legitimate named workflows
   //    that parent workflows invoke by prose reference).
+  const slashAllowlist = slashAllowlistFor(relFile);
   for (const { token, line } of slashTokens) {
     if (RETIRED_COMMANDS.has(token)) continue;
-    if (SLASH_ALLOWLIST.has(token)) continue;
+    if (slashAllowlist.has(token)) continue;
     // Namespaced loop commands (`/loops:<name>`, Story #4289) resolve to a
     // loop unit under `.agents/workflows/loops/<name>.md`. Split on the `:`
     // and resolve the namespaced path rather than a flat `loops:<name>.md`.
