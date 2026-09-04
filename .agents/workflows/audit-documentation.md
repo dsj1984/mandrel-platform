@@ -38,9 +38,9 @@ union of:
    key for it.
 
 **Generated docs are excluded from per-doc semantic review.** The output of
-`generate-config-docs.js`, `generate-lifecycle-docs.js`, and
-`generate-workflows-doc.js`, and the synced `.claude/commands/` mirrors, are
-generator-owned: hand-editing them is never the remediation. Instead, Step 1
+`generate-config-docs.js` and `generate-workflows-doc.js`, and the synced
+`.claude/commands/` mirrors, are generator-owned: hand-editing them is never
+the remediation. Instead, Step 1
 runs the generators' `--check` mode and emits a **single** "generator output
 dirty" finding when their output is stale — the remediation is "rerun the
 generator", not "edit the doc". Auto-generated changelog files
@@ -79,7 +79,6 @@ are cheap, exact, and de-duplicate the easy findings:
 ```bash
 node .agents/scripts/check-doc-links.js
 node .agents/scripts/generate-config-docs.js --check
-node .agents/scripts/generate-lifecycle-docs.js --check
 node .agents/scripts/generate-workflows-doc.js --check
 node .agents/scripts/resolve-doc-tiers.js --json
 ```
@@ -87,8 +86,8 @@ node .agents/scripts/resolve-doc-tiers.js --json
 Fold the results in as findings:
 
 - **Checker failures** (broken links, generator drift) become individual
-  findings with `Category: Link Integrity` (or `Generator Drift` for the
-  lifecycle gate), citing the checker output verbatim.
+  findings with `Category: Link Integrity`, citing the checker output
+  verbatim.
 - **Generator dirtiness** (any `--check` reporting stale output, including
   a stale `.claude/commands/` mirror) becomes **one single finding** with
   `Category: Generator Drift` — never per-line findings — whose
@@ -189,7 +188,7 @@ auditable.
 ## Periodic full-scope sweep
 
 Context Economy findings accrete slowly — a doc that is lean today grows a
-bloated tail over many deliveries, and no single change-set-scoped `/deliver`
+bloated tail over many deliveries, and no single change-set-scoped `/mandrel-deliver`
 run sees the whole picture. Run this lens **full-scope** on a
 recurring cadence so the drift is caught before it compounds:
 
@@ -203,7 +202,7 @@ recurring cadence so the drift is caught before it compounds:
 Route the resulting `audit-documentation-results.md` through
 [`/audit-to-stories`](audit-to-stories.md), which groups the findings,
 deduplicates them against existing Issues by fingerprint, and opens
-remediation Stories (or chains into `/plan --seed`) so the Context-Economy
+remediation Stories (or chains into `/mandrel-plan --seed`) so the Context-Economy
 findings land as actionable, tracked work rather than a report nobody reads.
 
 ## Constraint (lens-specific carve-out)

@@ -1,7 +1,7 @@
 /* node:coverage ignore file -- AJV schema declaration (data-as-code); MI < 70 is inherent to large flat schema literals, no business logic to test */
 
-import Ajv from 'ajv';
-
+import { createRequire } from 'node:module';
+import process from 'node:process';
 import { COMMANDS_DEFAULTS } from './config/commands.js';
 import {
   BRANCH_PROTECTION_DEFAULTS,
@@ -15,6 +15,7 @@ import { SHELL_INJECTION_PATTERN_STRING } from './config-schema-shared.js';
 // to keep this aggregate module above the maintainability floor. The
 // resolved AGENTRC_SCHEMA is unchanged.
 import { DELIVERY_SCHEMA } from './config-settings-schema-delivery.js';
+import compiledAgentrcValidator from './generated/agentrc-validator.js';
 
 /**
  * Annotation contract (Story #5007). These schema literals are the SINGLE
@@ -431,7 +432,7 @@ const GITHUB_SCHEMA = {
 };
 
 // ---------------------------------------------------------------------------
-// planning.* — inputs to /plan
+// planning.* — inputs to /mandrel-plan
 // ---------------------------------------------------------------------------
 
 // Story #4541: `planning.context.{maxBytes, summaryMode}` was retired. The
@@ -455,7 +456,7 @@ const GITHUB_SCHEMA = {
 const PLANNING_SCHEMA = {
   type: 'object',
   description:
-    'Inputs to `/plan`: risk escalation heuristics, ceremony-lite routing, and the cross-Story conflict-finding severity gates.',
+    'Inputs to `/mandrel-plan`: risk escalation heuristics, ceremony-lite routing, and the cross-Story conflict-finding severity gates.',
   properties: {
     riskHeuristics: {
       ...LIST_OR_EXTENDER_OF_STRINGS,
@@ -590,7 +591,7 @@ const PLANNING_SCHEMA = {
 };
 
 // ---------------------------------------------------------------------------
-// delivery.* — /deliver + story-deliver consume. The full block of
+// delivery.* — /mandrel-deliver + story-deliver consume. The full block of
 // per-key sub-schemas lives in `config-settings-schema-delivery.js` (refs
 // #3457); DELIVERY_SCHEMA is imported above and referenced unchanged below.
 // ---------------------------------------------------------------------------
@@ -861,10 +862,49 @@ export const AGENTRC_SCHEMA = {
 };
 
 let _agentrcValidator = null;
+
+/**
+ * Compile `AGENTRC_SCHEMA` with a live AJV instance.
+ *
+ * `ajv` is pulled in through `createRequire` rather than a top-level
+ * `import` so the module never enters the graph on the fast path
+ * (Story #5109). Loading AJV was itself a measurable share of the ~35 ms
+ * this function used to cost in each of the 36 config-touching entry
+ * scripts, and the precompiled validator needs none of it.
+ *
+ * @returns {import('ajv').ValidateFunction}
+ */
+function compileAgentrcValidatorDynamically() {
+  const require = createRequire(import.meta.url);
+  const ajvModule = require('ajv');
+  const Ajv = ajvModule.default ?? ajvModule;
+  const ajv = new Ajv({ allErrors: true });
+  return ajv.compile(AGENTRC_SCHEMA);
+}
+
+/**
+ * The `.agentrc.json` validator.
+ *
+ * Returns the **precompiled** validator committed at
+ * `lib/generated/agentrc-validator.js` — AJV's standalone emit for the exact
+ * `AGENTRC_SCHEMA` literal above, kept in step by
+ * `check-generated-validator.js --check` inside `npm run lint`. The verdicts
+ * are AJV's own, produced by AJV's own generated code with the same
+ * `allErrors: true` option the dynamic path uses, so nothing about what a
+ * config is allowed to contain changes — only when the codegen runs.
+ *
+ * Set `MANDREL_AGENTRC_VALIDATOR=dynamic` to compile at runtime instead. That
+ * escape hatch exists so a consumer who has hand-edited the schema (or hit a
+ * platform where the generated module will not load) is never stuck with a
+ * validator they cannot regenerate; it costs the ~35 ms the artifact removes.
+ *
+ * @returns {import('ajv').ValidateFunction}
+ */
 export function getAgentrcValidator() {
-  if (!_agentrcValidator) {
-    const ajv = new Ajv({ allErrors: true });
-    _agentrcValidator = ajv.compile(AGENTRC_SCHEMA);
-  }
+  if (_agentrcValidator) return _agentrcValidator;
+  _agentrcValidator =
+    process.env.MANDREL_AGENTRC_VALIDATOR === 'dynamic'
+      ? compileAgentrcValidatorDynamically()
+      : compiledAgentrcValidator;
   return _agentrcValidator;
 }

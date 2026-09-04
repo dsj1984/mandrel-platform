@@ -81,7 +81,9 @@ export const STRUCTURED_COMMENT_TYPES = Object.freeze([
   'epic-run-state',
   'epic-run-progress',
   'epic-plan-state',
-  'parked-follow-ons',
+  // `parked-follow-ons` retired in Story #5114 with the module that was its
+  // only writer. A kind the reader still recognises but nothing emits is the
+  // same dead wiring in a new place.
   // Story #566 — per-phase wall-clock summary posted by single-story-close.js.
   'phase-timings',
   // Story #831 — story-init upserts a `story-init` comment that
@@ -118,7 +120,7 @@ export const STRUCTURED_COMMENT_TYPES = Object.freeze([
   'epic-handoff',
   // Story #2899 (Epic #2880, F13) — the deleted `epic-deliver-preflight.js`
   // upserted a `delivery-preflight` comment on the Epic at the start of
-  // pre-v2 Epic `/deliver` Phase 1, surfacing estimated story count, install cost,
+  // pre-v2 Epic `/mandrel-deliver` Phase 1, surfacing estimated story count, install cost,
   // wave count, GitHub API request volume, Claude quota burn, and any
   // threshold breaches against `delivery.preflight.max*`. One entry per
   // Epic; re-runs replace prior content.
@@ -129,7 +131,7 @@ export const STRUCTURED_COMMENT_TYPES = Object.freeze([
   // `close-validate.end`. One entry per Epic; re-ticks with the same
   // findings upsert in place (`upsertStructuredComment` diffs by body).
   'recurring-failure-class',
-  // Story #3061 (Epic #3051) — the pre-v2 `/deliver` idle-watchdog prose
+  // Story #3061 (Epic #3051) — the pre-v2 `/mandrel-deliver` idle-watchdog prose
   // instructed the parent host LLM to upsert a `wave-stall` comment on the
   // Epic whenever an in-flight Story had been silent for longer than the
   // configured cadence. The deleted `wave-tick.js --check-idle` CLI emitted
@@ -164,7 +166,7 @@ export const STRUCTURED_COMMENT_TYPES = Object.freeze([
   // (replaces epic-plan-state for new plans). plan-summary stays primary-only.
   'story-plan-state',
   // Story #4535 — `plan-persist.js` upserts a `superseded-by` comment on
-  // each `/plan --tickets` source issue at persist time, naming the single
+  // each `/mandrel-plan --tickets` source issue at persist time, naming the single
   // Story that claims it (plus any per-supersede note the plan authored),
   // immediately before closing the issue as `not_planned`. Keying off this
   // marker rather than a bare `postComment` is what makes a re-run

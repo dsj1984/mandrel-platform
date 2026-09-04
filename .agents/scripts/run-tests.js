@@ -16,16 +16,18 @@
  * to opt back in for the rare case where a contract test deliberately
  * exercises a sandbox endpoint.
  *
- * Windows arg-length safety: the `quick` / `integration` tiers enumerate
- * explicit test-file targets (they exclude specific slow suites, so a single
- * glob will not do). With ~700+ targets the joined command line crosses the
- * Windows `CreateProcess` ~32 767-char `lpCommandLine` ceiling, and
- * `spawnSync` throws `ENAMETOOLONG` before a single test runs. To stay safe
- * on every platform the runner partitions the targets into chunks whose
- * joined length stays well under that ceiling (`MAX_TARGET_CHARS`) and spawns
- * one `node --test` process per chunk, aggregating the exit codes. The
- * `full` tier (a single recursive `tests` glob) yields exactly one chunk, so
- * its behaviour is unchanged.
+ * Windows arg-length safety: every tier enumerates explicit test-file
+ * targets. `quick` / `integration` always did (they exclude specific slow
+ * suites, so a single glob will not do), and `full` joined them in Story
+ * #5111 — `node --test` has no negative pattern, so "everything except
+ * `tests/e2e/**`" is only sayable as a file set. With ~700+ targets the
+ * joined command line crosses the Windows `CreateProcess` ~32 767-char
+ * `lpCommandLine` ceiling, and `spawnSync` throws `ENAMETOOLONG` before a
+ * single test runs. To stay safe on every platform the runner partitions the
+ * targets into chunks whose joined length stays well under that ceiling
+ * (`MAX_TARGET_CHARS`) and spawns one `node --test` process per chunk,
+ * aggregating the exit codes. On POSIX the far larger
+ * `POSIX_MAX_TARGET_CHARS` budget collapses every tier back into one spawn.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -126,18 +128,38 @@ export function chunkTestTargets(targets, maxChars = MAX_TARGET_CHARS) {
 }
 
 /**
+ * Build the argv for one `node --test` invocation.
+ *
+ * **Flag position is load-bearing.** Node stops treating tokens as options
+ * at the first positional, so every runner flag — the fixed
+ * `TEST_RUNNER_FLAGS`, the optional `--test-reporter`, and any caller
+ * `extraArgs` — has to sit *before* the test-file targets. Appending
+ * `--test-reporter tap` after the targets (what `run-test-profile.js` used
+ * to do) made Node read the two tokens as two more file patterns: the
+ * default reporter ran, no TAP was emitted, and the profiler parsed zero
+ * timed entries out of a full suite run. `reporter` is therefore an option
+ * of this builder rather than something a caller concatenates on the end.
+ *
  * @param {object} [opts]
- * @param {string[]} [opts.extraArgs]
+ * @param {string[]} [opts.extraArgs] Extra runner arguments (flag position).
  * @param {'full' | 'quick' | 'integration'} [opts.tier]
  * @param {string} [opts.repoRoot]
+ * @param {string} [opts.reporter] `--test-reporter` value, e.g. `'tap'`.
+ * @returns {string[]}
  */
 export function buildNodeTestArgs({
   extraArgs = [],
   tier = 'full',
   repoRoot = ROOT,
+  reporter,
 } = {}) {
-  const targets = listTestFilesForTier(tier, repoRoot);
-  return [...TEST_RUNNER_FLAGS, ...targets, ...extraArgs];
+  return [
+    ...(reporter
+      ? [...TEST_RUNNER_FLAGS, '--test-reporter', reporter]
+      : TEST_RUNNER_FLAGS),
+    ...extraArgs,
+    ...listTestFilesForTier(tier, repoRoot),
+  ];
 }
 
 export function runTestSuite({
@@ -169,7 +191,13 @@ export function runTestSuite({
   for (const chunk of chunks) {
     const testRun = spawn(
       process.execPath,
-      [...TEST_RUNNER_FLAGS, ...chunk, ...rest],
+      // `rest` carries the documented `node --test` pass-throughs
+      // (`--test-name-pattern`, `--test-only`) — `parseTierArgv` has already
+      // rejected anything else. They precede the targets for the same reason
+      // `buildNodeTestArgs` orders them that way: Node stops parsing options
+      // at the first positional, so a flag after a target is silently read as
+      // another file pattern.
+      [...TEST_RUNNER_FLAGS, ...rest, ...chunk],
       { cwd, stdio: 'inherit', env },
     );
     if (testRun.error) {
@@ -199,7 +227,44 @@ export function runTestSuite({
   return status;
 }
 
+/**
+ * `--help` contract for the runner — the pre-rendered shape
+ * `lib/cli-usage.js` accepts alongside a spec object, matching how
+ * `check-baselines.js` declares its own.
+ *
+ * Handed to `runAsCli`, which prints it and returns **before** `main` runs.
+ * That ordering is the whole point: with no `usage` the flag fell through to
+ * `runTestSuite`, which ran the tier preflight, spawned the full ~10 000-test
+ * suite, and swept `temp/` — 25+ seconds and a mutated working tree in
+ * answer to a question about flags.
+ *
+ * Exported so the unit test can assert the documented surface without
+ * spawning the CLI.
+ */
+export const USAGE = `Usage: node .agents/scripts/run-tests.js [--tier <full|quick|integration|e2e>] [runner args...]
+
+Run the test suite: tier preflight, \`node --test\` over the tier's targets,
+then reserved-temp cleanup — which runs even when the suite fails.
+
+Flags:
+  --tier <full|quick|integration|e2e>
+                        Tier to run. Default: full — every test file except
+                        \`tests/e2e/**\`, which only \`--tier e2e\` runs.
+  --test-name-pattern <re>, --test-only
+                        The documented \`node --test\` pass-throughs, forwarded
+                        verbatim in flag position, ahead of the file targets.
+                        Any other \`--flag\` is rejected rather than forwarded:
+                        \`node --test\` reads an unrecognized flag as another
+                        file pattern, so forwarding one ran nothing and
+                        still exited 0.
+  --help                Show this message.
+
+Exits with the first non-zero \`node --test\` chunk status, or 2 when the tier
+preflight refuses to start the suite.
+`;
+
 runAsCli(import.meta.url, async () => runTestSuite(), {
   source: 'run-tests',
   propagateExitCode: true,
+  usage: USAGE,
 });

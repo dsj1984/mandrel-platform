@@ -66,13 +66,13 @@ const DOCS_FRESHNESS_SCHEMA = {
  */
 const DELIVER_RUNNER_SCHEMA = {
   type: 'object',
-  description: 'Bounded-concurrency knob for the /deliver fan-out.',
+  description: 'Bounded-concurrency knob for the /mandrel-deliver fan-out.',
   properties: {
     concurrencyCap: {
       type: 'integer',
       minimum: 1,
       description:
-        'Maximum ready Stories dispatched by /deliver at once. Default 3. Moderate by design — keeps host-quota consumption predictable while allowing a small ready-set fan-out. Set 1 for strictly sequential delivery; raise further on hosts with adequate parallel-agent quota. See deliver.md for the sequencing model and throughput tradeoff.',
+        'Maximum ready Stories dispatched by /mandrel-deliver at once. Default 3. Moderate by design — keeps host-quota consumption predictable while allowing a small ready-set fan-out. Set 1 for strictly sequential delivery; raise further on hosts with adequate parallel-agent quota. See deliver.md for the sequencing model and throughput tradeoff.',
       // getRunners() resolves this from its own DEFAULT_DELIVER_RUNNER
       // constant, not from this annotation; the parity suite asserts the two
       // agree.
@@ -389,6 +389,19 @@ const CI_DELIVERY_SCHEMA = {
         "Story #4356 (Epic #4355). Merge posture. 'trust-ci' (default) merges once required checks pass; 'strict' additionally requires a clean review gate.",
       default: CI_DELIVERY_DEFAULTS.autoMerge,
     },
+    blockOnAdvisoryFailure: {
+      type: 'boolean',
+      description:
+        'Story #5096. When true (default), delivery refuses to arm — and disarms — GitHub native auto-merge while a non-required (advisory) check is genuinely red on the PR head and GitHub reports the PR mergeable anyway (mergeStateStatus=UNSTABLE). `--auto` waits on REQUIRED contexts only, so without this a red advisory quality gate merges unattended. Set false to restore the pre-#5096 behaviour verbatim.',
+      default: CI_DELIVERY_DEFAULTS.blockOnAdvisoryFailure,
+    },
+    advisoryAllowlist: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        'Story #5096. Check-run names exempt from blockOnAdvisoryFailure — a red run whose name matches exactly never blocks arming. Matching is exact; an unnamed run can never match and always blocks.',
+      default: [...CI_DELIVERY_DEFAULTS.advisoryAllowlist],
+    },
   },
   additionalProperties: false,
 };
@@ -624,7 +637,7 @@ const TEMP_RETENTION_SCHEMA = {
 export const DELIVERY_SCHEMA = {
   type: 'object',
   description:
-    'Everything `/deliver` and `single-story-close` consume: execution timeouts, worktree isolation, runner concurrency, docs freshness, signals, quality gates, merge/CI watch, review ceremony, and the feedback loop.',
+    'Everything `/mandrel-deliver` and `single-story-close` consume: execution timeouts, worktree isolation, runner concurrency, docs freshness, signals, quality gates, merge/CI watch, review ceremony, and the feedback loop.',
   properties: {
     execution: EXECUTION_SCHEMA,
     docsFreshness: DOCS_FRESHNESS_SCHEMA,

@@ -7,7 +7,7 @@
  *   - `enforce_admins: true` — admins do not bypass the prGate suite.
  *   - `required_pull_request_reviews.required_approving_review_count: 0` —
  *     CI is the gate; the operator monitors and iterates the open PR
- *     to green via `/deliver`'s Phase 7 watch loop.
+ *     to green via `/mandrel-deliver`'s Phase 7 watch loop.
  *
  * Behaviour rules
  * ---------------
@@ -43,7 +43,7 @@ const TARGET_APPROVAL_COUNT = 0;
  * return value is a structured diff suitable for `hitlConfirm` so the
  * operator sees exactly what would flip.
  */
-export function diffProtection(current, targetContexts) {
+function diffProtection(current, targetContexts) {
   if (!current) return null; // create-from-scratch path; no diff needed.
 
   const diff = {};

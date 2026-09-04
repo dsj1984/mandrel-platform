@@ -1,7 +1,7 @@
 /**
  * duplicate-search.js — Cross-Story Duplicate Detection
  *
- * Used by `/plan` to surface open Stories whose scope overlaps with a
+ * Used by `/mandrel-plan` to surface open Stories whose scope overlaps with a
  * seed / seed-file / tickets corpus before new Stories are created.
  * Returns ranked candidates with an overlap score and URL so the host
  * LLM can pause for HITL confirmation.
@@ -207,7 +207,7 @@ function normalizeIssue(issue) {
  * }} args
  * @returns {Array<{ id: number, title: string, score: number, url: string }>}
  */
-export function rankOpenStoryDuplicates({
+function rankOpenStoryDuplicates({
   seed,
   openStories,
   minScore = DEFAULT_MIN_SCORE,

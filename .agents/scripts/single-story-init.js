@@ -2,7 +2,7 @@
 /* node:coverage ignore file */
 
 /**
- * single-story-init.js — Initialize a Story for v2 `/deliver`.
+ * single-story-init.js — Initialize a Story for v2 `/mandrel-deliver`.
  *
  * Seeds `story-<id>` from `project.baseBranch` (default `main`), materialises
  * the per-Story worktree when isolation is enabled, upserts a `story-init`
@@ -73,6 +73,7 @@ import {
 } from './lib/orchestration/ticketing.js';
 import { createProvider } from './lib/provider-factory.js';
 import { buildProtectionCtx } from './lib/single-story-sweep/protection-ctx.js';
+import { resolveSweepLockPath } from './lib/single-story-sweep/sweep-lock.js';
 // `sweepMergedStoryBranches` is imported dynamically below — its transitive
 // graph reaches `picomatch` (via `git-cleanup.js`). Loading it statically
 // would crash module resolution before `assertDepsInstalled()` can emit a
@@ -121,7 +122,7 @@ export function assertDeliverableStory(story, storyId) {
   if (!story.labels.includes(TYPE_LABELS.STORY)) {
     throw new Error(
       `Issue #${storyId} is not a Story (labels: ${story.labels.join(', ')}). ` +
-        'v2 /deliver accepts type::story tickets only.',
+        'v2 /mandrel-deliver accepts type::story tickets only.',
     );
   }
   if (story.state === 'closed') {
@@ -131,7 +132,7 @@ export function assertDeliverableStory(story, storyId) {
   if (/\b(?:Epic|Parent):\s*#\d+/i.test(body)) {
     throw new Error(
       `Story #${storyId} still declares an Epic/Parent footer. ` +
-        'v2 delivery is Story-only — re-plan as a standalone Story before /deliver.',
+        'v2 delivery is Story-only — re-plan as a standalone Story before /mandrel-deliver.',
     );
   }
 }
@@ -188,7 +189,7 @@ export async function assertNotForeignExecuting({
       (lease.previousOwner
         ? ` (assignee @${lease.previousOwner})`
         : ' with no assignee') +
-      '. Another /deliver run may already own it. Confirm that run is dead, ' +
+      '. Another /mandrel-deliver run may already own it. Confirm that run is dead, ' +
       'then re-run with --steal to take it.',
   );
 }
@@ -292,6 +293,9 @@ export function decideStoryBranchSeed({ localHas, remoteHas }) {
  *     in `sweep.protected` for the operator).
  *   - Cross-session lock: a single lockfile under `tempRoot` prevents
  *     two concurrent `/single-story-deliver` invocations from racing.
+ *     Story #5112 made that lockfile shared with `boot-sweep.js` — the
+ *     other entry point into the same merged-branch reap — by routing
+ *     both through `resolveSweepLockPath`.
  *
  * Exported for testing.
  */
@@ -307,7 +311,7 @@ export async function reapMergedStoryBranches({
     injectedSweep ??
     (await import('./lib/single-story-sweep.js')).sweepMergedStoryBranches;
   const tempRoot = config?.project?.paths?.tempRoot ?? 'temp';
-  const lockPath = path.resolve(cwd, tempRoot, 'single-story-sweep.lock');
+  const lockPath = resolveSweepLockPath({ cwd, tempRoot });
   const lockTimeoutMs =
     config.delivery?.worktreeIsolation?.sweepLockMs ?? 60_000;
   try {
@@ -603,7 +607,7 @@ export async function runSingleStoryInit({
   );
   progress('INIT', `Initializing standalone Story #${storyId}...`);
 
-  // Issue #4483 — deterministic remote evidence at the v2 `/deliver` entry
+  // Issue #4483 — deterministic remote evidence at the v2 `/mandrel-deliver` entry
   // seam (`single-story-init.js`). The
   // probe is read-only, so it runs under --dry-run too. The CLI records
   // the fact; the workflow owns the `agent::blocked` transition on
