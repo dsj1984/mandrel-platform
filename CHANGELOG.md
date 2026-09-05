@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.5.0...mandrel-platform-v1.5.1) (2026-09-05)
+
+
+### Fixed
+
+* make the documented `runner` JSON-array form actually resolve at every `runs-on` site across the six reusable workflows ([#421](https://github.com/dsj1984/mandrel-platform/issues/421)) ([#422](https://github.com/dsj1984/mandrel-platform/issues/422)) ([37bd17a](https://github.com/dsj1984/mandrel-platform/commit/37bd17a3a16324bbf3cff2dc0bd4a1dd9470a74d))
+
 ## [1.5.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.4.2...mandrel-platform-v1.5.0) (2026-08-29)
 
 
