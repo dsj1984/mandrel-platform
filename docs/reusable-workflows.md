@@ -99,7 +99,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 
 | Input              | Type    | Default          | When to override                                                                                                                              |
 | ------------------ | ------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `runner`           | string  | `'ubuntu-latest'`| Runs-on label for all jobs. Pass a JSON-encoded array string (e.g. `'["self-hosted","domio-runner"]'`) to target a self-hosted runner.        |
+| `runner`           | string  | `'ubuntu-latest'`| Runs-on label for all jobs. Either a single label (`'ubuntu-latest'`) or a JSON-encoded label-array string (e.g. `'["self-hosted","domio-runner"]'`) to target a self-hosted runner. See [`runner` label shapes](#runner-label-shapes). |
 | `tier-timeouts`    | string  | `'{}'`           | JSON object of per-tier `timeout-minutes` overrides, keyed by tier (e.g. `'{"ci-required": 17, "e2e": 57}'`). GitHub charges the pre-job `Set up runner` wait against each job's `timeout-minutes`, so on a self-hosted pool a tier's real budget is `work + queue wait` — and only you know your fleet's queue distribution. Unlisted tiers keep their default. Default `'{}'` is byte-for-byte today's behaviour. See [Caller-addressable tier timeouts](#caller-addressable-tier-timeouts-tier-timeouts). |
 | `shards`           | number  | `1`              | **DEPRECATED — no longer read.** Sharding is configured solely via `shard-matrix`; the shard-count denominator is derived from the matrix size (`strategy.job-total`). Declared for backwards compatibility only (passing it is harmless and changes nothing); scheduled for removal in the next breaking release. |
 | `shard-matrix`     | string  | `'[1]'`          | JSON-encoded array of shard indices driving the test matrix (unit, contract, e2e) — e.g. `'[1,2,3]'` for 3 shards. The only sharding input: each test invocation's `--shard=<n>/<total>` denominator is derived from the matrix size, so a mismatched second input cannot under- or over-run the suite. |
@@ -151,7 +151,38 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 > **`runner` array syntax.** Single labels are plain strings
 > (`'ubuntu-latest'`). Multi-label / self-hosted targets must be a
 > **JSON-encoded string** (`'["self-hosted","domio-runner"]'`), not a YAML
-> sequence.
+> sequence. Both shapes are normalized at every `runs-on` site — see
+> [`runner` label shapes](#runner-label-shapes) for what that does and how a
+> malformed value behaves.
+
+### `runner` label shapes
+
+`runner` is a **string** input — `workflow_call` has no array type — so a
+multi-label target travels as JSON text. Every `runs-on:` site in every
+reusable workflow here normalizes it:
+
+```yaml
+runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner
+                      || format('"{0}"', inputs.runner)) }}
+```
+
+| You pass | `runs-on` receives |
+| --- | --- |
+| `'ubuntu-latest'` | the label `ubuntu-latest` |
+| `'my-runner'` | the label `my-runner` |
+| `'["self-hosted","my-runner"]'` | the labels `self-hosted` **and** `my-runner` |
+
+**A malformed array is a hard error, on purpose.** A value that opens with
+`[` but is not valid JSON fails the workflow immediately rather than falling
+back to the bare-label branch. That is the loud behaviour you want: an
+unmatchable label is not a failure GitHub reports, it is a job that sits
+`queued` until the 24-hour timeout with no logs to read (#419).
+
+**Why `fromJSON` wraps the conditional** rather than sitting inside a branch
+of it: both `&&` / `||` operands stay plain strings, so the expression is
+correct whether or not GitHub's evaluator short-circuits — which GitHub does
+not specify. The shorter `startsWith(x,'[') && fromJSON(x) || x` would be
+correct only if it does.
 
 ### Caller-addressable tier timeouts (`tier-timeouts`)
 
@@ -489,6 +520,14 @@ today's caching untouched; only a caller that explicitly names `self-hosted`
 `'["self-hosted","my-runner"]'`) opts into the no-save behaviour. A self-hosted
 pool whose labels omit `self-hosted` should pass `toolchain-cache: 'false'`
 explicitly.
+
+> **Before v1.5.1 the array half of that was unreachable** (#419). Every
+> `runs-on:` consumed `runner` raw, so the JSON label-array string — the only
+> shape from which `auto` could derive `'false'` — never matched a runner at
+> all, while the bare label that did match derived `'true'`. A self-hosted
+> caller could not get both right from the documented interface. Normalizing
+> `runs-on` fixed the pairing rather than the derivation: `contains()` still
+> reads the raw input string and is unchanged.
 
 **Pinning still wins.** Any explicit `'true'` or `'false'` is passed through
 untouched on either runner class — the derivation applies only to the literal
