@@ -128,7 +128,7 @@ concurrency:
 jobs:
   advisory-scan:
     name: advisory-scan
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
     timeout-minutes: 20
     permissions:
       contents: read
