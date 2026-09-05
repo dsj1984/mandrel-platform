@@ -31,6 +31,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
+import { evaluate } from "./lib/actions-expression.mjs";
 
 const QUALITY = ".github/workflows/pr-quality.yml";
 const ADVISORY = ".github/workflows/advisory-scan.yml";
@@ -68,145 +69,12 @@ function inputDefault(text, name, file) {
 }
 
 // ---------------------------------------------------------------------------
-// A minimal GitHub Actions expression evaluator
-//
-// Only the surface this expression uses: string literals, `inputs.<name>` /
-// `inputs['<name>']` context reads, `==`/`!=`, `&&`/`||`, parentheses, and
-// `contains()`. The semantics that matter and that a hand-read gets wrong:
-//
-//   - `a && b` yields `b` when `a` is truthy, else `a`.
-//   - `a || b` yields `a` when `a` is truthy, else `b`.
-//   - EVERY non-empty string is truthy — including the string `'false'`.
-//   - String comparison is case-insensitive.
+// The Actions expression evaluator now lives in scripts/lib/actions-expression.mjs
+// (extracted by Story #421, when check-runner-runs-on.test.mjs needed the same
+// read-then-execute approach). Its own semantics are covered by
+// scripts/lib/actions-expression.test.mjs, so this file asserts only the
+// toolchain-cache contract.
 // ---------------------------------------------------------------------------
-
-function truthy(v) {
-  if (typeof v === "boolean") return v;
-  if (typeof v === "number") return v !== 0;
-  if (typeof v === "string") return v !== "";
-  return v !== null && v !== undefined;
-}
-
-function looseEqual(a, b) {
-  if (typeof a === "string" && typeof b === "string") {
-    return a.toLowerCase() === b.toLowerCase();
-  }
-  return a === b;
-}
-
-function evaluate(expr, inputs) {
-  let i = 0;
-
-  const ws = () => {
-    while (i < expr.length && /\s/.test(expr[i])) i++;
-  };
-  const eat = (token) => {
-    ws();
-    if (expr.startsWith(token, i)) {
-      i += token.length;
-      return true;
-    }
-    return false;
-  };
-
-  function parseOr() {
-    let left = parseAnd();
-    for (;;) {
-      ws();
-      if (!eat("||")) return left;
-      const right = parseAnd();
-      left = truthy(left) ? left : right;
-    }
-  }
-
-  function parseAnd() {
-    let left = parseCompare();
-    for (;;) {
-      ws();
-      if (!eat("&&")) return left;
-      const right = parseCompare();
-      left = truthy(left) ? right : left;
-    }
-  }
-
-  function parseCompare() {
-    const left = parsePrimary();
-    ws();
-    if (eat("!=")) return !looseEqual(left, parsePrimary());
-    if (eat("==")) return looseEqual(left, parsePrimary());
-    return left;
-  }
-
-  function parsePrimary() {
-    ws();
-    if (eat("(")) {
-      const v = parseOr();
-      ws();
-      assert.ok(eat(")"), `unbalanced parenthesis at ${i} in: ${expr}`);
-      return v;
-    }
-    if (expr[i] === "'") {
-      i++;
-      let out = "";
-      while (i < expr.length) {
-        if (expr[i] === "'" && expr[i + 1] === "'") {
-          out += "'";
-          i += 2;
-          continue;
-        }
-        if (expr[i] === "'") {
-          i++;
-          return out;
-        }
-        out += expr[i++];
-      }
-      assert.fail(`unterminated string literal in: ${expr}`);
-    }
-    if (expr.startsWith("contains(", i)) {
-      i += "contains(".length;
-      const hay = parseOr();
-      ws();
-      assert.ok(eat(","), `contains() expects two arguments in: ${expr}`);
-      const needle = parseOr();
-      ws();
-      assert.ok(eat(")"), `unclosed contains() in: ${expr}`);
-      return String(hay).toLowerCase().includes(String(needle).toLowerCase());
-    }
-    const ident = expr.slice(i).match(/^[A-Za-z_][A-Za-z0-9_.\-]*(\['[^']*'\])?/);
-    assert.ok(ident, `unparseable token at ${i} in: ${expr}`);
-    i += ident[0].length;
-    const raw = ident[0];
-    if (raw === "true") return true;
-    if (raw === "false") return false;
-    const bracket = raw.match(/^inputs\['([^']*)'\]$/);
-    const dotted = raw.match(/^inputs\.(.+)$/);
-    const key = bracket ? bracket[1] : dotted ? dotted[1] : null;
-    assert.ok(key !== null, `unsupported context read \`${raw}\` in: ${expr}`);
-    assert.ok(key in inputs, `expression reads \`inputs.${key}\`, not provided by the test case`);
-    return inputs[key];
-  }
-
-  const value = parseOr();
-  ws();
-  assert.equal(i, expr.length, `trailing tokens at ${i} in: ${expr}`);
-  return value;
-}
-
-// ---------------------------------------------------------------------------
-// The evaluator itself must be trustworthy before it can judge the workflow.
-// ---------------------------------------------------------------------------
-
-test("the expression evaluator models Actions truthiness, not JavaScript's", () => {
-  // The trap the real expression depends on: the STRING 'false' is truthy, so
-  // an explicitly-pinned 'false' survives the first arm of the ternary.
-  assert.equal(evaluate("'false' && 'yes' || 'no'", {}), "yes");
-  // `&&`/`||` yield operands, not booleans.
-  assert.equal(evaluate("true && 'kept'", {}), "kept");
-  assert.equal(evaluate("'' || 'fallback'", {}), "fallback");
-  // Comparison is case-insensitive.
-  assert.equal(evaluate("'AUTO' == 'auto'", {}), true);
-  assert.equal(evaluate("contains('[\"self-hosted\",\"x\"]', 'self-hosted')", {}), true);
-});
 
 // ---------------------------------------------------------------------------
 // The contract

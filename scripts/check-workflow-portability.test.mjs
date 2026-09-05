@@ -197,3 +197,69 @@ test("parseArgs: --no-pin-check, dir overrides, and --help are parsed", () => {
     help: true,
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rule 4 — `runs-on` must not consume a `runner` input raw (Story #421)
+// ---------------------------------------------------------------------------
+
+/** A minimal reusable workflow whose single job's `runs-on` is `value`. */
+function runnerWorkflow(value) {
+  return [
+    "on:",
+    "  workflow_call:",
+    "    inputs:",
+    "      runner:",
+    "        required: false",
+    "        type: string",
+    "        default: 'ubuntu-latest'",
+    "jobs:",
+    "  build:",
+    `    runs-on: ${value}`,
+    "    steps:",
+    "      - run: echo hi",
+    "",
+  ].join("\n");
+}
+
+const NORMALIZED =
+  "${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner " +
+  "|| format('\"{0}\"', inputs.runner)) }}";
+
+test("Rule 4: a raw `runs-on: ${{ inputs.runner }}` is a violation", () => {
+  const violations = checkWorkflowContent(runnerWorkflow("${{ inputs.runner }}"));
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].line, 10);
+  assert.match(violations[0].message, /consumes the input raw/);
+  // The message must name the failure mode, not just the rule — a silent
+  // 24-hour queue is not something a reader infers from "normalize this".
+  assert.match(violations[0].message, /queues until the 24-hour timeout/);
+});
+
+test("Rule 4: the normalized form is clean", () => {
+  assert.deepEqual(checkWorkflowContent(runnerWorkflow(NORMALIZED)), []);
+});
+
+test("Rule 4: a hardcoded `runs-on` is untouched", () => {
+  assert.deepEqual(checkWorkflowContent(runnerWorkflow("ubuntu-latest")), []);
+});
+
+test("Rule 4: an unrelated expression in `runs-on` is untouched", () => {
+  // Only the exact raw-input read is flagged; a caller doing its own
+  // normalization or reading a different context is none of this rule's business.
+  assert.deepEqual(checkWorkflowContent(runnerWorkflow("${{ fromJSON(vars.CI_RUNNER) }}")), []);
+  assert.deepEqual(checkWorkflowContent(runnerWorkflow("${{ inputs.runner-label }}")), []);
+});
+
+test("Rule 4: only reusable workflows are checked", () => {
+  // A `push`-triggered workflow has no workflow_call interface to break.
+  const plain = [
+    "on:",
+    "  push:",
+    "    branches: [main]",
+    "jobs:",
+    "  build:",
+    "    runs-on: ${{ inputs.runner }}",
+    "",
+  ].join("\n");
+  assert.deepEqual(checkWorkflowContent(plain), []);
+});

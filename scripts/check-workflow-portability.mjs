@@ -39,6 +39,20 @@
  *      job". Requires git history (run CI checkout with fetch-depth: 0); the
  *      check degrades to a skipped NOTE when the pinned blob is unreachable.
  *
+ *   4. `runs-on: ${{ inputs.runner }}` — consuming a `runner` input RAW is
+ *      PROHIBITED. GitHub does not parse a JSON-array *string* in that
+ *      position: it takes the entire text as ONE label name, so the
+ *      documented `'["self-hosted","my-runner"]'` form matches no runner and
+ *      every job sits `queued` until the 24-hour timeout. This one is worse
+ *      than the others because it is not even loud — no job starts, so there
+ *      are no logs, and `gh pr checks` reports `pending 0`, indistinguishable
+ *      from a busy fleet. Normalize to
+ *      `fromJSON(startsWith(inputs.runner, '[') && inputs.runner ||
+ *      format('"{0}"', inputs.runner))`, which accepts both documented
+ *      shapes. (Caused #419 / v1.5.0; behaviour is covered by
+ *      check-runner-runs-on.test.mjs, which evaluates the real expression
+ *      rather than matching its spelling.)
+ *
  * What this lint deliberately does NOT flag: `${{ }}` in `runs.steps[].with`
  * (e.g. `dest: ${{ inputs['pnpm-dest'] || format('{0}/pnpm', runner.temp) }}`)
  * is a VALID runtime expression. The lint only inspects `description` and
@@ -265,6 +279,31 @@ export function checkWorkflowContent(content) {
       });
     }
   }
+
+
+  // Rule 4: no `runs-on` that consumes a `runner` input raw. GitHub does not
+  // parse a JSON-array STRING in that position — it takes the whole text as one
+  // label name — so the documented `'["self-hosted","my-runner"]'` form matches
+  // no runner and every job sits `queued` until the 24-hour timeout. The failure
+  // is silent (no job starts, so no logs, and `gh pr checks` shows `pending 0`),
+  // which is why it needs a static tripwire as well as the behavioural guard in
+  // check-runner-runs-on.test.mjs.
+  content.split("\n").forEach((raw, idx) => {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith("runs-on:")) return;
+    const m = trimmed.match(/^runs-on:\s*\$\{\{(.+)\}\}\s*$/);
+    if (!m) return;
+    if (m[1].trim() !== "inputs.runner") return;
+    violations.push({
+      line: idx + 1,
+      message:
+        `\`runs-on: \${{ inputs.runner }}\` consumes the input raw — a ` +
+        `JSON-encoded label-array string resolves to ONE unmatchable label ` +
+        `name and the job queues until the 24-hour timeout, silently. ` +
+        `Normalize it: \`fromJSON(startsWith(inputs.runner, '[') && ` +
+        `inputs.runner || format('"{0}"', inputs.runner))\`.`,
+    });
+  });
 
   return violations;
 }

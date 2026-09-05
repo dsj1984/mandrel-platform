@@ -94,7 +94,7 @@ permissions:
 jobs:
   uptime-apply:
     name: uptime-apply
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
     timeout-minutes: 10
     # Reusable-side apply serialization: the caller template provides a
     # concurrency group, but a hand-rolled caller that omits it can run two

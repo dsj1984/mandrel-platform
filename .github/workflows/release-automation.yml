@@ -110,7 +110,7 @@ permissions:
 jobs:
   release-please:
     name: Run release-please
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
     timeout-minutes: 15
     # Reusable-side release-train serialization: two quick pushes to the
     # caller's main running release-please concurrently is a known source of
