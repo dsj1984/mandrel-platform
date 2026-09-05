@@ -2560,7 +2560,7 @@ jobs:
 | Input                        | Type    | Default     | When to override                                                                                                                                          |
 | ---------------------------- | ------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `environment`                | string  | *(required)*| Target Cloudflare environment label (e.g. `staging`, `production`). Maps to `wrangler --env`.                                                              |
-| `runner`                     | string  | `'ubuntu-latest'` | Runs-on label for every job in this workflow. Single string or a JSON-encoded label array string (e.g. `'["self-hosted","domio-runner"]'`). The `secret-isolation-audit` job's gitleaks download is runner-portable — see [Secret isolation audit](#secret-isolation-audit-and-the-runner-input) below. |
+| `runner`                     | string  | `'ubuntu-latest'` | Runs-on label for every job in this workflow. Single string or a JSON-encoded label array string (e.g. `'["self-hosted","domio-runner"]'`) — See [`runner` label shapes](#runner-label-shapes). The `secret-isolation-audit` job's gitleaks download is runner-portable — see [Secret isolation audit](#secret-isolation-audit-and-the-runner-input) below. |
 | `workers`                    | string  | *(required)*| Comma-separated Worker names to deploy (e.g. `"api,worker-cron"`). Each name must match a `wrangler.toml` `[env.<environment>]` section.                   |
 | `gh-environment`             | string  | `''`        | GitHub **Deployment Environment** name attached to every secret-touching job, for secret scoping and protection rules. See [gh-environment model](#the-gh-environment-model). |
 | `migrate`                    | boolean | `false`     | Run migrations. When `true`, a pre-migration snapshot runs first. Defaults to D1 tooling; override the command seams for non-D1.                           |
@@ -2764,7 +2764,7 @@ jobs:
 
 | Input                   | Type   | Default                                          | When to override                                                                    |
 | ----------------------- | ------ | ------------------------------------------------ | ----------------------------------------------------------------------------------- |
-| `runner`                | string | `'ubuntu-latest'`                                | Runs-on label (single string or JSON label-array string). `ubuntu-latest` keeps the monitor running when a self-hosted fleet is down. |
+| `runner`                | string | `'ubuntu-latest'`                                | Runs-on label (single string or JSON label-array string — See [`runner` label shapes](#runner-label-shapes).). `ubuntu-latest` keeps the monitor running when a self-hosted fleet is down. |
 | `osv-fail-on-severity`  | string | `'high'`                                         | Lowest CVSS band counted as a tracked finding (`none`…`critical`).                  |
 | `osv-scanner-version`   | string | `'2.4.0'`                                        | Pinned OSV-scanner version — must match the `osv-scan` composite's checksum map.     |
 | `osv-allowlist-path`    | string | `'.osv-allowlist.json'`                          | Path to the optional allow-list (same schema as the PR tier). Suppressed findings are reported in the issue, never raised. |
@@ -3048,7 +3048,7 @@ jobs:
 
 | Input              | Type   | Default          | When to override                                                                 |
 | ------------------ | ------ | ---------------- | ------------------------------------------------------------------------------- |
-| `runner`           | string | `'ubuntu-latest'`| Runs-on label. The post-merge scan does not need the consumer's PR runner — `ubuntu-latest` is recommended even for self-hosted consumers. |
+| `runner`           | string | `'ubuntu-latest'`| Runs-on label (single string or JSON label-array string — See [`runner` label shapes](#runner-label-shapes).). The post-merge scan does not need the consumer's PR runner — `ubuntu-latest` is recommended even for self-hosted consumers. |
 
 ### Where findings surface
 
@@ -3115,7 +3115,7 @@ and is materialized into a consumer's `.github/workflows/` by `platform-sync`
 | ----------------- | ------ | ---------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `monitor-config`  | string | *(required)*     | Path (relative to the caller repo root) to the JSON monitor-config file. See [Monitor config schema](#monitor-config-schema) below. |
 | `apply`           | string | `'false'`        | `'true'` applies the computed plan (create/update) against the Better Stack API. `'false'` (default) computes and prints the plan without writing — use for a PR-time preview, and reserve `'true'` for the production apply trigger (e.g. push to `main`). |
-| `runner`          | string | `'ubuntu-latest'`| Runs-on label for the apply job.                                                                                     |
+| `runner`          | string | `'ubuntu-latest'`| Runs-on label for the apply job (single string or JSON label-array string — See [`runner` label shapes](#runner-label-shapes).).          |
 
 ### Secrets
 
@@ -3287,7 +3287,7 @@ the version from `package.json` and writes `CHANGELOG.md`.
 
 | Input           | Type   | Default  | When to override                                                                                                                                              |
 | --------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `runner`        | string | `'ubuntu-latest'` | Runs-on label for the `release-please` job.                                                                                                          |
+| `runner`        | string | `'ubuntu-latest'` | Runs-on label for the `release-please` job (single string or JSON label-array string — See [`runner` label shapes](#runner-label-shapes).). |
 | `target-branch` | string | `'main'` | Branch release-please maintains the release PR against. Set to your release branch if you cut releases off a branch other than the default.                   |
 | `release-type`  | string | `'node'` | release-please strategy. `'node'` reads/writes `package.json` + `CHANGELOG.md`. Use `'simple'` for a non-Node version file, etc. Ignored when `config-file` is set. |
 | `config-file`   | string | `''`     | Path to a release-please config JSON. Omit for single-package mode; supply for a monorepo or to pin `changelog-sections` to the platform's `git-conventions.md` mapping. |
