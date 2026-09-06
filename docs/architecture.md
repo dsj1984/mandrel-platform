@@ -12,7 +12,7 @@ artifact, and its own repo dog-foods every one of them:
   (tiered PR CI), `deploy-cloudflare.yml` (defence-in-depth Cloudflare deploy),
   `secret-scan-push.yml`, `codeql.yml`, `release-automation.yml`,
   `uptime-apply.yml`, and the platform-internal `smoke-dispatch.yml`. The
-  remaining workflows (`ci.yml`, `pin-drift.yml`, `runner-fleet-health.yml`,
+  remaining workflows (`ci.yml`, `pin-drift.yml`,
   `platform-sync-repair.yml`, `release-please.yml`,
   `issue-body-conformance.yml`) are this repo's own standing checks and
   release automation. The public `workflow_call` input and secret contracts
@@ -35,12 +35,11 @@ artifact, and its own repo dog-foods every one of them:
 - **Guardrail scripts** (`scripts/`) — the fail-closed checks that enforce the
   platform's invariants (SHA-pinned actions, no phantom required contexts, CVE
   policy, cross-repo pin drift, workflow portability, Wrangler baseline,
-  destructive-migration guard, repo-settings / ruleset baseline,
-  scheduled runner-fleet health with offline alerting via
-  `check-runner-health.mjs`). Each ships with a `node:test` sibling
-  (`*.test.mjs`). `platform-sync.mjs` / `platform-repair.mjs` drive the fleet
-  convergence loop. One script is deliberately **advisory** rather than
-  fail-closed: `check-release-type.mjs` (see _Release-type advisory_ below).
+  destructive-migration guard, repo-settings / ruleset baseline). Each ships
+  with a `node:test` sibling (`*.test.mjs`). `platform-sync.mjs` /
+  `platform-repair.mjs` drive the fleet convergence loop. One script is
+  deliberately **advisory** rather than fail-closed: `check-release-type.mjs`
+  (see _Release-type advisory_ below).
 - **Operator runbook templates** (`templates/runbooks/`) plus starter workflows
   (`templates/workflows/`) — copy-in operator procedures (deploy promotion,
   post-deploy smoke, incident response, backup/restore, environment
