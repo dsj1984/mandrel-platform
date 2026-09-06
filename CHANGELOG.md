@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.5.1...mandrel-platform-v1.6.0) (2026-09-06)
+
+
+### Added
+
+* pr-quality gains an advisory workflow-lint tier (actionlint + zizmor) that consumers inherit ([#429](https://github.com/dsj1984/mandrel-platform/issues/429)) ([95a616c](https://github.com/dsj1984/mandrel-platform/commit/95a616c71053b734030a7e47370c024e8a663b19))
+
 ## [1.5.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.5.0...mandrel-platform-v1.5.1) (2026-09-05)
 
 
