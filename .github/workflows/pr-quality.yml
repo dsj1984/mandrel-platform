@@ -1336,13 +1336,19 @@ jobs:
       - *checkout
 
       # First-party composite, pinned by absolute SHA like every other call
-      # site (docs/reusable-workflows.md § First-party self-pin freshness). A
-      # NEW action cannot pin its own not-yet-existing merge commit, so this
-      # lands on the current main SHA and the documented follow-up bump PR
-      # repoints it once the action exists on main — which is exactly why the
-      # freshness guard runs on push-to-main and not as a PR gate.
+      # site (docs/reusable-workflows.md § First-party self-pin freshness).
+      #
+      # THIS PIN IS TRANSITIONAL AND MUST BE BUMPED. A brand-new action cannot
+      # pin its own not-yet-existing merge commit, and pinning a SHA that does
+      # not carry the action would fail EVERY consumer at action-load time —
+      # immediately for the smoke consumer, which pins @main. So it points at
+      # the branch commit that introduced the action: that resolves today, but
+      # after the squash-merge it is the documented `unreachable` class (a
+      # pre-squash commit, valid only until GitHub garbage-collects it).
+      # `check-first-party-pin-freshness.mjs` flags it on the very next push to
+      # main; the follow-up bump PR repoints it to the squashed commit.
       - name: Lint workflows (actionlint + zizmor)
-        uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@2a095f6692c6be096d047e885ad0f2b84c86e46e
+        uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@786c869c99520fe498f496387d47819b0f6cc081
         with:
           enforce: ${{ inputs.workflow-lint-enforce }}
           # Left off for consumers: actionlint resolves shellcheck from PATH,
