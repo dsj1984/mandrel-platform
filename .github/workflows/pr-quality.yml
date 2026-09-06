@@ -79,8 +79,8 @@ on:
       tier-timeouts:
         description: >
           JSON object of per-tier `timeout-minutes` overrides, keyed by tier —
-          lint, typecheck, unit, contract, e2e, migration-guard, security,
-          osv-scan, ci-required. Unlisted tiers keep their default budget, so
+          lint, workflow-lint, typecheck, unit, contract, e2e,
+          migration-guard, security, osv-scan, ci-required. Unlisted tiers keep their default budget, so
           '{"ci-required": 17, "e2e": 57}' overrides two tiers and leaves the
           rest alone. Default '{}' is byte-for-byte today's behaviour. On a
           self-hosted fleet, size each value as that tier's default budget PLUS
@@ -255,6 +255,30 @@ on:
         required: false
         type: boolean
         default: true
+
+      # Workflow-lint tier (Story #425). ON by default but ADVISORY: the job
+      # runs, reports every actionlint/zizmor finding to the log, the job
+      # summary and as PR annotations, and stays green. That posture is
+      # deliberate — consumers inherit this workflow on a pin bump, and a gate
+      # that went from absent to blocking would red their CI on workflow debt
+      # that predates the tier, with no changelog entry to warn them (a `ci:`
+      # -typed change cuts no release note). Flip `workflow-lint-enforce` when
+      # the corpus is clean; the job is already a `needs:` of `ci-required`, so
+      # enforcing requires no new required context to be registered.
+      enable-workflow-lint:
+        description: 'Enable the workflow-lint tier (actionlint + zizmor).'
+        required: false
+        type: boolean
+        default: true
+
+      workflow-lint-enforce:
+        description: >
+          Make workflow-lint findings BLOCK the merge. Default false — findings
+          are reported but never fail the tier. Download, checksum and
+          tool-failure errors always fail it regardless.
+        required: false
+        type: boolean
+        default: false
 
       enable-typecheck:
         description: 'Enable the typecheck tier.'
@@ -1284,6 +1308,48 @@ jobs:
           fi
           echo "::warning::fail-fast could not cancel run ${RUN_ID} (HTTP ${status:-n/a}) — the tier failure above still fails ci-required. Grant 'actions: write' on the caller's GITHUB_TOKEN to enable fail-fast cancellation (see docs/reusable-workflows.md)."
           exit 0
+
+  # ── Tier 1b: Workflow lint (actionlint + zizmor) ──────────────────────────
+  # ADVISORY BY DEFAULT — see `enable-workflow-lint` / `workflow-lint-enforce`
+  # above for why this tier reports rather than blocks on arrival.
+  #
+  # NO JOB-LEVEL `permissions:` HERE, DELIBERATELY. GitHub validates a called
+  # reusable workflow's declared job permissions against the caller's grant at
+  # COMPILE time, regardless of the job's `if:` gate — so adding a scope to
+  # this job would fail the ENTIRE call with `startup_failure` (zero jobs) for
+  # every consumer that has not granted it, including consumers who disabled
+  # this tier. Story #292 is the precedent (`pull-requests: read` on
+  # migration-guard broke ci.yml and the smoke consumer, and stranded a
+  # release). The workflow-level `contents: read` already covers the checkout
+  # and the binary downloads this tier needs; it must stay that way.
+  # `scripts/check-workflow-lint-tier.test.mjs` pins the absence.
+  workflow-lint:
+    name: Workflow lint
+    if: ${{ inputs.enable-workflow-lint }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['workflow-lint'] || 10 }}
+    concurrency:
+      group: pr-quality-workflow-lint-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - *harden-runner
+      - *checkout
+
+      # First-party composite, pinned by absolute SHA like every other call
+      # site (docs/reusable-workflows.md § First-party self-pin freshness). A
+      # NEW action cannot pin its own not-yet-existing merge commit, so this
+      # lands on the current main SHA and the documented follow-up bump PR
+      # repoints it once the action exists on main — which is exactly why the
+      # freshness guard runs on push-to-main and not as a PR gate.
+      - name: Lint workflows (actionlint + zizmor)
+        uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@2a095f6692c6be096d047e885ad0f2b84c86e46e
+        with:
+          enforce: ${{ inputs.workflow-lint-enforce }}
+          # Left off for consumers: actionlint resolves shellcheck from PATH,
+          # so enabling it would make this gate's strength depend on which host
+          # in a mixed self-hosted pool took the job. This repo's own ci.yml
+          # opts in, where the runner image is known.
+          shellcheck: 'false'
 
   # ── Tier 2: Typecheck ─────────────────────────────────────────────────────
   typecheck:
@@ -2565,6 +2631,7 @@ jobs:
     if: always()
     needs:
       - lint
+      - workflow-lint
       - typecheck
       - unit
       - contract
