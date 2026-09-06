@@ -234,9 +234,22 @@ export function renderSummary(verdict, { heading = "Workflow lint" } = {}) {
   return lines.join("\n");
 }
 
-/** @param {string} text */
+/**
+ * Escape one finding message for a markdown table cell.
+ *
+ * Backslashes MUST be escaped BEFORE pipes: escaping pipes first turns an
+ * input backslash into the escape character for the pipe that follows it, so
+ * `a\` + `|b` would render as an escaped pipe and silently merge two cells
+ * (CodeQL js/incomplete-sanitization). Finding messages are tool output, not
+ * user input, but a linter that garbles its own report is still a bad report.
+ *
+ * @param {string} text
+ */
 function escapeCell(text) {
-  return String(text).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ");
 }
 
 /**

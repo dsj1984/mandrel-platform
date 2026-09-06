@@ -327,6 +327,15 @@ jobs:
     uses: ./.github/workflows/pr-quality.yml
     with:
       enable-lint: false
+      # This repo runs the workflow-lint tier NATIVELY in the `actionlint` job
+      # above (against the working-tree composite), so running it again here
+      # would duplicate the work — the same reason every other tier below is
+      # off. It also keeps the dogfood self-call independent of the tier's
+      # SHA-pinned `uses:`, which by construction cannot resolve in the PR that
+      # first introduces the action (docs/reusable-workflows.md § First-party
+      # self-pin freshness). Flip this on in the follow-up bump PR if the
+      # pinned path is ever worth dogfooding directly.
+      enable-workflow-lint: false
       enable-typecheck: false
       enable-unit: false
       enable-contract: false

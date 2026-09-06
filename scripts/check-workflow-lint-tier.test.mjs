@@ -42,8 +42,10 @@ const DOCS = read("docs/reusable-workflows.md");
  */
 export function jobBlock(text, job) {
   const lines = text.split(/\r?\n/);
-  const startRe = new RegExp(`^  ${job.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\s*$`);
-  const start = lines.findIndex((l) => startRe.test(l));
+  // A plain line comparison, not a built regex: Semgrep's
+  // detect-non-literal-regexp rejects a RegExp built from a non-literal,
+  // and a job header is an exact line anyway.
+  const start = lines.findIndex((l) => l.trimEnd() === `  ${job}:`);
   assert.notEqual(start, -1, `job '${job}' not found`);
   const block = [];
   for (let i = start + 1; i < lines.length; i += 1) {
@@ -71,11 +73,16 @@ export function jobKeys(block) {
  * @param {string} text @param {string} name
  */
 export function actionInput(text, name) {
-  const m = new RegExp(`^  ${name}:$`, "m").exec(text);
-  assert.ok(m, `input '${name}' not declared`);
-  const rest = text.slice(m.index + m[0].length);
-  const next = /^  [A-Za-z_-]+:$/m.exec(rest);
-  return next ? rest.slice(0, next.index) : rest;
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.trimEnd() === `  ${name}:`);
+  assert.ok(start !== -1, `input '${name}' not declared`);
+  const block = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    // The next input header (indent 2, bare key) ends this block.
+    if (/^ {2}[A-Za-z_-]+:\s*$/.test(lines[i])) break;
+    block.push(lines[i]);
+  }
+  return block.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +255,11 @@ test("the composite pins four checksums per tool across darwin/linux x amd64/arm
     "1.30.0_aarch64-unknown-linux-gnu",
     "1.30.0_x86_64-unknown-linux-gnu",
   ]) {
-    const m = ACTION.match(
-      new RegExp(`"${slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"\\)\\s*\\w+="([0-9a-f]{64})"`),
-    );
-    assert.ok(m, `missing pinned SHA-256 for ${slug}`);
+    // Plain string scan (no built regex — see jobBlock): find the slug's own
+    // case arm, then assert the 64-hex literal that follows it on that line.
+    const arm = ACTION.split(/\r?\n/).find((l) => l.includes(`"${slug}")`));
+    assert.ok(arm, `missing case arm for ${slug}`);
+    assert.match(arm, /="[0-9a-f]{64}"/, `missing pinned SHA-256 for ${slug}`);
   }
 });
 
@@ -270,6 +278,29 @@ test("actionlint gets no path arguments — it errors on a directory", () => {
     !/actionlint" -no-color -format '\{\{json \.\}\}'[^\n]*\$\{zz_targets\}/.test(ACTION),
     "actionlint must not be handed directory arguments",
   );
+});
+
+test("ci.yml's dogfood self-call does not run the natively-covered tier", () => {
+  // The self-call exists to dogfood the SECURITY tier; every tier ci.yml runs
+  // itself is disabled there. workflow-lint is now one of them — and leaving it
+  // on would also make the dogfood depend on the tier's SHA-pinned `uses:`,
+  // which cannot resolve in the PR that first introduces the action.
+  const block = CI.slice(CI.indexOf("uses: ./.github/workflows/pr-quality.yml"));
+  assert.match(block.slice(0, 1500), /enable-workflow-lint: false/);
+});
+
+test("no test or action file builds a RegExp from a non-literal", () => {
+  // Semgrep's detect-non-literal-regexp is diff-baselined and blocks new JS
+  // that does. Pinning it here keeps a future edit from rediscovering it in CI.
+  for (const rel of [
+    "scripts/check-workflow-lint-tier.test.mjs",
+    "scripts/workflow-lint-gate.test.mjs",
+    ".github/actions/workflow-lint/workflow-lint-gate.mjs",
+  ]) {
+    // Assembled so this guard's own needle is not a literal occurrence.
+    const needle = ["new", "RegExp("].join(" ");
+    assert.ok(!read(rel).includes(needle), `${rel} builds a RegExp dynamically`);
+  }
 });
 
 // ---------------------------------------------------------------------------

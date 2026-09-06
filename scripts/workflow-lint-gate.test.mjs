@@ -302,6 +302,17 @@ test("the summary says findings fail the build when enforcing", () => {
   assert.doesNotMatch(md, /do \*\*not\*\* fail/);
 });
 
+test("backslashes are escaped BEFORE pipes, so a cell cannot be merged", () => {
+  // CodeQL js/incomplete-sanitization: escaping pipes first would let an input
+  // backslash become the escape character for the pipe after it, silently
+  // merging two table cells.
+  const md = renderSummary(
+    classify(normalizeActionlint([actionlintRow({ message: String.raw`a \ b | c` })])),
+  );
+  const row = md.split("\n").find((l) => l.includes("| actionlint |"));
+  assert.ok(row.includes(String.raw`a \\ b \| c`), row);
+});
+
 test("a pipe in a finding message cannot break the summary table", () => {
   const md = renderSummary(
     classify(normalizeActionlint([actionlintRow({ message: "a | b" })])),
