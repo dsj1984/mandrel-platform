@@ -193,7 +193,7 @@ jobs:
       - name: Run unit tests
         run: npm test
 
-  # ── Workflow lint (actionlint + embedded shellcheck) ──────────────────────
+  # ── Workflow lint (actionlint + zizmor) ───────────────────────────────────
   #
   # The reusable workflows ARE the product, yet their YAML was historically
   # validated only by a full cross-repo smoke round-trip — expensive, late
@@ -206,12 +206,12 @@ jobs:
   # catches the shell-bug class. shellcheck ships preinstalled on the
   # ubuntu-latest image, so no extra install step is needed for it.
   #
-  # PIN HYGIENE: actionlint is pinned to a release version and the linux_amd64
-  # release archive is verified against its pinned SHA-256 before extraction —
-  # the same download-and-verify posture this repo uses for the pinned gitleaks
-  # binary in the gitleaks-scan composite action. Bump ACTIONLINT_VERSION and ACTIONLINT_SHA256
-  # in lockstep (checksums:
-  # https://github.com/rhysd/actionlint/releases/download/v<version>/actionlint_<version>_checksums.txt).
+  # PIN HYGIENE now lives in `.github/actions/workflow-lint` (Story #425): that
+  # composite owns the pinned versions and the per-platform SHA-256 maps for
+  # BOTH binaries, and is the single place to bump. It was extracted from this
+  # job precisely so the reusable `pr-quality.yml` — which consumers call, and
+  # which shipped no workflow-lint signal at all — could inherit the same gate
+  # instead of every consumer re-deriving it (#424).
   # The runner kit ships a shell script that runs on the fleet's macOS hosts,
   # where `/bin/bash` is 3.2 — Apple cannot ship a GPL3 bash. Every other job
   # here is ubuntu-latest (bash 5), and the divergences that matter are RUNTIME,
@@ -264,45 +264,39 @@ jobs:
         run: node --test scripts/runner-env-drift.test.mjs
 
   actionlint:
-    name: Lint workflows (actionlint + shellcheck)
+    name: Lint workflows (actionlint + zizmor)
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      ACTIONLINT_VERSION: '1.7.12'
-      ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # Download + verify a PINNED actionlint binary, then lint every workflow
-      # under .github/workflows/. actionlint auto-discovers `.github/workflows/`
-      # when invoked with no path args, so pr-quality.yml, deploy-cloudflare.yml,
-      # secret-scan-push.yml and the rest are all covered. shellcheck is on
-      # PATH (ubuntu-latest), so actionlint runs it on every `run:` block.
-      - name: Install pinned actionlint and lint workflows
-        shell: bash
-        run: |
-          set -euo pipefail
-          asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${asset}"
-          tmp="$(mktemp -d)"
-          echo "Downloading pinned actionlint: ${url}"
-          # L8: retry a release-asset blip rather than fail ci-required on a
-          # transient registry outage. The SHA-256 check below still gates
-          # trust; retries only widen the availability window.
-          curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$url" -o "${tmp}/${asset}"
-          actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
-          if [ "$actual" != "$ACTIONLINT_SHA256" ]; then
-            echo "::error::actionlint checksum mismatch for ${asset}: expected ${ACTIONLINT_SHA256}, got ${actual}"
-            exit 1
-          fi
-          echo "✅ actionlint ${asset} checksum verified."
-          tar -xzf "${tmp}/${asset}" -C "${tmp}" actionlint
-          chmod +x "${tmp}/actionlint"
-          "${tmp}/actionlint" -version
-          # No path args → actionlint discovers and lints all .github/workflows/*.
-          # -color forces the annotated output even though stdout is not a TTY.
-          "${tmp}/actionlint" -color
+      # Story #425 consolidated the version + checksum map that used to live
+      # inline here into the shared composite, so a bump is ONE edit rather
+      # than two that can silently diverge. This call site uses the RELATIVE
+      # `./` form on purpose: it exercises the working-tree action, so a PR
+      # that changes the action is gated by the action it actually changes.
+      # (pr-quality.yml, which consumers call, uses the absolute SHA-pinned
+      # form — see docs/reusable-workflows.md § First-party self-pin freshness.)
+      #
+      # ENFORCEMENT IS PER TOOL HERE, deliberately:
+      #   • actionlint stays BLOCKING, which is what this job has done since
+      #     Story #108 and what catches the expression-lex class that takes a
+      #     workflow to zero jobs. The corpus is clean, so this costs nothing.
+      #   • zizmor is ADVISORY for now — it arrives with 23 pre-existing
+      #     findings (4 high, 19 medium) on this repo, and burning that backlog
+      #     down is explicitly not part of the Story that introduced the tier.
+      #     Flip enforce-zizmor to 'true' once it is clean.
+      #
+      # shellcheck is ON here (unlike the consumer-facing default): the runner
+      # image is known to be ubuntu-latest, which ships shellcheck, so the
+      # embedded run:-block linting this job has always had is preserved.
+      - name: Lint workflows (actionlint + zizmor)
+        uses: ./.github/actions/workflow-lint
+        with:
+          enforce-actionlint: 'true'
+          enforce-zizmor: 'false'
+          shellcheck: 'true'
 
   # ── Security tier (dogfood self-call of pr-quality.yml, Story #236) ───────
   #
@@ -333,6 +327,15 @@ jobs:
     uses: ./.github/workflows/pr-quality.yml
     with:
       enable-lint: false
+      # This repo runs the workflow-lint tier NATIVELY in the `actionlint` job
+      # above (against the working-tree composite), so running it again here
+      # would duplicate the work — the same reason every other tier below is
+      # off. It also keeps the dogfood self-call independent of the tier's
+      # SHA-pinned `uses:`, which by construction cannot resolve in the PR that
+      # first introduces the action (docs/reusable-workflows.md § First-party
+      # self-pin freshness). Flip this on in the follow-up bump PR if the
+      # pinned path is ever worth dogfooding directly.
+      enable-workflow-lint: false
       enable-typecheck: false
       enable-unit: false
       enable-contract: false

@@ -1,0 +1,315 @@
+# Shared workflow-lint composite action (Story #425).
+#
+# Single source of truth for the pinned actionlint + zizmor installers, the
+# lint run, and the advisory/enforcing gate. Before this action, actionlint
+# lived as an inline block in THIS repo's own ci.yml only — so the reusable
+# `pr-quality.yml` that every consumer calls shipped no workflow-lint signal at
+# all, and each consumer re-derived one (the swarm-os report behind #424).
+#
+# NEITHER PUBLISHED ACTION WAS USABLE, which is the main thing worth
+# inheriting here:
+#   • `rhysd/actionlint` ships no root `action.yml` (404).
+#   • `zizmorcore/zizmor-action` defaults to `version: latest` behind a nested
+#     `codeql-action` step — SHA-pinning it would pin a wrapper around an
+#     UNPINNED download, defeating the point.
+# So both tools are installed as checksum-verified binaries, exactly like the
+# gitleaks-scan and osv-scan composites next door.
+#
+# This composite owns the ONE version + per-platform checksum map for BOTH
+# binaries (see the two `case` blocks below — the single place to bump) and the
+# cross-platform asset selector (darwin/linux × amd64/arm64, bash-3.2-compatible
+# for macOS self-hosted runners). ci.yml calls this action rather than carrying
+# its own copy, so a bump is one edit, not two that can silently diverge.
+#
+# CHECKSUM PROVENANCE (re-verify on every bump):
+#   • actionlint publishes `actionlint_<version>_checksums.txt`. The four SHAs
+#     below are its lines verbatim; the linux_amd64 line also matched the value
+#     ci.yml had independently pinned, which authenticates the whole file.
+#   • zizmor publishes NO checksums file and NO repo-level attestations, so its
+#     four SHAs were computed locally and independently reproduced over two
+#     distinct fetch paths (the release CDN via curl, and the GitHub API via
+#     `gh release download`) before being pinned here.
+#
+# Usage (advisory tier — pr-quality's `workflow-lint` job):
+#   - name: Lint workflows (actionlint + zizmor)
+#     uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@<sha>
+#     with:
+#       enforce: 'false'
+#
+# Usage (this repo's own ci.yml, which keeps its shellcheck coverage):
+#   - name: Lint workflows (actionlint + zizmor)
+#     uses: ./.github/actions/workflow-lint
+#     with:
+#       shellcheck: 'true'
+#
+# Cross-repo portability contract (scripts/check-workflow-portability.mjs):
+# no `${{ }}` expressions in input descriptions/defaults; reusable workflows
+# reference this action by absolute `owner/repo/path@<sha>` form only.
+name: Workflow Lint
+description: >
+  Download pinned, SHA-256-verified actionlint and zizmor binaries
+  (cross-platform asset selector, darwin/linux amd64/arm64), lint the
+  workflow/action tree, and report findings to the run log and job summary.
+  Advisory by default; set enforce to gate on findings. The pinned versions and
+  their per-platform checksum maps live in this action — the single place to
+  bump on a release.
+
+inputs:
+  actionlint-version:
+    description: >
+      Pinned actionlint release version (without the leading 'v'). Must have a
+      matching entry in this action's per-platform SHA-256 checksum map — bump
+      both together. Default 1.7.12.
+    required: false
+    default: '1.7.12'
+  zizmor-version:
+    description: >
+      Pinned zizmor release version (without the leading 'v'). Must have a
+      matching entry in this action's per-platform SHA-256 checksum map — bump
+      both together. Default 1.30.0.
+    required: false
+    default: '1.30.0'
+  enforce:
+    description: >
+      Tier-wide default for whether findings FAIL this step. Default 'false'
+      — findings are reported to the run log, the job summary and as PR
+      annotations, but the step stays green. Override per tool with
+      enforce-actionlint / enforce-zizmor. Download, checksum and tool failures
+      always fail the step regardless of this setting.
+    required: false
+    default: 'false'
+  enforce-actionlint:
+    description: >
+      Per-tool override for actionlint findings: 'true' or 'false'. Empty (the
+      default) inherits the tier-wide `enforce` value. Exists because the two
+      linters arrive with different debt — a repo can block on actionlint while
+      zizmor's backlog is still being burned down.
+    required: false
+    default: ''
+  enforce-zizmor:
+    description: >
+      Per-tool override for zizmor findings: 'true' or 'false'. Empty (the
+      default) inherits the tier-wide `enforce` value.
+    required: false
+    default: ''
+  shellcheck:
+    description: >
+      When 'true', leave actionlint's embedded shellcheck integration enabled,
+      which lints every `run:` block. Default 'false' — the integration resolves
+      shellcheck from PATH, so on a mixed self-hosted pool it would make the
+      gate's strength depend on which host took the job. A 'true' value on a
+      runner with no shellcheck emits a warning rather than silently linting
+      less.
+    required: false
+    default: 'false'
+  zizmor-min-severity:
+    description: >
+      Lowest zizmor severity to report: one of informational, low, medium,
+      high. Default medium.
+    required: false
+    default: 'medium'
+  zizmor-paths:
+    description: >
+      Space-separated paths for zizmor to audit; each is skipped when absent.
+      Governs zizmor ONLY — actionlint takes no path arguments because it
+      errors on a directory ("is a directory") and auto-discovers
+      .github/workflows itself, which is its canonical mode and the one this
+      repo's ci.yml has always used. Default
+      '.github/workflows .github/actions'.
+    required: false
+    default: '.github/workflows .github/actions'
+
+runs:
+  using: composite
+  steps:
+    # Download + verify BOTH pinned binaries, lint, then hand the two JSON
+    # reports to the gate script. The asset selectors map uname OS/arch → each
+    # publisher's release-asset slug (they disagree: actionlint uses
+    # `<os>_<arch>`, zizmor uses rust target triples), verify the archive
+    # against the pinned SHA-256, and only then extract and execute.
+    - name: Lint workflows (pinned actionlint + zizmor)
+      shell: bash
+      env:
+        ACTIONLINT_VERSION: ${{ inputs.actionlint-version }}
+        ZIZMOR_VERSION: ${{ inputs.zizmor-version }}
+        WORKFLOW_LINT_ENFORCE: ${{ inputs.enforce }}
+        WORKFLOW_LINT_ENFORCE_ACTIONLINT: ${{ inputs.enforce-actionlint }}
+        WORKFLOW_LINT_ENFORCE_ZIZMOR: ${{ inputs.enforce-zizmor }}
+        WORKFLOW_LINT_SHELLCHECK: ${{ inputs.shellcheck }}
+        ZIZMOR_MIN_SEVERITY: ${{ inputs.zizmor-min-severity }}
+        ZIZMOR_PATHS: ${{ inputs.zizmor-paths }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        os="$(uname -s)"
+        arch="$(uname -m)"
+        case "$os" in
+          Darwin) al_os="darwin"; zz_os="apple-darwin" ;;
+          Linux)  al_os="linux";  zz_os="unknown-linux-gnu" ;;
+          *) echo "::error::Unsupported OS for the workflow-lint asset selector: $os"; exit 1 ;;
+        esac
+        case "$arch" in
+          arm64|aarch64) al_arch="arm64"; zz_arch="aarch64" ;;
+          x86_64|amd64)  al_arch="amd64"; zz_arch="x86_64" ;;
+          *) echo "::error::Unsupported arch for the workflow-lint asset selector: $arch"; exit 1 ;;
+        esac
+
+        # ── Single bump point: actionlint ────────────────────────────────
+        # Verbatim lines from actionlint_<version>_checksums.txt. On a bump,
+        # update the actionlint-version default above and ALL FOUR together.
+        al_slug="${ACTIONLINT_VERSION}_${al_os}_${al_arch}"
+        case "$al_slug" in
+          "1.7.12_darwin_amd64") al_expected="5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644" ;;
+          "1.7.12_darwin_arm64") al_expected="aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f" ;;
+          "1.7.12_linux_amd64")  al_expected="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" ;;
+          "1.7.12_linux_arm64")  al_expected="325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6" ;;
+          *) al_expected="" ;;
+        esac
+        if [ -z "$al_expected" ]; then
+          echo "::error::No pinned checksum for actionlint $al_slug — update the SHA256 map for this version/platform."
+          exit 1
+        fi
+
+        # ── Single bump point: zizmor ────────────────────────────────────
+        # zizmor publishes no checksums file and no repo attestations, so these
+        # four were computed locally and independently reproduced over two
+        # distinct fetch paths before being pinned. Re-do that on every bump.
+        zz_slug="${ZIZMOR_VERSION}_${zz_arch}-${zz_os}"
+        case "$zz_slug" in
+          "1.30.0_aarch64-apple-darwin")      zz_expected="c9c5d83730efb86f2cd71b487605c00a4d63903e4f9458485ed5eac3b1924ab1" ;;
+          "1.30.0_x86_64-apple-darwin")       zz_expected="343c85c8f709edf14bf3c8781d53574975ecbb2d23c80ed1eab4932ab0a72343" ;;
+          "1.30.0_aarch64-unknown-linux-gnu") zz_expected="018a024d6b6d09733b07f6ef42838d984c23ec04bc9b2acd55f7d67826aeafe5" ;;
+          "1.30.0_x86_64-unknown-linux-gnu")  zz_expected="ec8c95cd800845abb9bbc5f377ec7c57d2eb8e2386a00a201d3a74ee4092e5ed" ;;
+          *) zz_expected="" ;;
+        esac
+        if [ -z "$zz_expected" ]; then
+          echo "::error::No pinned checksum for zizmor $zz_slug — update the SHA256 map for this version/platform."
+          exit 1
+        fi
+
+        # Runner-scoped download dir (issue #343) — a bare `mktemp -d` leaks
+        # into the host-shared $TMPDIR, which nothing reaps on a persistent
+        # self-hosted runner.
+        tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/workflow-lint.XXXXXX")"
+
+        al_asset="actionlint_${ACTIONLINT_VERSION}_${al_os}_${al_arch}.tar.gz"
+        al_url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${al_asset}"
+        echo "Downloading pinned actionlint: ${al_url}"
+        # Retry a release-asset blip rather than fail fleet-wide. Fail-closed is
+        # preserved — the SHA-256 check below still gates trust.
+        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$al_url" -o "${tmp}/${al_asset}"
+        al_actual="$(shasum -a 256 "${tmp}/${al_asset}" | awk '{print $1}')"
+        if [ "$al_actual" != "$al_expected" ]; then
+          echo "::error::actionlint checksum mismatch for ${al_asset}: expected ${al_expected}, got ${al_actual}"
+          exit 1
+        fi
+        echo "✅ actionlint ${al_asset} checksum verified."
+        tar -xzf "${tmp}/${al_asset}" -C "${tmp}" actionlint
+        chmod +x "${tmp}/actionlint"
+        "${tmp}/actionlint" -version
+
+        zz_asset="zizmor-${zz_arch}-${zz_os}.tar.gz"
+        zz_url="https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${zz_asset}"
+        echo "Downloading pinned zizmor: ${zz_url}"
+        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$zz_url" -o "${tmp}/${zz_asset}"
+        zz_actual="$(shasum -a 256 "${tmp}/${zz_asset}" | awk '{print $1}')"
+        if [ "$zz_actual" != "$zz_expected" ]; then
+          echo "::error::zizmor checksum mismatch for ${zz_asset}: expected ${zz_expected}, got ${zz_actual}"
+          exit 1
+        fi
+        echo "✅ zizmor ${zz_asset} checksum verified."
+        tar -xzf "${tmp}/${zz_asset}" -C "${tmp}" zizmor
+        chmod +x "${tmp}/zizmor"
+        "${tmp}/zizmor" --version
+
+        # THE TWO TOOLS TAKE DIFFERENT ARGUMENT SHAPES — do not unify them.
+        # actionlint ERRORS on a directory argument ("is a directory"); its
+        # canonical mode is bare auto-discovery of .github/workflows, which is
+        # what ci.yml has always used. zizmor, by contrast, takes directories
+        # and is the one that also audits composite action.yml files.
+        #
+        # Absent targets are a NO-OP PASS, never a failure: a repo with no
+        # workflows has nothing to lint. This matters because actionlint exits
+        # 3 (fatal) rather than 0 when it finds no project, which the
+        # tool-failure branch below would otherwise turn into a red tier.
+        zz_targets=""
+        for p in ${ZIZMOR_PATHS}; do
+          if [ -e "$p" ]; then
+            zz_targets="${zz_targets} $p"
+          else
+            echo "Skipping absent zizmor path: $p"
+          fi
+        done
+        run_actionlint="false"
+        if [ -d ".github/workflows" ]; then
+          run_actionlint="true"
+        else
+          echo "Skipping actionlint: no .github/workflows directory to auto-discover."
+        fi
+        if [ "$run_actionlint" != "true" ] && [ -z "${zz_targets# }" ]; then
+          echo "No workflow-lint targets present — nothing to lint."
+          exit 0
+        fi
+
+        # actionlint's shellcheck/pyflakes integrations resolve their commands
+        # from PATH, which would make a required gate's strength depend on
+        # which host in a mixed pool took the job. pyflakes is always off;
+        # shellcheck is off unless the caller opts in, and an opt-in on a
+        # runner without shellcheck warns rather than silently linting less.
+        al_shellcheck=""
+        if [ "${WORKFLOW_LINT_SHELLCHECK}" = "true" ]; then
+          if command -v shellcheck >/dev/null 2>&1; then
+            al_shellcheck="shellcheck"
+          else
+            echo "::warning::shellcheck: 'true' was requested but no shellcheck binary is on PATH — actionlint's embedded run:-block linting will NOT run on this runner."
+          fi
+        fi
+
+        al_report="${tmp}/actionlint-report.json"
+        zz_report="${tmp}/zizmor-report.json"
+
+        # actionlint exit codes: 0 clean, 1 problems found, >=2 a genuine tool
+        # failure (2 command-line error, 3 fatal). Only 0/1 mean it ran, so
+        # anything higher fails the step regardless of the enforce dial.
+        echo "[]" > "${al_report}"
+        if [ "$run_actionlint" = "true" ]; then
+          set +e
+          "${tmp}/actionlint" -no-color -format '{{json .}}' \
+            -shellcheck="${al_shellcheck}" -pyflakes= > "${al_report}"
+          al_code=$?
+          set -e
+          if [ "$al_code" -gt 1 ]; then
+            echo "::error::actionlint failed to run (exit ${al_code}) — the gate cannot vouch for these workflows."
+            cat "${al_report}" || true
+            exit "$al_code"
+          fi
+        fi
+
+        # `--no-exit-codes` makes findings exit 0, so a non-zero code here is a
+        # genuine tool failure — the same split actionlint gets above.
+        # `--offline` disables every online audit rule: they red on real
+        # ref-version-mismatch findings and would make this gate depend on a
+        # live API call.
+        echo "[]" > "${zz_report}"
+        if [ -n "${zz_targets# }" ]; then
+          set +e
+          "${tmp}/zizmor" --offline --no-exit-codes --no-progress --color never \
+            --min-severity "${ZIZMOR_MIN_SEVERITY}" --format json ${zz_targets} > "${zz_report}"
+          zz_code=$?
+          set -e
+          if [ "$zz_code" -ne 0 ]; then
+            echo "::error::zizmor failed to run (exit ${zz_code}) — the gate cannot vouch for these workflows."
+            cat "${zz_report}" || true
+            exit "$zz_code"
+          fi
+        fi
+
+        # The gate script owns the advisory/enforcing decision (Story #425) —
+        # it is unit-tested, unlike an inline shell conditional.
+        ACTIONLINT_REPORT="${al_report}" \
+        ZIZMOR_REPORT="${zz_report}" \
+        WORKFLOW_LINT_ENFORCE="${WORKFLOW_LINT_ENFORCE}" \
+        WORKFLOW_LINT_ENFORCE_ACTIONLINT="${WORKFLOW_LINT_ENFORCE_ACTIONLINT}" \
+        WORKFLOW_LINT_ENFORCE_ZIZMOR="${WORKFLOW_LINT_ENFORCE_ZIZMOR}" \
+          node "${ACTION_PATH}/workflow-lint-gate.mjs"

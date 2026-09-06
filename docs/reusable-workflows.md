@@ -108,6 +108,8 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `affected`         | boolean | `false`          | **Opt-in.** Run the diff-scoped tiers (lint, typecheck, unit, contract, e2e) affected-only — turbo `--affected` scoped to the packages the event introduced, cutting merge-queue / strict-required re-run cost. Exports `TURBO_SCM_BASE` / `TURBO_SCM_HEAD` (derived event-agnostically, Story #314) and deepens the checkout to full history. Your turbo task must **gate** the flag on the exported base — `turbo run <tier> ${TURBO_SCM_BASE:+--affected}` — never bake `--affected` in unconditionally: with `TURBO_SCM_*` unset turbo falls back to its own default `main...HEAD` base, which is empty on a push to `main`, so it schedules zero tasks and exits `0`. Read [Affected-only tier execution](#affected-only-tier-execution-affected) for that precondition before enabling this. Default `false` is byte-for-byte today's behaviour. |
 | `affected-base`    | string  | `''`             | Optional base git ref/SHA that overrides the event-derived `TURBO_SCM_BASE` in affected mode (e.g. `'origin/main'`). Empty (default) uses the event-agnostic derivation. Ignored when `affected` is `false`. |
 | `enable-lint`      | boolean | `true`           | Set `false` to skip the lint + format-check tier.                                                                                              |
+| `enable-workflow-lint` | boolean | `true`       | Enable the workflow-lint tier (SHA-pinned actionlint + zizmor over your `.github/` tree). **Advisory by default** — findings are reported but never block. See [Workflow lint tier](#workflow-lint-tier-enable-workflow-lint). |
+| `workflow-lint-enforce` | boolean | `false`     | Make workflow-lint findings **block** the merge. Default `false`; download/checksum/tool failures always fail the tier regardless. See [Workflow lint tier](#workflow-lint-tier-enable-workflow-lint). |
 | `enable-typecheck` | boolean | `true`           | Set `false` to skip the typecheck tier.                                                                                                        |
 | `enable-unit`      | boolean | `true`           | Set `false` to skip the unit-test tier.                                                                                                        |
 | `enable-contract`  | boolean | `true`           | Set `false` to skip the contract-test tier.                                                                                                    |
@@ -1534,6 +1536,106 @@ A dependent-scoped nested override is checked too and reported by its full
 path (`overrides.some-dep.left-pad`). The check runs **before** `pnpm audit`,
 so it costs nothing and reports even when the audit itself cannot run. Point it
 at a non-default manifest with `--package-json <path>`.
+
+### Workflow lint tier (`enable-workflow-lint`)
+
+A **workflow-lint tier** that runs [actionlint](https://github.com/rhysd/actionlint)
+and [zizmor](https://docs.zizmor.sh) over your `.github/` tree from pinned,
+checksum-verified binaries.
+
+**Why it exists.** GitHub Actions has failure modes that no test, `bash -n` or
+YAML parse can see, because the workflow never *compiles*: `timeout-minutes:
+${{ 15 + inputs.headroom }}` fails to lex, and the run appears as the file path
+with **zero jobs** and a required context that never reports — so an armed
+auto-merge PR sits blocked forever while `gh pr checks` looks green. actionlint
+catches that class statically. zizmor covers the adjacent supply-chain and
+permissions classes (credential persistence, template injection, overly broad
+scopes). This platform has linted its **own** workflows since Story #108, but
+the reusable workflow you call shipped no such signal, so every consumer
+re-derived one — which is what [#424](https://github.com/dsj1984/mandrel-platform/issues/424)
+reported.
+
+**Advisory by default — read this before enabling enforcement.** The tier is
+**on** (`enable-workflow-lint: true`) but **non-blocking**: findings go to the
+run log, the job summary and PR annotations (as warnings), and the tier stays
+green. That is deliberate. You inherit this workflow on a **pin bump**, and a
+gate that arrived blocking would red your CI on workflow debt that predates the
+tier — with no changelog entry to warn you, since a `ci:`-typed change cuts no
+release note. For calibration: on this repo the first run reported **0
+actionlint and 23 zizmor findings** (4 high, 19 medium), and the swarm-os
+corpus that prompted the request reported 20 and 6.
+
+Set `workflow-lint-enforce: true` once your corpus is clean. The job is already
+a [`needs:` of `ci-required`](#the-ci-required-aggregator), so enforcing needs
+**no new required check registered** — the aggregate context you already have
+becomes load-bearing for it.
+
+> **Two failure classes, and only one is advisory.** A *finding* obeys the
+> dial. A **download, checksum or tool failure always fails the tier**,
+> whatever the dial says: a linter that did not run is a broken gate, not a
+> clean one. The gate script refuses to report "no findings" for a report that
+> never arrived.
+
+#### Per-tool enforcement
+
+The two linters usually arrive with different debt, so the dial is also
+per-tool at the composite-action level (`enforce-actionlint` /
+`enforce-zizmor`, each inheriting the tier-wide value when unset). This repo's
+own `ci.yml` is the worked example: actionlint stays **blocking** — it has been
+since Story #108 and the corpus is clean — while zizmor lands **advisory**
+against its 23-finding backlog.
+
+#### zizmor posture
+
+Runs `--offline` at `--min-severity medium`. **Online audits are off**: they
+red on real `ref-version-mismatch` findings (an action pinned to a SHA whose
+tag disagrees with the adjacent `# vX.Y.Z` comment) and would make a gate
+depend on a live API call.
+
+#### actionlint's shellcheck / pyflakes integrations
+
+Both resolve their command from `PATH`, which would make a required gate's
+strength depend on **which host in a mixed self-hosted pool took the job**. So
+**pyflakes is always disabled**, and **shellcheck is off for consumers** — a
+deterministic gate everywhere. This repo's own `ci.yml` opts back in
+(`shellcheck: 'true'`), because its runner image is known to be
+`ubuntu-latest`, which ships shellcheck; that preserves the `run:`-block
+coverage this platform had before the tier was extracted. If you want it and
+control your runner image, install shellcheck explicitly rather than relying on
+what happens to be present.
+
+#### Pinning and checksum provenance
+
+Neither published action was usable, which is the part worth inheriting:
+`rhysd/actionlint` ships **no root `action.yml`** (404), and
+`zizmorcore/zizmor-action` defaults to `version: latest` behind a nested
+`codeql-action` step — SHA-pinning it would pin a wrapper around an *unpinned*
+download. Both tools are therefore installed as **checksum-verified binaries**,
+exactly like the gitleaks and OSV-scanner gates, with a per-platform SHA-256
+map covering darwin/linux × amd64/arm64. An unmapped platform slug is a hard
+error, never a silent skip.
+
+The version + checksum maps live in
+`.github/actions/workflow-lint/action.yml` — the single place to bump, shared
+by this workflow and the platform's own `ci.yml`.
+
+> **On a version bump, re-establish provenance:**
+>
+> - **actionlint** publishes `actionlint_<version>_checksums.txt`; take its
+>   four lines verbatim.
+> - **zizmor publishes no checksums file and no repo-level attestations.** Its
+>   four SHA-256 values must be **computed locally and independently
+>   reproduced** over two distinct fetch paths (the release CDN via `curl`, and
+>   the GitHub API via `gh release download`) before being pinned. Record that
+>   in the bump PR.
+
+#### Scope
+
+actionlint takes **no path arguments** — it errors on a directory (`is a
+directory`) and auto-discovers `.github/workflows` itself. zizmor takes the
+`zizmor-paths` list (default `.github/workflows .github/actions`), so it also
+audits composite actions. A repo with none of those paths is a **no-op pass**:
+there is nothing to lint, which is not the same as a failure.
 
 ### Wrangler-baseline check (`enable-wrangler-baseline-check`)
 
