@@ -6,15 +6,14 @@
  * WHY THIS CHECKER NEEDS A SUITE AT ALL
  *
  * A runner's `<RUNNER_DIR>/.env` is invisible to every other observer the fleet
- * has. `scripts/check-runner-health.mjs` reaches runners through
- * `GET /repos/{owner}/{repo}/actions/runners`, which reports name, labels and
- * online status — not local configuration. So a half-provisioned pool never
- * presents as a configuration fault; it presents as an unattributable
- * behavioural difference between two runs of the same job (issue #343: two
- * hooked runners sat 5m29s in `Set up runner` while the same job on an unhooked
- * runner finished in 54 seconds). This checker is the only thing that names the
- * odd runners out, so what the suite pins is that it NAMES them — not merely
- * that it noticed drift exists.
+ * has. The GitHub runners API (`GET /repos/{owner}/{repo}/actions/runners`)
+ * reports name, labels and online status — not local configuration. So a
+ * half-provisioned pool never presents as a configuration fault; it presents
+ * as an unattributable behavioural difference between two runs of the same
+ * job (issue #343: two hooked runners sat 5m29s in `Set up runner` while the
+ * same job on an unhooked runner finished in 54 seconds). This checker is the
+ * only thing that names the odd runners out, so what the suite pins is that it
+ * NAMES them — not merely that it noticed drift exists.
  *
  * The three properties worth stating up front, because each has a counterpart
  * failure that would make the tool actively misleading:

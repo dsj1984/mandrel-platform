@@ -66,28 +66,6 @@ shasum -a 256 actions-runner-osx-arm64-<RUNNER_VERSION>.tar.gz
 tar xzf actions-runner-osx-arm64-<RUNNER_VERSION>.tar.gz
 ```
 
-## ⚠️ Read second: keep the health-monitor roster in lockstep
-
-Any change to a fleet's size — **adding or removing a runner** — **MUST** be
-accompanied by an update to that repo's `expectedCount` in
-[`scripts/runner-fleet-consumers.json`](../../scripts/runner-fleet-consumers.json).
-That file is the roster the scheduled `runner-fleet-health.yml` monitor
-(`scripts/check-runner-health.mjs`) compares the live fleet against.
-
-- **Scale up (add a runner):** bump `expectedCount` so the shortfall floor
-  keeps pace. Over-provisioning does not trip the alarm on its own (the
-  monitor is **warn-below**: `shortfall = max(0, expectedCount - matchingOnline)`),
-  but leaving the count stale hides a later drop back down to the old value.
-- **Scale down (remove a runner):** lower `expectedCount` in the same change,
-  otherwise the monitor will correctly flag the now-missing runner(s) as a
-  shortfall and page the operator for a deliberate downsizing.
-
-If the roster and the live fleet drift apart, the monitor either false-alarms
-(count too high) or goes silent on real outages above the stale threshold
-(count too low) — the exact mis-calibration this contract exists to prevent.
-See also [`runner-fleet-health.md`](runner-fleet-health.md) for the operator
-response when the monitor does fire.
-
 ## 2. Register with `config.sh` (repo-level)
 
 Registration is **repo-level** (the fleet's standing model), not org-level.
@@ -198,9 +176,8 @@ A key absent from **every** runner is reported as a uniform gap and does *not*
 exit non-zero, so a fleet that has deliberately not adopted a key is not a
 standing alarm.
 
-**Why this check exists at all:** `scripts/check-runner-health.mjs` monitors
-the fleet through the GitHub runners API, which reports a runner's name,
-labels and online status — it cannot see `<RUNNER_DIR>/.env`. So partial
+**Why this check exists at all:** the GitHub runners API reports a runner's
+name, labels and online status — it cannot see `<RUNNER_DIR>/.env`. So partial
 provisioning never surfaces as a configuration fault; it surfaces as an
 unattributable behavioural difference between two runs of the same job. In
 issue #343, 16 of 19 runners on one host carried the hook, and the resulting
@@ -254,10 +231,7 @@ The runner loads `.env` at service start — after any `.env` change, restart:
   (§5). Mint the removal token via
   `gh api -X POST repos/<OWNER>/<REPO>/actions/runners/remove-token --jq .token`.
 - **Decommission.** Same removal sequence, then delete `<RUNNER_DIR>`.
-  Confirm the runner disappeared from *Settings → Actions → Runners*, **and**
-  lower the repo's `expectedCount` in `scripts/runner-fleet-consumers.json`
-  (see the roster-lockstep callout above) so the health monitor does not flag
-  the intentional removal as a shortfall.
+  Confirm the runner disappeared from *Settings → Actions → Runners*.
 
 ## Project-Specific Notes
 

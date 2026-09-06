@@ -33,6 +33,32 @@ Each decision is a short, append-only entry:
 
 ## Decisions
 
+## 2026-09-06 — Retire the scheduled runner-fleet health monitor
+
+**Context.** The monitor (Story #258, three entries below) had been red on
+every run since 2026-08-29: `athportal` reported `0/5` runners and `domio`
+`4/7`. That was a true positive, not a broken check — `athportal` is dormant
+and its self-hosted runners were deliberately removed, so the roster's
+`expectedCount` described a fleet that no longer exists. The remaining choice
+was to re-baseline the roster or retire the monitor; the operator does not use
+it, so a permanently-red 15-minute schedule was pure noise.
+
+**Decision.** Delete `.github/workflows/runner-fleet-health.yml`,
+`scripts/check-runner-health.mjs` (+ its `node:test` sibling), the roster
+`scripts/runner-fleet-consumers.json`, and the operator runbook
+`templates/runbooks/runner-fleet-health.md`. The runner *provisioning* runbook
+and the `.env`-drift checker stay — they stand on their own and no longer
+reference the roster.
+
+**Consequences.** Nothing watches the self-hosted fleet. A wedged operator Mac
+once again stalls `domio`'s CI silently — `domio` still runs on self-hosted
+runners (4 online at retirement), so this is a real, accepted coverage loss,
+not a no-op. `athportal`'s workflows remain pinned to
+`runs-on: [self-hosted, athportal-runner]` with no such runners registered;
+they will queue indefinitely until that repo is either revived or repointed at
+GitHub-hosted runners. Reinstating the monitor means restoring the four files
+from history and re-deriving `expectedCount` from the live fleet.
+
 ## 2026-07-03 — Runner-fleet roster: drop `Beestera/swarm-os` (cross-org token boundary)
 
 **Context.** The runner-fleet monitor reads each rostered repo's runner API

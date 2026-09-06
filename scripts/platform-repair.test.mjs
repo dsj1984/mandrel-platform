@@ -474,8 +474,8 @@ test("renderRepairReport tabulates outcomes and a repaired section", () => {
 // detector row errors → every consumer classifies `error`/repairable-false,
 // which otherwise renders a reassuring green "no repairable drift". runCli must
 // hard-fail on that when the token was provided, and stay exit-0 when it was
-// absent (bootstrap). Mirrors scripts/check-runner-health.mjs error-row
-// handling. (temp/audits/workflow-robustness-review-2026-07-05.md M11)
+// absent (bootstrap).
+// (temp/audits/workflow-robustness-review-2026-07-05.md M11)
 // ---------------------------------------------------------------------------
 
 /**

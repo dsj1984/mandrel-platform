@@ -5,9 +5,8 @@
 #
 # ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
 #
-# Nothing else observes a runner's LOCAL configuration. The fleet monitor
-# (`scripts/check-runner-health.mjs`) reaches runners through
-# `GET /repos/{owner}/{repo}/actions/runners`, which reports a runner's name,
+# Nothing else observes a runner's LOCAL configuration. The GitHub runners
+# API (`GET /repos/{owner}/{repo}/actions/runners`) reports a runner's name,
 # labels and online status — the endpoint cannot see `<RUNNER_DIR>/.env`, so
 # hook configuration is invisible to it.
 #
@@ -49,9 +48,7 @@
 #   exit 0 — no drift: every mandated key is uniform across the pool (set
 #            everywhere, or unset everywhere).
 #   exit 1 — drift: at least one key is set on some runners but not all. The
-#            non-zero exit IS the alert channel, matching the posture
-#            `scripts/check-runner-health.mjs` already uses, so this can be
-#            scheduled.
+#            non-zero exit IS the alert channel, so this can be scheduled.
 #   exit 2 — usage error: unknown flag, or a pool root that is not a directory
 #            or holds no runners. Deliberately distinct from 0: reporting "no
 #            drift" over an empty walk would read as evidence the fleet is

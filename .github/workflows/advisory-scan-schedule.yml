@@ -5,10 +5,10 @@
 # (scan → non-blocking gate → tracking-issue upsert/close) is exercised on a
 # live repo, not shipped untested.
 #
-# GitHub-hosted (ubuntu-latest) deliberately, like runner-fleet-health.yml: a
-# scheduled advisory monitor must keep running when the self-hosted Mac is
-# down. Daily cadence — advisories publish continuously, but a red feature-PR
-# check is only avoided if the proactive scan runs at least daily.
+# GitHub-hosted (ubuntu-latest) deliberately: a scheduled advisory monitor
+# must keep running when the self-hosted Mac is down. Daily cadence —
+# advisories publish continuously, but a red feature-PR check is only
+# avoided if the proactive scan runs at least daily.
 name: Advisory Scan
 
 on:
