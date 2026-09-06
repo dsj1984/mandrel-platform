@@ -177,7 +177,7 @@ jobs:
           findings-out: ${{ runner.temp }}/osv-findings.json
 
       - name: Upsert advisory tracking issue
-        uses: dsj1984/mandrel-platform/.github/actions/osv-track-issue@f9ed94bae8963ce9cef5e7e1d06f8df431b9ec5b
+        uses: dsj1984/mandrel-platform/.github/actions/osv-track-issue@6800b42d9d74602d95f9e9879a0f1689b71051e8
         with:
           findings-path: ${{ runner.temp }}/osv-findings.json
           repo: ${{ github.repository }}
