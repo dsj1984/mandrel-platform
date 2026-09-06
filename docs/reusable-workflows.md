@@ -1576,6 +1576,30 @@ becomes load-bearing for it.
 > clean one. The gate script refuses to report "no findings" for a report that
 > never arrived.
 
+#### On upgrade — what changes when you bump your pin
+
+This tier arrives **enabled**, so the first run after you bump into the release
+carrying it adds a `workflow-lint` job you did not have before. What to expect:
+
+- **It cannot fail your build.** Findings are reported as warnings and the tier
+  stays green. Nothing to do if you would rather not act on them yet.
+- **It can still fail on infrastructure.** A download, checksum or tool failure
+  fails the tier regardless of the dial — that is a broken gate, not a finding.
+- **Expect findings on first contact.** A corpus with no prior workflow linter
+  typically reports tens of them; this repo saw 0 actionlint and 23 zizmor
+  (4 high, 19 medium), and the corpus that prompted the tier saw 20 and 6.
+  Read them, then decide.
+- **Opt out entirely** with `enable-workflow-lint: false` if you already run
+  these linters yourself — that is the right setting when your own CI covers
+  them, and it is exactly what this repo's `ci.yml` does for its self-call.
+- **Turn it into a gate** with `workflow-lint-enforce: true` once you are
+  clean. No new required check needs registering: the job is already a
+  `needs:` of `ci-required`.
+
+If your runners are self-hosted, note the tier honours `runner` and
+`tier-timeouts` (key `workflow-lint`, base 10 minutes) like every other tier,
+and installs both binaries per-platform across darwin/linux × amd64/arm64.
+
 #### Per-tool enforcement
 
 The two linters usually arrive with different debt, so the dial is also
