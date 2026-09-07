@@ -134,16 +134,20 @@ turso db destroy <DB_NAME>-staging --yes
 1. Add the secret to Infisical (in the appropriate environment).
 2. Wait for the Infisical → GitHub sync to propagate (or set it manually via `gh secret set`).
 3. Add the secret name to the `env:` block in the deploy workflow:
+
    ```yaml
    env:
      NEW_SECRET: ${{ secrets.NEW_SECRET }}
    ```
+
 4. Add the binding to `wrangler.toml` if the secret needs to be a Worker binding:
+
    ```toml
    [env.staging.vars]
    # Non-secret vars (public) go here
    # Secrets are injected via `wrangler secret put` or the deploy workflow
    ```
+
 5. Redeploy to staging and verify the Worker reads the new secret correctly.
 
 ---

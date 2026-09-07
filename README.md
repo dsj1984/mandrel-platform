@@ -302,8 +302,8 @@ means a rule change lands fleet-wide in one place instead of drifting across
 each consumer's hand-copied `.secretlintrc.json`.
 
 secretlint's `.secretlintrc` has **no native file-level `extends`**, so
-consumers adopt this base one of two ways. The **husky hook _wiring_ stays
-consumer-local** either way — only the _ruleset_ is single-sourced.
+consumers adopt this base one of two ways. The **husky hook *wiring* stays
+consumer-local** either way — only the *ruleset* is single-sourced.
 
 **Reference the base directly from the husky hook (simplest — no local
 config file).** Point the pre-commit hook's `--secretlintrc` at the package

@@ -186,8 +186,8 @@ reading nineteen `.env` files would have.
 
 Do **not** wire this into `ACTIONS_RUNNER_HOOK_JOB_STARTED`. That hook runs
 inside the job's clock, where every read is billed to `Set up runner` and
-counts against the job's `timeout-minutes` — the exact cost model that made
-#343 a job-killer. This is an operator-run tool.
+counts against the job's `timeout-minutes` — the exact cost model that
+made #343 a job-killer. This is an operator-run tool.
 
 ## 5. Install as a launchd service (`svc.sh`)
 

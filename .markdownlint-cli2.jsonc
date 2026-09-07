@@ -1,0 +1,44 @@
+// markdownlint-cli2 configuration for mandrel-platform itself.
+//
+// This repo publishes `config/markdownlint.base.jsonc` for its consumers and,
+// until Story #443, ran it against nothing. This file is the dog-food: it
+// extends that same base and adds the two things the base deliberately does
+// not carry — the glob set and the repo-local ignores.
+//
+// `globs` is not optional. `markdownlint-cli2` invoked with no glob prints its
+// usage banner and exits 2, so committing the glob here is what lets every
+// caller — `npm run lint`, CI, and the close-time review lens — agree about
+// which files are in scope instead of each passing its own list and drifting.
+{
+  "config": {
+    "extends": "./config/markdownlint.base.jsonc",
+
+    // MD028 (blank line inside blockquote): off. All 12 sites in this repo are
+    // two ADJACENT BUT DISTINCT admonitions — a deprecation note followed by a
+    // syntax note, a privacy note followed by a GHAS alternative — separated by
+    // a blank line. CommonMark and GitHub both render that as two separate
+    // blockquotes, which is exactly what the author meant. The rule exists to
+    // catch a single quote accidentally split by a stray blank line; that is not
+    // the pattern here, and "fixing" it by joining the two with a `>` would
+    // merge unrelated notes into one quote. Same rationale as the base config's
+    // MD013 exemption: the rule is wrong about this repo, so narrow it rather
+    // than damage the prose to satisfy it.
+    "MD028": false
+  },
+
+  "globs": ["**/*.md"],
+
+  // Everything this repo does not author, plus two trees that exist only on a
+  // developer's disk. `.claude/` matters most: it holds a multi-megabyte mirror
+  // of the tree ignored solely by a per-clone `.git/info/exclude`, which this
+  // runner never reads — omit it and the lint verdict depends on whose machine
+  // it runs on.
+  "ignores": [
+    "CHANGELOG.md",
+    ".agents/**",
+    ".claude/**",
+    "temp/**",
+    ".worktrees/**",
+    "node_modules/**"
+  ]
+}

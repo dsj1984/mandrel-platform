@@ -219,9 +219,10 @@ export function lintFile(filePath) {
       if (prevLine.includes(`staleness-ignore: ${rule.id}`)) continue;
 
       // Reset regex state for global patterns
+      // `matchAll` copies the source regex's `lastIndex`, so a shared global
+      // pattern must still be rewound between lines or it resumes mid-string.
       rule.pattern.lastIndex = 0;
-      let match;
-      while ((match = rule.pattern.exec(line)) !== null) {
+      for (const match of line.matchAll(rule.pattern)) {
         // A rule may declare a `matchFilter` predicate to decide, per match,
         // whether the hit is actually a finding (e.g. the expired-placeholder
         // rule only fires when the captured date is in the past).

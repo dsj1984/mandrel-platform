@@ -76,6 +76,7 @@ curl -X POST <STAGING_WORKER_URL>/debug/sentry-test \
 ```
 
 Check the Sentry staging project for the event within 30 seconds. If it doesn't appear, check:
+
 - The `SENTRY_DSN` secret is set correctly in the environment.
 - The Worker is using the `@sentry/cloudflare` (or equivalent Workers-compatible) SDK — **not** the Node SDK, which is a no-op on Workers.
 - Source maps were uploaded during the deploy workflow.

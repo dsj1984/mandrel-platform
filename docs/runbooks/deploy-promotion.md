@@ -8,7 +8,7 @@
 
 ## 1. Promotion Model Overview
 
-```
+```text
 feature branch
     │  PR + CI gate (required checks)
     ▼

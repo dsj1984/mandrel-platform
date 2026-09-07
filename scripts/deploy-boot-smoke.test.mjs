@@ -176,7 +176,7 @@ test("probeUrl returns the first non-transient response without retrying", async
 
 test("probeUrl never follows redirects (curl-without--L parity: a 302 is a failure)", async () => {
   let seenOptions;
-  const fetchImpl = async (url, options) => {
+  const fetchImpl = async (_url, options) => {
     seenOptions = options;
     return { status: 302, text: async () => "" };
   };

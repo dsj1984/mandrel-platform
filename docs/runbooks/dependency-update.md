@@ -83,6 +83,7 @@ The gate **blocks** on any High or Critical severity vulnerability in the produc
 
 1. **Update the package** to a version that resolves the CVE. This is always preferred.
 2. If no fix is available, add a temporary allowlist entry:
+
    ```json
    // In the CVE allowlist (project-specific location — see docs/environments.md)
    {
@@ -91,6 +92,7 @@ The gate **blocks** on any High or Critical severity vulnerability in the produc
      "reason": "No fix available; upstream tracking issue: <URL>"
    }
    ```
+
    Allowlist entries **must** include an expiry date and a reason. The gate will re-fail when the entry expires.
 3. If the CVE is in a dev-only dependency (not in the `--prod` graph), the gate will not fire — but you should still update it.
 

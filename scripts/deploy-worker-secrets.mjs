@@ -184,7 +184,7 @@ function defaultRunWrangler(args, stdinValue) {
 // ---------------------------------------------------------------------------
 
 const invokedDirectly =
-  process.argv[1] && process.argv[1].endsWith("deploy-worker-secrets.mjs");
+  process.argv[1]?.endsWith("deploy-worker-secrets.mjs");
 if (invokedDirectly) {
   process.exit(provisionWorkerSecrets(process.env));
 }

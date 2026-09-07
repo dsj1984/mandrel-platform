@@ -113,6 +113,22 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
+          cache: npm
+
+      # The other steps in this job are dependency-free, but the lint step is
+      # not: it runs the markdownlint-cli2 and biome pinned in devDependencies.
+      # `--ignore-scripts` keeps this install from newly executing the
+      # `prepare` hook on a runner — neither linter needs an install script,
+      # and this job feeds `ci-required`.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # Markdown + code lint (Story #443). Runs as a STEP of this job rather
+      # than its own job so it registers no new status context — the
+      # branch-protection contract in docs/runbooks/main-protection.json
+      # requires only `ci-required`.
+      - name: Lint markdown and code
+        run: npm run lint
 
       - name: Lint branch-protection contract
         run: node scripts/check-required-contexts.mjs

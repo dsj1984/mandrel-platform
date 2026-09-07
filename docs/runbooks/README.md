@@ -154,6 +154,7 @@ Add it to your CI quality workflow:
 ### What it checks
 
 The lint flags:
+
 - References to Cloudflare Pages deploy commands or `pages.dev` URLs in projects that have migrated to Workers.
 - References to job names in `main-protection.json` that don't match any job in the CI workflow files.
 - Any configurable pattern list (see `scripts/check-docs-staleness.mjs --help`).

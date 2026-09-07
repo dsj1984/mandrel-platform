@@ -98,9 +98,11 @@ wrangler secret put <SECRET_NAME> --name <WORKER_NAME> --env <ENVIRONMENT>
 1. **Revoke immediately** — revoke the suspected secret at the provider before rotating. Do not wait to generate the replacement first.
 2. Follow Steps 1–5 above as fast as possible.
 3. Run a full-history secret scan to confirm the secret is not present in the git history:
+
    ```bash
    gitleaks detect --source . --no-git=false
    ```
+
 4. If the secret is found in git history, it must be purged via `git filter-repo` or BFG — this is destructive. Escalate to the on-call lead before proceeding.
 5. Open a security incident issue and document the rotation, scope, and timeline.
 

@@ -30,10 +30,12 @@ node node_modules/mandrel-platform/scripts/platform-sync.mjs --ref mandrel-platf
 **Manual path.**
 
 1. Copy the stub(s) you need into your project's `docs/runbooks/`:
+
    ```bash
    cp node_modules/mandrel-platform/templates/runbooks/deploy-promotion.md \
       docs/runbooks/deploy-promotion.md
    ```
+
 2. Replace every `<PLACEHOLDER>` with your project's real values.
 3. Fill in the **Project-Specific Notes** section.
 4. Leave the canonical link intact — when the upstream process changes, you only

@@ -160,7 +160,7 @@ export function parse(expr) {
       if (!eat(")")) fail(`unclosed format() in: ${expr}`);
       return { kind: "call", name: "format", args };
     }
-    const ident = expr.slice(i).match(/^[A-Za-z_][A-Za-z0-9_.\-]*(\['[^']*'\])?/);
+    const ident = expr.slice(i).match(/^[A-Za-z_][A-Za-z0-9_.-]*(\['[^']*'\])?/);
     if (!ident) fail(`unparseable token at ${i} in: ${expr}`);
     i += ident[0].length;
     const raw = ident[0];

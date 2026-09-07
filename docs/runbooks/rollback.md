@@ -21,7 +21,7 @@ Do **not** roll back for cosmetic issues or non-critical degradation — use a f
 
 ## 2. Rollback Decision Tree
 
-```
+```text
 Did the CI/CD pipeline already auto-rollback?
 ├─ YES → Verify the rollback landed (Step 3), then proceed to post-rollback steps (Step 5).
 └─ NO  → Was a DB migration part of this deploy?
@@ -96,9 +96,11 @@ turso db restore <DB_NAME> --timestamp <ISO8601_TIMESTAMP_BEFORE_MIGRATION>
 ## 5. Post-Rollback Steps
 
 1. **Verify the rollback is live:**
+
    ```bash
    curl -sf <HEALTH_ENDPOINT> && echo "OK"
    ```
+
 2. **Monitor error rate** for at least 10 minutes post-rollback to confirm stabilization.
 3. **Open a post-incident issue** tagging the commit SHA that caused the regression and the rollback PR/deployment ID.
 4. **Update the incident log** in the project's incident-response doc.

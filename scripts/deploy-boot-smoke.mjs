@@ -438,7 +438,7 @@ async function main() {
 }
 
 const invokedDirectly =
-  process.argv[1] && process.argv[1].endsWith("deploy-boot-smoke.mjs");
+  process.argv[1]?.endsWith("deploy-boot-smoke.mjs");
 if (invokedDirectly) {
   await main();
 }
