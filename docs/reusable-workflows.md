@@ -677,7 +677,7 @@ Semantics and caveats:
 - **Default off, unchanged behaviour.** With the input unset (or `false`) every
   tier runs its full command set, the checkout stays shallow, and none of the
   affected-mode steps run. Byte-for-byte identical to before the input existed.
-- **The full-run fallback covers an _unresolvable_ base only — not an empty
+- **The full-run fallback covers an *unresolvable* base only — not an empty
   range.** turbo falls back to treating **all** packages as changed when it
   **cannot resolve** the base (e.g. the checkout is too shallow), so *that*
   case degrades to a full run (today's behaviour), never a skipped task. When
@@ -2425,7 +2425,7 @@ limitation above:
   and `repository_dispatch` are the two events that **always create a workflow
   run even when triggered with the built-in `GITHUB_TOKEN`**, so the dispatcher
   needs only `permissions: actions: write`. (A cross-repo dispatch — as in
-  [`smoke-dispatch.yml`](#dispatch-cross-repo-smoke) — still needs a PAT; a
+  [`smoke-dispatch.yml`](#smoke-dispatchyml) — still needs a PAT; a
   same-repo dispatch does not.) The dispatcher's job `if:` requires **three**
   conditions, not just success (Story #284 / audit M3): `conclusion ==
   'success'` **and** `workflow_run.event == 'push'` **and**
@@ -3136,7 +3136,7 @@ The extraction is deliberately non-breaking at every level:
 > `osv-track-issue` pin reading *fresh* while the pinned SHA runs the old state
 > machine — the Story #379 blind spot, reopened one directory up. The freshness
 > checker's companion map closes it; see
-> [Companion subpaths](#companion-subpaths-a-shared-core-no-uses-line-names).
+> [Companion subpaths](#companion-subpaths--a-shared-core-no-uses-line-names).
 
 ---
 

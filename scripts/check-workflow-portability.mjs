@@ -158,7 +158,7 @@ export function walkYaml(content) {
     const trimmed = raw.slice(indent);
 
     // Match a mapping key, optionally introduced by a sequence dash.
-    const m = trimmed.match(/^(-\s+)?(["']?[A-Za-z0-9_.\-]+["']?):(\s*)(.*)$/);
+    const m = trimmed.match(/^(-\s+)?(["']?[A-Za-z0-9_.-]+["']?):(\s*)(.*)$/);
     if (!m) {
       i++;
       continue;

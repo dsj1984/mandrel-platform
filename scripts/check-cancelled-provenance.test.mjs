@@ -852,10 +852,10 @@ test("each tier's override key matches its own job id", () => {
   let job = null;
   const seen = new Set();
   for (const line of lines) {
-    const j = line.match(/^  ([a-z][a-z0-9-]*):$/);
+    const j = line.match(/^ {2}([a-z][a-z0-9-]*):$/);
     if (j) job = j[1];
     const t = line.match(
-      /^    timeout-minutes: \$\{\{ fromJSON\(inputs\.tier-timeouts\)\['([a-z0-9-]+)'\]/
+      /^ {4}timeout-minutes: \$\{\{ fromJSON\(inputs\.tier-timeouts\)\['([a-z0-9-]+)'\]/
     );
     if (!t) continue;
     assert.equal(

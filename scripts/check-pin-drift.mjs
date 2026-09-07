@@ -216,9 +216,9 @@ export function extractStaleLiterals(file, text, platformRepo) {
     // `uses:` lines are owned by extractPlatformPins — never double-count them.
     if (usesRe.test(line)) continue;
     const commentIndex = line.indexOf("#");
-    let match;
+    // `matchAll` copies `lastIndex`; rewind the shared global regex first.
     litRe.lastIndex = 0;
-    while ((match = litRe.exec(line)) !== null) {
+    for (const match of line.matchAll(litRe)) {
       const ref = match[1];
       const col = match.index;
       // A literal inside a `#` comment is a comment-kind literal; otherwise it

@@ -302,7 +302,7 @@ function resolveSha() {
   } catch (err) {
     fail(
       `could not resolve ref '${opts.ref}' on ${opts.repo}: ${
-        (err && err.stderr) || err.message
+        err?.stderr || err.message
       }`
     );
   }

@@ -10,7 +10,7 @@
 
 An **SLO (Service Level Objective)** is a target reliability level for a service. A **SLI (Service Level Indicator)** is what you measure. An **SLA (Service Level Agreement)** is a contract with users or customers that references SLOs.
 
-```
+```text
 SLA ──► SLO ──► SLI
 (contract)  (target)  (measurement)
 ```
@@ -20,6 +20,7 @@ SLA ──► SLO ──► SLI
 The **error budget** is the allowable amount of unreliability implied by the SLO. If your SLO is 99.9% availability over 30 days, your error budget is 0.1% of 30 days = **43.2 minutes of downtime per month**.
 
 When the error budget is exhausted:
+
 - **Stop non-critical deploys** until the budget resets.
 - **Prioritize reliability work** over feature work.
 - **Review recent incidents** to address root causes.
@@ -48,7 +49,7 @@ These are the recommended defaults for a Cloudflare Workers deployment. Consumer
 
 Better Stack probes the health endpoint every 30 seconds. Uptime percentage is calculated as:
 
-```
+```text
 availability = (total_checks - failed_checks) / total_checks × 100
 ```
 
@@ -93,17 +94,19 @@ At the start of each month, review the prior month's SLIs against the SLO target
 1. Pull availability from Better Stack (monthly report).
 2. Query AE for success rate and P99 latency.
 3. Calculate error budget consumption:
-   ```
+
+   ```text
    budget_used_minutes = (1 - actual_availability) × 30 × 24 × 60
    budget_remaining_pct = 1 - budget_used_minutes / budget_total_minutes
    ```
+
 4. Record the result in the project's SLO log (see `docs/environments.md`).
 
 ### 4b. Real-time error budget burn
 
 During an ongoing incident, estimate the budget burn rate:
 
-```
+```text
 burn_rate = current_error_rate / (1 - slo_target)
 ```
 

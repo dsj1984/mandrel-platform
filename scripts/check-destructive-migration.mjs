@@ -206,8 +206,7 @@ const SECTION_DIRECTIVE_RE =
 export function sectionBoundaries(text) {
   const re = new RegExp(SECTION_DIRECTIVE_RE.source, "gim");
   const offsets = [];
-  let m;
-  while ((m = re.exec(text)) !== null) offsets.push(m.index);
+  for (const m of text.matchAll(re)) offsets.push(m.index);
   return offsets;
 }
 
@@ -373,8 +372,7 @@ export function maskNonExecutable(text) {
 export function collectCreatedIndexes(text) {
   const re = new RegExp(CREATE_INDEX_SOURCE, "gi");
   const created = [];
-  let m;
-  while ((m = re.exec(text)) !== null) {
+  for (const m of text.matchAll(re)) {
     created.push({ name: normalizeIndexName(m[1]), index: m.index });
   }
   return created;
@@ -408,16 +406,14 @@ export function scanDropStatements(text) {
   const re = new RegExp(DROP_OBJECT_SOURCE, "gi");
   let destructiveDrops = 0;
   const recreatedIndexes = [];
-  let m;
-  while ((m = re.exec(dropText)) !== null) {
+  for (const m of dropText.matchAll(re)) {
     if (m[1].toUpperCase() === "INDEX") {
       const names = parseDroppedIndexNames(dropText.slice(m.index));
       // An unparseable name list fails closed — counted as destructive below.
       // EVERY name in the list must be recreated after the drop; one excused
       // name never excuses its neighbours.
       if (
-        names &&
-        names.every((name) =>
+        names?.every((name) =>
           created.some(
             (c) => c.name === name && c.index > m.index && sameSection(m.index, c.index)
           )

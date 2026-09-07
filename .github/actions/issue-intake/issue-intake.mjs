@@ -86,7 +86,7 @@ export const MAX_LABEL_PAGES = 50;
  * so there is nothing an attacker can prefix — isolating a candidate is
  * deliberately kept separate from deciding whether its host is trusted.
  */
-const URL_TOKEN_DELIMITERS = /[\s<>"'`()\[\],]+/;
+const URL_TOKEN_DELIMITERS = /[\s<>"'`()[\],]+/;
 
 /**
  * The Sentry issue id a body links, or null when it links none.
@@ -256,7 +256,7 @@ export function intrinsicIdentity(body, preset) {
   if (entry.extract) return entry.extract(body);
   if (!entry.identity) return null;
   const m = entry.identity.exec(String(body ?? ""));
-  return m && m[1] ? m[1].trim() : null;
+  return m?.[1] ? m[1].trim() : null;
 }
 
 /**
@@ -610,7 +610,7 @@ export async function fireRoutine({ url, token, payload }, fetchImpl = globalThi
       headers: fireHeaders(token),
       body: payload,
     });
-    if (res && res.ok) return { delivered: true, detail: `HTTP ${res.status}` };
+    if (res?.ok) return { delivered: true, detail: `HTTP ${res.status}` };
     return { delivered: false, detail: `HTTP ${res ? res.status : "no response"}` };
   } catch (e) {
     return { delivered: false, detail: e.message };
@@ -832,7 +832,7 @@ export async function main(env = process.env, { runner = gh, fetchImpl } = {}) {
 
 // Only run when executed directly, not when imported by the test suite.
 const invokedDirectly =
-  process.argv[1] && process.argv[1].endsWith("issue-intake.mjs");
+  process.argv[1]?.endsWith("issue-intake.mjs");
 if (invokedDirectly) {
   process.exit(await main());
 }

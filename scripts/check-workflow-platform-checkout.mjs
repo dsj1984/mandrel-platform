@@ -227,7 +227,7 @@ export function lintWorkflow(path, source) {
       const ref = body.match(/^\s*ref:\s*(.+?)\s*$/m);
 
       // Rule 2 — the ref must come from a resolve step's output.
-      const viaStep = ref && ref[1].match(/\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.sha\s*\}\}/);
+      const viaStep = ref?.[1].match(/\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.sha\s*\}\}/);
       if (!viaStep) {
         add(
           step.line,

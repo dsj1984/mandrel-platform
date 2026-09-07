@@ -94,7 +94,7 @@ export function extractJobIds(yamlContent) {
     }
 
     // Job ID lines: exactly 2-space indent, identifier, colon, optional spaces.
-    const jobMatch = line.match(/^  ([a-zA-Z0-9_-]+):\s*$/);
+    const jobMatch = line.match(/^ {2}([a-zA-Z0-9_-]+):\s*$/);
     if (jobMatch) {
       ids.add(jobMatch[1]);
     }

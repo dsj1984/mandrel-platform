@@ -56,9 +56,9 @@ function buildHsts(hsts) {
     return null;
   }
   const maxAge =
-    hsts && typeof hsts.maxAge === "number" ? hsts.maxAge : DEFAULT_HSTS_MAX_AGE;
-  const includeSubDomains = !hsts || hsts.includeSubDomains !== false;
-  const preload = Boolean(hsts && hsts.preload);
+    typeof hsts?.maxAge === "number" ? hsts.maxAge : DEFAULT_HSTS_MAX_AGE;
+  const includeSubDomains = hsts?.includeSubDomains !== false;
+  const preload = Boolean(hsts?.preload);
 
   let value = `max-age=${maxAge}`;
   if (includeSubDomains) {

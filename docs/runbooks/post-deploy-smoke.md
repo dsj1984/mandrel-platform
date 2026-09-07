@@ -105,9 +105,11 @@ done
 
 1. **Check recent deploys:** Was there a code change that could break the health handler or the Worker boot sequence?
 2. **`wrangler tail`:** Stream the Worker logs to see the error:
+
    ```bash
    wrangler tail --name <WORKER_NAME> --format pretty
    ```
+
 3. **Check for startup errors:** A Worker that throws during module initialization will not respond to any route. Look for `Error: Cannot read properties of undefined` or import failures in the tail output.
 4. **Check environment bindings:** A missing `env.SECRET` accessed at module scope causes an immediate crash. Compare the Worker bindings in `wrangler.toml` against the secrets set in the Cloudflare dashboard.
 

@@ -63,8 +63,8 @@ export function parseFlags(argv, spec) {
   }
 
   const canonical = (arg) => {
-    if (Object.prototype.hasOwnProperty.call(flags, arg)) return arg;
-    if (Object.prototype.hasOwnProperty.call(aliases, arg)) return aliases[arg];
+    if (Object.hasOwn(flags, arg)) return arg;
+    if (Object.hasOwn(aliases, arg)) return aliases[arg];
     return null;
   };
 

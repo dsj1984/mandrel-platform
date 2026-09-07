@@ -45,11 +45,13 @@ Severity is assigned by the first responder and may be upgraded or downgraded as
 1. Alert fires (Better Stack, Sentry, or user report).
 2. First responder acknowledges within 15 minutes (P1) / 1 hour (P2).
 3. Open an incident issue:
-   ```
+
+   ```text
    Title: [P1] <Short description of the problem> — <date>
    Labels: incident, severity::P1, status::open
    Body: (use the postmortem template below)
    ```
+
 4. Classify severity. If unsure, classify higher and downgrade once more information is available.
 
 ### 3b. Investigate
@@ -90,7 +92,7 @@ For P1 and P2 incidents, complete a blameless postmortem within 48 hours:
 - What went poorly (detection gaps, slow escalation, wrong hypothesis).
 - Action items (each with an owner and due date, linked to a GitHub issue).
 
-Use the [Postmortem Template](#postmortem-template) in this runbook.
+Use the [Postmortem Template](#5-postmortem-template) in this runbook.
 
 ---
 
@@ -98,7 +100,7 @@ Use the [Postmortem Template](#postmortem-template) in this runbook.
 
 ### Initial stakeholder notification (P1)
 
-```
+```text
 Subject: [P1 INCIDENT] <Project> — <short description>
 Time: <UTC timestamp>
 Impact: <One sentence — who is affected and how badly>
@@ -109,7 +111,7 @@ Incident issue: <GitHub issue URL>
 
 ### Resolution notification
 
-```
+```text
 Subject: [RESOLVED] <Project> — <short description>
 Time resolved: <UTC timestamp>
 Duration: <N minutes>

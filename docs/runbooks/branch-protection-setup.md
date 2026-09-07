@@ -116,10 +116,12 @@ If the output is empty or missing `ci-required`, branch protection is not applie
 A PR stuck on a required check that never reports is the most common branch-protection failure:
 
 1. **Check the check name:** The required check in branch protection must exactly match what CI reports. Even a trailing space or casing difference blocks forever.
+
    ```bash
    # List the checks reported on the PR
    gh pr checks <PR_NUMBER>
    ```
+
 2. **Compare against `main-protection.json`:** Is the reported aggregator job name (`ci-required` or equivalent) listed as a required check?
 3. **Check `upstreamJobs` in `main-protection.json`:** Is every upstream job actually being emitted by the workflow? Run `node scripts/check-required-contexts.mjs`.
 4. **If a job was renamed:** Update the job name in `main-protection.json#upstreamJobs` and re-run the lint. Branch protection itself only cares about the aggregator name.

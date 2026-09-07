@@ -45,7 +45,7 @@
  *       silently on missing data).
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 // ---------------------------------------------------------------------------

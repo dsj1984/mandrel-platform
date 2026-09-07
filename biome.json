@@ -1,0 +1,24 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
+  "extends": ["./config/biome.base.json"],
+  "root": true,
+  "files": {
+    "includes": [
+      "**",
+      "!**/.agents/**",
+      "!**/.claude/**",
+      "!**/temp/**",
+      "!**/.worktrees/**",
+      "!**/node_modules/**"
+    ]
+  },
+  "formatter": { "enabled": false },
+  "linter": {
+    "rules": {
+      "suspicious": {
+        "noTemplateCurlyInString": "off",
+        "useBiomeIgnoreFolder": "off"
+      }
+    }
+  }
+}

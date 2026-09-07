@@ -375,6 +375,6 @@ test("index barrel re-exports every public unit", () => {
     "createHonoRateLimit",
     "rateLimitHeaders",
   ]) {
-    assert.equal(typeof barrel[name] !== "undefined", true, `barrel missing ${name}`);
+    assert.equal(Object.hasOwn(barrel, name), true, `barrel missing ${name}`);
   }
 });
