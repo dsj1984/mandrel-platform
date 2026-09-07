@@ -69,6 +69,10 @@ import {
 } from '../ticket-validator-conflicts.js';
 import { upsertStructuredComment } from '../ticketing.js';
 import {
+  resolveContainerEpic,
+  resolveCrossPlanLinks,
+} from './cross-plan-links.js';
+import {
   enforceFanOutGate,
   surfaceSoftConflictFindings,
 } from './fan-out-gate.js';
@@ -711,6 +715,10 @@ export async function runPlanPersist({
     closeSuperseded = true,
     routeDowngradeReason = null,
     injectedRules = undefined,
+    // Story #5139 — the optional container Epic. `null` (the default) is the
+    // ordinary shape: no Epic is created unless `/mandrel-plan` offered one
+    // above the threshold and the operator confirmed it.
+    epic = null,
   } = opts;
 
   // Boundary for the plan-metrics summary below: everything this invocation
@@ -745,6 +753,14 @@ export async function runPlanPersist({
     config,
   });
   await enforceReachability(reachability, config);
+
+  // Story #5155 — the plan's outward references (`--epic <id>`, and any
+  // `#<id>` blocker) resolve BEFORE the first create, dry run included.
+  const adoptionTarget = await resolveCrossPlanLinks({
+    provider,
+    stories: rawStories,
+    epicId: opts.adoptEpicId ?? null,
+  });
 
   // Split policy + inline Spec fold (over-budget Specs fail closed — no docs/).
   const { stories } = assemblePlanStories(rawStories, {
@@ -840,6 +856,19 @@ export async function runPlanPersist({
     });
   }
 
+  // Story #5139 — the container Epic is created LAST among the writes: its
+  // body embeds the child issue numbers and its sub-issue edges need their
+  // database ids, neither of which exists until the Stories are live. It is
+  // never load-bearing, so a failure here degrades to "no container" and the
+  // Stories still deliver by id.
+  const containerEpic = await resolveContainerEpic({
+    provider,
+    adoptionTarget,
+    epic,
+    created,
+    opts: { dryRun },
+  });
+
   const supersede = await runSupersedePhase({
     provider,
     stories,
@@ -866,5 +895,6 @@ export async function runPlanPersist({
     freshness,
     waveTable,
     supersede,
+    epic: containerEpic,
   };
 }

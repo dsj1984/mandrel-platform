@@ -44,10 +44,12 @@ They remain read-only emitters of audit reports.
 ## Phase 1 — Discover & parse
 
 Run the CLI in `--scan` mode against the resolved glob. It parses every
-`### Finding` block, normalises the fields (`Severity` / `Impact` are
+finding block, normalises the fields (`Severity` / `Impact` are
 both recognised; `Dimension` / `Category` likewise), and extracts file
-paths mentioned in the body. It then stamps each finding with a stable
-sha1 fingerprint via the shared
+paths mentioned in the body. A `###` heading that carries no severity axis and
+holds `####` blocks is read as a **grouping header**: its `####` children are
+the findings, and the header itself never becomes one. It then stamps each
+finding with a stable sha1 fingerprint via the shared
 [`lib/findings/route-finding.js`](../scripts/lib/findings/route-finding.js)
 helper (`fingerprintFinding`) — the single dedup/route implementation
 shared with `qa-explore`. The workflow carries **no** separate inline
@@ -63,6 +65,19 @@ node .agents/scripts/audit-to-stories.js --scan \
 The emitted plan envelope carries `findings`, `groups`, `edges`,
 `classifications`, and `summary`. Subsequent phases consume the file
 rather than re-parsing the reports.
+
+**The tally cross-check is automatic.** Every report declares
+`Severity tally: Critical <n> / High <n> / Medium <n> / Low <n>` in its
+Executive Summary; the scan compares that line with what it parsed and carries
+each disagreement on `summary.reportFailures[]` as
+`{ sourceReport, kind, reported, parsed }`. The kinds are `missing-tally` (no
+line), `tally-mismatch` (line and parse disagree), and `unresolved-severity` (a
+finding whose severity did not resolve — dropped from grouping, never filed as
+an `unknown` group). They print to stderr before `--scan` returns its plan, so
+a mis-parsed report is never read as a clean audit: re-run the lens rather than
+file from it. Over older reports predating the mandate,
+`--scan --allow-missing-tally` downgrades **only** `missing-tally` to a
+warning.
 
 ## Phase 2 — HITL: severity gate
 
@@ -117,6 +132,11 @@ Ask:
 >   default-single policy.
 > - **Individual standalone Stories** — opens one GitHub Issue per
 >   group directly (no plan ceremony).
+>
+> Either way, if the sweep proposes **more than 2** Stories they are grouped
+> under a **container Epic** by default — a title, a one-paragraph goal and a
+> child checklist, carrying nothing a child does not already carry. Say so if
+> you would rather file them flat.
 
 **STOP** until the operator picks.
 
@@ -133,7 +153,14 @@ node .agents/scripts/audit-to-stories.js --emit-plan-seed \
 The seed renders the canonical one-pager sections — Problem Statement,
 Recommended Direction, Key Assumptions (with links to every source
 report), MVP Scope (the M proposed Stories), Key Files (so `/mandrel-plan`'s
-authoring step has concrete anchors), Not Doing.
+authoring step has concrete anchors), Grouping, Not Doing.
+
+**Grouping is the container-Epic directive.** Above 2 proposed Stories the
+seed instructs `/mandrel-plan` to group them under one Epic — a sweep is the
+clearest case for a container, since every Story shares a provenance and an
+operator usually delivers them together. It is a directive in the text, not an
+automatic write: Phase 4 above is where an operator declines it. Below the
+threshold the section says so and asks for nothing.
 
 Chain into the existing planning entrypoint:
 
@@ -215,6 +242,14 @@ its footprint guard ignores the shared provenance footers, so an unwired cohort
 is genuinely unordered and `/mandrel-deliver` will co-dispatch Stories the edges say
 must follow one another.
 
+**Preconditions.** The pass writes through the configured provider, so it needs
+`github.owner` **and** `github.repo` in `.agentrc.json` plus working `gh` auth
+(`GH_TOKEN`/`gh auth status`) — the same two things Phase 1's dedup needs. When
+either is missing the command refuses and names which one; fix that and re-run
+the exact command above. Do not transcribe the footers by hand: `/mandrel-deliver`
+reads them, but the native `blocked_by` relations only exist if this pass wrote
+them.
+
 ## Phase 6 — Idempotency (folded into Phase 1 scan)
 
 The `--scan` step routes each group's findings through the shared
@@ -289,6 +324,8 @@ summarising the run:
 
 When the single-plan path ran, link the Story (or plan-run) the chained
 `/mandrel-plan` opened. When the Standalone-Stories path ran, list every Issue URL.
+Either way, name the container Epic if one was created — it is the single id
+that delivers the whole sweep (`/mandrel-deliver <epicId>`).
 
 ## Constraints
 
@@ -330,9 +367,19 @@ writing their `temp/audits/audit-*-results.md` reports, then (2) invokes the
 CLI's **`--auto` mode** over those results:
 
 ```bash
-node .agents/scripts/audit-to-stories.js --auto [--dry-run] \
+node .agents/scripts/audit-to-stories.js --auto [--dry-run] [--ledger-commit] \
   [--glob "temp/audits/audit-*-results.md"] [--severity <floor>]
 ```
+
+The routine shape is **lenses full-scope → dry-run → live with a ledger PR**:
+
+1. Run the `audit-*` lenses with no `--paths` and no change-set filter. A
+   sweep scoped to a change set re-reports the same recent files every cycle
+   and never reaches the untouched code where findings accumulate.
+2. `--auto --dry-run` for the first cycles — zero writes, summary only. Read
+   `totals.create` and raise the severity floor until it is a batch the team
+   would actually take on.
+3. `--auto --ledger-commit` once the tallies stop surprising you.
 
 `--auto` runs with **no interactive gates**: it resolves the severity floor
 from `delivery.auditToStories.severityFloor` (default `high`, overridable with
@@ -340,8 +387,39 @@ from `delivery.auditToStories.severityFloor` (default `high`, overridable with
 and prints a run-summary JSON (create / skip-open / skip-reoccurring /
 suppressed-by-ledger tallies, plus the re-detected open Issue numbers an
 operator may want a "re-detected" comment on). `--dry-run` performs zero GitHub
-writes and skips the ledger write, emitting only the summary. The host
-scheduler owns the cadence; this workflow owns the routing.
+writes and skips the ledger write, emitting only the summary.
+
+`--auto` **fails closed on any `summary.reportFailures[]` entry** (Phase 1): an
+unattended sweep has no operator to read a warning, so a missing or mismatched
+`Severity tally:` line — or a finding whose severity did not resolve — exits
+non-zero having opened no Issue and written no ledger. `--allow-missing-tally`
+is a `--scan` affordance that `--auto` ignores. A red sweep means the report is
+untrustworthy: re-run the lens. The host scheduler owns the cadence; this
+workflow owns the routing.
+
+### The ledger is consumer state — commit it
+
+`baselines/audit-ledger.json` is **committed consumer state, not scratch
+output**. A scheduled sweep normally runs on an ephemeral checkout, so unless
+the reconciled ledger is committed back it dies with the clone: every later
+sweep starts amnesiac, re-proposing findings already filed and re-surfacing
+findings a human already rejected.
+
+`--ledger-commit` closes that loop. After the summary prints — and only when
+the ledger changed — it creates `chore/audit-ledger-<YYYY-MM-DD>` from HEAD,
+commits **only** the ledger file, pushes it, and opens a PR against
+`project.baseBranch`. **Auto-merge is never requested**: a human glance at the
+`accepted-risk` / `regressed` flips before it lands is the point. A git or `gh`
+failure is fatal and names its step, but only after the summary is printed, so
+a broken remote never costs the operator the run's findings. `--dry-run` skips
+the tail. Without the flag, a changed ledger on a checkout that cannot persist
+it — no `origin`, or HEAD off the base branch — sets `ledger.unpersisted: true`
+in the summary and warns on stderr naming the file.
+
+The full sweep procedure — tally cross-check, the ledger PR, the
+enrich-before-deliver step and the label convention — ships as a
+consumer-copyable template at
+[`templates/docs/audit-sweep-runbook.md`](../templates/docs/audit-sweep-runbook.md).
 
 ## See also
 

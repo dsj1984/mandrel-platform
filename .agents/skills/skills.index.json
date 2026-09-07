@@ -1,24 +1,14 @@
 {
-  "generatedAt": "2026-08-06T10:26:18.702Z",
+  "generatedAt": "2026-09-06T12:59:23.069Z",
   "generator": "generate-skills-index.js@1",
   "skills": [
-    {
-      "name": "api-and-interface-design",
-      "tier": "core",
-      "category": "core",
-      "path": ".agents/skills/core/api-and-interface-design/SKILL.md",
-      "description": "Designs stable, well-documented APIs and module interfaces. Use when creating REST/GraphQL endpoints, defining contracts between modules, or changing public interfaces. The wire-format SSOT — response envelope, HTTP status codes, validation taxonomy, payload naming — lives in `.agents/rules/api-conventions.md`; this skill shows authors how to apply it.",
-      "policyCapsuleBullets": 9,
-      "allowedTools": null,
-      "vendor": null
-    },
     {
       "name": "browser-testing-with-devtools",
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/browser-testing-with-devtools/SKILL.md",
       "description": "Tests in real browsers. Use when building or debugging anything that runs in a browser. Use when you need to inspect the DOM, capture console errors, analyze network requests, profile performance, or verify visual output with real runtime data via Chrome DevTools MCP.",
-      "policyCapsuleBullets": 9,
+      "policyCapsuleBullets": 8,
       "allowedTools": null,
       "vendor": null
     },
@@ -28,17 +18,7 @@
       "category": "core",
       "path": ".agents/skills/core/code-review-and-quality/SKILL.md",
       "description": "Conducts multi-axis code review and runs the disciplined post-green refactor pass. Use before merging any change, when reviewing code written by yourself, another agent, or a human, or when the opt-in `delivery.refactorStage` checkpoint asks for a behaviour-preserving CRAP/duplication pass after the suite is green.",
-      "policyCapsuleBullets": 12,
-      "allowedTools": null,
-      "vendor": null
-    },
-    {
-      "name": "debugging-and-error-recovery",
-      "tier": "core",
-      "category": "core",
-      "path": ".agents/skills/core/debugging-and-error-recovery/SKILL.md",
-      "description": "Guides systematic root-cause debugging. Use when tests fail, builds break, behavior doesn't match expectations, or you encounter any unexpected error. Use when you need a systematic approach to finding and fixing the root cause rather than guessing.",
-      "policyCapsuleBullets": 9,
+      "policyCapsuleBullets": 7,
       "allowedTools": null,
       "vendor": null
     },
@@ -48,7 +28,7 @@
       "category": "core",
       "path": ".agents/skills/core/documentation-and-adrs/SKILL.md",
       "description": "Records decisions and documentation. Use when making architectural decisions, changing public APIs, shipping features, or when you need to record context that future engineers and agents will need to understand the codebase.",
-      "policyCapsuleBullets": 9,
+      "policyCapsuleBullets": 6,
       "allowedTools": null,
       "vendor": null
     },
@@ -57,19 +37,9 @@
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/gates-and-baselines/SKILL.md",
-      "description": "Governs quality gates and the unified-baseline snapshots. Use when authoring a baseline refresh commit (CRAP, maintainability, dead-exports, lighthouse), when setting up or modifying CI quality gates, or when introducing a new gate that asserts on pre-existing state without turning the integration branch red.",
-      "policyCapsuleBullets": 9,
+      "description": "Governs quality gates and the unified-baseline snapshots. Use when authoring a baseline refresh commit (coverage, CRAP, maintainability, duplication, dead-exports), when setting up or modifying CI quality gates, or when introducing a new gate that asserts on pre-existing state without turning the base branch red.",
+      "policyCapsuleBullets": 10,
       "allowedTools": ["Read", "Write", "Bash"],
-      "vendor": null
-    },
-    {
-      "name": "git-workflow-and-versioning",
-      "tier": "core",
-      "category": "core",
-      "path": ".agents/skills/core/git-workflow-and-versioning/SKILL.md",
-      "description": "Structures git workflow practices. Use when making any code change. Use when committing, branching, resolving conflicts, or when you need to organize work across multiple parallel streams.",
-      "policyCapsuleBullets": 6,
-      "allowedTools": null,
       "vendor": null
     },
     {
@@ -80,16 +50,6 @@
       "description": "Refines ideas iteratively. Refine ideas through structured divergent and convergent thinking. Use \"idea-refine\" or \"ideate\" to trigger.",
       "policyCapsuleBullets": 10,
       "allowedTools": null,
-      "vendor": null
-    },
-    {
-      "name": "qa-coverage-mapping",
-      "tier": "core",
-      "category": "core",
-      "path": ".agents/skills/core/qa-coverage-mapping/SKILL.md",
-      "description": "Map a quality finding to a per-tier coverage verdict (unit / contract / acceptance) aligned to `.agents/rules/testing-standards.md`. Use when a finding points at a symbol or surface and you need to know which test tiers already cover it and which are missing, so remediation lands the right tier. Delegates the verdict to the deterministic `lib/qa/coverage-verdict.js#coverageVerdict` helper.",
-      "policyCapsuleBullets": 7,
-      "allowedTools": ["Read", "Bash"],
       "vendor": null
     },
     {
@@ -107,7 +67,7 @@
       "tier": "core",
       "category": "core",
       "path": ".agents/skills/core/security-and-hardening/SKILL.md",
-      "description": "Hardens code against vulnerabilities. Use when handling user input, authentication, data storage, or external integrations. The non-negotiable security MUSTs live in `.agents/rules/security-baseline.md`; this skill shows how to apply them with process guidance, an audit-triage tree, and a review checklist.",
+      "description": "Hardens code against vulnerabilities. Use when handling user input, authentication, data storage, or external integrations. The non-negotiable security MUSTs live in `.agents/rules/security-baseline.md`; this skill shows how to apply them, with the project's surfacing and validation-response process.",
       "policyCapsuleBullets": 6,
       "allowedTools": null,
       "vendor": null
@@ -128,7 +88,7 @@
       "category": "qa",
       "path": ".agents/skills/stack/qa/playwright-bdd/SKILL.md",
       "description": "Wires Gherkin `.feature` files to Playwright via the `playwright-bdd` library. Use when running BDD scenarios on a Playwright runtime — pairs with the `gherkin-authoring` skill (scenario prose) and the `playwright` skill (browser conventions). Drives execution by tag expression with trace-first debugging and Playwright-native sharding.",
-      "policyCapsuleBullets": 8,
+      "policyCapsuleBullets": 9,
       "allowedTools": null,
       "vendor": "playwright"
     },
@@ -143,34 +103,14 @@
       "vendor": "playwright"
     },
     {
-      "name": "qa-explore-driving",
-      "tier": "stack",
-      "category": "qa",
-      "path": ".agents/skills/stack/qa/qa-explore-driving/SKILL.md",
-      "description": "Conventions for agent-driven exploratory QA driving — how the agent itself drives a surface during `/qa-explore` (agent-led), as opposed to the human-led `/qa-assist`. Use when the agent explores a running app via the browser MCP (navigation-first, the default) — including authenticated deployed surfaces reached through the resolved environment's sign-in seam — or walks a static surface (the documented interim where no seam resolves), under a strictly read-only capture invariant. The exploration procedure lives in `.agents/workflows/qa-explore.md`; this skill is the driving-conventions reference it leans on.",
-      "policyCapsuleBullets": 9,
-      "allowedTools": null,
-      "vendor": null
-    },
-    {
       "name": "qa-harness",
       "tier": "stack",
       "category": "qa",
       "path": ".agents/skills/stack/qa/qa-harness/SKILL.md",
-      "description": "Conventions for the agent-driven QA harness that drives Gherkin scenarios through a real browser. Use when executing `/qa-run` or instrumenting a live surface — covers navigation-first execution, per-surface console and network capture, design-token visual checks, and the framework-generic heuristic cards for turning signal into findings. The harness procedure lives in `.agents/workflows/qa-run.md`; this skill is the conventions reference it leans on.",
-      "policyCapsuleBullets": 7,
+      "description": "Conventions for agent-driven QA driving — the one driving-conventions reference behind both `/qa-run` (the known-scenario sweep through a real browser) and `/qa-explore` (agent-led exploratory driving). Use when instrumenting a live surface — covers navigation-first execution, per-surface console and network capture, design-token visual checks, the `F#` finding shape, per-environment resolution, and static driving as the documented interim. The run procedures live in `.agents/workflows/qa-run.md` and `.agents/workflows/qa-explore.md`; this skill is the conventions reference they lean on.",
+      "policyCapsuleBullets": 11,
       "allowedTools": null,
       "vendor": null
-    },
-    {
-      "name": "vitest",
-      "tier": "stack",
-      "category": "qa",
-      "path": ".agents/skills/stack/qa/vitest/SKILL.md",
-      "description": "Writes fast, isolated unit and integration tests with Vitest. Use when each test must run on file-save without shared state — `vi.mock()` for external deps, `vi.spyOn()` for call monitoring, AAA structure, and edge-case coverage for null/undefined/boundary inputs.",
-      "policyCapsuleBullets": 8,
-      "allowedTools": null,
-      "vendor": "vitest"
     }
   ]
 }
