@@ -139,6 +139,13 @@ jobs:
       - name: Lint third-party action pins
         run: node scripts/check-action-pins.mjs
 
+      # A first-party action that fetches a release asset without retry flags
+      # dies on the first transient 5xx — run 34133838332 lost the security job
+      # (a `needs:` of `ci-required`) to a single 504. Two of three sibling
+      # downloads already retried; nothing noticed the third did not.
+      - name: Lint action asset-download retries
+        run: node scripts/check-action-download-retries.mjs
+
       # Catches `gh` CLI flag combinations that pass actionlint/shellcheck but
       # fail the gh CLI at RUNTIME (e.g. --slurp with --jq), which otherwise
       # only surface when the step runs — for the release pipeline, at release
