@@ -27,6 +27,18 @@ Process-level runbooks that are substantially identical across all projects. The
 | [`incident-response.md`](incident-response.md) | Severity classification, escalation path, response steps, postmortem template |
 | [`slo.md`](slo.md) | SLO framework, canonical targets, error-budget policy, rollback triggers |
 | [`pin-drift-dashboard.md`](pin-drift-dashboard.md) | Cross-consumer pin-drift dashboard: split-pin / release-lag detection across consumers |
+| [`self-healing.md`](self-healing.md) | Governance for unattended repo automations: the detect → report → remediate ladder, the roster, the rules they all share, and the per-automation runbook skeleton |
+| [`routine-wake-up.md`](routine-wake-up.md) | Waking a Claude Code cloud routine from a repo event: the API-trigger recipe, the four requirements a caller cannot skip, and what to read when one does not wake |
+
+Two of these ship **no thin stub** under `templates/runbooks/`, so
+`platform-sync.mjs` never copies them into a consumer's `docs/runbooks/`:
+[`self-healing.md`](self-healing.md) and
+[`routine-wake-up.md`](routine-wake-up.md) are platform-process docs a
+consumer reads directly (as `rollback.md`, `slo.md`, `secret-rotation.md` and
+`pin-drift-dashboard.md` already are). What a consumer keeps locally is the
+**per-automation runbook** each one tells it to write — those hold
+project-specific triggers, allowlists and identity values, and belong in the
+table below.
 
 ### Project-local runbooks (stay in each consumer repo)
 
