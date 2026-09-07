@@ -189,7 +189,11 @@ runs:
         # this `gitleaks.*` glob under RUNNER_TEMP.
         tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gitleaks.XXXXXX")"
         echo "Downloading pinned gitleaks: ${url}"
-        curl -fsSL "$url" -o "${tmp}/${asset}"
+        # Retry flags match the osv-scan and workflow-lint siblings exactly. A
+        # single transient 504 from the release CDN used to fail this job
+        # outright (run 34133838332), and the job is a `needs:` of
+        # `ci-required` for every consumer of pr-quality.yml.
+        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$url" -o "${tmp}/${asset}"
 
         # Verify the pinned SHA-256 before trusting the binary.
         actual="$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')"
