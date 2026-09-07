@@ -11,7 +11,7 @@
 #   4. if the target cannot be reached without stopping a runner that is
 #      mid-job, choose whether to wait for those jobs to finish
 #
-# VERSION: 2.0.0  (2026-09-07)
+# VERSION: 2.1.0  (2026-09-07)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -35,9 +35,9 @@
 #   <fleet-dir>/<runner>/bin/Runner.Listener   the always-on listener process
 #   <fleet-dir>/<runner>/bin/Runner.Worker     exists only while a job is running
 #
-# A "fleet" is any sibling folder of this script (or of the symlink pointing
-# at it) that contains at least one sub-folder with svc.sh + .service. Other
-# sub-folders (tarballs, notes) are ignored.
+# A "fleet" is any folder under the resolved fleet root (see step 0) holding
+# at least one sub-folder with svc.sh + .service. Other sub-folders (tarballs,
+# notes) are ignored.
 #
 # The runner folders are the source of truth, NOT ~/Library/LaunchAgents:
 # that directory accumulates plists for runners whose folders were deleted,
@@ -90,7 +90,12 @@
 # CANONICAL COPY
 # --------------
 # mandrel-platform/docs/runbooks/runner-toggle.sh — see runner-fleet.md next
-# to it. The working copy in the runners folder is a symlink to this file.
+# to it. The installed copy is a real COPY, deliberately not a symlink into
+# that repo: mandrel-platform is branched constantly (story-<id> branches), and
+# a symlink dangles the moment a checkout lands on a branch without this file.
+# An operator tool must not break because of an unrelated branch switch.
+# `runner-fleet.md` carries the one-line reinstall; the VERSION above is how
+# you tell an installed copy from the canonical one.
 
 set -euo pipefail
 
@@ -102,10 +107,13 @@ if [ $# -gt 0 ]; then
 fi
 [ -t 0 ] || { echo "runner-toggle is interactive and needs a terminal on stdin" >&2; exit 1; }
 
-# `dirname "$0"` follows the symlink's *location*, not its target, so a
-# symlinked working copy looks for fleets next to the symlink — which is the
-# point of symlinking it into the runners folder.
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# Where this script itself lives. Used as one candidate for the fleet root,
+# resolved further down once is_runner() exists.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Fallback fleet root for a PATH install, where SELF_DIR is a bin directory
+# with no fleets in it.
+DEFAULT_ROOT="${HOME}/Development/github-runners"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -142,18 +150,60 @@ svc() {
 }
 
 # ---------------------------------------------------------------------------
+# 0. Resolve the fleet root
+# ---------------------------------------------------------------------------
+# The "fleet root" is the folder that HOLDS the fleet folders. Two install
+# shapes must both work, so the root is the first candidate that actually
+# contains a fleet:
+#
+#   1. $RUNNER_TOGGLE_ROOT — explicit override. If set it is used verbatim;
+#      a root with no fleets in it is an error rather than a silent fallback,
+#      because a typo'd override should not quietly scale the wrong machine.
+#   2. this script's own directory — the "installed in the runners folder"
+#      shape, run as ./runner-toggle.
+#   3. DEFAULT_ROOT — the "installed on PATH" shape (e.g. ~/.local/bin), where
+#      the script's directory is a bin dir holding no runners.
+has_fleet() {
+  local d r
+  [ -d "$1" ] || return 1
+  for d in "$1"/*/; do
+    for r in "${d%/}"/*/; do
+      is_runner "${r%/}" && return 0
+    done
+  done
+  return 1
+}
+
+if [ -n "${RUNNER_TOGGLE_ROOT:-}" ]; then
+  ROOT="$RUNNER_TOGGLE_ROOT"
+  has_fleet "$ROOT" || { echo "RUNNER_TOGGLE_ROOT=$ROOT holds no runner fleets" >&2; exit 1; }
+elif has_fleet "$SELF_DIR"; then
+  ROOT="$SELF_DIR"
+elif has_fleet "$DEFAULT_ROOT"; then
+  ROOT="$DEFAULT_ROOT"
+else
+  echo "no runner fleets found. Tried:" >&2
+  echo "  \$RUNNER_TOGGLE_ROOT  (unset)" >&2
+  echo "  $SELF_DIR  (this script's directory)" >&2
+  echo "  $DEFAULT_ROOT  (default)" >&2
+  echo "Set RUNNER_TOGGLE_ROOT to the folder holding your fleet folders." >&2
+  exit 1
+fi
+ROOT="$(cd "$ROOT" && pwd)"
+
+# ---------------------------------------------------------------------------
 # 1. Pick a fleet
 # ---------------------------------------------------------------------------
 FLEETS=()
-for d in "$HERE"/*/; do
+for d in "$ROOT"/*/; do
   d="${d%/}"
   for r in "$d"/*/; do
     if is_runner "${r%/}"; then FLEETS+=("$d"); break; fi
   done
 done
-[ "${#FLEETS[@]}" -gt 0 ] || { echo "no fleet folders found under $HERE" >&2; exit 1; }
+[ "${#FLEETS[@]}" -gt 0 ] || { echo "no fleet folders found under $ROOT" >&2; exit 1; }
 
-echo "Fleets under $HERE:"
+echo "Fleets under $ROOT:"
 i=0
 for d in "${FLEETS[@]}"; do
   i=$((i+1)); up=0; total=0
