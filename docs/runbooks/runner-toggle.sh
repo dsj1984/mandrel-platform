@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# runner-toggle.sh — interactively set how many self-hosted GitHub Actions
+# runners in one fleet folder are active on this machine.
+#
+#   ./runner-toggle
+#
+# That is the whole interface. The script walks you through:
+#   1. pick a fleet folder (numbered list with "active of total" counts)
+#   2. read the fleet's status table
+#   3. type how many runners should be active (blank leaves it as is)
+#   4. if the target cannot be reached without stopping a runner that is
+#      mid-job, choose whether to wait for those jobs to finish
+#
+# VERSION: 2.0.0  (2026-09-07)
+#
+# WHY THIS EXISTS
+# ---------------
+# A developer Mac hosts several runner fleets, one folder per fleet, one
+# sub-folder per registered runner (github-runners/<fleet>/<fleet>-<n>/).
+# Each runner is a launchd LaunchAgent that the stock `svc.sh` in its folder
+# can start, stop and query. Scaling a fleet by hand means `cd`-ing into each
+# folder in turn, and `launchctl list` output is unreadable at a dozen
+# runners. This script turns that into one guided prompt: "make it N".
+#
+# It is deliberately interactive-only (v2). Earlier revisions took
+# `<fleet> <N> --wait --dry-run` arguments; the operator asked for a single
+# guided flow instead, so those were removed rather than kept as a parallel
+# path. Every step prints what it is about to do, and each `svc.sh` call is
+# echoed, so the transcript doubles as the audit trail.
+#
+# LAYOUT ASSUMPTIONS (the only coupling to the runner install)
+# -------------------------------------------------------------
+#   <fleet-dir>/<runner>/svc.sh     stock GitHub runner service script
+#   <fleet-dir>/<runner>/.service   absolute path of the runner's launchd plist
+#   <fleet-dir>/<runner>/bin/Runner.Listener   the always-on listener process
+#   <fleet-dir>/<runner>/bin/Runner.Worker     exists only while a job is running
+#
+# A "fleet" is any sibling folder of this script (or of the symlink pointing
+# at it) that contains at least one sub-folder with svc.sh + .service. Other
+# sub-folders (tarballs, notes) are ignored.
+#
+# The runner folders are the source of truth, NOT ~/Library/LaunchAgents:
+# that directory accumulates plists for runners whose folders were deleted,
+# and iterating folders sidesteps those orphans.
+#
+# ORDERING
+# --------
+# Runner numbering is rarely contiguous (a fleet may have 1-7, 11, 12, 16-18),
+# and a lexical sort puts `x-11` before `x-2`, so runners are ordered by their
+# trailing integer. A folder with no numeric suffix sorts as 0. "N active"
+# always means "the N lowest-numbered": scale-up starts from the bottom,
+# scale-down stops from the top.
+#
+# SAFETY: busy runners
+# --------------------
+# `svc.sh stop` is a plain `launchctl unload`, which kills the listener and
+# CANCELS any job it is running. So a runner whose Runner.Worker exists is
+# "busy" and is never stopped without asking. Idle runners are stopped first;
+# if busy ones remain in the way, you are asked whether to wait. Waiting
+# polls every 10s and stops each busy runner the moment its job finishes;
+# Ctrl-C abandons the wait (the idle stops already made stay made). There is
+# deliberately no "cancel the job" option: that should be an explicit
+# `./svc.sh stop` in the runner's own folder.
+#
+# PERSISTENCE
+# -----------
+# Unloading the plist means a stopped runner stays down across logout and
+# reboot; `svc.sh start` uses `launchctl load -w`, which re-enables it. So
+# the count you set is durable until you change it.
+#
+# STATES in the status table
+# --------------------------
+#   idle     loaded, listener has a PID, no job running
+#   busy     loaded, listener has a PID, Runner.Worker present
+#   dead     loaded in launchd but the listener has no PID (crashed / exited);
+#            counts as inactive; a scale-up unloads then loads it
+#   stopped  not loaded in launchd
+#
+# EXIT CODES
+# ----------
+#   0  target reached, or the session was left as is
+#   1  bad input, no fleets found, a svc.sh call failed, or busy runners were
+#      left running because you chose not to wait (target NOT reached)
+#
+# PORTABILITY
+# -----------
+# macOS only (launchd). Written for the stock /bin/bash 3.2: no mapfile, no
+# associative arrays, `${arr[@]+"${arr[@]}"}` for possibly-empty arrays.
+#
+# CANONICAL COPY
+# --------------
+# mandrel-platform/docs/runbooks/runner-toggle.sh — see runner-fleet.md next
+# to it. The working copy in the runners folder is a symlink to this file.
+
+set -euo pipefail
+
+POLL_SECS=10
+
+if [ $# -gt 0 ]; then
+  echo "runner-toggle takes no arguments; just run it and follow the prompts." >&2
+  exit 1
+fi
+[ -t 0 ] || { echo "runner-toggle is interactive and needs a terminal on stdin" >&2; exit 1; }
+
+# `dirname "$0"` follows the symlink's *location*, not its target, so a
+# symlinked working copy looks for fleets next to the symlink — which is the
+# point of symlinking it into the runners folder.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+is_runner() { [ -f "$1/svc.sh" ] && [ -f "$1/.service" ]; }
+
+# list_runners <fleet-dir>: one record per runner on stdout,
+# "<num>\t<dir>\t<launchd-label>", ordered by the numeric suffix.
+list_runners() {
+  local d name num svc
+  for d in "$1"/*/; do
+    d="${d%/}"
+    is_runner "$d" || continue
+    name="$(basename "$d")"
+    num="${name##*-}"; [[ "$num" =~ ^[0-9]+$ ]] || num=0
+    svc="$(basename "$(cat "$d/.service")" .plist)"   # launchd label
+    printf '%s\t%s\t%s\n' "$num" "$d" "$svc"
+  done | sort -n -k1,1
+}
+
+# One launchctl snapshot per pass; refreshed before the closing table.
+LAUNCHCTL="$(launchctl list)"
+
+dir_of()  { cut -f2 <<<"$1"; }
+svc_of()  { cut -f3 <<<"$1"; }
+pid_of()  { awk -v s="$1" '$3==s {print $1}' <<<"$LAUNCHCTL"; }  # "" unloaded, "-" loaded/no pid
+is_up()   { [[ "$(pid_of "$1")" =~ ^[0-9]+$ ]]; }                # loaded AND running
+is_busy() { pgrep -qf "$1/bin/Runner.Worker"; }
+
+# svc <dir> start|stop — wraps the stock svc.sh, which must run from its folder.
+svc() {
+  echo "  $2 $(basename "$1")"
+  ( cd "$1" && ./svc.sh "$2" >/dev/null ) || { echo "  FAILED: $2 $(basename "$1")" >&2; return 1; }
+}
+
+# ---------------------------------------------------------------------------
+# 1. Pick a fleet
+# ---------------------------------------------------------------------------
+FLEETS=()
+for d in "$HERE"/*/; do
+  d="${d%/}"
+  for r in "$d"/*/; do
+    if is_runner "${r%/}"; then FLEETS+=("$d"); break; fi
+  done
+done
+[ "${#FLEETS[@]}" -gt 0 ] || { echo "no fleet folders found under $HERE" >&2; exit 1; }
+
+echo "Fleets under $HERE:"
+i=0
+for d in "${FLEETS[@]}"; do
+  i=$((i+1)); up=0; total=0
+  while IFS= read -r rec; do
+    total=$((total+1)); is_up "$(svc_of "$rec")" && up=$((up+1))
+  done < <(list_runners "$d")
+  printf '  %d) %-20s %d of %d active\n' "$i" "$(basename "$d")" "$up" "$total"
+done
+read -r -p "Fleet [1-${#FLEETS[@]}]: " choice
+[[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#FLEETS[@]}" ] \
+  || { echo "not a valid choice: '$choice'" >&2; exit 1; }
+FLEET="${FLEETS[$((choice-1))]}"
+echo
+
+# ---------------------------------------------------------------------------
+# 2. Show the fleet
+# ---------------------------------------------------------------------------
+RUNNERS=()
+while IFS= read -r line; do RUNNERS+=("$line"); done < <(list_runners "$FLEET")
+
+UP=(); DOWN=()   # active / inactive, numeric order preserved
+for r in "${RUNNERS[@]}"; do
+  if is_up "$(svc_of "$r")"; then UP+=("$r"); else DOWN+=("$r"); fi
+done
+
+status_table() {
+  local up=0 busy=0 r d s p state
+  printf '%-16s %-8s %-7s %s\n' "RUNNER" "STATE" "PID" "SERVICE"
+  for r in "${RUNNERS[@]}"; do
+    d="$(dir_of "$r")"; s="$(svc_of "$r")"; p="$(pid_of "$s")"
+    if   [ -z "$p" ];     then state="stopped"
+    elif [ "$p" = "-" ];  then state="dead"
+    elif is_busy "$d";    then state="busy"; up=$((up+1)); busy=$((busy+1))
+    else                       state="idle"; up=$((up+1)); fi
+    printf '%-16s %-8s %-7s %s\n' "$(basename "$d")" "$state" "$p" "$s"
+  done
+  echo
+  echo "$up of ${#RUNNERS[@]} active ($busy busy)"
+}
+status_table
+echo
+
+# ---------------------------------------------------------------------------
+# 3. Ask for the target
+# ---------------------------------------------------------------------------
+read -r -p "How many should be active? [0-${#RUNNERS[@]}, blank = leave as is] " TARGET
+[ -n "$TARGET" ] || exit 0
+[[ "$TARGET" =~ ^[0-9]+$ ]] && [ "$TARGET" -le "${#RUNNERS[@]}" ] \
+  || { echo "not a number between 0 and ${#RUNNERS[@]}: '$TARGET'" >&2; exit 1; }
+echo
+echo "$(basename "$FLEET"): ${#UP[@]} active, target $TARGET"
+
+# ---------------------------------------------------------------------------
+# 4. Reconcile
+# ---------------------------------------------------------------------------
+rc=0
+if [ "$TARGET" -gt "${#UP[@]}" ]; then
+  # ---- scale up: lowest-numbered inactive runners first -------------------
+  need=$((TARGET - ${#UP[@]}))
+  for r in "${DOWN[@]+"${DOWN[@]}"}"; do
+    [ "$need" -gt 0 ] || break
+    d="$(dir_of "$r")"; s="$(svc_of "$r")"
+    # A "dead" runner is still loaded; `launchctl load` would refuse it.
+    if [ "$(pid_of "$s")" = "-" ]; then svc "$d" stop || true; fi
+    if svc "$d" start; then need=$((need-1)); else rc=1; fi
+  done
+
+elif [ "$TARGET" -lt "${#UP[@]}" ]; then
+  # ---- scale down: highest-numbered active runners first ------------------
+  # Idle candidates stop immediately. Busy candidates are queued in PENDING;
+  # they still count toward `need`, so the walk stops once idle stops plus
+  # queued busy runners cover the deficit.
+  need=$((${#UP[@]} - TARGET))
+  PENDING=()
+  for (( i=${#UP[@]}-1; i>=0; i-- )); do
+    [ "$((need - ${#PENDING[@]}))" -gt 0 ] || break
+    d="$(dir_of "${UP[$i]}")"
+    if is_busy "$d"; then
+      PENDING+=("$d")
+    elif svc "$d" stop; then
+      need=$((need-1))
+    else
+      rc=1
+    fi
+  done
+
+  if [ "${#PENDING[@]}" -gt 0 ]; then
+    echo "  ${#PENDING[@]} runner(s) are mid-job and would be cancelled by a stop: ${PENDING[*]##*/}"
+    read -r -p "  Wait for those jobs to finish, then stop them? (Ctrl-C abandons the wait) [y/N] " yn
+    if [[ "$yn" =~ ^[Yy] ]]; then
+      while [ "${#PENDING[@]}" -gt 0 ]; do
+        still=()
+        for d in "${PENDING[@]}"; do
+          if is_busy "$d"; then still+=("$d"); else svc "$d" stop || rc=1; fi
+        done
+        PENDING=("${still[@]+"${still[@]}"}")
+        [ "${#PENDING[@]}" -gt 0 ] || break
+        printf '  still busy: %s (next check in %ss)\n' "${PENDING[*]##*/}" "$POLL_SECS"
+        sleep "$POLL_SECS"
+      done
+    else
+      echo "  left running: ${PENDING[*]##*/} (target not reached)" >&2
+      rc=1
+    fi
+  fi
+fi
+
+echo
+LAUNCHCTL="$(launchctl list)"
+status_table
+exit $rc
