@@ -298,7 +298,7 @@
     },
     "planning": {
       "type": "object",
-      "description": "Inputs to `/mandrel-plan`: risk escalation heuristics, ceremony-lite routing, and the cross-Story conflict-finding severity gates.",
+      "description": "Inputs to `/mandrel-plan`: risk escalation heuristics, ceremony-lite routing, the memory-hygiene advisory thresholds, and the cross-Story conflict-finding severity gates.",
       "properties": {
         "riskHeuristics": {
           "oneOf": [
@@ -348,6 +348,25 @@
               "type": "integer",
               "minimum": 0,
               "description": "Enumerated-artifact threshold reported by the plan-context complexity signals. An input signal for the planner verdict — carries no routing authority. Default 1."
+            }
+          },
+          "additionalProperties": false
+        },
+        "memoryPool": {
+          "type": "object",
+          "description": "Thresholds for the memory-hygiene advisory `/mandrel-plan` surfaces at Gate #1. Advisory only: it recommends `/memory-consolidate` and never gates, reroutes, or mutates the memory pool.",
+          "properties": {
+            "staleAfterDays": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Recommend a consolidation pass once the pool's stamp is older than this many days. Default 30.",
+              "default": 30
+            },
+            "growthDelta": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Recommend a consolidation pass once this many entries have been written since the last one. Measured against the entry count the last pass stamped, so a stamp predating that field leaves growth unmeasured and only the age threshold applies. Default 25.",
+              "default": 25
             }
           },
           "additionalProperties": false
@@ -451,6 +470,11 @@
               "minimum": 1,
               "description": "Per-command timeout (ms) for the long-running spawns delivery drives — the close-validation chain and the gate CLIs.",
               "default": 600000
+            },
+            "fullSuiteLock": {
+              "type": "boolean",
+              "description": "Serialize full-suite spawns (`npm test` / `npm run test:coverage`) behind a host-level advisory lock, so two concurrent deliveries on one checkout do not run two suites against the same cores. Best-effort: a wait that expires spawns anyway, so the lock can never fail a delivery. Set false — or export `MANDREL_FULL_SUITE_LOCK=0` for one invocation — to disable.",
+              "default": true
             }
           },
           "additionalProperties": false
@@ -978,11 +1002,21 @@
                     },
                     "incrementalCoverage": {
                       "type": "object",
-                      "description": "Story #4981 — opt-in incremental coverage-capture + CRAP-join scoping. Default (key absent) preserves today’s full-repo behaviour byte-for-byte. When `enabled: true`, the changed-file set against `baseRef` (default: the gate’s own `--ref` / `main`) decides WHETHER to capture — no changed file under `crap.targetDirs` means no capture at all — and the CRAP join treats a method in a file the diff did not touch as resolved by its committed baseline row instead of requiring fresh coverage for it. It does NOT narrow the capture run itself: a capture that does happen is the ordinary full `npm run test:coverage` (Story #5065).",
+                      "description": "The two independent full-suite economies (Story #4981, split by Story #5173). `skipWhenUnchanged` (default true) decides WHETHER to capture — no changed file under `crap.targetDirs` versus `baseRef` means no capture at all — and is a pure saving. `baselineJoin` (default false) loosens gate semantics: the CRAP join resolves a method in an untouched file from its committed baseline row instead of requiring fresh coverage for it. Neither narrows the capture run itself: a capture that does happen is the ordinary full `npm run test:coverage` (Story #5065).",
                       "properties": {
+                        "skipWhenUnchanged": {
+                          "type": "boolean",
+                          "description": "Skip the capture entirely when no changed file under `crap.targetDirs` versus `baseRef` was touched. The only measured saving, and gate-semantics-neutral. Defaults to true.",
+                          "default": true
+                        },
+                        "baselineJoin": {
+                          "type": "boolean",
+                          "description": "Let the CRAP join resolve a method in a file the diff did not touch from its committed baseline row instead of requiring fresh coverage for it. A gate loosening, not a saving — defaults to false.",
+                          "default": false
+                        },
                         "enabled": {
                           "type": "boolean",
-                          "description": "Master switch for the capture skip and the baseline-resolved CRAP join."
+                          "description": "DEPRECATED alias for setting both `skipWhenUnchanged` and `baselineJoin`. Prefer the two switches: they are not equally safe, and bundling them is why the earlier default flip was reverted. Either explicit switch overrides this alias."
                         },
                         "baseRef": {
                           "type": "string",
@@ -1921,7 +1955,9 @@
             },
             "advisoryAllowlist": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "description": "Story #5096. Check-run names exempt from blockOnAdvisoryFailure — a red run whose name matches exactly never blocks arming. Matching is exact; an unnamed run can never match and always blocks.",
               "default": []
             }
@@ -1985,7 +2021,7 @@
         },
         "environments": {
           "type": "object",
-          "description": "Deployment targets the QA harness can run against (Epic #4326). A map keyed by environment name (e.g. `local`, `staging`), each carrying its own `baseUrl`, its own per-environment sign-in seam (the same url-template/skill union as the top-level seam), and an optional `allowWrites` gate. resolveQaEnvironment selects one environment per invocation by name or by raw-URL origin match against `baseUrl`; `allowWrites` defaults to true only for the `local` environment. Replaces the retired top-level single `signInSeam`.",
+          "description": "Deployment targets the QA harness can run against (Epic #4326). A map keyed by environment name (e.g. `local`, `staging`), each carrying its own `baseUrl`, an optional per-environment sign-in seam, and an optional `allowWrites` gate. `signInSeam` is the union `{ urlTemplate }` (a dev impersonation route) or `{ skill }` (a skill id such as `stack/qa/acme-sso`, resolved against `.agents/skills/` then the consumer-writable `.agents/local/skills/` zone, and rejected loudly by resolveQaEnvironment when it resolves under neither); omit it entirely for a target with no sign-in seam. resolveQaEnvironment selects one environment per invocation by name or by raw-URL origin match against `baseUrl`; `allowWrites` defaults to true only for the `local` environment. Replaces the retired top-level single `signInSeam`.",
           "default": {
             "local": {
               "baseUrl": "http://localhost:3000",
@@ -1995,9 +2031,6 @@
             },
             "staging": {
               "baseUrl": "https://staging.example.test",
-              "signInSeam": {
-                "skill": "stack/qa/sign-in"
-              },
               "allowWrites": false
             }
           },
@@ -2048,7 +2081,7 @@
                 "type": "boolean"
               }
             },
-            "required": ["baseUrl", "signInSeam"],
+            "required": ["baseUrl"],
             "additionalProperties": false
           }
         },
@@ -2059,7 +2092,7 @@
               "credentialRef": "QA_ADMIN_CREDENTIAL"
             },
             "member": {
-              "signInSkill": "stack/qa/sign-in-member"
+              "credentialRef": "QA_MEMBER_CREDENTIAL"
             }
           },
           "oneOf": [

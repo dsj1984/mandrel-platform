@@ -72,6 +72,10 @@
       "Monorepo-wide AST or text replacements touching overlapping files in parallel (catastrophic merge-conflict risk across concurrent agents).",
       "Schema migrations that rewrite existing rows or drop columns without a backfill or rollback plan."
     ],
+    "memoryPool": {
+      "staleAfterDays": 30,
+      "growthDelta": 25
+    },
     "failOnSharedEditors": false,
     "requireExplicitCrossStoryDeps": false,
     "crossCuttingRegistries": [
@@ -89,7 +93,8 @@
   },
   "delivery": {
     "execution": {
-      "timeoutMs": 600000
+      "timeoutMs": 600000,
+      "fullSuiteLock": true
     },
     "docsFreshness": {
       "paths": ["README.md"]
@@ -188,7 +193,11 @@
           },
           "refreshTag": "baseline-refresh:",
           "refreshTimeoutMs": 60000,
-          "ignoreGlobs": []
+          "ignoreGlobs": [],
+          "incrementalCoverage": {
+            "skipWhenUnchanged": true,
+            "baselineJoin": false
+          }
         },
         "maintainability": {
           "enabled": true,
@@ -363,9 +372,6 @@
       },
       "staging": {
         "baseUrl": "https://staging.example.test",
-        "signInSeam": {
-          "skill": "stack/qa/sign-in"
-        },
         "allowWrites": false
       }
     },
@@ -374,7 +380,7 @@
         "credentialRef": "QA_ADMIN_CREDENTIAL"
       },
       "member": {
-        "signInSkill": "stack/qa/sign-in-member"
+        "credentialRef": "QA_MEMBER_CREDENTIAL"
       }
     },
     "gherkinLint": {

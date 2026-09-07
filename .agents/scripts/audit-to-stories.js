@@ -35,6 +35,7 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { buildStoryBody } from './lib/audit-to-stories/build-story-body.js';
 import { classifyGroupsAgainstGitHub } from './lib/audit-to-stories/dedupe-against-github.js';
+import { formatEpicGrouping } from './lib/audit-to-stories/epic-grouping-directive.js';
 import { withFingerprints } from './lib/audit-to-stories/finding-adapter.js';
 import { groupFindings } from './lib/audit-to-stories/group-findings.js';
 import {
@@ -43,7 +44,14 @@ import {
   reconcileLedger,
   writeLedger,
 } from './lib/audit-to-stories/ledger.js';
-import { parseAuditReports } from './lib/audit-to-stories/parse-audit-md.js';
+import {
+  resolveLedgerSummary,
+  runLedgerCommit,
+} from './lib/audit-to-stories/ledger-commit.js';
+import {
+  parseAuditReports,
+  parseSeverityTally,
+} from './lib/audit-to-stories/parse-audit-md.js';
 import { buildPlanSeedMarkdown } from './lib/audit-to-stories/seed-from-findings.js';
 import { wireAuditStoryEdges } from './lib/audit-to-stories/wire-dependencies.js';
 import { runAsCli } from './lib/cli-utils.js';
@@ -118,6 +126,180 @@ function tallyBySeverity(findings) {
 }
 
 /**
+ * The four levels a report's `Severity tally:` line declares. `Info` is
+ * deliberately absent — the severity scale already excludes it from scheduled
+ * work — and `unknown` is not a level a lens can declare, so neither is
+ * comparable against the line.
+ */
+const TALLY_LEVELS = Object.freeze(['critical', 'high', 'medium', 'low']);
+
+/**
+ * Project a findings list onto the four comparable levels, so a report's
+ * declared tally and the parsed one are compared over the same axes.
+ *
+ * @param {Array<{ severity?: string }>} findings
+ * @returns {{ critical: number, high: number, medium: number, low: number }}
+ */
+function comparableTally(findings) {
+  const full = tallyBySeverity(findings);
+  return Object.fromEntries(TALLY_LEVELS.map((level) => [level, full[level]]));
+}
+
+function sameTally(a, b) {
+  return TALLY_LEVELS.every((level) => a[level] === b[level]);
+}
+
+function formatTally(tally) {
+  if (!tally) return '(no Severity tally line)';
+  return `Critical ${tally.critical} / High ${tally.high} / Medium ${tally.medium} / Low ${tally.low}`;
+}
+
+/**
+ * Run the cross-check, route its messages to stderr, and enforce the
+ * fail-closed arm — the whole report-verification step as one call, so
+ * `buildPlan` reads as a pipeline rather than absorbing the branching.
+ *
+ * `--auto` files unattended, so a report it cannot trust must stop the run
+ * BEFORE the ledger reconcile and before any Story payload is built: no GitHub
+ * write, no ledger write, non-zero exit. `--scan` reports and carries on — the
+ * failures ride the plan envelope for the operator to act on.
+ *
+ * @param {object} params
+ * @param {Array<{ sourceReport: string, markdown: string }>} params.reports
+ * @param {Array<object>} params.findings — every parsed finding, unfiltered.
+ * @param {boolean} [params.allowMissingTally]
+ * @param {boolean} [params.failOnReportFailures]
+ * @param {{ warn: Function }} params.logger
+ * @returns {Array<object>} the failures, for `summary.reportFailures[]`.
+ */
+function auditReportFailures({
+  reports,
+  findings,
+  allowMissingTally,
+  failOnReportFailures,
+  logger,
+}) {
+  const { failures, warnings } = crossCheckReports({
+    reports,
+    findings,
+    allowMissingTally,
+  });
+  for (const warning of warnings) logger.warn(warning);
+  if (failures.length === 0) return failures;
+  const message = reportFailureWarning(failures);
+  logger.warn(message);
+  if (failOnReportFailures) {
+    throw new Error(
+      `refusing to file from an unverified report set. ${message}`,
+    );
+  }
+  return failures;
+}
+
+/**
+ * Cross-check every report's declared `Severity tally:` line against the
+ * findings the parser actually extracted from it (Story #5144).
+ *
+ * A parser that silently drops findings is indistinguishable from a clean
+ * report: the empty plan looks exactly like "nothing to file". The lens
+ * contract therefore mandates one machine-readable tally line per report, and
+ * this is where the two numbers meet. Three failure kinds are named:
+ *
+ * - `missing-tally` — the report declares no tally at all (an older or
+ *   hand-written report). `allowMissingTally` downgrades ONLY this kind to a
+ *   warning, for an interactive `--scan` over legacy reports.
+ * - `tally-mismatch` — the report says one thing and the parse says another.
+ * - `unresolved-severity` — a finding parsed with no resolvable severity. It
+ *   is a report defect, never an `unknown` group.
+ *
+ * Pure: returns the messages and lets the caller own the single `Logger.warn`
+ * (stderr) sink, so `--scan` JSON on stdout stays clean.
+ *
+ * @param {object} params
+ * @param {Array<{ sourceReport: string, markdown: string }>} params.reports
+ * @param {Array<{ sourceReport: string, severity?: string, title?: string }>} params.findings
+ * @param {boolean} [params.allowMissingTally]
+ * @returns {{ failures: Array<object>, warnings: string[] }}
+ */
+function crossCheckReports({ reports, findings, allowMissingTally }) {
+  const failures = [];
+  const warnings = [];
+  const byReport = new Map(reports.map((r) => [r.sourceReport, []]));
+  for (const finding of findings) {
+    byReport.get(finding.sourceReport)?.push(finding);
+  }
+
+  for (const report of reports) {
+    const own = byReport.get(report.sourceReport) ?? [];
+    const parsed = comparableTally(own);
+    const reported = parseSeverityTally(report.markdown);
+    const sourceReport = report.sourceReport;
+    const unresolved = own.filter((f) => !f.severity);
+    if (unresolved.length > 0) {
+      failures.push({
+        sourceReport,
+        kind: 'unresolved-severity',
+        reported,
+        parsed,
+        titles: unresolved.map((f) => f.title),
+      });
+    }
+    if (!reported) {
+      const failure = {
+        sourceReport,
+        kind: 'missing-tally',
+        reported: null,
+        parsed,
+      };
+      if (allowMissingTally) warnings.push(missingTallyWarning(failure));
+      else failures.push(failure);
+      continue;
+    }
+    if (!sameTally(reported, parsed)) {
+      failures.push({ sourceReport, kind: 'tally-mismatch', reported, parsed });
+    }
+  }
+
+  return { failures, warnings };
+}
+
+/**
+ * The `--allow-missing-tally` downgrade message. It still names the report and
+ * says plainly that `--auto` ignores the flag, so an operator never reads the
+ * warning as "this report is fine".
+ *
+ * @param {{ sourceReport: string, parsed: object }} failure
+ * @returns {string}
+ */
+function missingTallyWarning(failure) {
+  return `audit report cross-check: ${failure.sourceReport} declares no "Severity tally:" line — downgraded to a warning by --allow-missing-tally (parsed ${formatTally(failure.parsed)}). --auto ignores that flag and refuses the report.`;
+}
+
+/**
+ * Render the report-failure block: one line per failure naming the report path
+ * and BOTH tallies, so the operator can see which side is wrong without
+ * re-reading the report.
+ *
+ * Pure: returns the message string so the caller owns the single `Logger.warn`.
+ *
+ * @param {Array<{ sourceReport: string, kind: string, reported: object|null, parsed: object, titles?: string[] }>} failures
+ * @returns {string}
+ */
+function reportFailureWarning(failures) {
+  const lines = failures.map((f) => {
+    const titles = f.titles?.length
+      ? ` findings=${f.titles.map((t) => `"${t}"`).join(', ')}`
+      : '';
+    return `  - ${f.sourceReport} [${f.kind}] reported=${formatTally(f.reported)} parsed=${formatTally(f.parsed)}${titles}`;
+  });
+  return [
+    `audit report cross-check FAILED for ${failures.length} report(s) — the declared severity tally does not match the parsed findings:`,
+    ...lines,
+    'Every report must carry "Severity tally: Critical <n> / High <n> / Medium <n> / Low <n>" in its Executive Summary, matching its own findings. Fix the report (or re-run the lens) before filing.',
+  ].join('\n');
+}
+
+/**
  * Test-only seam: when `AUDIT_TO_STORIES_PROVIDER_FIXTURE` names a module, load
  * its default export as the dedup provider (ports) instead of the live GitHub
  * provider. This lets the soft-fail contract be exercised end-to-end through
@@ -133,60 +315,198 @@ async function loadFixtureProvider() {
   return mod.default ?? null;
 }
 
-async function loadProvider({ createProviderImpl, resolveConfigImpl } = {}) {
-  // The provider is optional — when missing, the dedupe step emits a
-  // create-only classification and the workflow operator is informed. The
-  // `createProviderImpl` / `resolveConfigImpl` seams let a contract test drive
-  // this exact adapter (fingerprint + semantic-candidate ports) with an
-  // in-memory issue store instead of the live GitHub provider.
-  const fixture = await loadFixtureProvider();
-  if (fixture) return fixture;
+/**
+ * Why the live provider could not be adapted, as a typed refusal.
+ *
+ * `loadProvider` used to collapse every one of these onto a bare `null`, which
+ * was survivable for the dedup path (it degrades to a create-only plan and
+ * warns) but not for `--wire-edges`, which cannot degrade and could therefore
+ * only blame "configuration" for what was just as likely an auth failure.
+ * Throwing a reason keeps the soft-fail (`loadProviderOrNull`) and lets the
+ * write path name the missing precondition (Story #5143).
+ */
+class ProviderUnavailableError extends Error {
+  /**
+   * @param {'no-config'|'provider-construction-failed'|'no-search-port'} reason
+   * @param {string} detail
+   */
+  constructor(reason, detail) {
+    super(detail);
+    this.name = 'ProviderUnavailableError';
+    this.reason = reason;
+  }
+}
+
+/**
+ * Flatten one raw `searchIssues` hit onto the `{ number, state, title, body }`
+ * shape the dedupe module reads, collapsing every closed-ish state spelling
+ * (`CLOSED`, `state_reason: not_planned`, …) onto `'closed'`.
+ *
+ * @param {object} hit
+ * @returns {{ number: number, state: 'open'|'closed', title: string, body: string }}
+ */
+function normaliseIssueHit(hit) {
+  return {
+    number: hit.number,
+    state: (hit.state ?? hit.state_reason ?? 'open')
+      .toString()
+      .toLowerCase()
+      .includes('closed')
+      ? 'closed'
+      : 'open',
+    title: hit.title ?? '',
+    body: hit.body ?? '',
+  };
+}
+
+/**
+ * The two read ports the dedupe module consumes, adapted off the provider's
+ * one full-text `searchIssues` call: `findIssuesByFingerprint(sha)` for the
+ * exact-fingerprint pass and — since Story #4626 — `searchCandidates(finding)`
+ * for the meaning-first Stage-1 pass. Adapted here so no provider-shape
+ * knowledge is baked into the dedupe module.
+ *
+ * @param {object} provider
+ * @param {{ owner: string, repo: string }} coords
+ * @returns {{ findIssuesByFingerprint: Function, searchCandidates: Function }}
+ */
+function buildDedupPorts(provider, { owner, repo }) {
+  return {
+    async findIssuesByFingerprint(sha) {
+      const hits = await provider.searchIssues({ query: sha, owner, repo });
+      return (hits ?? []).map(normaliseIssueHit);
+    },
+    async searchCandidates(finding) {
+      // Wire the shared semantic search onto the provider's full-text
+      // issue search (open + closed) so route-finding's Stage-1 pass runs.
+      const search = async (query) => {
+        if (!query || query.trim().length === 0) return [];
+        const hits = await provider.searchIssues({ query, owner, repo });
+        return (hits ?? []).map(normaliseIssueHit);
+      };
+      return searchSemanticCandidates(finding, { search });
+    },
+  };
+}
+
+/**
+ * The provider's write ports, carried through the adapter **bound** to their
+ * provider so `this` survives the hand-off — `GitHubProvider` delegates each
+ * of these to a composed gateway off `this`, so an unbound reference throws on
+ * first call. Narrowing the adapter to the dedup read ports is what made
+ * `--wire-edges` fail closed against a correctly configured repo (Story #5143).
+ *
+ * A port the provider does not implement is omitted rather than stubbed: the
+ * wire step already degrades per port (footer-only when the native dependency
+ * ports are absent), and a stub would defeat that check.
+ *
+ * @param {object} provider
+ * @returns {Record<string, Function>}
+ */
+function bindWritePorts(provider) {
+  const ports = {};
+  for (const name of PROVIDER_WRITE_PORTS) {
+    if (typeof provider[name] === 'function') {
+      ports[name] = provider[name].bind(provider);
+    }
+  }
+  return ports;
+}
+
+/** The provider ports `--wire-edges` needs on the far side of the adapter. */
+const PROVIDER_WRITE_PORTS = [
+  'updateTicket',
+  'getTicket',
+  'getDependencyWriteContext',
+];
+
+/**
+ * Resolve the config and construct the live provider, converting each way that
+ * can fail into a typed refusal.
+ *
+ * @param {{ createProviderImpl?: Function, resolveConfigImpl?: Function }} seams
+ * @returns {Promise<{ config: object, provider: object }>}
+ * @throws {ProviderUnavailableError}
+ */
+async function constructProvider({ createProviderImpl, resolveConfigImpl }) {
+  let config;
   try {
     const resolveConfig =
       resolveConfigImpl ??
       (await import('./lib/config-resolver.js')).resolveConfig;
+    config = resolveConfig();
+  } catch (err) {
+    throw new ProviderUnavailableError(
+      'no-config',
+      `resolving the project config failed: ${err.message}`,
+    );
+  }
+  if (!config?.github?.owner || !config?.github?.repo) {
+    throw new ProviderUnavailableError(
+      'no-config',
+      'github.owner and github.repo must both be set in .agentrc.json',
+    );
+  }
+  try {
     const createProvider =
       createProviderImpl ??
       (await import('./lib/provider-factory.js')).createProvider;
-    const config = resolveConfig();
-    const provider = createProvider(config ?? {});
-    // The existing provider exposes higher-level ticket I/O. The dedupe
-    // module needs `findIssuesByFingerprint(sha)` for the exact-fingerprint
-    // pass and — since Story #4626 — a `searchCandidates(finding)` port for
-    // the meaning-first Stage-1 pass. Adapt both here so we don't bake
-    // provider-shape knowledge into the dedupe module.
-    if (typeof provider.searchIssues === 'function') {
-      const owner = config?.github?.owner;
-      const repo = config?.github?.repo;
-      const normalise = (h) => ({
-        number: h.number,
-        state: (h.state ?? h.state_reason ?? 'open')
-          .toString()
-          .toLowerCase()
-          .includes('closed')
-          ? 'closed'
-          : 'open',
-        title: h.title ?? '',
-        body: h.body ?? '',
-      });
-      return {
-        async findIssuesByFingerprint(sha) {
-          const hits = await provider.searchIssues({ query: sha, owner, repo });
-          return (hits ?? []).map(normalise);
-        },
-        async searchCandidates(finding) {
-          // Wire the shared semantic search onto the provider's full-text
-          // issue search (open + closed) so route-finding's Stage-1 pass runs.
-          const search = async (query) => {
-            if (!query || query.trim().length === 0) return [];
-            const hits = await provider.searchIssues({ query, owner, repo });
-            return (hits ?? []).map(normalise);
-          };
-          return searchSemanticCandidates(finding, { search });
-        },
-      };
-    }
-    return null;
+    return { config, provider: createProvider(config) };
+  } catch (err) {
+    throw new ProviderUnavailableError(
+      'provider-construction-failed',
+      `constructing the configured provider failed: ${err.message}`,
+    );
+  }
+}
+
+/**
+ * Adapt the configured provider for this CLI: the dedup read ports plus the
+ * provider's own write ports, bound.
+ *
+ * The `createProviderImpl` / `resolveConfigImpl` seams let a contract test
+ * drive this exact adapter with an in-memory issue store instead of the live
+ * GitHub provider. The `AUDIT_TO_STORIES_PROVIDER_FIXTURE` fixture is returned
+ * verbatim — it stands in for the whole adapter, not for the provider behind
+ * it.
+ *
+ * @param {{ createProviderImpl?: Function, resolveConfigImpl?: Function }} [seams]
+ * @returns {Promise<object>} the adapter (never null).
+ * @throws {ProviderUnavailableError} when no live provider could be adapted.
+ */
+async function loadProvider({ createProviderImpl, resolveConfigImpl } = {}) {
+  const fixture = await loadFixtureProvider();
+  if (fixture) return fixture;
+  const { config, provider } = await constructProvider({
+    createProviderImpl,
+    resolveConfigImpl,
+  });
+  if (typeof provider.searchIssues !== 'function') {
+    throw new ProviderUnavailableError(
+      'no-search-port',
+      'the configured provider exposes no searchIssues port',
+    );
+  }
+  return {
+    ...buildDedupPorts(provider, {
+      owner: config.github.owner,
+      repo: config.github.repo,
+    }),
+    ...bindWritePorts(provider),
+  };
+}
+
+/**
+ * The dedup path's soft-fail view of `loadProvider`: the provider is optional
+ * there — when it cannot be adapted the dedupe step emits a create-only
+ * classification and warns the operator loudly rather than aborting the scan.
+ *
+ * @param {{ createProviderImpl?: Function, resolveConfigImpl?: Function }} [seams]
+ * @returns {Promise<object|null>}
+ */
+async function loadProviderOrNull(seams = {}) {
+  try {
+    return await loadProvider(seams);
   } catch (_) {
     return null;
   }
@@ -197,7 +517,8 @@ async function loadProvider({ createProviderImpl, resolveConfigImpl } = {}) {
  * does NOT run against real GitHub issues. Two distinct reasons:
  *
  *   - `'no-provider-port'` — the configured provider resolved but exposes no
- *     `searchIssues` port (or `loadProvider()` threw). This is the
+ *     `searchIssues` port (or `loadProviderOrNull()` swallowed a typed
+ *     refusal — bad config, failed construction). This is the
  *     silent-no-op the workflow's "Never open a duplicate Issue" contract
  *     was failing on: every group classifies `create` and the operator gets
  *     zero automated dedup signal. Surfacing it loudly is the whole point.
@@ -267,7 +588,7 @@ function dedupDegradedWarning(entries) {
  * @param {{
  *   collectReportPathsImpl?: typeof collectReportPaths,
  *   readReportsImpl?: typeof readReports,
- *   loadProviderImpl?: typeof loadProvider,
+ *   loadProviderImpl?: typeof loadProviderOrNull,
  *   classifyGroupsImpl?: typeof classifyGroupsAgainstGitHub,
  *   reconcileScanLedgerImpl?: typeof reconcileScanLedger,
  *   logger?: { warn: Function },
@@ -275,13 +596,20 @@ function dedupDegradedWarning(entries) {
  * @returns {Promise<object>} the plan envelope.
  */
 async function buildPlan(
-  { glob: pattern, severity, useProvider, ledger },
+  {
+    glob: pattern,
+    severity,
+    useProvider,
+    ledger,
+    allowMissingTally,
+    failOnReportFailures,
+  },
   deps = {},
 ) {
   const {
     collectReportPathsImpl = collectReportPaths,
     readReportsImpl = readReports,
-    loadProviderImpl = loadProvider,
+    loadProviderImpl = loadProviderOrNull,
     classifyGroupsImpl = classifyGroupsAgainstGitHub,
     reconcileScanLedgerImpl = reconcileScanLedger,
     logger = Logger,
@@ -302,14 +630,25 @@ async function buildPlan(
         create: 0,
         skipOpen: 0,
         skipReoccurring: 0,
+        reportFailures: [],
       },
     };
   }
 
   const reports = readReportsImpl(reportPaths);
   const allFindings = parseAuditReports(reports, { repoRoot: process.cwd() });
+  const reportFailures = auditReportFailures({
+    reports,
+    findings: allFindings,
+    allowMissingTally,
+    failOnReportFailures,
+    logger,
+  });
   const filtered = allFindings.filter((f) => meetsSeverity(f, severity));
-  const stamped = withFingerprints(filtered);
+  // A finding whose severity did not resolve is a report defect, not a Story.
+  // It stays visible in `summary.tally.unknown` and in `reportFailures`, but
+  // it never reaches grouping — an `unknown` group is not a thing to file.
+  const stamped = withFingerprints(filtered.filter((f) => Boolean(f.severity)));
   const { groups, edges } = groupFindings(stamped);
 
   let classifications = groups.map((g) => ({
@@ -392,6 +731,7 @@ async function buildPlan(
       totalFindings: allFindings.length,
       filtered: filtered.length,
       tally: tallyBySeverity(filtered),
+      reportFailures,
       dedupApplied,
       ...(ledgerSummary ? { ledger: ledgerSummary } : {}),
       ...summary,
@@ -492,15 +832,35 @@ async function resolveSeverityFloor(explicit) {
  * @param {boolean} [params.dryRun]
  * @param {boolean} [params.useProvider]
  * @param {string} [params.ledgerPath]
+ * @param {boolean} [params.ledgerCommit] — the operator asked for a ledger PR,
+ *   so an unpersistable checkout is not a warning: it is about to be fixed.
+ * @param {(cwd: string, ...args: string[]) => string} [params.git] — probe seam.
+ * @param {string} [params.cwd]
+ * @param {{ warn: Function }} [params.logger]
  * @returns {Promise<{ summary: object, stories: Array<object> }>}
  */
-async function runAuto({ glob, severity, dryRun, useProvider, ledgerPath }) {
+async function runAuto({
+  glob,
+  severity,
+  dryRun,
+  useProvider,
+  ledgerPath,
+  ledgerCommit,
+  git,
+  cwd,
+  logger = Logger,
+}) {
   const floor = await resolveSeverityFloor(severity);
+  const resolvedLedgerPath = ledgerPath ?? DEFAULT_LEDGER_PATH;
   const plan = await buildPlan({
     glob,
     severity: floor,
     useProvider,
-    ledger: { path: ledgerPath ?? DEFAULT_LEDGER_PATH, write: !dryRun },
+    ledger: { path: resolvedLedgerPath, write: !dryRun },
+    // `--auto` never accepts `--allow-missing-tally`: an unattended sweep has
+    // no operator to read a warning, so every report failure is fatal here.
+    allowMissingTally: false,
+    failOnReportFailures: true,
   });
 
   const byAction = {
@@ -538,7 +898,19 @@ async function runAuto({ glob, severity, dryRun, useProvider, ledgerPath }) {
       .flatMap((c) => c.matchedIssues ?? [])
       .map((i) => i.number)
       .filter((n) => typeof n === 'number'),
-    ledger: plan.summary?.ledger ?? null,
+    // The sweep may have just written memory this checkout cannot keep — an
+    // ephemeral scheduled clone is exactly where that bites (Story #5145).
+    // The whole decision lives in `resolveLedgerSummary` so this assembly
+    // stays branch-free.
+    ledger: await resolveLedgerSummary({
+      ledger: plan.summary?.ledger ?? null,
+      ledgerPath: resolvedLedgerPath,
+      dryRun,
+      ledgerCommit,
+      cwd,
+      git,
+      logger,
+    }),
   };
 
   return { summary, stories };
@@ -585,6 +957,42 @@ function buildAndGateStories(eligible, edges) {
 }
 
 /**
+ * Which precondition is missing, keyed by the reason `loadProvider` refused.
+ *
+ * `--wire-edges` cannot degrade — the `blocked by #N` footers are the only
+ * thing `/mandrel-deliver`'s resolver reads — so the one thing its failure owes the
+ * operator is which of the preconditions is actually unmet. The message it
+ * replaced ("Configure github.owner/repo (and auth), or wire the edges by
+ * hand") blamed configuration for an auth failure and pointed at a manual
+ * fallback for what is a wiring bug (Story #5143).
+ */
+const WIRE_EDGES_PRECONDITIONS = {
+  'no-config': 'github.owner and github.repo are not both set in .agentrc.json',
+  'provider-construction-failed':
+    'the configured provider could not be constructed — check GH_TOKEN / gh auth',
+  'no-search-port': 'the configured provider exposes no issue ports',
+  'fixture-no-write-port':
+    'AUDIT_TO_STORIES_PROVIDER_FIXTURE names a fixture provider with no updateTicket port',
+};
+
+/**
+ * @param {string} reason  A `ProviderUnavailableError.reason`, `'fixture-no-write-port'`,
+ *   or `'unknown'` for a refusal that carried no reason at all.
+ * @param {string} [detail]
+ * @returns {Error}
+ */
+function wireEdgesPreconditionError(reason, detail) {
+  const named =
+    WIRE_EDGES_PRECONDITIONS[reason] ??
+    `the provider could not be loaded (${reason})`;
+  return new Error(
+    '--wire-edges needs a provider exposing updateTicket to rewrite the ' +
+      `Story bodies with their \`blocked by #N\` footers, but ${named}.` +
+      (detail ? ` [${detail}]` : ''),
+  );
+}
+
+/**
  * The `--wire-edges` pass: hand the opened issue numbers back so the cohort's
  * detected group edges become declared ordering (Story #5044).
  *
@@ -608,13 +1016,14 @@ async function wireEdges({ plan, issueByGroupKey }, deps = {}) {
   const groups = (plan.classifications ?? [])
     .filter((c) => c.action === 'create')
     .map((c) => c.group);
-  const provider = await loadProviderImpl();
+  let provider;
+  try {
+    provider = await loadProviderImpl();
+  } catch (err) {
+    throw wireEdgesPreconditionError(err.reason ?? 'unknown', err.message);
+  }
   if (typeof provider?.updateTicket !== 'function') {
-    throw new Error(
-      '--wire-edges needs a provider exposing updateTicket to rewrite the ' +
-        'Story bodies with their `blocked by #N` footers. Configure ' +
-        'github.owner/repo (and auth), or wire the edges by hand.',
-    );
+    throw wireEdgesPreconditionError('fixture-no-write-port');
   }
   return wireImpl({
     groups,
@@ -672,7 +1081,10 @@ export const __testing = {
   meetsSeverity,
   collectReportPaths,
   buildPlan,
+  crossCheckReports,
+  reportFailureWarning,
   loadProvider,
+  loadProviderOrNull,
   dedupSkippedWarning,
   dedupDegradedWarning,
   buildAndGateStories,
@@ -718,6 +1130,7 @@ export async function runAuditToStories(
     wireEdgesImpl = wireEdges,
     parseIssueMapImpl = parseIssueMap,
     persistImpl = persist,
+    runLedgerCommitImpl = runLedgerCommit,
     stdout = process.stdout,
   } = deps;
   const { values } = parseArgs({
@@ -733,9 +1146,11 @@ export async function runAuditToStories(
       glob: { type: 'string' },
       severity: { type: 'string' },
       ledger: { type: 'string' },
+      'ledger-commit': { type: 'boolean' },
       plan: { type: 'string' },
       out: { type: 'string' },
       'no-provider': { type: 'boolean' },
+      'allow-missing-tally': { type: 'boolean' },
       json: { type: 'boolean' },
     },
     strict: false,
@@ -751,14 +1166,24 @@ export async function runAuditToStories(
         dryRun: values['dry-run'],
         useProvider: !values['no-provider'],
         ledgerPath: values.ledger,
+        ledgerCommit: values['ledger-commit'],
       })
     ).summary;
+
+  // Deliberately AFTER the summary is persisted (see the subcommand table's
+  // `after` slot): a broken remote must not cost the operator the sweep's
+  // findings, so the PR attempt is the last thing the run does (Story #5145).
+  const commitLedger = async () => {
+    if (!values['ledger-commit'] || values['dry-run']) return;
+    await runLedgerCommitImpl({ ledgerPath: values.ledger });
+  };
 
   const scanPlan = () =>
     buildPlanImpl({
       glob: values.glob,
       severity: values.severity,
       useProvider: !values['no-provider'],
+      allowMissingTally: values['allow-missing-tally'],
     });
 
   const seedMarkdown = () => {
@@ -789,9 +1214,10 @@ export async function runAuditToStories(
   // renders its sub-command's output; persisting it — and the stdout newline a
   // piped run needs — happens once, below. The chain restated that tail in
   // every arm, so each new sub-command paid for it twice: once in the branch
-  // and once in the complexity budget.
+  // and once in the complexity budget. The optional fourth slot is an
+  // after-persist tail for work that must not pre-empt the report.
   const subcommands = [
-    ['auto', async () => json(await runAutoSummary()), true],
+    ['auto', async () => json(await runAutoSummary()), true, commitLedger],
     ['scan', async () => json(await scanPlan()), true],
     ['emit-plan-seed', () => seedMarkdown(), false],
     ['emit-stories', () => emittedStories(), true],
@@ -804,9 +1230,10 @@ export async function runAuditToStories(
       'Usage: node audit-to-stories.js (--scan | --emit-plan-seed | --emit-stories | --wire-edges) [options]',
     );
   }
-  const [, render, newlineOnStdout] = entry;
+  const [, render, newlineOnStdout, after] = entry;
   persistImpl(await render(), values.out);
   if (newlineOnStdout && !values.out) stdout.write('\n');
+  if (after) await after();
 }
 
 /**
@@ -816,11 +1243,17 @@ export async function runAuditToStories(
  * numbers yet — so this is where a human driving the create pass by hand sees
  * the ordering they will replay through `--wire-edges` (Story #5044).
  *
+ * The trailing `--- grouping ---` block carries the container-Epic default
+ * (Story #5139), so the standalone path states it where it is actually read.
+ * The `--json` form stays a bare array on purpose: it is a documented output
+ * shape with a test asserting it, and the Epic is an operator decision the
+ * workflow's Phase 4 stop owns, not a field a machine consumer acts on.
+ *
  * @param {Array<{ title: string, labels: string[], body: string, groupKey?: string, dependsOn?: string[] }>} built
  * @returns {string}
  */
 function renderStoryDrafts(built) {
-  return built
+  const drafts = built
     .map((s, i) => {
       const deps = (s.dependsOn ?? []).length
         ? `\nDepends on group(s): ${s.dependsOn.join(', ')}`
@@ -828,6 +1261,9 @@ function renderStoryDrafts(built) {
       return `--- story ${i + 1} ---\nTitle: ${s.title}\nLabels: ${s.labels.join(', ')}\nGroup key: ${s.groupKey}${deps}\n\n${s.body}\n`;
     })
     .join('\n');
+
+  const grouping = formatEpicGrouping(built);
+  return `${drafts}\n--- grouping ---\n${grouping}\n`;
 }
 
 async function main() {
@@ -858,11 +1294,19 @@ runAsCli(import.meta.url, main, {
       ['--severity <level>', 'Lowest severity to include (high|medium|low).'],
       ['--ledger <path>', 'Path to the dedup ledger.'],
       [
+        '--ledger-commit',
+        'After the --auto summary prints, commit a changed ledger onto chore/audit-ledger-<date>, push it, and open a PR against the base branch (never auto-merged). Ignored under --dry-run.',
+      ],
+      [
         '--plan <path>',
         'Read a previously emitted plan instead of re-scanning.',
       ],
       ['--out <path>', 'Write output to a file instead of stdout.'],
       ['--no-provider', 'Skip live GitHub dedup lookups (offline).'],
+      [
+        '--allow-missing-tally',
+        'Downgrade a missing "Severity tally:" line to a warning (--scan only; --auto ignores it).',
+      ],
       ['--json', 'Force JSON output.'],
       ['--dry-run', 'Report what would be filed; create nothing.'],
     ],

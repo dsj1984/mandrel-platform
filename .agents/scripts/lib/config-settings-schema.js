@@ -456,7 +456,7 @@ const GITHUB_SCHEMA = {
 const PLANNING_SCHEMA = {
   type: 'object',
   description:
-    'Inputs to `/mandrel-plan`: risk escalation heuristics, ceremony-lite routing, and the cross-Story conflict-finding severity gates.',
+    'Inputs to `/mandrel-plan`: risk escalation heuristics, ceremony-lite routing, the memory-hygiene advisory thresholds, and the cross-Story conflict-finding severity gates.',
   properties: {
     riskHeuristics: {
       ...LIST_OR_EXTENDER_OF_STRINGS,
@@ -498,6 +498,34 @@ const PLANNING_SCHEMA = {
       },
       additionalProperties: false,
     },
+    // Story #5182 — the `/mandrel-plan` Phase 0 memory-hygiene advisory's two
+    // arms. The count arm this replaced was an absolute ceiling, which no
+    // consolidation pass could ever bring a pool back under; `growthDelta`
+    // measures entries written since the last pass instead, which a pass
+    // does reset. Both are advisory thresholds — nothing here gates a plan.
+    memoryPool: {
+      type: 'object',
+      description:
+        'Thresholds for the memory-hygiene advisory `/mandrel-plan` surfaces at Gate #1. Advisory only: it recommends `/memory-consolidate` and never gates, reroutes, or mutates the memory pool.',
+      properties: {
+        staleAfterDays: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            "Recommend a consolidation pass once the pool's stamp is older than this many days. Default 30.",
+          default: 30,
+        },
+        growthDelta: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Recommend a consolidation pass once this many entries have been written since the last one. Measured against the entry count the last pass stamped, so a stamp predating that field leaves growth unmeasured and only the age threshold applies. Default 25.',
+          default: 25,
+        },
+      },
+      additionalProperties: false,
+    },
+
     // Cross-Story conflict-finding severity gates. Off by default so
     // existing repos keep advisory-only behaviour; flipping either to
     // `true` upgrades the matching finding class to `'hard'`, which routes
@@ -622,6 +650,17 @@ const PLANNING_SCHEMA = {
 // qa.* — Agent-driven QA harness contract (Epic #3214)
 // ---------------------------------------------------------------------------
 
+// The per-environment sign-in seam. `{ urlTemplate }` is a dev
+// impersonation route; `{ skill }` names a skill by its tier-relative id
+// (e.g. `stack/qa/acme-sso`), resolved against the payload skills root and
+// then the consumer-writable `.agents/local/skills/` zone (Story #5135).
+//
+// No default anywhere in this file may name a skill id: the framework ships
+// no sign-in skill, so any id baked into an inventory value would be a
+// dangling pointer a consumer copies verbatim — the exact defect #5134
+// reported. The `{ skill }` arm is taught in prose (`.agents/README.md`
+// § "Expose a `signInSeam`"), and `resolveQaEnvironment` fails loudly on an
+// id that resolves under neither root.
 const QA_SIGN_IN_SEAM_SCHEMA = {
   oneOf: [
     {
@@ -654,9 +693,13 @@ const QA_PERSONAS_SCHEMA = {
   description:
     'Personas the QA-harness sign-in seam accepts. Two accepted shapes: (1) a plain array of persona names — the honest shape for a `urlTemplate` dev-impersonation seam, where the persona name is the sole input the workflow consumes; (2) the object-map form keyed by persona name, where each entry carries per-persona auth material (`credentialRef` or `signInSkill`) consulted only under a skill-based or credential-based seam.',
   // Inventory value: an illustrative map showing both per-persona shapes.
+  // Inventory value: illustrative credential references, not resolvable
+  // ones. It deliberately does NOT illustrate the `signInSkill` arm — a
+  // skill id in a shipped default is a dangling pointer (see
+  // QA_SIGN_IN_SEAM_SCHEMA above); that arm is taught in prose instead.
   default: {
     admin: { credentialRef: 'QA_ADMIN_CREDENTIAL' },
-    member: { signInSkill: 'stack/qa/sign-in-member' },
+    member: { credentialRef: 'QA_MEMBER_CREDENTIAL' },
   },
   oneOf: [
     {
@@ -703,11 +746,11 @@ const QA_PERSONAS_SCHEMA = {
 const QA_ENVIRONMENTS_SCHEMA = {
   type: 'object',
   description:
-    'Deployment targets the QA harness can run against (Epic #4326). A map keyed by environment name (e.g. `local`, `staging`), each carrying its own `baseUrl`, its own per-environment sign-in seam (the same url-template/skill union as the top-level seam), and an optional `allowWrites` gate. resolveQaEnvironment selects one environment per invocation by name or by raw-URL origin match against `baseUrl`; `allowWrites` defaults to true only for the `local` environment. Replaces the retired top-level single `signInSeam`.',
+    'Deployment targets the QA harness can run against (Epic #4326). A map keyed by environment name (e.g. `local`, `staging`), each carrying its own `baseUrl`, an optional per-environment sign-in seam, and an optional `allowWrites` gate. `signInSeam` is the union `{ urlTemplate }` (a dev impersonation route) or `{ skill }` (a skill id such as `stack/qa/acme-sso`, resolved against `.agents/skills/` then the consumer-writable `.agents/local/skills/` zone, and rejected loudly by resolveQaEnvironment when it resolves under neither); omit it entirely for a target with no sign-in seam. resolveQaEnvironment selects one environment per invocation by name or by raw-URL origin match against `baseUrl`; `allowWrites` defaults to true only for the `local` environment. Replaces the retired top-level single `signInSeam`.',
   // Inventory value: an illustrative two-environment map, not a resolvable
-  // default. The QA harness is opt-in and every value here is
-  // project-specific; the entry exists so `mandrel explain` can show the
-  // expected shape.
+  // default. `staging` deliberately carries NO `signInSeam` — that is the
+  // honest shape for a deployed target with no dev sign-in seam, and it
+  // shows the field is optional (Story #5135).
   default: {
     local: {
       baseUrl: 'http://localhost:3000',
@@ -715,7 +758,6 @@ const QA_ENVIRONMENTS_SCHEMA = {
     },
     staging: {
       baseUrl: 'https://staging.example.test',
-      signInSeam: { skill: 'stack/qa/sign-in' },
       allowWrites: false,
     },
   },
@@ -727,7 +769,11 @@ const QA_ENVIRONMENTS_SCHEMA = {
       signInSeam: QA_SIGN_IN_SEAM_SCHEMA,
       allowWrites: { type: 'boolean' },
     },
-    required: ['baseUrl', 'signInSeam'],
+    // `signInSeam` is OPTIONAL (Story #5135). An environment that resolves no
+    // seam is a state the QA workflows already branch on — they drive the
+    // unauthenticated surface and record the gap — so requiring it made an
+    // honestly seamless remote target undeclarable.
+    required: ['baseUrl'],
     additionalProperties: false,
   },
 };
