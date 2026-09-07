@@ -667,7 +667,7 @@ jobs:
         # pinned to the intra-PR commit that introduced the composite — the
         # first SHA whose tree contains it. Bump to the next release SHA in
         # the post-release pin-bump follow-up.
-        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@9d09c4ddb441510d3626c55f6c28808f303cb65a
+        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@083578ce67fe10db82d64b772bf2672048b34402
         with:
           mode: dir
 
