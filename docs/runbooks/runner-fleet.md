@@ -126,7 +126,54 @@ rm ~/Library/LaunchAgents/<label>.plist
 ```
 
 Only do this for labels whose runner folder no longer exists; a live runner's
-plist is exactly what `svc.sh start` reloads. Removing the plist does **not**
-deregister the runner on GitHub — a runner whose folder you deleted without
-running `config.sh remove` still shows as offline in the repo or org runner
-list and has to be removed there by hand.
+plist is exactly what `svc.sh start` reloads.
+
+## Reconciling against GitHub — offline is **not** orphaned
+
+Removing a plist does not deregister anything on GitHub, so it is reasonable
+to expect leftover registrations after a fleet is deleted. **Do not clean them
+up by deleting whatever shows `offline`.** A runner you stopped on purpose
+(with `runner-toggle`, or `svc.sh stop`) reports `offline` and is
+indistinguishable, in the runner list alone, from one whose folder is gone.
+Deleting it forces a full `config.sh` re-registration to get it back.
+
+The only safe signal is whether a **local folder still claims that runner
+name**. Each folder's `.service` file names its launchd label, whose last
+dot-separated field is the registered runner name, so the two sides can be
+matched exactly:
+
+```bash
+# registered: "<scope>\t<name>"
+{ gh api orgs/<ORG>/actions/runners --paginate --jq '.runners[] | "org\t\(.name)"'
+  gh api repos/<OWNER>/<REPO>/actions/runners --paginate --jq '.runners[] | "repo\t\(.name)"'
+} | sort > /tmp/registered.tsv
+
+# local: runner name derived from each folder's .service label
+for d in ~/Development/github-runners/*/*/; do
+  d="${d%/}"; [ -f "$d/.service" ] || continue
+  lbl="$(basename "$(cat "$d/.service")" .plist)"   # actions.runner.<scope>.<name>
+  echo "${lbl##*.}"
+done | sort > /tmp/local.txt
+
+# a registered name absent from local.txt is a genuine orphan registration.
+# The re-sort matters: registered.tsv is sorted by whole line (scope first),
+# so cutting field 2 does NOT leave it sorted, and comm needs sorted input.
+cut -f2 /tmp/registered.tsv | sort | comm -23 - /tmp/local.txt
+```
+
+Only a name that comes out of that last command is safe to remove, via the
+runner list in the org or repo settings, or:
+
+```bash
+gh api -X DELETE repos/<OWNER>/<REPO>/actions/runners/<ID>
+gh api -X DELETE orgs/<ORG>/actions/runners/<ID>
+```
+
+**Verified 2026-09-07**: 18 registrations (12 in the `Beestera` org, 6 in
+`dsj1984/domio`) against 18 local folders — an exact 1:1 match in both
+directions, zero orphan registrations. The `swarm-os`, `design-system` and
+`athportal` runners whose plists were swept that day had already been
+deregistered; the stale plists were the only trace they left. Every other
+repo and org on the account reports zero self-hosted runners. The three
+`offline` entries in `dsj1984/domio` at the time were deliberately stopped
+runners, not orphans.
