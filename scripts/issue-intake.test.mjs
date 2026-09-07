@@ -229,6 +229,14 @@ test("AC-4: every preset matcher is a stateless RegExp literal (no `g` flag)", (
   assert.ok(PRESET_NAMES.length >= 3);
   for (const name of PRESET_NAMES) {
     const entry = PRODUCER_PRESETS[name];
+    if (entry.extract) {
+      // A URL-signalled preset supplies a parser INSTEAD of the regex pair: a
+      // regex cannot check a host safely (see the sentry regression below).
+      assert.equal(typeof entry.extract, "function", `${name}.extract is a function`);
+      assert.equal(entry.shape, undefined, `${name} carries no regex shape`);
+      assert.equal(entry.identity, undefined, `${name} carries no regex identity`);
+      continue;
+    }
     assert.ok(entry.shape instanceof RegExp, `${name}.shape is a RegExp`);
     assert.ok(!entry.shape.global, `${name}.shape must not carry the g flag`);
     if (entry.identity) {
@@ -249,6 +257,42 @@ test("each shipped preset matches its own producer shape and rejects prose", () 
     assert.equal(matchesBodyShape(body, name), true, `${name} matches its own shape`);
     assert.equal(matchesBodyShape(NON_MATCHING_BODY, name), false, `${name} rejects prose`);
   }
+});
+
+test("the sentry matcher checks the HOST, so a lookalike URL is not a producer shape", () => {
+  const real = "Error spike: https://acme.sentry.io/issues/554120 needs attention.";
+  assert.equal(matchesBodyShape(real, "sentry"), true, "a real Sentry link still matches");
+  assert.equal(intrinsicIdentity(real, "sentry"), "554120");
+  assert.equal(matchesBodyShape("https://sentry.io/issues/9 fired.", "sentry"), true, "the bare host matches too");
+
+  // Every body below carries the literal text of a Sentry issue URL, and the
+  // unanchored host regex this preset used to ship matched all of them
+  // (CodeQL js/regex/missing-regexp-anchor, PR #438). An issue body is
+  // attacker-controlled, so each one forged the second of the two trust
+  // signals — a real defect, not a lint.
+  const forged = [
+    "https://evil.example/?u=https://acme.sentry.io/issues/1",
+    "https://evil.example/acme.sentry.io/issues/1",
+    "https://notsentry.io/issues/1",
+    "https://acme.sentry.io.evil.example/issues/1",
+    "http://acme.sentry.io/issues/1",
+  ];
+  for (const body of forged) {
+    assert.equal(matchesBodyShape(body, "sentry"), false, `forged shape accepted: ${body}`);
+    assert.equal(intrinsicIdentity(body, "sentry"), null, `forged identity extracted: ${body}`);
+  }
+});
+
+test("a forged sentry body is ignored even when the author IS a configured producer", () => {
+  // The producer login is real; only the body is forged. Signal one alone must
+  // not be enough, which is the whole point of the two-signal boundary.
+  const verdict = classifyIntake({
+    login: PRODUCER,
+    body: "https://evil.example/?u=https://acme.sentry.io/issues/1",
+    preset: "sentry",
+    logins: LOGINS,
+  });
+  assert.equal(verdict.action, IGNORED);
 });
 
 test("the mandrel-tracker matcher honours the legacy `--!>` comment terminator", () => {

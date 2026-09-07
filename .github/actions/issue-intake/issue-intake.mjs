@@ -82,13 +82,60 @@ export const LABEL_PAGE_SIZE = 100;
 export const MAX_LABEL_PAGES = 50;
 
 /**
+ * Characters that terminate a URL token in prose. This pattern names no host,
+ * so there is nothing an attacker can prefix — isolating a candidate is
+ * deliberately kept separate from deciding whether its host is trusted.
+ */
+const URL_TOKEN_DELIMITERS = /[\s<>"'`()\[\],]+/;
+
+/**
+ * The Sentry issue id a body links, or null when it links none.
+ *
+ * Each candidate is parsed with `new URL()` and its `hostname` compared
+ * exactly, which is what a regex cannot do safely:
+ * `https://evil.example/?u=https://acme.sentry.io/issues/1` carries the wrong
+ * host, and `https://notsentry.io/issues/1` is a different registrable domain
+ * that merely ends in the same letters. Both must fail, because this is one of
+ * the two trust signals (header § 1).
+ *
+ * @param {string|undefined} body
+ * @returns {string|null}
+ */
+function sentryIssueId(body) {
+  for (const token of String(body ?? "").split(URL_TOKEN_DELIMITERS)) {
+    if (!token.toLowerCase().startsWith("https://")) continue;
+    let url;
+    try {
+      url = new URL(token);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "https:") continue;
+    const host = url.hostname.toLowerCase();
+    if (host !== "sentry.io" && !host.endsWith(".sentry.io")) continue;
+    const path = /^\/issues\/([0-9]+)\/?$/.exec(url.pathname);
+    if (path) return path[1];
+  }
+  return null;
+}
+
+/**
  * Body-shape matchers, keyed by `producer-preset`.
  *
- * Every pattern here is a REGEX LITERAL (see the header). `shape` decides the
- * second trust signal; `identity` optionally captures a stable id carried IN
- * the body, which is what makes duplicate detection possible — a preset with
- * no intrinsic identity still classifies, it just cannot dedupe (see
- * `resolveFingerprint`).
+ * Every matcher here is STATIC (see the header): a regex literal, or a named
+ * function over literals. `shape` decides the second trust signal; `identity`
+ * optionally captures a stable id carried IN the body, which is what makes
+ * duplicate detection possible — a preset with no intrinsic identity still
+ * classifies, it just cannot dedupe (see `resolveFingerprint`).
+ *
+ * A preset whose signal is a URL supplies `extract` instead of the pair: a
+ * regex cannot check a host safely. An unanchored host pattern matches
+ * anywhere in an attacker-controlled body, so
+ * `https://evil.example/?u=https://acme.sentry.io/issues/1` satisfies it —
+ * which would reduce the two-signal trust boundary of header § 1 to the
+ * producer login alone. `extract` parses each candidate with `new URL()` and
+ * compares `hostname` exactly, so a lookalike host cannot pass. CodeQL names
+ * the regex form of this defect `js/regex/missing-regexp-anchor`.
  *
  * No pattern carries the `g` flag: a shared literal with `lastIndex` state
  * would return different answers on alternating calls.
@@ -110,11 +157,11 @@ export const PRODUCER_PRESETS = Object.freeze({
     shape: /<!--[ \t]*[A-Za-z0-9_.:-]*-digest:[ \t]*[0-9a-f]{6,64}[ \t]*--!?>/,
     identity: /<!--[ \t]*[A-Za-z0-9_.:-]*-digest:[ \t]*([0-9a-f]{6,64})[ \t]*--!?>/,
   }),
-  // A Sentry alert forwarded into the repo.
+  // A Sentry alert forwarded into the repo. Host-checked by `new URL()`, never
+  // by a regex — see the `extract` note above.
   sentry: Object.freeze({
     description: "A body linking a Sentry issue (`https://<org>.sentry.io/issues/<id>`).",
-    shape: /https:\/\/[A-Za-z0-9-]+\.sentry\.io\/issues\/[0-9]+/,
-    identity: /https:\/\/[A-Za-z0-9-]+\.sentry\.io\/issues\/([0-9]+)/,
+    extract: sentryIssueId,
   }),
   // An advisory-shaped report naming a GHSA id.
   "osv-advisory": Object.freeze({
@@ -171,7 +218,8 @@ export function isProducerLogin(login, logins) {
  * `producer-preset` of `constructor` must be an unknown preset, not a hit.
  *
  * @param {string} preset
- * @returns {{description: string, shape: RegExp, identity: RegExp|null}|null}
+ * @returns {{description: string, shape?: RegExp, identity?: RegExp|null,
+ *   extract?: (body: string|undefined) => string|null}|null}
  */
 export function lookupPreset(preset) {
   const key = String(preset ?? "").trim();
@@ -189,6 +237,7 @@ export function lookupPreset(preset) {
 export function matchesBodyShape(body, preset) {
   const entry = lookupPreset(preset);
   if (!entry) return false;
+  if (entry.extract) return entry.extract(body) !== null;
   return entry.shape.test(String(body ?? ""));
 }
 
@@ -203,7 +252,9 @@ export function matchesBodyShape(body, preset) {
  */
 export function intrinsicIdentity(body, preset) {
   const entry = lookupPreset(preset);
-  if (!entry || !entry.identity) return null;
+  if (!entry) return null;
+  if (entry.extract) return entry.extract(body);
+  if (!entry.identity) return null;
   const m = entry.identity.exec(String(body ?? ""));
   return m && m[1] ? m[1].trim() : null;
 }
