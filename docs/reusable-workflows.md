@@ -3140,6 +3140,188 @@ The extraction is deliberately non-breaking at every level:
 
 ---
 
+## `issue-intake` — producer-agnostic issue-intake normalizer
+
+A first-party **composite action**
+([`.github/actions/issue-intake/action.yml`](../.github/actions/issue-intake/action.yml))
+that stands between an external issue producer — a monitor, a scanner, a bot,
+another repo's workflow — and whatever the consumer wants to happen next.
+Wiring a producer to an agent is a trust decision, and every consumer that has
+done it by hand re-derived the same three mechanisms and got at least one of
+them wrong. This ships them once.
+
+The classification is a pure function of `(author login, body text, preset,
+duplicate lookup)`, unit-tested without network access in
+[`scripts/issue-intake.test.mjs`](../scripts/issue-intake.test.mjs).
+
+### The trigger label is the trust boundary
+
+`<label-prefix>:triage` is what an agent workflow keys off, so applying it *is*
+the act of conscripting the agent. It requires **two independent signals**:
+
+| Producer login | Body shape | Verdict                                     |
+| -------------- | ---------- | ------------------------------------------- |
+| ✅ matches     | ✅ matches | `triage` — or `duplicate`, see below.       |
+| ✅ matches     | ❌         | `ignored`                                   |
+| ❌             | ✅ matches | `ignored`                                   |
+| ❌             | ❌         | `ignored`                                   |
+
+Either signal alone is forgeable. A login check alone trusts every issue a
+compromised — or merely careless — bot account files. A body check alone lets
+any account that can open an issue paste the right shape and be routed to an
+agent. Only the pair is a boundary.
+
+An **`ignored` verdict is inert**: no label is created, none is applied, and
+nothing is fired. An issue the action does not trust is left exactly as its
+author wrote it, which is also what keeps the action safe to enable on a repo
+that takes public issues.
+
+### Presets, not patterns
+
+`producer-preset` *selects* a body-shape matcher from a table inside the
+action; it never *supplies* one. The matchers are regex literals:
+
+| Preset              | Matches                                                        | Dedupe identity      |
+| ------------------- | -------------------------------------------------------------- | -------------------- |
+| `structured-report` | A body carrying an explicit `Fingerprint: <id>` line.           | The `<id>`.          |
+| `mandrel-tracker`   | A `track-issue` body carrying its `<!-- …-digest: … -->` marker. | The digest.          |
+| `sentry`            | A body linking `https://<org>.sentry.io/issues/<id>`.           | The Sentry issue id. |
+| `osv-advisory`      | A body naming a GHSA advisory id.                               | The GHSA id.         |
+
+`structured-report` is the producer-agnostic one: any bot can be taught to emit
+a single `Fingerprint:` line.
+
+There is deliberately **no free-form pattern input**, for two reasons that
+reinforce each other. Building a matcher from an input value means
+`new RegExp(<input>)`, which the vendored SAST ruleset raises as
+`detect-non-literal-regexp` — and the diff-baselined SAST tier does not exempt
+test files, so it could not ship even behind a test. The substantive reason is
+that a caller-supplied pattern is a way to widen the trust boundary from
+*outside* the action, which is the one thing the boundary exists to prevent.
+
+An unknown preset fails closed twice over: it matches no body, and it is
+rejected as a configuration error before any lookup runs.
+
+### Label discovery pages, and "already exists" is a skip
+
+`gh label list` returns one page. A consumer with 313 labels lost the intake
+labels off the end of it, so every run after the first tried to re-create them
+and died on GitHub's refusal. Two rules follow, and both are asserted against a
+313-label fixture:
+
+- **Discovery pages to exhaustion.** A label sitting at position 300 is found,
+  so it is never re-created.
+- **A create refused as already-existing is a `skip`, not an error.** A
+  concurrent run that won the race lands here too, and in both cases the
+  desired end state — the label exists — has been reached. A create refused for
+  any *other* reason (permissions, a bad colour) is still a failure.
+
+### Fire semantics invert on configuration
+
+| `fire-url`       | Outcome                                                        |
+| ---------------- | -------------------------------------------------------------- |
+| set, accepted    | Green.                                                          |
+| set, **refused** | **Red.** The issue was classified and nothing picked it up.     |
+| empty            | Green, with a warning. The repo has not opted in yet.           |
+
+Collapsing those two failure readings into one behaviour makes the action
+either unadoptable (every un-wired repo goes red) or silently useless (a broken
+routing pipeline reports success). The POST carries `Authorization: Bearer`,
+`Content-Type: application/json`, `anthropic-version: 2023-06-01` **and**
+`anthropic-beta: experimental-cc-routine-2026-04-01` — omitting either
+Anthropic header returns 400 — with a `{"text": "…"}` body. The text *names*
+the issue rather than quoting it: the body is untrusted producer text, and the
+agent should read it from the issue, where its provenance is visible.
+
+A `duplicate` never fires. Something already carrying that fingerprint was
+routed, and re-firing is the storm dedupe exists to stop.
+
+### Inputs
+
+| Input             | Required | Default    | Notes                                                                              |
+| ----------------- | -------- | ---------- | ---------------------------------------------------------------------------------- |
+| `producer-logins` | yes      | —          | Comma-separated logins, matched case-insensitively. Signal one.                     |
+| `producer-preset` | yes      | —          | One of the presets above. Signal two. An unknown value is a configuration error.    |
+| `label-prefix`    | no       | `'intake'` | Owns `<prefix>:triage`, `<prefix>:duplicate`, `<prefix>:ignored`.                    |
+| `fire-url`        | no       | `''`       | Empty means not wired: warn, stay green. Set means a refusal reds the run.           |
+| `fire-token`      | no       | `''`       | Bearer token; required whenever `fire-url` is set. Read it from `secrets.*`.         |
+| `dry-run`         | no       | `'false'`  | Classify and print; create no label, apply none, fire nothing.                       |
+| `repo`            | yes      | —          | `owner/repo` the inbound issue lives in.                                             |
+| `github-token`    | yes      | —          | Needs `issues: write` on `repo`; an `issues: opened` caller already has one.          |
+
+The issue's number, title, body, author and URL are **not** inputs — they come
+off the `github.event` context inside the action, through step-level `env:`.
+An issue title is attacker-controlled text, and no consumer should have to get
+that hand-off right itself.
+
+### Outputs
+
+| Output   | Value                                                                      |
+| -------- | -------------------------------------------------------------------------- |
+| `action` | `triage`, `duplicate` or `ignored` — always populated, including `ignored`. |
+| `issue`  | Decimal number of the issue this run classified.                            |
+
+### Consumer caller
+
+```yaml
+# .github/workflows/issue-intake.yml
+name: Issue intake
+on:
+  issues:
+    types: [opened]
+permissions:
+  contents: read
+  issues: write
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    steps:
+      - id: intake
+        uses: dsj1984/mandrel-platform/.github/actions/issue-intake@<sha> # <tag>
+        with:
+          producer-logins: acme-monitor-bot,acme-scanner-bot
+          producer-preset: structured-report
+          repo: ${{ github.repository }}
+          # Consumer-facing values synced from Infisical land in `secrets.*`,
+          # never `vars.*` — a routine token in vars is a readable secret.
+          fire-url: ${{ secrets.ROUTINE_FIRE_URL }}
+          fire-token: ${{ secrets.ROUTINE_FIRE_TOKEN }}
+          github-token: ${{ github.token }}
+
+      - name: Page the on-call owner
+        if: steps.intake.outputs.action == 'triage'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ steps.intake.outputs.issue }}
+        run: |
+          set -euo pipefail
+          gh issue edit "${ISSUE}" --repo "${GITHUB_REPOSITORY}" --add-assignee "@me"
+```
+
+`permissions` is declared at the caller: a composite action cannot widen its
+caller's token scope, and `issues: write` belongs in a workflow the consumer
+owns rather than in a PR-gating reusable workflow every consumer resolves at
+compile time.
+
+### Why this repo ships no call site
+
+Nothing in `.github/workflows/` `uses:` this action, and no
+`templates/workflows/` caller stub exists — both deliberately:
+
+1. **A self-pin can only name a commit that already contains the action.** A
+   pin added in the same change that creates the directory names a SHA that
+   predates it, and GitHub resolves the action *at that SHA* — so every
+   consumer would fail at action-load time, before a single step ran. The pin
+   lands, if ever, in a follow-up.
+2. **`platform-sync.mjs` copies every workflow template into every consumer's
+   `.github/workflows/`.** A `templates/workflows/issue-intake.yml` would
+   therefore auto-install an `issues: opened` workflow fleet-wide, on repos
+   that never asked for one and have no producer configured.
+
+Adoption is a consumer writing the caller above, pinned to a released SHA.
+
+---
+
 ## `secret-scan-push.yml`
 
 A full-history secret-scan **signal** on push to the default branch. The

@@ -1,0 +1,122 @@
+# Producer-agnostic issue-intake normalizer composite action (Story #435).
+#
+# Wiring an external issue producer (a monitor, a scanner, a bot, another
+# repo's workflow) to an agent is a trust decision, and every consumer that has
+# done it re-derived the same three things by hand — and got at least one of
+# them wrong:
+#
+#   1. WHAT MAY CONSCRIPT THE AGENT. The label this action applies is the
+#      trigger an agent workflow keys off, so it is the trust boundary. It is
+#      applied only when the producer login AND the body shape both match:
+#      either signal alone lets any account that can open an issue put words in
+#      the agent's mouth.
+#   2. LABEL DISCOVERY THAT PAGES. `gh label list` returns the first page. A
+#      consumer with 313 labels lost the intake labels off the end of it, so
+#      every run after the first tried to re-create them and died on the
+#      "already exists" refusal — which is a SKIP, not an error.
+#   3. FIRE SEMANTICS THAT INVERT ON CONFIGURATION. A fire that was configured
+#      and then refused is a broken pipeline and must red the run; a fire that
+#      was never wired at all is a repo that has not opted in yet and must stay
+#      green with a warning. Collapsing those two into one behaviour makes the
+#      action either unadoptable or silently useless.
+#
+# Every input reaches the script through step-level `env:`, never `${{ }}`
+# inside the `run:` body — an issue title or body is attacker-controlled text,
+# and interpolating it into a shell script is a script-injection vulnerability.
+# The issue fields come off the `github.event` context the same way, which is
+# why they are not action inputs.
+name: Issue Intake Normalizer
+description: >
+  Classify an inbound issue from an external producer as triage, duplicate or
+  ignored behind a two-signal trust boundary, apply the intake label, and
+  optionally fire a routine.
+
+inputs:
+  producer-logins:
+    description: >
+      Comma-separated GitHub logins whose issues are eligible for intake.
+      Matching is case-insensitive. This is one of the two required signals —
+      a matching login alone never classifies an issue as triage.
+    required: true
+  producer-preset:
+    description: >
+      Which body-shape matcher to apply. One of `structured-report`,
+      `mandrel-tracker`, `sentry`, `osv-advisory`. The matchers are regex
+      literals in a table inside the action, deliberately not a free-form
+      pattern input — a pattern built from an input is both a SAST finding and
+      a real hazard, since a caller-supplied pattern is a way to widen the
+      trust boundary from the outside.
+    required: true
+  label-prefix:
+    description: >
+      Prefix of the three intake labels this action owns — `<prefix>:triage`,
+      `<prefix>:duplicate` and `<prefix>:ignored`. `<prefix>:triage` is the
+      trigger label an agent workflow keys off.
+    required: false
+    default: 'intake'
+  fire-url:
+    description: >
+      Endpoint POSTed when a new issue classifies as triage. Empty means the
+      fire is not wired: the run warns and stays green. A configured fire that
+      is refused fails the run.
+    required: false
+    default: ''
+  fire-token:
+    description: >
+      Bearer token for the fire endpoint. Required whenever `fire-url` is set.
+      Read it from `secrets.*` — a consumer-facing value synced from Infisical
+      lands in secrets, never vars.
+    required: false
+    default: ''
+  dry-run:
+    description: >
+      Print the verdict without creating labels, labelling the issue or firing.
+    required: false
+    default: 'false'
+  repo:
+    description: owner/repo the inbound issue lives in.
+    required: true
+  github-token:
+    description: >
+      Token with `issues: write` on `repo`. The caller forwards its own
+      github.token; an `issues: opened` workflow already runs with one.
+    required: true
+
+outputs:
+  action:
+    description: >
+      The classification this run resolved to — `triage`, `duplicate` or
+      `ignored`. `ignored` is inert: no label is created or applied and no fire
+      is sent, so an issue that fails the trust boundary is left exactly as its
+      author wrote it.
+    value: ${{ steps.issue-intake.outputs.action }}
+  issue:
+    description: >
+      Decimal number of the issue this run classified. Always populated, so a
+      caller can act on the verdict without re-reading the event payload.
+    value: ${{ steps.issue-intake.outputs.issue }}
+
+runs:
+  using: composite
+  steps:
+    - name: Normalize inbound issue
+      id: issue-intake
+      shell: bash
+      env:
+        INTAKE_PRODUCER_LOGINS: ${{ inputs.producer-logins }}
+        INTAKE_PRODUCER_PRESET: ${{ inputs.producer-preset }}
+        INTAKE_LABEL_PREFIX: ${{ inputs.label-prefix }}
+        INTAKE_FIRE_URL: ${{ inputs.fire-url }}
+        INTAKE_FIRE_TOKEN: ${{ inputs.fire-token }}
+        INTAKE_DRY_RUN: ${{ inputs.dry-run }}
+        INTAKE_REPO: ${{ inputs.repo }}
+        INTAKE_ISSUE_NUMBER: ${{ github.event.issue.number }}
+        INTAKE_ISSUE_TITLE: ${{ github.event.issue.title }}
+        INTAKE_ISSUE_BODY: ${{ github.event.issue.body }}
+        INTAKE_ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+        INTAKE_ISSUE_URL: ${{ github.event.issue.html_url }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        node "${ACTION_PATH}/issue-intake.mjs"
