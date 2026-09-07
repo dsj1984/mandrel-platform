@@ -45,6 +45,12 @@
  *
  * Runners resolve from `node_modules/.bin`, never through `npx`, so this can
  * never silently registry-fetch an unpinned linter.
+ *
+ * There is deliberately no `shell: true` branch for Windows. Spawning through
+ * a shell is an injection surface — Semgrep's `spawn-shell-true` blocks it —
+ * and the branch would have been untested anyway: this repo pins Linux/macOS
+ * runners and a Node version to match. A future Windows port should resolve
+ * the `.cmd` shim explicitly rather than reintroduce a shell.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -88,7 +94,6 @@ for (const surface of SURFACES) {
   const result = spawnSync(bin, surface.args, {
     cwd: repoRoot,
     stdio: 'inherit',
-    shell: process.platform === 'win32',
   });
 
   if (result.error) {
