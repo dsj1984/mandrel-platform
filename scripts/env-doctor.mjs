@@ -121,6 +121,8 @@ export const SHAPE_NAMES = Object.freeze(Object.keys(SHAPE_VOCABULARY));
  */
 export const MANIFEST_SCHEMA = Object.freeze({
   environments: "string[] — environment slugs, e.g. ['staging','production']",
+  environmentSlugs:
+    "object? — surface name -> {environment: slug}. Only 'infisical' is honored; an unmapped environment resolves to itself.",
   workers:
     "object? — worker id -> {config, scriptName}. `scriptName` may contain '{env}', substituted per environment.",
   keys: "object[] — one entry per env var / secret (see KEY_SCHEMA)",
@@ -132,11 +134,96 @@ export const KEY_SCHEMA = Object.freeze({
   sensitivity: "'public' | 'secret'",
   residency:
     "object — {local: 'var'|'secret'|'file'|null, github: G|G[]|null where G = {scope,kind,environments?}, cloudflare: {workers,kind}|null}",
-  infisical: "{folder, environments} | 'unmanaged'",
+  infisical:
+    "{folder, environments} | {folders: (string | {folder, environments})[]} | 'unmanaged'",
   shape: `string? — one of ${SHAPE_NAMES.join(", ")}`,
   placeholderPattern: "string? — literal, case-insensitive substring marking an unset placeholder value",
   note: "string? — free text",
 });
+
+/**
+ * The surfaces whose environment namespace can be remapped.
+ *
+ * `manifest.environments` names DEPLOY environments, and until Story #464 that
+ * one list was substituted verbatim into three namespaces that are not the
+ * same namespace — the Worker script name, the GitHub Environment API path,
+ * and the Infisical environment slug. A project whose Infisical slugs differ
+ * from its deploy names (`prod` against a `production` environment) could not
+ * be probed at all: the surface went to `error`, which is deliberately
+ * unsuppressable, so the lane was permanently red with no downstream fix.
+ *
+ * Only `infisical` is remappable, and deliberately so. Cloudflare already has
+ * its own escape hatch — `resolveScriptName` substitutes `{env}` into
+ * `workers[].scriptName`, so `acme-site-{env}` resolves whatever the deploy
+ * name is — and giving it a slug map too would be two mechanisms for one job.
+ * The GitHub Environment API is read at `manifest.environments` verbatim and
+ * no divergence has been observed there. The CONTAINER is nonetheless keyed by
+ * surface rather than being an Infisical-only field, so a surface that ever
+ * does diverge adopts it without inventing a second idiom.
+ */
+export const SLUG_MAPPED_SURFACES = Object.freeze(["infisical"]);
+
+/**
+ * Normalize `manifest.environmentSlugs` to a total map over the slug-mapped
+ * surfaces, so a caller never has to distinguish "absent" from "empty".
+ *
+ * Validation fails closed, matching this module's posture on an unknown
+ * `shape`: silently ignoring a misspelled surface or environment is how a
+ * manifest author comes to believe they have remapped something they have not,
+ * and the symptom — a 404 from the store — looks nothing like the cause.
+ *
+ * @param {unknown} raw
+ * @param {string[]} environments
+ * @returns {Record<string, Record<string, string>>}
+ */
+function normalizeEnvironmentSlugs(raw, environments) {
+  const out = {};
+  for (const surface of SLUG_MAPPED_SURFACES) out[surface] = {};
+  if (raw === undefined || raw === null) return out;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("manifest.environmentSlugs must be an object mapping a surface name -> {environment: slug}");
+  }
+
+  for (const [surface, map] of Object.entries(raw)) {
+    if (!SLUG_MAPPED_SURFACES.includes(surface)) {
+      throw new Error(
+        `manifest.environmentSlugs."${surface}" is not a slug-mapped surface — supported: ` +
+          `${SLUG_MAPPED_SURFACES.join(", ")}. Cloudflare resolves each environment through the ` +
+          `"{env}" substitution in workers[].scriptName, and the GitHub Environment API is read at ` +
+          `manifest.environments verbatim, so neither takes a slug map.`
+      );
+    }
+    if (!map || typeof map !== "object" || Array.isArray(map)) {
+      throw new Error(`manifest.environmentSlugs.${surface} must be an object mapping environment -> slug`);
+    }
+    for (const [environment, slug] of Object.entries(map)) {
+      if (!environments.includes(environment)) {
+        throw new Error(
+          `manifest.environmentSlugs.${surface} maps "${environment}", absent from manifest.environments`
+        );
+      }
+      if (typeof slug !== "string" || !slug) {
+        throw new Error(`manifest.environmentSlugs.${surface}["${environment}"] must be a non-empty slug string`);
+      }
+      out[surface][environment] = slug;
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve the slug one surface uses for a manifest environment. Identity for
+ * any environment the manifest does not remap, which is what keeps an absent
+ * `environmentSlugs` a no-op for every manifest written before Story #464.
+ *
+ * @param {object} manifest  A parsed manifest.
+ * @param {string} surface
+ * @param {string} environment
+ * @returns {string}
+ */
+export function resolveSurfaceEnvironment(manifest, surface, environment) {
+  return manifest?.environmentSlugs?.[surface]?.[environment] ?? environment;
+}
 
 /**
  * Parse and validate a raw manifest object. Throws with an actionable message
@@ -175,10 +262,12 @@ export function parseManifest(raw) {
     throw new Error("manifest.keys must be a non-empty array");
   }
 
+  const environmentSlugs = normalizeEnvironmentSlugs(raw.environmentSlugs, environments);
+
   const seen = new Set();
   const keys = raw.keys.map((entry, i) => validateKeyEntry(entry, i, workers, environments, seen));
 
-  return { environments: [...environments], workers, keys };
+  return { environments: [...environments], environmentSlugs, workers, keys };
 }
 
 /**
@@ -272,6 +361,102 @@ function normalizeGitHubResidency(raw, { at, name, environments }) {
 }
 
 /**
+ * Normalize `infisical` residency to its canonical `{folders: [...]}` form.
+ *
+ * The field accepts EITHER a single `{folder, environments}` object — the shape
+ * every manifest written before Story #464 uses — or `{folders: [...]}` whose
+ * entries are a bare folder path or a `{folder, environments}` object, because
+ * two residencies that occur in practice cannot be said with one folder:
+ *
+ *   1. **Multi-folder residency.** A key can legitimately be resident in more
+ *      than one folder, and folder IMPORTS are what make that normal rather
+ *      than sloppy: when `/cloudflare` imports `/shared`, a value entering at
+ *      `/shared` is genuinely read through `/cloudflare` as well. Both
+ *      statements are true and one field could hold only one, so the same
+ *      misplacement was counted TWICE — `missing` from the declared folder and
+ *      `orphan` in the folder that actually held it.
+ *   2. **Per-environment residency.** A key can live in a different folder per
+ *      environment (an operator-held credential that arrives via `/github` in
+ *      staging only). With no per-entry `environments`, one of the two folders
+ *      was always wrong.
+ *
+ * Both authored shapes normalize to one array of `{folder, environments}` with
+ * `environments` defaulted and materialized to `manifest.environments`, so
+ * `probeInfisical` has exactly one shape to read — the same normalize-at-parse
+ * treatment `residency.github` received in Story #459, so there is one
+ * precedent for expressive residency rather than two idioms.
+ *
+ * @param {unknown} raw
+ * @param {{at: string, name: string, environments: string[]}} ctx
+ * @returns {"unmanaged" | {folders: Array<{folder: string, environments: string[]}>}}
+ */
+function normalizeInfisicalResidency(raw, { at, name, environments }) {
+  if (raw === undefined || raw === null || raw === "unmanaged") return "unmanaged";
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`${at}.infisical must be "unmanaged", {folder, environments} or {folders: [...]} (key ${name})`);
+  }
+
+  const hasFolder = raw.folder !== undefined;
+  const hasFolders = raw.folders !== undefined;
+  if (hasFolder && hasFolders) {
+    throw new Error(`${at}.infisical declares both "folder" and "folders" — use one or the other (key ${name})`);
+  }
+  if (!hasFolder && !hasFolders) {
+    throw new Error(`${at}.infisical must declare "folder" or "folders", or be "unmanaged" (key ${name})`);
+  }
+
+  let authored;
+  if (hasFolder) {
+    authored = [{ folder: raw.folder, environments: raw.environments, where: `${at}.infisical` }];
+  } else {
+    if (!Array.isArray(raw.folders) || raw.folders.length === 0) {
+      throw new Error(
+        `${at}.infisical.folders must be a non-empty array — use "unmanaged" when the key does not ` +
+          `belong in Infisical (key ${name})`
+      );
+    }
+    if (raw.environments !== undefined) {
+      throw new Error(
+        `${at}.infisical.environments is meaningful only beside a single "folder" — under "folders" ` +
+          `each entry carries its own environments (key ${name})`
+      );
+    }
+    authored = raw.folders.map((folderEntry, j) => {
+      const where = `${at}.infisical.folders[${j}]`;
+      if (typeof folderEntry === "string") return { folder: folderEntry, environments: undefined, where };
+      if (!folderEntry || typeof folderEntry !== "object" || Array.isArray(folderEntry)) {
+        throw new Error(`${where} must be a folder path string or {folder, environments} (key ${name})`);
+      }
+      return { folder: folderEntry.folder, environments: folderEntry.environments, where };
+    });
+  }
+
+  const seenFolders = new Set();
+  const folders = authored.map(({ folder, environments: authoredEnvs, where }) => {
+    if (typeof folder !== "string" || !folder) {
+      throw new Error(`${where}.folder must be a non-empty folder path string (key ${name})`);
+    }
+    if (seenFolders.has(folder)) {
+      throw new Error(`${at}.infisical repeats the folder "${folder}" — declare one entry per folder (key ${name})`);
+    }
+    seenFolders.add(folder);
+
+    const envs = authoredEnvs ?? environments;
+    if (!Array.isArray(envs) || !envs.every((e) => typeof e === "string")) {
+      throw new Error(`${at}.infisical.environments must be an array of environment slugs (key ${name})`);
+    }
+    for (const e of envs) {
+      if (!environments.includes(e)) {
+        throw new Error(`${at}.infisical.environments names "${e}", absent from manifest.environments (key ${name})`);
+      }
+    }
+    return { folder, environments: [...envs] };
+  });
+
+  return { folders };
+}
+
+/**
  * @param {unknown} entry
  * @param {number} index
  * @param {Record<string, object>} workers
@@ -324,21 +509,7 @@ function validateKeyEntry(entry, index, workers, environments, seen) {
     }
   }
 
-  const infisical = entry.infisical ?? "unmanaged";
-  if (infisical !== "unmanaged") {
-    if (!infisical || typeof infisical !== "object" || typeof infisical.folder !== "string") {
-      throw new Error(`${at}.infisical must be "unmanaged" or {folder, environments} (key ${name})`);
-    }
-    const envs = infisical.environments ?? environments;
-    if (!Array.isArray(envs) || !envs.every((e) => typeof e === "string")) {
-      throw new Error(`${at}.infisical.environments must be an array of environment slugs (key ${name})`);
-    }
-    for (const e of envs) {
-      if (!environments.includes(e)) {
-        throw new Error(`${at}.infisical.environments names "${e}", absent from manifest.environments (key ${name})`);
-      }
-    }
-  }
+  const infisical = normalizeInfisicalResidency(entry.infisical, { at, name, environments });
 
   if (entry.shape !== undefined) {
     if (typeof entry.shape !== "string" || !Object.hasOwn(SHAPE_VOCABULARY, entry.shape)) {
@@ -361,10 +532,7 @@ function validateKeyEntry(entry, index, workers, environments, seen) {
       github,
       cloudflare: cloudflare ? { workers: [...cloudflare.workers], kind: cloudflare.kind } : null,
     },
-    infisical:
-      infisical === "unmanaged"
-        ? "unmanaged"
-        : { folder: infisical.folder, environments: [...(infisical.environments ?? environments)] },
+    infisical,
     shape: entry.shape ?? null,
     placeholderPattern: entry.placeholderPattern ?? null,
     note: typeof entry.note === "string" ? entry.note : null,
@@ -1306,6 +1474,48 @@ async function probeCloudflare({ manifest, environments, cloudflare, surfaces, f
 }
 
 /**
+ * Does a key declare residency at this folder in this environment?
+ *
+ * @param {object} key   A parsed manifest key with normalized infisical residency.
+ * @param {string} folder
+ * @param {string} environment
+ * @returns {boolean}
+ */
+function residentAt(key, folder, environment) {
+  return key.infisical.folders.some((f) => f.folder === folder && f.environments.includes(environment));
+}
+
+/**
+ * Names declared in a SIBLING declared folder of the same environment.
+ *
+ * Infisical is probed once per (environment, folder) pair, so a key resident
+ * in two folders is read in two partitions — and reporting it as an orphan in
+ * the one the manifest happens not to be reconciling is the false positive the
+ * `folders` array exists to remove. Suppression is deliberately no wider:
+ *
+ * - **Cross-folder, same environment** is suppressed: that is multi-folder
+ *   residency, including the folder-import case.
+ * - **Cross-environment is NOT suppressed.** A key declared for staging only
+ *   but present in production is undeclared presence in that environment —
+ *   the most interesting thing this surface can find — so it still orphans.
+ *
+ * A name declared in no folder at all orphans exactly as before, which is what
+ * keeps `--strict-orphans` worth enabling once a manifest is correct. This is
+ * the `declaredElsewhere` treatment `probeGitHub` has had since Story #459;
+ * its absence here is why a single misplacement was reported twice.
+ *
+ * @param {object[]} managed
+ * @param {string} folder
+ * @param {string} environment
+ * @returns {string[]}
+ */
+function infisicalNamesElsewhere(managed, folder, environment) {
+  return managed
+    .filter((k) => k.infisical.folders.some((f) => f.folder !== folder && f.environments.includes(environment)))
+    .map((k) => k.name);
+}
+
+/**
  * The Infisical probe, plus the shape stage — the only place a value is read.
  *
  * @param {object} ctx
@@ -1321,27 +1531,39 @@ async function probeInfisical({ manifest, environments, infisical, surfaces, fin
     return;
   }
   try {
-    const folders = new Set(managed.map((k) => k.infisical.folder));
+    const folders = new Set(managed.flatMap((k) => k.infisical.folders.map((f) => f.folder)));
     const shapeChecked = [];
+    // A key resident in several folders is READ in each of them, but its value
+    // is one value — so it earns at most one shape verdict per environment.
+    // Scoring it once per folder would re-introduce, in the shape stage, the
+    // very double-reporting this Story removes from the residency stage.
+    const shapeSeen = new Set();
     for (const environment of environments) {
+      // The store's own environment slug, which need not be the deploy name.
+      const slug = resolveSurfaceEnvironment(manifest, "infisical", environment);
       for (const folder of folders) {
-        const expected = managed
-          .filter((k) => k.infisical.folder === folder && k.infisical.environments.includes(environment))
-          .map((k) => k.name);
-        const present = await infisical.listNames({ environment, folder });
+        const expected = managed.filter((k) => residentAt(k, folder, environment)).map((k) => k.name);
+        const present = await infisical.listNames({ environment: slug, folder });
         findings.push(
-          ...reconcileNames({ expected, present, surface: "infisical", environment, scope: `folder ${folder}` })
+          ...reconcileNames({
+            expected,
+            present,
+            surface: "infisical",
+            environment,
+            scope: `folder ${folder}`,
+            declaredElsewhere: infisicalNamesElsewhere(managed, folder, environment),
+          })
         );
 
         // Shape stage. Values enter this scope and leave it as verdicts.
         const needShape = managed.filter(
           (k) =>
-            k.infisical.folder === folder &&
-            k.infisical.environments.includes(environment) &&
-            (k.shape || k.placeholderPattern)
+            residentAt(k, folder, environment) &&
+            (k.shape || k.placeholderPattern) &&
+            !shapeSeen.has(`${environment}\u241f${k.name}`)
         );
         if (needShape.length === 0) continue;
-        const values = await infisical.listValues({ environment, folder });
+        const values = await infisical.listValues({ environment: slug, folder });
         for (const key of needShape) {
           if (!values.has(key.name)) continue;
           const verdict = checkShape({
@@ -1350,6 +1572,7 @@ async function probeInfisical({ manifest, environments, infisical, surfaces, fin
             placeholderPattern: key.placeholderPattern,
           });
           shapeChecked.push(key.name);
+          shapeSeen.add(`${environment}\u241f${key.name}`);
           if (!verdict.ok) {
             findings.push({
               severity: "fail",
