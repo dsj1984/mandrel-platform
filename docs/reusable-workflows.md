@@ -118,8 +118,8 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `enable-migration-guard` | boolean | `false`    | **Opt-in.** Set `true` to enable the destructive-migration label guard. See [Destructive-migration guard](#destructive-migration-guard-enable-migration-guard). |
 | `migration-guard-label`  | string  | `'migration:destructive-ok'` | PR label that overrides a destructive-migration finding. Override only when you want a different acknowledgement-label name. |
 | `migration-guard-globs`  | string  | `'**/migrations/**,**/drizzle/**'` | Comma-separated migration path globs the guard scans. A changed file matching one of these (or any `*.sql`) is inspected. |
-| `coverage-threshold` | number | `0`            | Minimum coverage percentage the **unit** job must meet. `0` (default) disables the gate — current behaviour for non-adopters. When `> 0`, the unit job **fails** if measured coverage is below the floor. See [Coverage threshold gate](#coverage-threshold-gate-coverage-threshold). |
-| `coverage-metric`  | string  | `'lines'`        | Which coverage metric the floor asserts: `lines`, `statements`, `functions`, or `branches` (read from `total.<metric>.pct`). Ignored when `coverage-threshold` is `0`. |
+| `coverage-threshold` | number | `0`            | Minimum coverage percentage the **merged** run must meet. `0` (default) disables the gate — current behaviour for non-adopters. When `> 0`, the dedicated **`coverage-floor`** job unions every tier's coverage and **fails** if the merged number is below the floor. See [Coverage threshold gate](#coverage-threshold-gate-coverage-threshold). |
+| `coverage-metric`  | string  | `'lines'`        | Which coverage metric the floor asserts: `lines`, `statements`, `functions`, or `branches` (summed across each summary's per-file entries, falling back to `total.<metric>.pct` for a summary with none). Ignored when `coverage-threshold` is `0`. |
 | `enable-security`  | boolean | `true`           | Set `false` to skip the whole security tier (secret scan + SAST). See [Security tier](#security-tier-enable-security--enable-sast).             |
 | `enable-sast`      | boolean | `true`           | Set `false` to keep the PR-diff secret scan but skip the Semgrep SAST sub-step — use when SAST runs via a dedicated CodeQL/GHAS workflow.       |
 | `semgrep-config`   | string  | `'vendored'`     | Semgrep ruleset for the SAST sub-step. Default `'vendored'` resolves to this reusable workflow's own checked-out, platform-controlled snapshot at `.semgrep/rules.json` (see [SAST ruleset provenance](#sast-ruleset-provenance-and-update-process)) — NOT the live registry. Override with a registry ref (e.g. `'p/security-audit'`) or a path. **`'auto'` is unsupported.** |
@@ -700,10 +700,10 @@ Semantics and caveats:
   `skipped` as green. (`cancelled` only arises from `fail-fast`, an unrelated
   input.)
 - **Coverage-floor reconciliation (decision: bypass on affected runs).** The
-  `coverage-threshold` gate reads the **merged** `coverage-summary.json`
-  spanning all workspaces. Under affected mode the unit tier runs only the
-  changed packages' tests, so that merged number reflects a **partial subset**,
-  not a whole-repo measurement — comparing it to an absolute whole-repo floor
+  `coverage-threshold` gate unions every tier's `coverage-summary.json` into
+  one measurement. Under affected mode the test tiers run only the changed
+  packages' tests, so that merged number reflects a **partial subset**, not a
+  whole-repo measurement — comparing it to an absolute whole-repo floor
   would **false-fail**. The reconciliation is to **bypass the floor on affected
   runs**: when `affected: true`, the `coverage-threshold` gate is skipped and a
   visible `::notice::` is emitted (never a silent skip). The floor stays
@@ -1976,12 +1976,22 @@ By default `pr-quality.yml` uploads `**/coverage/` as an artifact but asserts
 unchanged).
 
 - **Off by default.** `coverage-threshold: 0` (the default) is a no-op: the
-  gate step is skipped entirely and behaviour is identical to today. Existing
-  callers need no change.
-- **Load-bearing when set.** With `coverage-threshold > 0`, the **unit** job
-  runs a coverage check after the tests. If measured coverage is below the
-  floor, the unit job **fails** — and the unit job is a `needs:` of
+  whole `coverage-floor` job is skipped and behaviour is identical to today.
+  Existing callers need no change.
+- **Load-bearing when set.** With `coverage-threshold > 0`, a dedicated
+  **`coverage-floor`** job runs downstream of the test tiers. If merged
+  coverage is below the floor, that job **fails** — and it is a `needs:` of
   [`ci-required`](#the-ci-required-aggregator), so the floor blocks the merge.
+- **Asserted once, over every tier.** The floor used to live *inside* the unit
+  job, and the contract job uploaded only test results — so contract-tier
+  coverage could never leave its job. A consumer whose contract tier carried a
+  material share of its coverage had two bad options and no third: keep the
+  whole suite in the unit tier so the floor stayed whole-repo (paying the same
+  run twice on every PR), or scope the tiers for speed and let the floor
+  silently become a partial measurement. Both tiers now upload `**/coverage/`,
+  and the `coverage-floor` job downloads every tier's artifacts, unions the
+  summaries and asserts once. **This also retires a latent false-fail**: each
+  shard of a sharded tier used to be asserted against its own partial subset.
 - **No new tooling.** The gate reads the **existing** `**/coverage/`
   output — specifically `coverage-summary.json` (the standard Istanbul / c8 /
   vitest `json-summary` reporter). Your test step must already emit that file
@@ -1995,9 +2005,30 @@ unchanged).
   **fails** rather than passing silently — a set floor must never be a no-op
   because coverage wasn't produced.
 - **Metric selectable.** `coverage-metric` (default `lines`) picks which of
-  `lines` / `statements` / `functions` / `branches` the floor asserts, read
-  from `total.<metric>.pct`. The comparison is inclusive — a floor of `80`
-  admits exactly `80%`.
+  `lines` / `statements` / `functions` / `branches` the floor asserts. The
+  comparison is inclusive — a floor of `80` admits exactly `80%`.
+- **How the union is computed (and why it can only understate).** Per-file
+  entries are keyed by the absolute path they had in the job that produced
+  them, so each key is first re-anchored against the `coverage-floor` job's own
+  checkout — two tiers that ran under different workspace roots still merge
+  into one file. The measurement is then `sum(covered) / sum(total)` over the
+  merged file map. Where two tiers exercise the **same** file, a summary
+  records how *many* lines each covered, never *which* — the true union is not
+  recoverable from counts — so overlap resolves as **`max(covered)`**, a
+  provable **lower bound** on the union. The practical consequence: the merged
+  number may **understate** real coverage, so this floor can false-fail but can
+  never false-pass. Tiers scoped to disjoint projects (the case this exists
+  for) overlap on nothing and merge exactly.
+
+> **Behaviour change for existing adopters (from the version that added the
+> `coverage-floor` job).** The floor was previously a logical **AND** across
+> per-workspace summaries — every summary had to clear it independently. It is
+> now **one weighted number**. A repo whose summaries sit at 90% and 70% used
+> to fail an 80 floor on the 70% summary alone; it now passes if the weighted
+> total clears 80. That is the semantics the input always described, and the
+> only semantics under which tier scoping and sharding are safe — but if you
+> relied on the per-workspace AND, raise the floor or keep a per-package check
+> of your own.
 
 > **Interaction with `affected` mode.** When `affected: true`, this floor is
 > **bypassed** (with a visible `::notice::`): an affected-subset run's merged
@@ -2006,8 +2037,10 @@ unchanged).
 > full run) if you need the floor asserted. See
 > [Affected-only tier execution](#affected-only-tier-execution-affected).
 
-> **Emitting the summary.** Ensure your unit test command writes
-> `coverage/coverage-summary.json`. For vitest: enable
+> **Emitting the summary.** Ensure each test tier you want counted writes
+> `coverage/coverage-summary.json`. A tier that emits none simply contributes
+> nothing — the job's log names every artifact that did contribute, so a tier
+> that quietly stopped producing coverage is visible rather than silent. For vitest: enable
 > `coverage.reporter: ['json-summary', ...]`. For nyc / c8: add
 > `--reporter=json-summary`. The file is what both the artifact upload and this
 > gate consume — no separate run.

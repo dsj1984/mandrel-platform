@@ -40,6 +40,11 @@ import {
   evaluateGate,
   formatVerdict,
   runCli,
+  summaryFileKeys,
+  commonDirPrefix,
+  toRepoRelativeKey,
+  normalizeSummary,
+  mergeNormalized,
 } from "./check-coverage-threshold.mjs";
 
 // Build a minimal Istanbul/c8/vitest-shaped coverage-summary object.
@@ -235,7 +240,8 @@ test("evaluateGate: SET + measured above floor → pass", () => {
   assert.equal(verdict.ok, true);
   assert.equal(verdict.skipped, false);
   assert.equal(verdict.results[0].pct, 91);
-  assert.equal(verdict.results[0].ok, true);
+  assert.equal(verdict.results[0].contributed, true);
+  assert.equal(verdict.merged.pct, 91);
 });
 
 test("evaluateGate: SET + measured below floor → fail", () => {
@@ -248,7 +254,7 @@ test("evaluateGate: SET + measured below floor → fail", () => {
   );
   assert.equal(verdict.ok, false);
   assert.equal(verdict.results[0].pct, 73);
-  assert.equal(verdict.results[0].ok, false);
+  assert.equal(verdict.merged.pct, 73);
 });
 
 test("evaluateGate: SET but no coverage summary found → fail (never silent-pass)", () => {
@@ -264,7 +270,10 @@ test("evaluateGate: SET but no coverage summary found → fail (never silent-pas
   assert.match(verdict.reason, /no coverage-summary\.json was found/);
 });
 
-test("evaluateGate: SET, one of many packages below floor → fail", () => {
+test("evaluateGate: SET, many packages — the floor is one merged number, not a per-summary AND", () => {
+  // 95/100 + 40/100 = 135/200 = 67.5%, below the 80 floor. Both summaries are
+  // still REPORTED as contributions (the log names which artifact carried
+  // what) but neither is asserted on its own.
   const verdict = evaluateGate(
     { threshold: 80, metric: "statements", cwd: ".", coverageDirs: [] },
     {
@@ -280,8 +289,13 @@ test("evaluateGate: SET, one of many packages below floor → fail", () => {
   );
   assert.equal(verdict.ok, false);
   assert.equal(verdict.results.length, 2);
-  assert.equal(verdict.results.find((r) => r.file.startsWith("a")).ok, true);
-  assert.equal(verdict.results.find((r) => r.file.startsWith("b")).ok, false);
+  assert.equal(verdict.merged.covered, 135);
+  assert.equal(verdict.merged.total, 200);
+  assert.equal(verdict.merged.pct, 67.5);
+  assert.ok(
+    verdict.results.every((r) => r.contributed),
+    "both summaries must be reported as contributions",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -478,6 +492,279 @@ test("formatVerdict renders a skip line for the disabled gate", () => {
   });
   assert.equal(lines.length, 1);
   assert.match(lines[0], /⏭️/);
+});
+
+// ---------------------------------------------------------------------------
+// Merged measurement (Story #468)
+//
+// The floor used to be a logical AND across per-workspace summaries, which
+// made it an artifact of which JOB ran which tests: a scoped tier's summary is
+// a partial measurement of the repo, and every shard of a sharded tier
+// false-failed on its own subset. These tests pin the union semantics and the
+// lower-bound property that makes the union safe to assert.
+// ---------------------------------------------------------------------------
+
+// A coverage-summary.json with real per-file entries: { "<abs path>": pct-ish
+// counts }, plus the `total` block json-summary always writes.
+function fileSummary(entries, metric = "lines") {
+  const out = {};
+  let covered = 0;
+  let total = 0;
+  for (const [path, counts] of Object.entries(entries)) {
+    covered += counts.covered;
+    total += counts.total;
+    out[path] = {
+      [metric]: {
+        total: counts.total,
+        covered: counts.covered,
+        skipped: 0,
+        pct: (counts.covered / counts.total) * 100,
+      },
+    };
+  }
+  out.total = {
+    [metric]: {
+      total,
+      covered,
+      skipped: 0,
+      pct: total > 0 ? (covered / total) * 100 : 0,
+    },
+  };
+  return out;
+}
+
+/** An `exists` stub that answers true only for a known set of repo-relative paths. */
+function existsIn(relPaths, cwd = "/repo") {
+  const known = new Set(relPaths.map((r) => join(cwd, r)));
+  return (candidate) => known.has(candidate);
+}
+
+test("summaryFileKeys returns per-file entries and never `total`", () => {
+  const sum = fileSummary({ "/ws/src/a.ts": { covered: 5, total: 10 } });
+  assert.deepEqual(summaryFileKeys(sum), ["/ws/src/a.ts"]);
+  assert.deepEqual(summaryFileKeys(null), []);
+});
+
+test("commonDirPrefix excludes the filename, so a single entry yields its directory", () => {
+  assert.equal(commonDirPrefix(["/ws/repo/src/a.ts"]), "/ws/repo/src/");
+  assert.equal(commonDirPrefix(["/ws/repo/src/a.ts", "/ws/repo/api/b.ts"]), "/ws/repo/");
+  assert.equal(commonDirPrefix([]), "");
+});
+
+test("toRepoRelativeKey anchors on the checkout — different workspace roots normalize alike", () => {
+  const exists = existsIn(["src/foo.ts"]);
+  // Two tiers, two runner workspace roots, one source file.
+  assert.equal(
+    toRepoRelativeKey("/actions-runner/_work/repo/repo/src/foo.ts", { exists, cwd: "/repo" }),
+    "src/foo.ts",
+  );
+  assert.equal(
+    toRepoRelativeKey("/srv/runner2/_work/repo/repo/src/foo.ts", { exists, cwd: "/repo" }),
+    "src/foo.ts",
+  );
+});
+
+test("toRepoRelativeKey returns null when nothing resolves against the checkout", () => {
+  const exists = existsIn(["src/foo.ts"]);
+  assert.equal(toRepoRelativeKey("/ws/generated/nope.ts", { exists, cwd: "/repo" }), null);
+  assert.equal(toRepoRelativeKey("", { exists, cwd: "/repo" }), null);
+});
+
+test("mergeNormalized: disjoint files sum — aggregate is sum(covered)/sum(total)", () => {
+  const exists = existsIn(["src/a.ts", "api/b.ts"]);
+  const opts = { exists, cwd: "/repo" };
+  const unit = normalizeSummary(
+    fileSummary({ "/ws/repo/src/a.ts": { covered: 90, total: 100 } }),
+    "lines",
+    opts,
+  );
+  const contract = normalizeSummary(
+    fileSummary({ "/ws/repo/api/b.ts": { covered: 30, total: 100 } }),
+    "lines",
+    opts,
+  );
+  const merged = mergeNormalized([unit, contract]);
+  assert.equal(merged.covered, 120);
+  assert.equal(merged.total, 200);
+  assert.equal(merged.pct, 60);
+  assert.equal(merged.fileCount, 2);
+});
+
+test("mergeNormalized: an overlapping file takes MAX(covered), never the sum (the lower-bound property)", () => {
+  const exists = existsIn(["src/shared.ts"]);
+  const opts = { exists, cwd: "/repo" };
+  const unit = normalizeSummary(
+    fileSummary({ "/ws/repo/src/shared.ts": { covered: 40, total: 100 } }),
+    "lines",
+    opts,
+  );
+  const contract = normalizeSummary(
+    fileSummary({ "/ws/repo/src/shared.ts": { covered: 70, total: 100 } }),
+    "lines",
+    opts,
+  );
+  const merged = mergeNormalized([unit, contract]);
+  // Summing would give 110/200 — and 110 covered lines in a 100-line file is
+  // not a measurement, it is an artifact. max() is a lower bound on the union.
+  assert.equal(merged.covered, 70);
+  assert.equal(merged.total, 100);
+  assert.equal(merged.pct, 70);
+  assert.equal(merged.fileCount, 1, "the shared file must merge into ONE entry");
+});
+
+test("normalizeSummary: mixed-depth tiers still merge the same file into one entry", () => {
+  // The unit tier spans the repo; the contract tier is scoped to packages/api.
+  // Their own longest-common-dir prefixes differ in DEPTH, so prefix-relative
+  // keys alone would disagree ("packages/api/src/db.ts" vs "src/db.ts") and
+  // double-count the shared file. Anchoring on the checkout resolves both.
+  const exists = existsIn(["packages/web/src/ui.ts", "packages/api/src/db.ts"]);
+  const opts = { exists, cwd: "/repo" };
+  const unit = normalizeSummary(
+    fileSummary({
+      "/ws/repo/packages/web/src/ui.ts": { covered: 80, total: 100 },
+      "/ws/repo/packages/api/src/db.ts": { covered: 10, total: 100 },
+    }),
+    "lines",
+    opts,
+  );
+  const contract = normalizeSummary(
+    fileSummary({ "/ws/repo/packages/api/src/db.ts": { covered: 95, total: 100 } }),
+    "lines",
+    opts,
+  );
+  assert.equal(contract.files.size, 1);
+  assert.ok(contract.files.has("packages/api/src/db.ts"));
+  const merged = mergeNormalized([unit, contract]);
+  assert.equal(merged.fileCount, 2, "the shared file must not double-count");
+  assert.equal(merged.covered, 175, "80 + max(10, 95)");
+  assert.equal(merged.total, 200);
+});
+
+test("normalizeSummary counts keys it could not resolve against the checkout", () => {
+  const exists = existsIn(["src/a.ts"]);
+  const part = normalizeSummary(
+    fileSummary({
+      "/ws/repo/src/a.ts": { covered: 5, total: 10 },
+      "/ws/repo/dist/generated.js": { covered: 1, total: 10 },
+    }),
+    "lines",
+    { exists, cwd: "/repo" },
+  );
+  assert.equal(part.unresolved, 1);
+  assert.equal(part.files.size, 2, "an unresolved key still contributes, via the prefix fallback");
+});
+
+test("evaluateGate: a weighted merge PASSES where the old per-summary AND failed", () => {
+  // 900/1000 (90%) + 70/100 (70%) = 970/1100 = 88.18%, above an 80 floor.
+  // Under the old AND the 70% summary alone red the gate — which is exactly
+  // the false-fail that forced a consumer to keep its whole suite in one tier.
+  const exists = existsIn(["src/big.ts", "api/small.ts"]);
+  const verdict = evaluateGate(
+    { threshold: 80, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists,
+      findSummaries: () => ["unit/coverage/coverage-summary.json", "contract/coverage/coverage-summary.json"],
+      read: (f) =>
+        f.startsWith("unit")
+          ? fileSummary({ "/ws/repo/src/big.ts": { covered: 900, total: 1000 } })
+          : fileSummary({ "/ws/repo/api/small.ts": { covered: 70, total: 100 } }),
+    },
+  );
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.merged.covered, 970);
+  assert.equal(verdict.merged.total, 1100);
+  assert.equal(Math.round(verdict.merged.pct * 100) / 100, 88.18);
+});
+
+test("evaluateGate: equal-weight 85% + 70% against an 80 floor fails on the weighted number (77.5%)", () => {
+  const exists = existsIn(["src/a.ts", "api/b.ts"]);
+  const verdict = evaluateGate(
+    { threshold: 80, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists,
+      findSummaries: () => ["a/coverage/coverage-summary.json", "b/coverage/coverage-summary.json"],
+      read: (f) =>
+        f.startsWith("a")
+          ? fileSummary({ "/ws/repo/src/a.ts": { covered: 85, total: 100 } })
+          : fileSummary({ "/ws/repo/api/b.ts": { covered: 70, total: 100 } }),
+    },
+  );
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.merged.pct, 77.5);
+});
+
+test("evaluateGate: a sharded tier's partial summaries merge instead of each false-failing", () => {
+  // Two shards of ONE tier, each measuring only the files its shard ran.
+  // Asserted individually both sit at 50%; merged they are the repo's 90%.
+  const exists = existsIn(["src/a.ts", "src/b.ts"]);
+  const verdict = evaluateGate(
+    { threshold: 80, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists,
+      findSummaries: () => ["unit-results-1/coverage/coverage-summary.json", "unit-results-2/coverage/coverage-summary.json"],
+      read: (f) =>
+        f.includes("unit-results-1")
+          ? fileSummary({
+              "/ws/repo/src/a.ts": { covered: 90, total: 100 },
+              "/ws/repo/src/b.ts": { covered: 10, total: 100 },
+            })
+          : fileSummary({
+              "/ws/repo/src/a.ts": { covered: 10, total: 100 },
+              "/ws/repo/src/b.ts": { covered: 90, total: 100 },
+            }),
+    },
+  );
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.merged.covered, 180, "max per file across shards: 90 + 90");
+  assert.equal(verdict.merged.pct, 90);
+});
+
+test("evaluateGate: summaries carrying only a `total` block still contribute (no silent vanish)", () => {
+  const verdict = evaluateGate(
+    { threshold: 80, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists: () => false,
+      findSummaries: () => ["a/coverage/coverage-summary.json"],
+      read: () => summary({ lines: 91 }),
+    },
+  );
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.merged.covered, 91);
+  assert.equal(verdict.merged.total, 100);
+  assert.equal(verdict.results[0].contributed, true);
+});
+
+test("evaluateGate: a set floor with summaries that carry no readable counts still FAILS", () => {
+  const verdict = evaluateGate(
+    { threshold: 80, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists: () => false,
+      findSummaries: () => ["a/coverage/coverage-summary.json"],
+      read: () => ({ total: { branches: { total: 1, covered: 1, pct: 100 } } }),
+    },
+  );
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.reason, /could be read from/);
+});
+
+test("formatVerdict names each contributing artifact and the merged total", () => {
+  const exists = existsIn(["src/a.ts", "api/b.ts"]);
+  const verdict = evaluateGate(
+    { threshold: 80, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists,
+      findSummaries: () => ["unit-results-1/coverage/coverage-summary.json", "contract-results-1/coverage/coverage-summary.json"],
+      read: (f) =>
+        f.startsWith("unit")
+          ? fileSummary({ "/ws/repo/src/a.ts": { covered: 90, total: 100 } })
+          : fileSummary({ "/ws/repo/api/b.ts": { covered: 80, total: 100 } }),
+    },
+  );
+  const out = formatVerdict(verdict).join("\n");
+  assert.match(out, /unit-results-1\/coverage\/coverage-summary\.json/);
+  assert.match(out, /contract-results-1\/coverage\/coverage-summary\.json/);
+  assert.match(out, /merged across 2 summary\(ies\)/);
+  assert.match(out, /170\/200/);
 });
 
 // ---------------------------------------------------------------------------
