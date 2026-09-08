@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.7.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.6.0...mandrel-platform-v1.7.0) (2026-09-07)
+
+
+### Added
+
+* ship `issue-intake` — a producer-agnostic issue-intake normalizer composite action ([#435](https://github.com/dsj1984/mandrel-platform/issues/435)) ([#438](https://github.com/dsj1984/mandrel-platform/issues/438)) ([8ae4a29](https://github.com/dsj1984/mandrel-platform/commit/8ae4a290287cdcd317e441d010ebfc71d11df1e3))
+
+
+### Fixed
+
+* lint the markdown and code this repo ships — adopt the config bases it publishes for consumers ([#443](https://github.com/dsj1984/mandrel-platform/issues/443)) ([#444](https://github.com/dsj1984/mandrel-platform/issues/444)) ([5ac1fa9](https://github.com/dsj1984/mandrel-platform/commit/5ac1fa9175535151952c7d8f1cc26afe4f5dd210))
+* retry the gitleaks asset download, and guard the invariant (refs [#446](https://github.com/dsj1984/mandrel-platform/issues/446)) ([#447](https://github.com/dsj1984/mandrel-platform/issues/447)) ([083578c](https://github.com/dsj1984/mandrel-platform/commit/083578ce67fe10db82d64b772bf2672048b34402))
+
 ## [1.6.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.5.1...mandrel-platform-v1.6.0) (2026-09-06)
 
 
