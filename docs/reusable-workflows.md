@@ -3685,7 +3685,11 @@ script and this document describe exactly one shape.
       "sensitivity": "public",       // "public" | "secret"
       "residency": {
         "local": "var",              // "var" | "secret" | "file" | null
+
+        // Either a single object, or an array of them — see
+        // "GitHub residency: dual scope and per-environment presence" below.
         "github": { "scope": "environment", "kind": "var" },
+
         "cloudflare": { "workers": ["site"], "kind": "var" }
       },
       "infisical": { "folder": "/", "environments": ["staging", "production"] },
@@ -3700,6 +3704,63 @@ script and this document describe exactly one shape.
 `infisical` is either `{folder, environments}` or the literal string
 `"unmanaged"`. A `residency` member is `null` when the key does not belong in
 that store.
+
+#### GitHub residency: dual scope and per-environment presence
+
+`residency.github` accepts **either** a single `{scope, kind}` object **or an
+array of them**, and each entry takes an optional `environments`:
+
+```jsonc
+"github": [
+  { "scope": "repository",  "kind": "secret" },
+  { "scope": "environment", "kind": "secret", "environments": ["staging", "production"] }
+]
+```
+
+Two residencies occur in practice that one object cannot say:
+
+**Dual scope.** A key can legitimately live at repository level *and* at
+environment level, for different consumers — a deploy job declares
+`environment:` and reads the per-environment value, while a CI or nightly job
+declares none and reads a repo-level credential of the same name. That is not
+drift, but under a single object whichever scope you declared, the other
+reported as an orphan, permanently, on a healthy repo.
+
+**Per-environment presence.** A key can be deliberately present in one
+environment and absent from another — a production-only analytics token whose
+staging counterpart is meant to resolve empty and render nothing. Without a
+per-entry `environments`, that intended absence reported as a `missing`
+failure.
+
+`environments` **defaults to all of `manifest.environments`**, so an entry that
+omits it is expected everywhere — which is why the single-object form keeps
+behaving exactly as it always did. It is meaningful only under
+`scope: "environment"`; supplying it on a `repository` entry is a validation
+error rather than a silently ignored field, as are an environment slug outside
+`manifest.environments`, a repeated `(scope, kind)` pair, and an empty array
+(use `null` when the key does not belong in GitHub at all).
+
+##### Orphans across scopes
+
+GitHub is probed in more than one partition — repository scope once, then each
+environment — so the surface suppresses one specific false orphan: **a name
+declared at one scope is never reported as an orphan at the other scope of the
+same kind.** Declaring the array form above is the right fix for a genuinely
+dual-resident key, but a manifest that declares only one scope no longer pays
+an orphan for the other.
+
+The suppression is deliberately no wider than that:
+
+| Case | Reported? |
+| --- | --- |
+| Declared at environment scope, present at repository scope (same kind) | **No** — this is the dual-scope case |
+| Declared as a `secret`, present as a `var` | **Yes** — a kind mismatch is real drift |
+| Declared `environments: ["production"]`, present in staging | **Yes** — undeclared presence in the wrong environment |
+| Declared in no GitHub scope at all | **Yes** — unchanged |
+
+The last two rows are what keep `--strict-orphans` worth enabling: once a
+manifest is authored correctly, a healthy repo reports zero orphans, so any new
+one is a real finding.
 
 #### `shape` is a closed vocabulary
 
