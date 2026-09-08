@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.9.0...mandrel-platform-v1.10.0) (2026-09-08)
+
+
+### Added
+
+* let env-doctor map Infisical env slugs and multi-folder residency (refs [#464](https://github.com/dsj1984/mandrel-platform/issues/464)) ([#465](https://github.com/dsj1984/mandrel-platform/issues/465)) ([e5b44a8](https://github.com/dsj1984/mandrel-platform/commit/e5b44a831cbd6a2b4b14a08b27e719524323ef25))
+
 ## [1.9.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.8.1...mandrel-platform-v1.9.0) (2026-09-08)
 
 
