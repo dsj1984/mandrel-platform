@@ -66,6 +66,7 @@ test("every workflow taking a `runner` input is covered by this guard", () => {
   assert.deepEqual(names, [
     "advisory-scan.yml",
     "deploy-cloudflare.yml",
+    "env-drift.yml",
     "pr-quality.yml",
     "release-automation.yml",
     "secret-scan-push.yml",
