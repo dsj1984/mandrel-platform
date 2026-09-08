@@ -79,7 +79,7 @@ on:
       tier-timeouts:
         description: >
           JSON object of per-tier `timeout-minutes` overrides, keyed by tier —
-          lint, workflow-lint, typecheck, unit, contract, e2e,
+          lint, workflow-lint, typecheck, unit, contract, coverage-floor, e2e,
           migration-guard, security, osv-scan, ci-required. Unlisted tiers keep their default budget, so
           '{"ci-required": 17, "e2e": 57}' overrides two tiers and leaves the
           rest alone. Default '{}' is byte-for-byte today's behaviour. On a
@@ -363,21 +363,27 @@ on:
         type: string
         default: '**/migrations/**,**/drizzle/**'
 
-      # Optional coverage floor (Story #109). Off by default (0) so
-      # non-adopters keep today's behaviour: pr-quality.yml already uploads
-      # `**/coverage/` as an artifact, but no job asserts a floor, so a PR can
-      # drop coverage while ci-required stays green. Set this to a percent and
-      # the unit job fails when measured coverage falls below it — and the unit
-      # job is a `needs:` of ci-required, so the floor is load-bearing. Coverage
-      # is read from the EXISTING `**/coverage/coverage-summary.json` output
-      # (json-summary reporter); no new tooling is required of consumers.
+      # Optional coverage floor (Story #109; relocated + merged, Story #468).
+      # Off by default (0) so non-adopters keep today's behaviour: pr-quality.yml
+      # already uploads `**/coverage/` as an artifact, but no job asserts a
+      # floor, so a PR can drop coverage while ci-required stays green. Set this
+      # to a percent and the `coverage-floor` job fails when measured coverage
+      # falls below it — and that job is a `needs:` of ci-required, so the floor
+      # is load-bearing. Coverage is read from the EXISTING
+      # `**/coverage/coverage-summary.json` output (json-summary reporter); no
+      # new tooling is required of consumers. Every tier's summaries are UNIONED
+      # into one measurement, so the floor no longer depends on which tier
+      # happens to run which tests.
       coverage-threshold:
         description: >
-          Minimum coverage percentage the unit job must meet. 0 (default)
-          disables the gate, preserving current behaviour. When > 0, the unit
-          job fails if measured coverage (read from the existing
-          **/coverage/coverage-summary.json) is below this floor. The unit job
-          is a needs: of ci-required, so the floor blocks the merge.
+          Minimum coverage percentage the merged run must meet. 0 (default)
+          disables the gate, preserving current behaviour. When > 0, the
+          coverage-floor job unions every tier's
+          **/coverage/coverage-summary.json into one measurement and fails if it
+          is below this floor. That job is a needs: of ci-required, so the floor
+          blocks the merge. Overlapping files resolve as max(covered), a lower
+          bound on the true union — the floor can never pass on a number larger
+          than reality.
         required: false
         type: number
         default: 0
@@ -387,9 +393,10 @@ on:
       coverage-metric:
         description: >
           Coverage metric the coverage-threshold floor asserts: 'lines',
-          'statements', 'functions', or 'branches'. Read from total.<metric>.pct
-          in coverage-summary.json. Default 'lines'. Ignored when
-          coverage-threshold is 0.
+          'statements', 'functions', or 'branches'. Summed across every tier's
+          coverage-summary.json per-file entries (falling back to
+          total.<metric>.pct for a summary that carries no per-file data).
+          Default 'lines'. Ignored when coverage-threshold is 0.
         required: false
         type: string
         default: 'lines'
@@ -1434,93 +1441,6 @@ jobs:
           TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
           TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
 
-      # ── Optional coverage floor (Story #109) ──────────────────────────────
-      #
-      # Off by default: when `coverage-threshold` is 0 both steps are skipped,
-      # so non-adopters keep today's behaviour. When set, the gate reads the
-      # EXISTING `**/coverage/coverage-summary.json` (the same json-summary
-      # output uploaded below) and FAILS the unit job — which is a `needs:` of
-      # ci-required — when measured `total.<metric>.pct` is below the floor. A
-      # set floor with NO coverage summary also fails (never a silent pass on
-      # missing data).
-      #
-      # The gate logic is the platform's own unit-tested
-      # scripts/check-coverage-threshold.mjs, delivered via a sparse
-      # side-checkout of mandrel-platform at `job.workflow_sha` — the
-      # same resolved-ref mechanism the SAST vendored-ruleset step below uses
-      # (Story #230; replaces the inlined heredoc copy whose drift #163
-      # documented). A script fetched at `job.workflow_sha` is exactly as
-      # version-locked as inline YAML: the consumer always runs the script
-      # that shipped with the workflow version it pinned, with zero drift risk.
-      #
-      # AFFECTED-MODE RECONCILIATION (Story #315). The gate reads the MERGED
-      # coverage-summary.json spanning all workspaces; under `affected` mode the
-      # unit tier runs only the changed packages' tests, so that merged number
-      # reflects a PARTIAL subset — not a whole-repo measurement — and comparing
-      # it to an absolute whole-repo floor would FALSE-FAIL. Reconciliation
-      # DECISION (documented in docs/reusable-workflows.md): BYPASS the floor on
-      # affected runs (`&& !inputs.affected` below) rather than re-derive a
-      # subset floor whose meaning drifts per run. The floor stays authoritative
-      # on non-affected (full) runs; a consumer needing a hard whole-repo floor
-      # keeps a non-affected required check (or a scheduled full run) for it. A
-      # visible `::notice::` is emitted (step below) whenever a set floor is
-      # skipped for this reason, so the bypass is never silent.
-      - name: Resolve platform ref (coverage gate scripts)
-        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
-        id: gate-scripts-ref
-        shell: bash
-        env:
-          # Fail-closed resolve of this reusable workflow's own commit — full
-          # rationale on the first "Resolve platform ref" step in this file
-          # (Story #415).
-          PLATFORM_SHA: ${{ job.workflow_sha }}
-          # Diagnostic only — names the CALLER whose run hit this, so a report
-          # is actionable without a second round trip.
-          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
-        run: |
-          set -euo pipefail
-          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
-            exit 1
-          fi
-          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout gate scripts (mandrel-platform@resolved-sha)
-        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: dsj1984/mandrel-platform
-          ref: ${{ steps.gate-scripts-ref.outputs.sha }}
-          sparse-checkout: |
-            scripts
-          sparse-checkout-cone-mode: false
-          path: _mandrel-platform-scripts
-          persist-credentials: false
-
-      - name: Coverage threshold gate
-        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
-        shell: bash
-        env:
-          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
-          COVERAGE_METRIC: ${{ inputs.coverage-metric }}
-        run: |
-          set -euo pipefail
-          node _mandrel-platform-scripts/scripts/check-coverage-threshold.mjs \
-            --threshold "${COVERAGE_THRESHOLD}" \
-            --metric "${COVERAGE_METRIC}"
-
-      # Surface the affected-mode coverage-floor bypass (Story #315) so it is
-      # never a silent skip: this fires only when a floor IS set AND affected
-      # mode is on, exactly the case the two steps above were gated out of.
-      - name: Coverage floor bypassed (affected mode)
-        if: ${{ inputs.coverage-threshold != 0 && inputs.affected }}
-        shell: bash
-        env:
-          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
-        run: |
-          set -euo pipefail
-          echo "::notice title=Coverage floor bypassed::coverage-threshold (${COVERAGE_THRESHOLD}%) is NOT asserted on this run because affected mode is on. The unit tier ran an affected subset, whose merged coverage-summary.json is a partial (not whole-repo) measurement and would false-fail an absolute floor. The floor remains authoritative on non-affected (full) runs — see docs/reusable-workflows.md."
-
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -1577,12 +1497,19 @@ jobs:
           TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
           TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
 
+      # `**/coverage/` matches the unit job's glob (Story #468). Without it
+      # contract-tier coverage could not leave this job, so a consumer that
+      # scoped its tiers lost that coverage from the floor entirely. A contract
+      # tier that emits no coverage still uploads its test results unchanged —
+      # a glob matching nothing does not fail the upload.
       - name: Upload contract results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: contract-results-${{ matrix.shard }}
-          path: '**/test-results/'
+          path: |
+            **/test-results/
+            **/coverage/
           retention-days: 7
 
       # Fail-fast attribution (Story #331) — aliased collateral explainer; see
@@ -1595,6 +1522,131 @@ jobs:
       # the LAST step; loud-but-non-fatal; ci-required counts cancelled as
       # non-success).
       - *cancel-on-failure
+
+  # ── Coverage floor (Story #109; relocated + merged, Story #468) ───────────
+  #
+  # The `coverage-threshold` floor used to be asserted INSIDE the unit job,
+  # against that job's own workspace, while the contract job uploaded only test
+  # results and never coverage. Contract-tier coverage could therefore never
+  # leave its job, which left a consumer two bad options and no third: keep the
+  # whole suite in the unit tier so the floor stays whole-repo — paying the
+  # same run twice on every PR — or scope the tiers for speed and let the floor
+  # silently become a partial measurement of whatever the unit tier still ran.
+  # Measured on one consumer tree the contract tier was ~18 points of line
+  # coverage: 94.95% whole-repo against 76.78% with that tier's project
+  # removed, i.e. under the consumer's own 80% floor. The dangerous outcome was
+  # the second one — nothing in the run said the number had changed meaning.
+  #
+  # The floor now lives HERE: one job downstream of every coverage-producing
+  # tier, which downloads their artifacts, unions the summaries and asserts
+  # once. That also retires a latent false-fail — every shard of a sharded unit
+  # tier used to be asserted against its own partial subset.
+  #
+  # NO JOB-LEVEL `permissions:` HERE, DELIBERATELY — the same compile-time
+  # hazard the migration-guard tier documents (Story #292): a called workflow's
+  # declared job scopes are validated against the caller's grant regardless of
+  # any `if:` gate, so a scope added here would fail the ENTIRE call with
+  # `startup_failure` for every consumer that has not granted it. The
+  # workflow-level `contents: read` + `actions: write` grant already covers
+  # same-run artifact download, so this job needs nothing new.
+  coverage-floor:
+    name: Coverage floor
+    # Fires whenever a floor is SET and no coverage-producing tier ended badly.
+    # `always()` is what lets the job evaluate at all after `needs:`; the
+    # result checks keep it off a run that is already red, where it would stack
+    # a confusing "no coverage found" on top of the real failure. Written as
+    # `!= failure && != cancelled` rather than `== success` on purpose: a tier
+    # legitimately disabled via `enable-unit` / `enable-contract` reports
+    # `skipped`, and a floor set with every test tier off must reach the gate
+    # and FAIL on missing data, never skip into a silent pass. Threshold 0
+    # skips the job entirely, which the aggregate counts as a pass — today's
+    # behaviour for non-adopters, unchanged.
+    if: >-
+      ${{ always() && inputs.coverage-threshold != 0
+      && needs.unit.result != 'failure' && needs.unit.result != 'cancelled'
+      && needs.contract.result != 'failure' && needs.contract.result != 'cancelled' }}
+    needs:
+      - unit
+      - contract
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['coverage-floor'] || 5 }}
+    steps:
+      - *harden-runner
+
+      # The consumer checkout is load-bearing, not incidental: a
+      # coverage-summary.json keys its per-file entries by the ABSOLUTE path
+      # they had in the workspace that produced them, and the gate normalizes
+      # each key by resolving it against THIS checkout. That is what lets two
+      # tiers' summaries merge when they ran under different workspace roots.
+      - *checkout
+
+      # Every tier's results land under `_tier-coverage/<artifact>/…`, each in
+      # its own subdirectory (no `merge-multiple`), so same-named files from
+      # different tiers and shards cannot overwrite one another. The gate's own
+      # recursive scan finds every coverage-summary.json beneath the workspace.
+      - name: Download tier coverage artifacts
+        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '*-results-*'
+          path: _tier-coverage
+
+      - name: Resolve platform ref (coverage gate scripts)
+        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
+        id: gate-scripts-ref
+        shell: bash
+        env:
+          # Fail-closed resolve of this reusable workflow's own commit — full
+          # rationale on the first "Resolve platform ref" step in this file
+          # (Story #415).
+          PLATFORM_SHA: ${{ job.workflow_sha }}
+          # Diagnostic only — names the CALLER whose run hit this, so a report
+          # is actionable without a second round trip.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
+            exit 1
+          fi
+          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout gate scripts (mandrel-platform@resolved-sha)
+        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          ref: ${{ steps.gate-scripts-ref.outputs.sha }}
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-scripts
+          persist-credentials: false
+
+      - name: Coverage threshold gate
+        if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
+        shell: bash
+        env:
+          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+          COVERAGE_METRIC: ${{ inputs.coverage-metric }}
+        run: |
+          set -euo pipefail
+          node _mandrel-platform-scripts/scripts/check-coverage-threshold.mjs \
+            --threshold "${COVERAGE_THRESHOLD}" \
+            --metric "${COVERAGE_METRIC}"
+
+      # Surface the affected-mode coverage-floor bypass (Story #315) so it is
+      # never a silent skip: this fires only when a floor IS set AND affected
+      # mode is on, exactly the case the two steps above were gated out of.
+      - name: Coverage floor bypassed (affected mode)
+        if: ${{ inputs.coverage-threshold != 0 && inputs.affected }}
+        shell: bash
+        env:
+          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+        run: |
+          set -euo pipefail
+          echo "::notice title=Coverage floor bypassed::coverage-threshold (${COVERAGE_THRESHOLD}%) is NOT asserted on this run because affected mode is on. The unit tier ran an affected subset, whose merged coverage-summary.json is a partial (not whole-repo) measurement and would false-fail an absolute floor. The floor remains authoritative on non-affected (full) runs — see docs/reusable-workflows.md."
+
 
   # ── Tier 5: E2E / Smoke (Playwright) ─────────────────────────────────────
   e2e:
@@ -2638,6 +2690,7 @@ jobs:
       - typecheck
       - unit
       - contract
+      - coverage-floor
       - e2e
       - migration-guard
       - security

@@ -10,9 +10,26 @@
  * green.
  * The `.agents/` harness ships a CRAP/MI/coverage *ratchet*, but the shared CI
  * workflow itself had no coverage floor an operator could opt into at the
- * workflow layer. This script is that floor: the `unit` job runs it with the
- * `coverage-threshold` workflow input, and a non-zero exit fails the job —
- * which is a `needs:` of `ci-required`.
+ * workflow layer. This script is that floor: the `coverage-floor` job runs it
+ * with the `coverage-threshold` workflow input, and a non-zero exit fails the
+ * job — which is a `needs:` of `ci-required`.
+ *
+ * MERGED MEASUREMENT (Story #468). The gate used to assert every discovered
+ * `coverage-summary.json` INDEPENDENTLY — a logical AND across per-workspace
+ * summaries. That made the floor an artifact of which job happened to run
+ * which tests: it false-failed every shard of a sharded tier (each shard
+ * measures its own subset), and it forced a consumer to keep its whole suite
+ * in the one tier the gate could see, because a scoped tier's summary is a
+ * partial measurement of the repo. The gate now UNIONS every summary it finds
+ * into one measurement and asserts the floor once.
+ *
+ * Two tiers can exercise the same source file, and a summary records how MANY
+ * lines each covered, never WHICH — so the true union is not recoverable from
+ * counts. Overlap therefore resolves as per-file `max(covered)`, which is a
+ * provable LOWER BOUND on the union: the merged number can only understate
+ * real coverage, so the floor may false-fail and can never false-pass. Tiers
+ * scoped to disjoint projects — the case this exists for — overlap on nothing
+ * and merge exactly.
  *
  * Design constraints:
  *   • OPT-IN. A threshold of 0 (the default) is a no-op: the gate prints a
@@ -40,7 +57,7 @@
  *
  * Exit codes:
  *   0 — gate disabled (threshold 0), or measured coverage ≥ threshold.
- *   1 — measured coverage below the threshold, OR the threshold is set but no
+ *   1 — merged coverage below the threshold, OR the threshold is set but no
  *       coverage summary could be found / parsed (a set floor must never pass
  *       silently on missing data).
  */
@@ -165,6 +182,169 @@ export function meetsThreshold(pct, threshold) {
 }
 
 /**
+ * The per-file keys of a coverage-summary.json (everything but `total`).
+ * json-summary emits one entry per source file, keyed by the ABSOLUTE path it
+ * had in the workspace that produced it.
+ */
+export function summaryFileKeys(summary) {
+  if (!summary || typeof summary !== "object") return [];
+  return Object.keys(summary).filter(
+    (k) => k !== "total" && summary[k] && typeof summary[k] === "object"
+  );
+}
+
+/**
+ * Longest common DIRECTORY prefix of a key list (trailing slash included, or
+ * "" when there is none). Filenames are excluded from the comparison so a
+ * single-entry summary yields its own directory rather than the file itself.
+ *
+ * This is the FALLBACK normalizer only — see `toRepoRelativeKey`. It is not
+ * safe on its own across summaries: two tiers whose file sets bottom out at
+ * different depths (one scoped to `packages/api`, one spanning the repo)
+ * produce prefixes of different lengths, so the same file normalizes to two
+ * different keys and the union double-counts it.
+ */
+export function commonDirPrefix(keys) {
+  const lists = keys.map((k) => String(k).replace(/\\/g, "/").split("/").slice(0, -1));
+  if (lists.length === 0) return "";
+  let prefix = lists[0];
+  for (let i = 1; i < lists.length; i++) {
+    const other = lists[i];
+    let n = 0;
+    while (n < prefix.length && n < other.length && prefix[n] === other[n]) n++;
+    prefix = prefix.slice(0, n);
+  }
+  return prefix.length > 0 ? prefix.join("/") + "/" : "";
+}
+
+/**
+ * Normalize one absolute coverage key to a repo-relative path, ANCHORED ON
+ * THE CHECKOUT rather than on the key list's own shape: walk the key's
+ * segments left-to-right and return the first (longest) suffix that resolves
+ * to a real path under `cwd`.
+ *
+ * This is what lets two tiers' summaries merge when they were produced under
+ * different workspace roots — a self-hosted fleet where one job ran under
+ * `/actions-runner/_work/repo/repo` and another under `/srv/runner2/_work/repo/repo`
+ * still normalizes both to `src/foo.ts`. Anchoring on the checkout also avoids
+ * the mixed-depth failure `commonDirPrefix` has on its own.
+ *
+ * Returns null when nothing resolves (a generated or since-deleted file); the
+ * caller falls back to the prefix form and counts it.
+ */
+export function toRepoRelativeKey(key, { exists = existsSync, cwd = process.cwd() } = {}) {
+  if (typeof key !== "string" || key.trim() === "") return null;
+  const norm = key.replace(/\\/g, "/");
+  const absolute = norm.startsWith("/") || /^[A-Za-z]:\//.test(norm);
+  if (!absolute) return norm.replace(/^\.\//, "");
+  const segs = norm.split("/").filter((seg) => seg !== "" && !/^[A-Za-z]:$/.test(seg));
+  for (let i = 0; i < segs.length; i++) {
+    const candidate = segs.slice(i).join("/");
+    if (exists(join(cwd, candidate))) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Reduce one parsed summary to the per-file {covered, total} counts for
+ * `metric`, keyed by normalized path.
+ *
+ * A summary carrying ONLY a `total` block (no per-file entries) cannot be
+ * merged per file, so it is kept as an OPAQUE contribution keyed by nothing —
+ * its counts are added to the aggregate whole. That can double-count a file
+ * two such summaries share, which is why json-summary's per-file output is the
+ * supported shape; the opaque path exists so a reduced summary degrades to
+ * today's arithmetic rather than vanishing from the measurement.
+ */
+export function normalizeSummary(summary, metric, { exists = existsSync, cwd = process.cwd() } = {}) {
+  const files = new Map();
+  let unresolved = 0;
+  const keys = summaryFileKeys(summary);
+
+  if (keys.length === 0) {
+    const total = summary && typeof summary === "object" ? summary.total : null;
+    const entry = total && typeof total === "object" ? total[metric] : null;
+    const covered = entry && Number.isFinite(entry.covered) ? entry.covered : null;
+    const denom = entry && Number.isFinite(entry.total) ? entry.total : null;
+    return {
+      files,
+      unresolved,
+      opaque: covered !== null && denom !== null ? { covered, total: denom } : null,
+    };
+  }
+
+  const prefix = commonDirPrefix(keys);
+  for (const key of keys) {
+    const entry = summary[key][metric];
+    if (!entry || !Number.isFinite(entry.covered) || !Number.isFinite(entry.total)) continue;
+    let normalized = toRepoRelativeKey(key, { exists, cwd });
+    if (normalized === null) {
+      unresolved += 1;
+      const raw = String(key).replace(/\\/g, "/");
+      normalized = prefix && raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+    }
+    const prev = files.get(normalized);
+    files.set(
+      normalized,
+      prev
+        ? {
+            // MAX, never sum. Two tiers exercising the same file report how
+            // MANY lines each covered, never WHICH — so the true union is
+            // unknowable from counts alone. max() is a provable lower bound on
+            // it (the union is at least the larger contribution), which keeps
+            // the floor able to false-fail but never to false-pass.
+            covered: Math.max(prev.covered, entry.covered),
+            total: Math.max(prev.total, entry.total),
+          }
+        : { covered: entry.covered, total: entry.total }
+    );
+  }
+  return { files, unresolved, opaque: null };
+}
+
+/**
+ * Union a list of normalized summaries into ONE measurement:
+ * `sum(covered) / sum(total) * 100` over the merged per-file map.
+ */
+export function mergeNormalized(parts) {
+  const files = new Map();
+  let covered = 0;
+  let total = 0;
+  let unresolved = 0;
+
+  for (const part of parts) {
+    unresolved += part.unresolved || 0;
+    for (const [key, value] of part.files) {
+      const prev = files.get(key);
+      files.set(
+        key,
+        prev
+          ? {
+              covered: Math.max(prev.covered, value.covered),
+              total: Math.max(prev.total, value.total),
+            }
+          : { covered: value.covered, total: value.total }
+      );
+    }
+    if (part.opaque) {
+      covered += part.opaque.covered;
+      total += part.opaque.total;
+    }
+  }
+  for (const value of files.values()) {
+    covered += value.covered;
+    total += value.total;
+  }
+  return {
+    covered,
+    total,
+    pct: total > 0 ? (covered / total) * 100 : null,
+    fileCount: files.size,
+    unresolved,
+  };
+}
+
+/**
  * Recursively find every `coverage-summary.json` under `root`, regardless of
  * the name of the directory that directly contains it. `node_modules` and
  * dotted dirs (e.g. `.git`, `.agents`) are pruned so the scan stays fast and
@@ -228,7 +408,10 @@ export function readSummary(file) {
  * drive it directly. Returns a structured verdict:
  *   { ok, skipped, reason, threshold, metric, results: [{ file, pct, ok }] }
  */
-export function evaluateGate(opts, { findSummaries = findCoverageSummaries, read = readSummary } = {}) {
+export function evaluateGate(
+  opts,
+  { findSummaries = findCoverageSummaries, read = readSummary, exists = existsSync } = {}
+) {
   const { threshold, metric, cwd, coverageDirs } = opts;
 
   if (threshold <= 0) {
@@ -239,6 +422,7 @@ export function evaluateGate(opts, { findSummaries = findCoverageSummaries, read
       threshold,
       metric,
       results: [],
+      merged: null,
     };
   }
 
@@ -254,28 +438,56 @@ export function evaluateGate(opts, { findSummaries = findCoverageSummaries, read
       threshold,
       metric,
       results: [],
+      merged: null,
     };
   }
 
+  // Per-summary rows stay in the verdict as CONTRIBUTIONS — they name which
+  // artifact carried which numbers, so a tier that quietly stopped producing
+  // coverage is visible in the log. They are no longer individually asserted:
+  // the floor is one verdict over the union (see the header note).
   const results = [];
+  const parts = [];
   for (const file of files) {
     const summary = read(file);
     const pct = extractPct(summary, metric);
-    if (pct === null) {
-      results.push({ file, pct: null, ok: false });
-    } else {
-      results.push({ file, pct, ok: meetsThreshold(pct, threshold) });
-    }
+    const part = normalizeSummary(summary, metric, { exists, cwd });
+    parts.push(part);
+    results.push({
+      file,
+      pct,
+      fileCount: part.files.size,
+      unresolved: part.unresolved,
+      contributed: part.files.size > 0 || part.opaque !== null,
+    });
   }
 
-  const failures = results.filter((r) => !r.ok);
+  const merged = mergeNormalized(parts);
+
+  if (merged.pct === null) {
+    return {
+      ok: false,
+      skipped: false,
+      reason:
+        `coverage threshold is set but no "${metric}" counts could be read from ` +
+        `any of the ${files.length} coverage summaries found (a set floor must ` +
+        "not pass on unreadable data)",
+      threshold,
+      metric,
+      results,
+      merged,
+    };
+  }
+
+  const ok = meetsThreshold(merged.pct, threshold);
   return {
-    ok: failures.length === 0,
+    ok,
     skipped: false,
-    reason: failures.length === 0 ? "all coverage summaries meet the floor" : "below floor",
+    reason: ok ? "merged coverage meets the floor" : "below floor",
     threshold,
     metric,
     results,
+    merged,
   };
 }
 
@@ -290,26 +502,43 @@ export function formatVerdict(verdict) {
     lines.push(`[coverage-threshold] ❌ ${verdict.reason}`);
     return lines;
   }
+
+  // Contribution rows first: which artifact carried what.
   for (const r of verdict.results) {
-    if (r.pct === null) {
+    if (!r.contributed) {
       lines.push(
-        `[coverage-threshold] ❌ ${r.file}: no "${verdict.metric}" total.pct in summary`
+        `[coverage-threshold] ⚠️  ${r.file}: no "${verdict.metric}" counts — contributed nothing`
       );
-    } else {
-      const mark = r.ok ? "✅" : "❌";
-      lines.push(
-        `[coverage-threshold] ${mark} ${r.file}: ${verdict.metric} ${r.pct}% ` +
-        `(floor ${verdict.threshold}%)`
-      );
+      continue;
     }
+    const shown = r.pct === null ? "n/a" : `${r.pct}%`;
+    const unresolvedNote =
+      r.unresolved > 0 ? `, ${r.unresolved} path(s) unresolved against the checkout` : "";
+    lines.push(
+      `[coverage-threshold] • ${r.file}: ${r.fileCount} file(s), ` +
+        `${verdict.metric} ${shown} on its own${unresolvedNote}`
+    );
   }
+
+  const m = verdict.merged;
+  if (!m || m.pct === null) {
+    lines.push(`[coverage-threshold] ❌ ${verdict.reason}`);
+    return lines;
+  }
+
+  const rounded = Math.round(m.pct * 100) / 100;
+  lines.push(
+    `[coverage-threshold] Σ merged across ${verdict.results.length} summary(ies): ` +
+      `${m.covered}/${m.total} ${verdict.metric} over ${m.fileCount} unique file(s) ` +
+      `= ${rounded}% (floor ${verdict.threshold}%)`
+  );
   if (verdict.ok) {
     lines.push(
-      `[coverage-threshold] ✅ ${verdict.metric} coverage meets the ${verdict.threshold}% floor.`
+      `[coverage-threshold] ✅ merged ${verdict.metric} coverage meets the ${verdict.threshold}% floor.`
     );
   } else {
     lines.push(
-      `[coverage-threshold] ❌ ${verdict.metric} coverage is below the ${verdict.threshold}% floor.`
+      `[coverage-threshold] ❌ merged ${verdict.metric} coverage is below the ${verdict.threshold}% floor.`
     );
   }
   return lines;
