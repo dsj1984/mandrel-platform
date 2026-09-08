@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.8.1...mandrel-platform-v1.9.0) (2026-09-08)
+
+
+### Added
+
+* let residency.github declare dual scope and per-environment presence (refs [#459](https://github.com/dsj1984/mandrel-platform/issues/459)) ([#460](https://github.com/dsj1984/mandrel-platform/issues/460)) ([cc3a61e](https://github.com/dsj1984/mandrel-platform/commit/cc3a61ee333968f72814f29e27bcb68214707c7e))
+
 ## [1.8.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.8.0...mandrel-platform-v1.8.1) (2026-09-08)
 
 
