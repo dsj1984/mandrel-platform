@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.7.0...mandrel-platform-v1.8.0) (2026-09-08)
+
+
+### Added
+
+* add the shared env/secrets residency doctor and env-drift.yml (refs [#451](https://github.com/dsj1984/mandrel-platform/issues/451)) ([#452](https://github.com/dsj1984/mandrel-platform/issues/452)) ([7ea3970](https://github.com/dsj1984/mandrel-platform/commit/7ea3970f026c8b5165570ecd2049615df82e5ac3))
+
 ## [1.7.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.6.0...mandrel-platform-v1.7.0) (2026-09-07)
 
 
