@@ -982,6 +982,7 @@ export async function runDoctor({
   github = null,
   cloudflare = null,
   infisical = null,
+  unavailability = {},
   now = new Date(),
 }) {
   const surfaces = [];
@@ -995,10 +996,17 @@ export async function runDoctor({
     notice: `${offlineResult.checked.length} check(s): ${offlineResult.checked.join(", ") || "none applicable"}`,
   });
 
-  if (!offline) {
-    await probeGitHub({ manifest, environments, github, surfaces, findings });
-    await probeCloudflare({ manifest, environments, cloudflare, surfaces, findings });
-    await probeInfisical({ manifest, environments, infisical, surfaces, findings });
+  if (offline) {
+    // Report the live surfaces as explicitly skipped rather than omitting
+    // them. Silence and "checked" look identical in a summary, which is the
+    // same failure mode the workflow avoids by never `if:`-skipping its job.
+    for (const surface of LIVE_SURFACES) {
+      surfaces.push({ surface, status: "unchecked", notice: OFFLINE_NOTICE });
+    }
+  } else {
+    await probeGitHub({ manifest, environments, github, surfaces, findings, unavailability });
+    await probeCloudflare({ manifest, environments, cloudflare, surfaces, findings, unavailability });
+    await probeInfisical({ manifest, environments, infisical, surfaces, findings, unavailability });
   }
 
   const applied = applyExceptions({ findings, exceptions, now });
@@ -1017,14 +1025,54 @@ export async function runDoctor({
 }
 
 /**
+ * Why a live surface has no client — the distinction the notices depend on.
+ *
+ * A surface can be `unchecked` for three different reasons, and until Story
+ * #455 all three rendered as the first one. That is not a cosmetic problem:
+ * "no Cloudflare API token supplied" sends a reader to re-issue a token that
+ * was never the thing missing, which is exactly how the reusable workflow's
+ * inability to pass an account id survived a release.
+ */
+const NO_CREDENTIAL_NOTICE = {
+  github: "no GitHub token supplied — Actions secret/variable names were not compared",
+  cloudflare: "no Cloudflare API token supplied — Worker secret names were not compared",
+  infisical: "no Infisical credential supplied — secret names and value shapes were not compared",
+};
+
+/** A credential WAS supplied; the identifier naming what to read was not. */
+const MISSING_IDENTIFIER_NOTICE = {
+  github:
+    "no repository supplied (GITHUB_REPOSITORY, or --repo) — a GitHub token WAS supplied; Actions secret/variable names were not compared",
+  cloudflare:
+    "no Cloudflare account id supplied (CLOUDFLARE_ACCOUNT_ID, or --cloudflare-account) — an API token WAS supplied; Worker secret names were not compared",
+  infisical:
+    "no Infisical project id supplied (INFISICAL_PROJECT_ID, or --infisical-project) — a credential WAS supplied; secret names and value shapes were not compared",
+};
+
+/** Nothing was contacted because the run asked for the credential-free arm. */
+const OFFLINE_NOTICE = "offline mode (--offline) — no live store was contacted";
+
+/** The live surfaces, in report order. */
+const LIVE_SURFACES = ["github", "cloudflare", "infisical"];
+
+/**
+ * @param {Record<string, string>} unavailability
+ * @param {string} surface
+ * @returns {string}
+ */
+function unavailableNotice(unavailability, surface) {
+  return unavailability[surface] ?? NO_CREDENTIAL_NOTICE[surface];
+}
+
+/**
  * @param {object} ctx
  */
-async function probeGitHub({ manifest, environments, github, surfaces, findings }) {
+async function probeGitHub({ manifest, environments, github, surfaces, findings, unavailability = {} }) {
   if (!github) {
     surfaces.push({
       surface: "github",
       status: "unchecked",
-      notice: "no GitHub token supplied — Actions secret/variable names were not compared",
+      notice: unavailableNotice(unavailability, "github"),
     });
     return;
   }
@@ -1070,13 +1118,13 @@ async function probeGitHub({ manifest, environments, github, surfaces, findings 
 /**
  * @param {object} ctx
  */
-async function probeCloudflare({ manifest, environments, cloudflare, surfaces, findings }) {
+async function probeCloudflare({ manifest, environments, cloudflare, surfaces, findings, unavailability = {} }) {
   const cfKeys = manifest.keys.filter((k) => k.residency.cloudflare?.kind === "secret");
   if (!cloudflare) {
     surfaces.push({
       surface: "cloudflare",
       status: "unchecked",
-      notice: "no Cloudflare API token supplied — Worker secret names were not compared",
+      notice: unavailableNotice(unavailability, "cloudflare"),
     });
     return;
   }
@@ -1129,13 +1177,13 @@ async function probeCloudflare({ manifest, environments, cloudflare, surfaces, f
  *
  * @param {object} ctx
  */
-async function probeInfisical({ manifest, environments, infisical, surfaces, findings }) {
+async function probeInfisical({ manifest, environments, infisical, surfaces, findings, unavailability = {} }) {
   const managed = manifest.keys.filter((k) => k.infisical !== "unmanaged");
   if (!infisical) {
     surfaces.push({
       surface: "infisical",
       status: "unchecked",
-      notice: "no Infisical credential supplied — secret names and value shapes were not compared",
+      notice: unavailableNotice(unavailability, "infisical"),
     });
     return;
   }
@@ -1232,21 +1280,28 @@ export function parseCliArgs(argv) {
       "--repo-root": { type: "string", dest: "repoRoot", default: process.cwd() },
       "--environments": { type: "string", dest: "environments", default: null },
       "--exceptions": { type: "string", dest: "exceptions", default: null },
-      "--repo": { type: "string", dest: "repo", default: process.env.GITHUB_REPOSITORY ?? null },
+      // `||`, not `??`, on every environment-backed default. An unset GitHub
+      // secret or input does not arrive as undefined — it interpolates to the
+      // EMPTY STRING, which `??` treats as a supplied value. For the three
+      // identifiers that is merely redundant (empty is falsy, so the client
+      // still resolves null), but for the site URL it is a live defect: an
+      // empty string would beat INFISICAL_DEFAULT_SITE and aim every probe at
+      // a host that does not exist.
+      "--repo": { type: "string", dest: "repo", default: process.env.GITHUB_REPOSITORY || null },
       "--cloudflare-account": {
         type: "string",
         dest: "cloudflareAccount",
-        default: process.env.CLOUDFLARE_ACCOUNT_ID ?? null,
+        default: process.env.CLOUDFLARE_ACCOUNT_ID || null,
       },
       "--infisical-project": {
         type: "string",
         dest: "infisicalProject",
-        default: process.env.INFISICAL_PROJECT_ID ?? null,
+        default: process.env.INFISICAL_PROJECT_ID || null,
       },
       "--infisical-site": {
         type: "string",
         dest: "infisicalSite",
-        default: process.env.INFISICAL_SITE_URL ?? INFISICAL_DEFAULT_SITE,
+        default: process.env.INFISICAL_SITE_URL || INFISICAL_DEFAULT_SITE,
       },
       "--offline": { type: "boolean", dest: "offline", default: false },
       "--strict-orphans": { type: "boolean", dest: "strictOrphans", default: false },
@@ -1266,15 +1321,15 @@ export function parseCliArgs(argv) {
  * @param {NodeJS.ProcessEnv} [env]
  */
 export function buildClients(opts, env = process.env) {
+  const hasGitHubCred = Boolean(env.ENV_DRIFT_GITHUB_TOKEN);
   const github =
-    env.ENV_DRIFT_GITHUB_TOKEN && opts.repo
-      ? createGitHubClient({ token: env.ENV_DRIFT_GITHUB_TOKEN, repo: opts.repo })
-      : null;
+    hasGitHubCred && opts.repo ? createGitHubClient({ token: env.ENV_DRIFT_GITHUB_TOKEN, repo: opts.repo }) : null;
+  const hasCloudflareCred = Boolean(env.CLOUDFLARE_API_TOKEN);
   const cloudflare =
-    env.CLOUDFLARE_API_TOKEN && opts.cloudflareAccount
+    hasCloudflareCred && opts.cloudflareAccount
       ? createCloudflareClient({ token: env.CLOUDFLARE_API_TOKEN, accountId: opts.cloudflareAccount })
       : null;
-  const hasInfisicalCreds = env.INFISICAL_TOKEN || (env.INFISICAL_CLIENT_ID && env.INFISICAL_CLIENT_SECRET);
+  const hasInfisicalCreds = Boolean(env.INFISICAL_TOKEN || (env.INFISICAL_CLIENT_ID && env.INFISICAL_CLIENT_SECRET));
   const infisical =
     hasInfisicalCreds && opts.infisicalProject
       ? createInfisicalClient({
@@ -1285,7 +1340,20 @@ export function buildClients(opts, env = process.env) {
           siteUrl: opts.infisicalSite,
         })
       : null;
-  return { github, cloudflare, infisical };
+
+  // Which HALF was missing. Every identifier is tested for truthiness rather
+  // than for null, because an unset GitHub secret arrives as "".
+  const unavailability = {};
+  for (const [surface, client, hasCredential] of [
+    ["github", github, hasGitHubCred],
+    ["cloudflare", cloudflare, hasCloudflareCred],
+    ["infisical", infisical, hasInfisicalCreds],
+  ]) {
+    if (client) continue;
+    unavailability[surface] = hasCredential ? MISSING_IDENTIFIER_NOTICE[surface] : NO_CREDENTIAL_NOTICE[surface];
+  }
+
+  return { github, cloudflare, infisical, unavailability };
 }
 
 async function main() {
@@ -1330,7 +1398,9 @@ async function main() {
         .filter(Boolean)
     : manifest.environments;
 
-  const clients = opts.offline ? { github: null, cloudflare: null, infisical: null } : buildClients(opts);
+  // Offline builds no clients at all; `runDoctor` marks the live surfaces
+  // skipped-because-offline rather than reaching for an unavailability reason.
+  const clients = opts.offline ? {} : buildClients(opts);
 
   let report;
   try {

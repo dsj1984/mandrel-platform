@@ -50,17 +50,26 @@ jobs:
       # way, and flipping this before the manifest is complete fails the run on
       # keys you simply have not declared yet.
       strict-orphans: 'false'
+      # Self-hosted Infisical only. Leave this line out to probe the hosted
+      # app; an empty value means the same thing.
+      # infisical-site: https://infisical.example.com
     # Every secret is optional on the shared side. Pass only what you have
     # provisioned — an absent credential marks its surface `unchecked` with a
     # ::notice and leaves the exit code alone, so the offline arm still gates.
+    #
+    # Pass credentials in PAIRS. A token says who is asking; an id says what to
+    # read, and the Cloudflare and Infisical probes need both — a token with no
+    # id leaves its surface `unchecked` (with a notice naming the missing id).
     #
     # INFISICAL_TOKEN and the INFISICAL_CLIENT_* pair are alternatives: supply
     # either one. Drop the lines you do not use.
     secrets:
       INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
       INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+      INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
       # A fine-grained PAT with `Secrets: read` + `Variables: read`. The
       # workflow GITHUB_TOKEN cannot list either collection — no `permissions:`
       # scope covers them.
       ENV_DRIFT_GITHUB_TOKEN: ${{ secrets.ENV_DRIFT_GITHUB_TOKEN }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

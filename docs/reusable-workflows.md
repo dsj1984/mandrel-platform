@@ -3574,9 +3574,18 @@ jobs:
     secrets:
       INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
       INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+      INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
       ENV_DRIFT_GITHUB_TOKEN: ${{ secrets.ENV_DRIFT_GITHUB_TOKEN }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
+
+> **Credentials come in pairs.** A token names *who is asking*; an account or
+> project id names *what to read*. The Cloudflare and Infisical probes need
+> both halves, so a caller that passes only the token gets an `unchecked`
+> surface — with a notice naming the missing **id**, not the token it did
+> supply. Before Story #455 the reusable workflow had no way to pass either id
+> at all, which made both surfaces permanently unreachable through it.
 
 A ready-to-copy version ships at
 [`templates/workflows/env-drift.yml`](../templates/workflows/env-drift.yml).
@@ -3592,6 +3601,7 @@ per-PR run would mostly re-answer a question nothing changed.
 | `environments`   | string | `''`              | Comma-separated environment slugs to check. Empty uses the manifest's own `environments[]`.                |
 | `exceptions`     | string | `''`              | Path to a JSON exceptions document. See [Exceptions](#exceptions-and-revisit-dates) below.                 |
 | `strict-orphans` | string | `'false'`         | `'true'` makes a store key with no manifest entry fail the run. Leave `'false'` while adopting the manifest — orphans are reported either way. Any value other than exactly `'true'`/`'false'` is rejected rather than silently defaulting. |
+| `infisical-site` | string | `''`              | Base URL of a **self-hosted** Infisical instance. Empty keeps the hosted default (`https://app.infisical.com`). An input rather than a secret: a hostname is not confidential, and a caller benefits from seeing which instance a run probed. |
 | `runner`         | string | `'ubuntu-latest'` | Runs-on label for the drift job (single string or JSON label-array string — see [`runner` label shapes](#runner-label-shapes)). |
 
 ### Secrets
@@ -3603,8 +3613,10 @@ Every credential is **optional**, and each one only unlocks its own surface.
 | `INFISICAL_TOKEN`         | No       | A pre-issued Infisical access token. Supply this **or** the universal-auth pair below — either reaches the same read-only listing calls. Absent both, the Infisical surface (names *and* value shapes) is `unchecked`. |
 | `INFISICAL_CLIENT_ID`     | No       | Universal-auth machine-identity client id, read-only project access.                                 |
 | `INFISICAL_CLIENT_SECRET` | No       | Universal-auth machine-identity client secret.                                                       |
+| `INFISICAL_PROJECT_ID`    | No       | The project to list — the other half of whichever credential above is supplied. Absent, the Infisical surface is `unchecked` however valid that credential is. |
 | `ENV_DRIFT_GITHUB_TOKEN`  | No       | Fine-grained PAT with `Secrets: read` and `Variables: read`. **Not** the workflow `GITHUB_TOKEN` — see below. Absent, the GitHub surface is `unchecked`. |
 | `CLOUDFLARE_API_TOKEN`    | No       | Cloudflare API token with Workers Scripts read. Absent, the Cloudflare surface is `unchecked`.        |
+| `CLOUDFLARE_ACCOUNT_ID`   | No       | The account owning the Workers — the other half of the API token. Absent, the Cloudflare surface is `unchecked` however valid the token is. A secret rather than an input, matching how [`deploy.yml`](#the-frozen-secret-allowlist) already carries this same value. |
 
 #### Why the GitHub probe needs a PAT
 
@@ -3623,6 +3635,10 @@ The distinction that makes this gate meaningful:
 - **An absent credential is not a failure.** That surface is marked
   `unchecked`, a `::notice` is raised naming it, and the exit code is
   untouched — a consumer with no Cloudflare token still gets the offline arm.
+  An `unchecked` surface always says **which** of the three causes applies: no
+  credential, a credential whose **identifier** is missing (naming that
+  identifier), or `--offline`. Reporting all three as "no token supplied" is
+  what sends a reader off to re-issue a token that was never the problem.
 - **A failed probe always is.** Once a credential *is* supplied, any probe
   error becomes an `error` surface that fails the run. Only a `404` may
   degrade to "this resource is absent". Without that rule a `401` from an

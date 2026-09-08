@@ -770,15 +770,17 @@ test("no secret VALUE reaches stdout or stderr on a real run against a mock Infi
 test("env-drift.yml declares the documented contract and asserts its own platform SHA", () => {
   const wf = readFileSync(join(HERE, "..", ".github", "workflows", "env-drift.yml"), "utf8");
   assert.match(wf, /^on:\n\s+workflow_call:/m);
-  for (const input of ["manifest:", "environments:", "exceptions:", "runner:"]) {
+  for (const input of ["manifest:", "environments:", "exceptions:", "infisical-site:", "runner:"]) {
     assert.ok(wf.includes(input), `env-drift.yml should declare the ${input} input`);
   }
   for (const secret of [
     "INFISICAL_TOKEN:",
     "INFISICAL_CLIENT_ID:",
     "INFISICAL_CLIENT_SECRET:",
+    "INFISICAL_PROJECT_ID:",
     "ENV_DRIFT_GITHUB_TOKEN:",
     "CLOUDFLARE_API_TOKEN:",
+    "CLOUDFLARE_ACCOUNT_ID:",
   ]) {
     assert.ok(wf.includes(secret), `env-drift.yml should declare the ${secret} secret`);
   }
@@ -797,4 +799,218 @@ test("the caller template is thin and pins the platform by SHA", () => {
   const tpl = readFileSync(join(HERE, "..", "templates", "workflows", "env-drift.yml"), "utf8");
   assert.match(tpl, /uses: dsj1984\/mandrel-platform\/\.github\/workflows\/env-drift\.yml@<MANDREL_PLATFORM_SHA>/);
   assert.match(tpl, /manifest:/);
+  // A template that passes a token but not its id reproduces the defect in
+  // every repo that copies it.
+  assert.match(tpl, /CLOUDFLARE_ACCOUNT_ID:/);
+  assert.match(tpl, /INFISICAL_PROJECT_ID:/);
+});
+
+test("env-drift.yml FORWARDS the identifiers, rather than declaring and dropping them", () => {
+  // Declaring a secret is not passing it. #454 was exactly this gap: the
+  // secrets existed on the boundary and never reached the doctor's process.
+  const wf = readFileSync(join(HERE, "..", ".github", "workflows", "env-drift.yml"), "utf8");
+  const step = wf.slice(wf.indexOf("- name: Check environment drift"));
+  assert.ok(step.length > 0, "the drift step should exist");
+  for (const [name, expression] of [
+    ["CLOUDFLARE_ACCOUNT_ID", "secrets.CLOUDFLARE_ACCOUNT_ID"],
+    ["INFISICAL_PROJECT_ID", "secrets.INFISICAL_PROJECT_ID"],
+    ["INFISICAL_SITE_URL", "inputs.infisical-site"],
+  ]) {
+    assert.ok(
+      step.includes(`${name}: \${{ ${expression} }}`),
+      `the drift step should map ${name} from ${expression}`,
+    );
+  }
+});
+
+test("every env-drift secret and input stays optional — a required one breaks existing callers", () => {
+  // A `workflow_call` secret added as `required: true` fails every caller that
+  // does not yet pass it, at workflow-compile time, before any job runs.
+  const wf = readFileSync(join(HERE, "..", ".github", "workflows", "env-drift.yml"), "utf8");
+  // Anchor on the real keys at column 0, not on the header prose — which
+  // discusses `permissions:` long before the block itself.
+  const start = wf.search(/^on:$/m);
+  const end = wf.search(/^permissions:$/m);
+  assert.ok(start >= 0 && end > start, "should locate the workflow_call block");
+  const callBlock = wf.slice(start, end);
+  // `manifest` is the one required input, and it predates this Story.
+  const required = callBlock.match(/required: true/g) || [];
+  assert.equal(required.length, 1, "manifest should be the ONLY required input or secret");
+  assert.match(callBlock.slice(0, callBlock.indexOf("required: true")), /manifest:/);
+});
+
+// ---------------------------------------------------------------------------
+// Why a surface is unchecked — credential vs identifier vs offline (Story #455)
+//
+// The reusable workflow could never check Cloudflare or Infisical, because it
+// had no way to pass the account/project id each client needs ALONGSIDE its
+// credential. What hid that for a release was the notice: every unchecked
+// surface blamed a missing credential, including the ones whose credential had
+// been supplied and whose identifier had not.
+// ---------------------------------------------------------------------------
+
+test("a credential AND its identifier yields a live client for every surface", () => {
+  const opts = { repo: "o/r", cloudflareAccount: "acct", infisicalProject: "proj" };
+  const clients = buildClients(opts, {
+    ENV_DRIFT_GITHUB_TOKEN: "tok",
+    CLOUDFLARE_API_TOKEN: "cf",
+    INFISICAL_TOKEN: "inf",
+  });
+  for (const surface of ["github", "cloudflare", "infisical"]) {
+    assert.ok(clients[surface], `${surface} should have a client when both halves are supplied`);
+    assert.equal(clients.unavailability[surface], undefined, `${surface} should record no unavailability reason`);
+  }
+});
+
+test("with the Cloudflare token AND account id, the Cloudflare surface is checked", async () => {
+  const root = makeRepo(CONSISTENT_REPO);
+  try {
+    const report = await runDoctor({
+      manifest: parseManifest(singleWorkerManifest()),
+      repoRoot: root,
+      environments: ["staging"],
+      cloudflare: { secretNames: async () => ["TURSO_AUTH_TOKEN"] },
+    });
+    const cf = report.surfaces.find((s) => s.surface === "cloudflare");
+    assert.equal(cf.status, "checked");
+    assert.equal(report.exitCode, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("with an Infisical credential AND project id, the Infisical surface is checked", async () => {
+  const root = makeRepo(CONSISTENT_REPO);
+  try {
+    const report = await runDoctor({
+      manifest: parseManifest(singleWorkerManifest()),
+      repoRoot: root,
+      environments: ["staging"],
+      infisical: {
+        listNames: async () => ["PUBLIC_SITE_URL", "TURSO_AUTH_TOKEN"],
+        listValues: async () => new Map([["PUBLIC_SITE_URL", "https://example.test"]]),
+      },
+    });
+    const inf = report.surfaces.find((s) => s.surface === "infisical");
+    assert.equal(inf.status, "checked");
+    assert.equal(report.exitCode, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a supplied credential with a missing identifier blames the IDENTIFIER, not the credential", async () => {
+  const root = makeRepo(CONSISTENT_REPO);
+  try {
+    // Exactly the shape the reusable workflow produced: every credential set,
+    // no identifier reachable.
+    const clients = buildClients(
+      { repo: null, cloudflareAccount: null, infisicalProject: null },
+      { ENV_DRIFT_GITHUB_TOKEN: "tok", CLOUDFLARE_API_TOKEN: "cf", INFISICAL_TOKEN: "inf" },
+    );
+    assert.equal(clients.github, null);
+    assert.equal(clients.cloudflare, null);
+    assert.equal(clients.infisical, null);
+
+    const report = await runDoctor({
+      manifest: parseManifest(singleWorkerManifest()),
+      repoRoot: root,
+      environments: ["staging"],
+      ...clients,
+    });
+    const byName = Object.fromEntries(report.surfaces.map((s) => [s.surface, s]));
+
+    assert.equal(byName.github.status, "unchecked");
+    assert.match(byName.github.notice, /GITHUB_REPOSITORY/);
+    assert.match(byName.cloudflare.notice, /CLOUDFLARE_ACCOUNT_ID/);
+    assert.match(byName.infisical.notice, /INFISICAL_PROJECT_ID/);
+
+    // The regression itself: none of the three may claim its credential was absent.
+    for (const surface of ["github", "cloudflare", "infisical"]) {
+      assert.doesNotMatch(
+        byName[surface].notice,
+        /no (GitHub token|Cloudflare API token|Infisical credential) supplied/,
+        `${surface} blamed the credential that WAS supplied: ${byName[surface].notice}`,
+      );
+    }
+    assert.equal(report.exitCode, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an identifier arriving as the empty string is absent, not supplied", () => {
+  // An unset `secrets.X` / `inputs.x` interpolates to "" rather than to
+  // nothing, so every identifier check must be a truthiness test.
+  const clients = buildClients(
+    { repo: "", cloudflareAccount: "", infisicalProject: "" },
+    { ENV_DRIFT_GITHUB_TOKEN: "tok", CLOUDFLARE_API_TOKEN: "cf", INFISICAL_TOKEN: "inf" },
+  );
+  assert.equal(clients.cloudflare, null);
+  assert.equal(clients.infisical, null);
+  assert.match(clients.unavailability.cloudflare, /CLOUDFLARE_ACCOUNT_ID/);
+  assert.match(clients.unavailability.infisical, /INFISICAL_PROJECT_ID/);
+});
+
+test("an empty INFISICAL_SITE_URL falls back to the default rather than becoming the site", () => {
+  // `??` would let "" win here and aim every Infisical probe at a host that
+  // does not resolve — the failure would surface as an `error`, not a config
+  // mistake.
+  const prior = process.env.INFISICAL_SITE_URL;
+  process.env.INFISICAL_SITE_URL = "";
+  try {
+    assert.equal(parseCliArgs(["--manifest", "m.json"]).infisicalSite, "https://app.infisical.com");
+  } finally {
+    if (prior === undefined) delete process.env.INFISICAL_SITE_URL;
+    else process.env.INFISICAL_SITE_URL = prior;
+  }
+});
+
+test("an offline run reports its live surfaces as skipped-because-offline, blaming no credential", async () => {
+  const root = makeRepo(CONSISTENT_REPO);
+  try {
+    const report = await runDoctor({
+      manifest: parseManifest(singleWorkerManifest()),
+      repoRoot: root,
+      environments: ["staging"],
+      offline: true,
+    });
+    const byName = Object.fromEntries(report.surfaces.map((s) => [s.surface, s]));
+    for (const surface of ["github", "cloudflare", "infisical"]) {
+      assert.equal(byName[surface].status, "unchecked", `${surface} should be visibly skipped, not omitted`);
+      assert.match(byName[surface].notice, /offline mode/);
+      assert.doesNotMatch(byName[surface].notice, /supplied/);
+    }
+    assert.equal(report.exitCode, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI: the reusable workflow's env shape reaches the identifiers without any flag", async () => {
+  // The whole workflow-side fix is naming these in the step `env:` block —
+  // the flags already default from exactly these variables, and routing them
+  // through argv instead would put them in the process table.
+  const root = makeRepo(CONSISTENT_REPO);
+  const manifestPath = join(root, "env.manifest.json");
+  writeFileSync(manifestPath, JSON.stringify(singleWorkerManifest()));
+  try {
+    const run = await runCli(["--manifest", manifestPath, "--repo-root", root, "--environments", "staging"], {
+      env: {
+        CLOUDFLARE_API_TOKEN: "cf",
+        CLOUDFLARE_ACCOUNT_ID: "",
+        INFISICAL_TOKEN: "inf",
+        INFISICAL_PROJECT_ID: "",
+        ENV_DRIFT_GITHUB_TOKEN: "",
+      },
+    });
+    assert.equal(run.code, 0, run.stdout + run.stderr);
+    assert.match(run.stdout, /cloudflare: unchecked — no Cloudflare account id supplied/);
+    assert.match(run.stdout, /infisical: unchecked — no Infisical project id supplied/);
+    // The GitHub credential really is absent here, so that surface keeps the
+    // credential wording — the two causes stay distinguishable in one run.
+    assert.match(run.stdout, /github: unchecked — no GitHub token supplied/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
