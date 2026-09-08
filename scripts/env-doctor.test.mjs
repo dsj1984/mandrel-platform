@@ -186,6 +186,78 @@ test("parseManifest rejects a duplicate key name and an infisical env outside th
   assert.throws(() => parseManifest(badEnv), /absent from manifest.environments/);
 });
 
+test("parseManifest normalizes the single-object residency.github to a one-entry array", () => {
+  const m = parseManifest(singleWorkerManifest());
+  // The authored shape is an object; the parsed shape is always an array, so
+  // probeGitHub reads exactly one shape. `environments` defaults to all of
+  // manifest.environments, the same treatment infisical.environments gets.
+  assert.deepEqual(m.keys[0].residency.github, [
+    { scope: "environment", kind: "var", environments: ["staging", "production"] },
+  ]);
+});
+
+test("parseManifest accepts the array form and defaults environments per entry", () => {
+  const raw = singleWorkerManifest();
+  raw.keys[0].residency.github = [
+    { scope: "repository", kind: "var" },
+    { scope: "environment", kind: "var", environments: ["production"] },
+  ];
+  const m = parseManifest(raw);
+  assert.deepEqual(m.keys[0].residency.github, [
+    { scope: "repository", kind: "var", environments: ["staging", "production"] },
+    { scope: "environment", kind: "var", environments: ["production"] },
+  ]);
+});
+
+test("parseManifest rejects an residency.github environments slug outside manifest.environments", () => {
+  const raw = singleWorkerManifest();
+  raw.keys[0].residency.github = [{ scope: "environment", kind: "var", environments: ["preview"] }];
+  assert.throws(() => parseManifest(raw), (err) => {
+    assert.match(err.message, /absent from manifest.environments/);
+    assert.match(err.message, /PUBLIC_SITE_URL/);
+    return true;
+  });
+});
+
+test("parseManifest rejects environments on a repository-scope entry rather than ignoring it", () => {
+  // Silently ignoring it is how an author comes to believe they scoped
+  // something they did not — the same fail-closed posture as an unknown shape.
+  const raw = singleWorkerManifest();
+  raw.keys[0].residency.github = [{ scope: "repository", kind: "var", environments: ["production"] }];
+  assert.throws(() => parseManifest(raw), (err) => {
+    assert.match(err.message, /meaningful only under scope "environment"/);
+    assert.match(err.message, /PUBLIC_SITE_URL/);
+    return true;
+  });
+});
+
+test("parseManifest rejects a duplicate (scope, kind) pair and an empty residency.github array", () => {
+  const dup = singleWorkerManifest();
+  dup.keys[0].residency.github = [
+    { scope: "environment", kind: "var" },
+    { scope: "environment", kind: "var", environments: ["production"] },
+  ];
+  assert.throws(() => parseManifest(dup), (err) => {
+    assert.match(err.message, /repeats the \(scope, kind\) pair "environment\/var"/);
+    assert.match(err.message, /PUBLIC_SITE_URL/);
+    return true;
+  });
+
+  const empty = singleWorkerManifest();
+  empty.keys[0].residency.github = [];
+  assert.throws(() => parseManifest(empty), /must not be an empty array/);
+});
+
+test("parseManifest still rejects a malformed scope and kind under both authored shapes", () => {
+  const objForm = singleWorkerManifest();
+  objForm.keys[0].residency.github = { scope: "org", kind: "var" };
+  assert.throws(() => parseManifest(objForm), /\.scope must be "environment" or "repository"/);
+
+  const arrForm = singleWorkerManifest();
+  arrForm.keys[0].residency.github = [{ scope: "repository", kind: "file" }];
+  assert.throws(() => parseManifest(arrForm), /residency\.github\[0\]\.kind must be "secret" or "var"/);
+});
+
 test("resolveScriptName substitutes {env} per environment", () => {
   assert.equal(resolveScriptName("acme-site-{env}", "staging"), "acme-site-staging");
   assert.equal(resolveScriptName("acme-site-{env}", "production"), "acme-site-production");
@@ -456,6 +528,214 @@ test("a non-404 probe failure becomes an error surface and exits 1 — never 'no
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// GitHub residency — dual scope and per-environment presence (Story #459)
+// ---------------------------------------------------------------------------
+
+/**
+ * A manifest with no workers and no local residency, so the offline arm over an
+ * empty repo root contributes no findings and every finding under test comes
+ * from the GitHub probe.
+ */
+function githubOnlyManifest(github) {
+  return parseManifest({
+    environments: ["staging", "production"],
+    keys: [{ name: "SHARED_TOKEN", kind: "secret", sensitivity: "secret", residency: { local: null, github } }],
+  });
+}
+
+/** Mock the two GitHub probe calls from a `{repository, staging, production}` map. */
+function githubProbe(present) {
+  const at = (slot) => ({ secret: [], var: [], ...(present[slot] ?? {}) });
+  return {
+    repositoryNames: async () => at("repository"),
+    environmentNames: async (environment) => at(environment),
+  };
+}
+
+async function githubFindings({ manifest, present, environments = ["staging", "production"] }) {
+  const root = makeRepo({});
+  try {
+    const report = await runDoctor({ manifest, repoRoot: root, environments, github: githubProbe(present) });
+    return report.findings.filter((f) => f.surface === "github");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const DUAL_SCOPE = [
+  { scope: "repository", kind: "secret" },
+  { scope: "environment", kind: "secret" },
+];
+
+test("a dual-scope key present at both scopes reports no finding", async () => {
+  const findings = await githubFindings({
+    manifest: githubOnlyManifest(DUAL_SCOPE),
+    present: {
+      repository: { secret: ["SHARED_TOKEN"] },
+      staging: { secret: ["SHARED_TOKEN"] },
+      production: { secret: ["SHARED_TOKEN"] },
+    },
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("a dual-scope key absent from one scope reports a missing naming that scope only", async () => {
+  const findings = await githubFindings({
+    manifest: githubOnlyManifest(DUAL_SCOPE),
+    present: {
+      repository: { secret: [] },
+      staging: { secret: ["SHARED_TOKEN"] },
+      production: { secret: ["SHARED_TOKEN"] },
+    },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "missing");
+  assert.equal(findings[0].key, "SHARED_TOKEN");
+  assert.equal(findings[0].environment, null);
+  assert.match(findings[0].detail, /repository secrets/);
+});
+
+test("a dual-scope key absent from one environment reports a missing naming that environment only", async () => {
+  const findings = await githubFindings({
+    manifest: githubOnlyManifest(DUAL_SCOPE),
+    present: {
+      repository: { secret: ["SHARED_TOKEN"] },
+      staging: { secret: [] },
+      production: { secret: ["SHARED_TOKEN"] },
+    },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "missing");
+  assert.equal(findings[0].environment, "staging");
+});
+
+test("an environments-scoped entry reports no missing for an environment it never names", async () => {
+  // The motivating case: a production-only analytics token whose staging
+  // counterpart is meant to resolve empty. That is design, not drift.
+  const manifest = githubOnlyManifest([{ scope: "environment", kind: "secret", environments: ["production"] }]);
+  assert.deepEqual(
+    await githubFindings({ manifest, present: { production: { secret: ["SHARED_TOKEN"] } } }),
+    []
+  );
+
+  const missing = await githubFindings({ manifest, present: {} });
+  assert.equal(missing.length, 1, "production still fails when it lacks the key");
+  assert.equal(missing[0].kind, "missing");
+  assert.equal(missing[0].environment, "production");
+});
+
+test("a key declared only at environment scope is not a repository-level orphan", async () => {
+  const findings = await githubFindings({
+    manifest: githubOnlyManifest([{ scope: "environment", kind: "secret" }]),
+    present: {
+      repository: { secret: ["SHARED_TOKEN"] },
+      staging: { secret: ["SHARED_TOKEN"] },
+      production: { secret: ["SHARED_TOKEN"] },
+    },
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("suppression is cross-scope only — an undeclared name still orphans", async () => {
+  // The half that keeps --strict-orphans worth enabling: nothing about the
+  // suppression hides a name the manifest never declared anywhere.
+  const findings = await githubFindings({
+    manifest: githubOnlyManifest([{ scope: "environment", kind: "secret" }]),
+    present: {
+      repository: { secret: ["SHARED_TOKEN", "UNDECLARED_TOKEN"] },
+      staging: { secret: ["SHARED_TOKEN"] },
+      production: { secret: ["SHARED_TOKEN"] },
+    },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "orphan");
+  assert.equal(findings[0].key, "UNDECLARED_TOKEN");
+  assert.equal(findings[0].environment, null);
+});
+
+test("suppression does not cross kind — a secret declared, a variable present, still orphans", async () => {
+  const findings = await githubFindings({
+    manifest: githubOnlyManifest([{ scope: "environment", kind: "secret" }]),
+    present: {
+      repository: { var: ["SHARED_TOKEN"] },
+      staging: { secret: ["SHARED_TOKEN"] },
+      production: { secret: ["SHARED_TOKEN"] },
+    },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "orphan");
+  assert.match(findings[0].detail, /repository vars/);
+});
+
+test("suppression does not cross environment — a production-only key found in staging orphans", async () => {
+  // Undeclared presence in the wrong environment is the most interesting thing
+  // this surface can find, so the cross-scope rule must not reach it.
+  const findings = await githubFindings({
+    manifest: githubOnlyManifest([{ scope: "environment", kind: "secret", environments: ["production"] }]),
+    present: {
+      staging: { secret: ["SHARED_TOKEN"] },
+      production: { secret: ["SHARED_TOKEN"] },
+    },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "orphan");
+  assert.equal(findings[0].environment, "staging");
+});
+
+test("the single-object residency.github form yields exactly the findings it did before", async () => {
+  // The regression case, over the unchanged existing fixture: both keys are
+  // authored as single objects at environment scope, so a repo-level probe
+  // holding neither must produce two per-environment missings and nothing else.
+  const root = makeRepo(CONSISTENT_REPO);
+  try {
+    const report = await runDoctor({
+      manifest: parseManifest(singleWorkerManifest()),
+      repoRoot: root,
+      environments: ["staging", "production"],
+      github: githubProbe({
+        staging: { var: ["PUBLIC_SITE_URL"], secret: ["TURSO_AUTH_TOKEN"] },
+        production: { var: ["PUBLIC_SITE_URL"] },
+      }),
+    });
+    const gh = report.findings.filter((f) => f.surface === "github");
+    assert.equal(gh.length, 1);
+    assert.deepEqual(
+      { kind: gh[0].kind, key: gh[0].key, environment: gh[0].environment },
+      { kind: "missing", key: "TURSO_AUTH_TOKEN", environment: "production" }
+    );
+    assert.equal(report.surfaces.find((s) => s.surface === "github").status, "checked");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("declaredElsewhere suppresses only orphans, never a missing", async () => {
+  // The new argument is opt-in and orphan-only, so the cloudflare and infisical
+  // call sites that omit it cannot change behaviour.
+  const suppressed = reconcileNames({
+    expected: ["A"],
+    present: ["B"],
+    surface: "github",
+    environment: null,
+    declaredElsewhere: ["A", "B"],
+  });
+  assert.deepEqual(
+    suppressed.map((f) => [f.kind, f.key]),
+    [["missing", "A"]]
+  );
+  assert.deepEqual(reconcileNames({ expected: [], present: ["B"], surface: "github", environment: null }), [
+    {
+      severity: "orphan",
+      kind: "orphan",
+      key: "B",
+      surface: "github",
+      environment: null,
+      detail: "present in github but declared by no manifest key",
+    },
+  ]);
 });
 
 test("the Cloudflare probe resolves {env} in scriptName once per environment", async () => {

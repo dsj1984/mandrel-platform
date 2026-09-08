@@ -131,7 +131,7 @@ export const KEY_SCHEMA = Object.freeze({
   kind: "'var' | 'secret'",
   sensitivity: "'public' | 'secret'",
   residency:
-    "object — {local: 'var'|'secret'|'file'|null, github: {scope,kind}|null, cloudflare: {workers,kind}|null}",
+    "object — {local: 'var'|'secret'|'file'|null, github: G|G[]|null where G = {scope,kind,environments?}, cloudflare: {workers,kind}|null}",
   infisical: "{folder, environments} | 'unmanaged'",
   shape: `string? — one of ${SHAPE_NAMES.join(", ")}`,
   placeholderPattern: "string? — literal, case-insensitive substring marking an unset placeholder value",
@@ -182,6 +182,96 @@ export function parseManifest(raw) {
 }
 
 /**
+ * Normalize `residency.github` to its canonical array form.
+ *
+ * The field accepts EITHER a single `{scope, kind}` object — the shape every
+ * manifest written before Story #459 uses — or an array of them, because two
+ * residencies that occur in practice cannot be said with one object:
+ *
+ *   1. **Dual scope.** A key can legitimately live at repository level AND at
+ *      environment level, for different consumers: a deploy job declares
+ *      `environment:` and reads the per-environment value while a CI job
+ *      declares none and reads a repo-level credential of the same name.
+ *      Under a single object, whichever scope the manifest declared, the other
+ *      reported as an orphan — permanently, on a healthy repo.
+ *   2. **Per-environment presence.** A key can be deliberately present in one
+ *      environment and absent from another (a production-only analytics token
+ *      whose staging counterpart is meant to resolve empty). With no
+ *      per-entry `environments`, the absence read as a `missing` failure.
+ *
+ * Both authored shapes normalize to one array of `{scope, kind, environments}`
+ * with `environments` defaulted and materialized to `manifest.environments`,
+ * so `probeGitHub` has exactly one shape to read — the same normalize-at-parse
+ * treatment `infisical.environments` already receives.
+ *
+ * Validation fails closed, matching this module's posture on an unknown
+ * `shape`: silently ignoring a misplaced or misspelled `environments` is how a
+ * manifest author comes to believe they have scoped something they have not.
+ *
+ * @param {unknown} raw
+ * @param {{at: string, name: string, environments: string[]}} ctx
+ * @returns {Array<{scope: string, kind: string, environments: string[]}> | null}
+ */
+function normalizeGitHubResidency(raw, { at, name, environments }) {
+  if (raw === undefined || raw === null) return null;
+
+  const authoredAsArray = Array.isArray(raw);
+  const entries = authoredAsArray ? raw : [raw];
+  if (entries.length === 0) {
+    throw new Error(
+      `${at}.residency.github must not be an empty array — use null when the key does not belong in GitHub (key ${name})`
+    );
+  }
+
+  const seenPairs = new Set();
+  return entries.map((entry, j) => {
+    const where = authoredAsArray ? `${at}.residency.github[${j}]` : `${at}.residency.github`;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`${where} must be an object with {scope, kind} (key ${name})`);
+    }
+    if (entry.scope !== "environment" && entry.scope !== "repository") {
+      throw new Error(`${where}.scope must be "environment" or "repository" (key ${name})`);
+    }
+    if (entry.kind !== "secret" && entry.kind !== "var") {
+      throw new Error(`${where}.kind must be "secret" or "var" (key ${name})`);
+    }
+
+    const pair = `${entry.scope}/${entry.kind}`;
+    if (seenPairs.has(pair)) {
+      throw new Error(
+        `${where} repeats the (scope, kind) pair "${pair}" — declare one entry per pair (key ${name})`
+      );
+    }
+    seenPairs.add(pair);
+
+    if (entry.environments !== undefined) {
+      if (entry.scope === "repository") {
+        throw new Error(
+          `${where}.environments is meaningful only under scope "environment" — a repository-scope ` +
+            `secret or variable belongs to no environment (key ${name})`
+        );
+      }
+      if (!Array.isArray(entry.environments) || !entry.environments.every((e) => typeof e === "string")) {
+        throw new Error(`${where}.environments must be an array of environment slugs (key ${name})`);
+      }
+      for (const e of entry.environments) {
+        if (!environments.includes(e)) {
+          throw new Error(
+            `${where}.environments names "${e}", absent from manifest.environments (key ${name})`
+          );
+        }
+      }
+    }
+
+    return {
+      scope: entry.scope,
+      kind: entry.kind,
+      environments: entry.environments ? [...entry.environments] : [...environments],
+    };
+  });
+}
+
+/**
  * @param {unknown} entry
  * @param {number} index
  * @param {Record<string, object>} workers
@@ -217,15 +307,7 @@ function validateKeyEntry(entry, index, workers, environments, seen) {
     throw new Error(`${at}.residency.local must be "var", "secret", "file" or null (key ${name})`);
   }
 
-  const github = residency.github ?? null;
-  if (github !== null) {
-    if (github.scope !== "environment" && github.scope !== "repository") {
-      throw new Error(`${at}.residency.github.scope must be "environment" or "repository" (key ${name})`);
-    }
-    if (github.kind !== "secret" && github.kind !== "var") {
-      throw new Error(`${at}.residency.github.kind must be "secret" or "var" (key ${name})`);
-    }
-  }
+  const github = normalizeGitHubResidency(residency.github, { at, name, environments });
 
   const cloudflare = residency.cloudflare ?? null;
   if (cloudflare !== null) {
@@ -774,12 +856,22 @@ export function runOfflineChecks({ manifest, repoRoot }) {
  * @param {string} opts.surface
  * @param {string | null} opts.environment
  * @param {string} [opts.scope]     Free-text scope for the detail line.
+ * @param {Iterable<string> | null} [opts.declaredElsewhere]
+ *   Names the caller has already accounted for in a SIBLING partition of the
+ *   same surface. A name in this set is never reported as an orphan here; it
+ *   has no effect on `missing`. The option exists because a surface can be
+ *   probed in more than one partition — GitHub is read at repository scope and
+ *   again per environment — and a key legitimately resident in two of them is
+ *   not drift. Only the caller knows which partitions are siblings, so the set
+ *   is supplied rather than inferred: the default is `null`, which keeps this
+ *   function's behaviour identical for every caller that omits it.
  * @returns {object[]} findings
  */
-export function reconcileNames({ expected, present, surface, environment, scope = "" }) {
+export function reconcileNames({ expected, present, surface, environment, scope = "", declaredElsewhere = null }) {
   const findings = [];
   const presentSet = new Set(present);
   const expectedSet = new Set(expected);
+  const elsewhere = declaredElsewhere ? new Set(declaredElsewhere) : null;
   const where = scope ? ` (${scope})` : "";
   for (const name of expected) {
     if (!presentSet.has(name)) {
@@ -795,6 +887,7 @@ export function reconcileNames({ expected, present, surface, environment, scope 
   }
   for (const name of present) {
     if (!expectedSet.has(name)) {
+      if (elsewhere?.has(name)) continue;
       findings.push({
         severity: "orphan",
         kind: "orphan",
@@ -1065,6 +1158,45 @@ function unavailableNotice(unavailability, surface) {
 }
 
 /**
+ * Names declared at one GitHub `(scope, kind)`, optionally narrowed to the
+ * entries that name a given environment.
+ *
+ * @param {object[]} keys           Parsed manifest keys.
+ * @param {string} scope            "repository" | "environment"
+ * @param {string} kind             "secret" | "var"
+ * @param {string | null} environment  Non-null narrows to entries naming it.
+ * @returns {string[]}
+ */
+function githubNamesAt(keys, scope, kind, environment) {
+  return keys
+    .filter((k) =>
+      (k.residency.github ?? []).some(
+        (g) =>
+          g.scope === scope && g.kind === kind && (environment === null || g.environments.includes(environment))
+      )
+    )
+    .map((k) => k.name);
+}
+
+/**
+ * Reconcile the GitHub surface per `(scope, kind, environment)` triple.
+ *
+ * Two partitions are read — repository scope once, environment scope once per
+ * environment — and a key may legitimately be resident in both. So each
+ * partition suppresses orphans for names declared at the OTHER scope with the
+ * SAME kind, and nothing wider:
+ *
+ * - **Cross-scope, same kind** is suppressed: that is the dual-scope residency
+ *   the array form exists to describe, and reporting it was the false orphan.
+ * - **Cross-kind is NOT suppressed.** A name declared as a secret but present
+ *   as a variable is a real mismatch, and the orphan is how it surfaces.
+ * - **Cross-environment is NOT suppressed.** A production-only key turning up
+ *   in staging is undeclared presence in that environment — arguably the most
+ *   interesting thing this surface can find — so it still orphans.
+ *
+ * A name declared in no GitHub scope at all orphans exactly as before, which
+ * is what keeps `--strict-orphans` worth enabling once a manifest is correct.
+ *
  * @param {object} ctx
  */
 async function probeGitHub({ manifest, environments, github, surfaces, findings, unavailability = {} }) {
@@ -1076,18 +1208,18 @@ async function probeGitHub({ manifest, environments, github, surfaces, findings,
     });
     return;
   }
-  const repoKeys = manifest.keys.filter((k) => k.residency.github?.scope === "repository");
-  const envKeys = manifest.keys.filter((k) => k.residency.github?.scope === "environment");
+  const keys = manifest.keys;
   try {
     const present = await github.repositoryNames();
     for (const kind of ["secret", "var"]) {
       findings.push(
         ...reconcileNames({
-          expected: repoKeys.filter((k) => k.residency.github.kind === kind).map((k) => k.name),
+          expected: githubNamesAt(keys, "repository", kind, null),
           present: present[kind] ?? [],
           surface: "github",
           environment: null,
           scope: `repository ${kind}s`,
+          declaredElsewhere: githubNamesAt(keys, "environment", kind, null),
         })
       );
     }
@@ -1096,11 +1228,12 @@ async function probeGitHub({ manifest, environments, github, surfaces, findings,
       for (const kind of ["secret", "var"]) {
         findings.push(
           ...reconcileNames({
-            expected: envKeys.filter((k) => k.residency.github.kind === kind).map((k) => k.name),
+            expected: githubNamesAt(keys, "environment", kind, environment),
             present: envPresent[kind] ?? [],
             surface: "github",
             environment,
             scope: `environment ${kind}s`,
+            declaredElsewhere: githubNamesAt(keys, "repository", kind, null),
           })
         );
       }
