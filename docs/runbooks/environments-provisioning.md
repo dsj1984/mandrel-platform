@@ -64,6 +64,32 @@ gh api repos/<OWNER>/<REPO>/environments/production --method PUT \
   --field "reviewers[][id]=<USER_ID>"
 ```
 
+#### The drift-doctor PAT (`ENV_DRIFT_GITHUB_TOKEN`)
+
+The [`env-drift.yml`](../reusable-workflows.md#env-driftyml) workflow lists
+Actions secret and variable **names** to check them against the residency
+manifest. The workflow `GITHUB_TOKEN` cannot do this at any permission level:
+GitHub's `permissions:` block has **no scope** covering Actions secrets or
+variables, so there is nothing to grant. Provision a fine-grained PAT instead:
+
+1. GitHub → Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → **Generate new token**.
+2. Resource owner: the org (or your account); Repository access: **only** the
+   repositories that will run the drift check.
+3. Repository permissions — grant exactly two, both **read-only**:
+   - **Secrets**: Read-only
+   - **Variables**: Read-only
+4. Set the shortest expiry your rotation cadence tolerates, and store it as a
+   repository secret named `ENV_DRIFT_GITHUB_TOKEN`.
+
+The token never reads a secret *value* — these endpoints expose names only —
+so read-only on those two permissions is the whole grant it needs. Do not add
+`Contents` or `Actions`: the workflow checks out with its own token.
+
+```bash
+gh secret set ENV_DRIFT_GITHUB_TOKEN --repo <OWNER>/<REPO>
+```
+
 ### Step 3: Infisical
 
 1. Create a new Infisical project (or environment folder within an existing project).
@@ -71,7 +97,59 @@ gh api repos/<OWNER>/<REPO>/environments/production --method PUT \
 3. Configure the Infisical → GitHub sync:
    - GitHub App connection: Infisical dashboard → Integrations → GitHub Actions.
    - Map each Infisical environment to the corresponding GitHub Environment (`staging` / `production`).
-4. Verify secrets appear in GitHub → Settings → Environments → `staging` / `production`.
+4. Create a **read-only machine identity** for the drift doctor (below).
+5. Verify the result with the doctor rather than by eye (see
+   [Verifying with the doctor](#verifying-with-the-doctor)).
+
+#### The read-only machine identity
+
+`env-drift.yml` reads Infisical secret **names** per environment and folder,
+and — only for keys declaring a `shape` — their values, in-process, to emit a
+pass/fail verdict. Give it its own identity with no more access than that:
+
+1. Infisical → Organization → **Access Control** → Identities → **Create
+   identity**. Name it for the job (`env-drift-doctor`), and give it the
+   organization role **No Access** — project access is granted separately.
+2. Auth method: **Universal Auth**. Create a client secret and note both the
+   **Client ID** and the **Client Secret** — the secret is shown once.
+3. Project → Access Control → Identities → **Add identity** → select it, and
+   grant the **Viewer** role (read-only) scoped to the environments the drift
+   check covers.
+4. Store the pair as repository secrets `INFISICAL_CLIENT_ID` and
+   `INFISICAL_CLIENT_SECRET`.
+
+```bash
+gh secret set INFISICAL_CLIENT_ID --repo <OWNER>/<REPO>
+gh secret set INFISICAL_CLIENT_SECRET --repo <OWNER>/<REPO>
+```
+
+If machine identities are unavailable on your plan, the doctor accepts a
+pre-issued access token as `INFISICAL_TOKEN` instead — either credential
+reaches the same read-only listing calls.
+
+#### Verifying with the doctor
+
+Provisioning used to end with a manual comparison: open GitHub → Settings →
+Environments, open the Infisical dashboard, and check the two lists match by
+eye. That does not scale past a handful of keys, it silently skips Cloudflare
+Worker secrets entirely, and it cannot catch a value that is present but
+malformed. Run the doctor instead:
+
+```bash
+node node_modules/mandrel-platform/scripts/env-doctor.mjs \
+  --manifest env.manifest.json \
+  --environments staging,production
+```
+
+It reports, per surface, every key the manifest declares but the store lacks,
+every key the store holds but the manifest does not declare, and — for keys
+with a declared `shape` — a verdict on the value's form, never the value
+itself. Exit 0 means provisioning is complete; exit 1 names what is missing.
+A surface with no credential is reported `unchecked` and does not affect the
+exit code, so this is worth running before every credential is in place.
+
+Schema, exit contract and the full option list:
+[`env-drift.yml`](../reusable-workflows.md#env-driftyml).
 
 ### Step 4: Turso / libSQL Database
 
@@ -148,7 +226,18 @@ turso db destroy <DB_NAME>-staging --yes
    # Secrets are injected via `wrangler secret put` or the deploy workflow
    ```
 
-5. Redeploy to staging and verify the Worker reads the new secret correctly.
+5. Add the key to the residency manifest (`env.manifest.json`) — declare
+   which stores should hold it, and a `shape` when the value has a checkable
+   form. A key absent from the manifest is reported as an orphan; a workflow
+   `secrets.NEW_SECRET` reference with no manifest entry fails the offline arm.
+6. Verify placement with the doctor before redeploying:
+
+   ```bash
+   node node_modules/mandrel-platform/scripts/env-doctor.mjs \
+     --manifest env.manifest.json --environments staging
+   ```
+
+7. Redeploy to staging and verify the Worker reads the new secret correctly.
 
 ---
 
@@ -158,6 +247,10 @@ turso db destroy <DB_NAME>-staging --yes
 - [ ] GitHub Environments (`staging`, `production`) created.
 - [ ] Infisical project and environments configured with all secrets.
 - [ ] Infisical → GitHub sync active and verified.
+- [ ] Residency manifest (`env.manifest.json`) written, covering every key.
+- [ ] Read-only Infisical machine identity and `ENV_DRIFT_GITHUB_TOKEN` PAT provisioned.
+- [ ] `env-doctor` exits 0 across every environment (replaces the manual
+      GitHub↔Infisical eyeball diff).
 - [ ] Turso databases created and connection strings stored as secrets.
 - [ ] Initial DB migrations applied to each environment.
 - [ ] Staging deploy successful and smoke passing.
@@ -329,4 +422,5 @@ matrix's home document/repo once this Story merges.
 - [Secret Rotation Runbook](secret-rotation.md)
 - [Branch Protection Setup Runbook](branch-protection-setup.md)
 - [Deploy Promotion Runbook](deploy-promotion.md)
+- [`env-drift.yml` — the shared residency doctor](../reusable-workflows.md#env-driftyml)
 - Project-local `docs/environments.md` — the authoritative environment inventory (URLs, secret names, DB names, Infisical project IDs).

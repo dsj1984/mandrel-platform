@@ -1,0 +1,66 @@
+name: env-drift
+
+# Canonical environment-drift caller template (Story #451).
+#
+# > **Thin local caller.** The manifest schema, the five surface probes, the
+# > values-safe shape stage and the exit contract (absent credential →
+# > unchecked; failed probe → fail) live in the shared
+# > `dsj1984/mandrel-platform` `env-drift.yml` reusable workflow — see
+# > https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#env-driftyml.
+# > This file only holds <PROJECT_NAME>-specific values (the manifest path and
+# > the schedule). When the drift-checking PROCESS changes, that change lands
+# > upstream in mandrel-platform — not here.
+#
+# Replace every <PLACEHOLDER> with your project's real values:
+#   <MANDREL_PLATFORM_SHA>   the pinned mandrel-platform commit SHA (resolve
+#                             via `node scripts/platform-sync.mjs --ref
+#                             <release-tag>` from the consumer repo root, or
+#                             hand-resolve via `git ls-remote`).
+#   <MANDREL_PLATFORM_TAG>   the human-readable release tag matching the SHA
+#                             above (trailing `# <tag>` comment).
+#   <MANIFEST_PATH>          path to this repo's residency manifest, e.g.
+#                             "env.manifest.json".
+#   <ENVIRONMENTS>           comma-separated slugs, e.g. "staging,production".
+#
+# See the full input/secret contract:
+# https://github.com/dsj1984/mandrel-platform/blob/main/docs/reusable-workflows.md#env-driftyml
+
+on:
+  schedule:
+    # Nightly. Drift accumulates between deploys — a per-PR run would mostly
+    # re-answer a question nothing changed.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: env-drift
+  cancel-in-progress: false
+
+jobs:
+  env-drift:
+    name: Env drift (shared env-drift.yml)
+    uses: dsj1984/mandrel-platform/.github/workflows/env-drift.yml@<MANDREL_PLATFORM_SHA> # <MANDREL_PLATFORM_TAG>
+    with:
+      manifest: <MANIFEST_PATH>
+      environments: <ENVIRONMENTS>
+      # Leave 'false' while adopting the manifest: orphans are reported either
+      # way, and flipping this before the manifest is complete fails the run on
+      # keys you simply have not declared yet.
+      strict-orphans: 'false'
+    # Every secret is optional on the shared side. Pass only what you have
+    # provisioned — an absent credential marks its surface `unchecked` with a
+    # ::notice and leaves the exit code alone, so the offline arm still gates.
+    #
+    # INFISICAL_TOKEN and the INFISICAL_CLIENT_* pair are alternatives: supply
+    # either one. Drop the lines you do not use.
+    secrets:
+      INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+      INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+      # A fine-grained PAT with `Secrets: read` + `Variables: read`. The
+      # workflow GITHUB_TOKEN cannot list either collection — no `permissions:`
+      # scope covers them.
+      ENV_DRIFT_GITHUB_TOKEN: ${{ secrets.ENV_DRIFT_GITHUB_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

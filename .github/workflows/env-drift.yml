@@ -1,0 +1,208 @@
+# Reusable environment/secret drift workflow (Story #451).
+#
+# Wraps the platform-owned `scripts/env-doctor.mjs` on the same thin-caller
+# model as `uptime-apply.yml`: a consumer ships only its residency manifest and
+# this workflow answers "does every declared key actually live where the
+# manifest says, in every store, and nowhere else?" — without ever putting a
+# secret VALUE in a job log. The doctor's module docblock is the contract; this
+# workflow adds no logic of its own beyond checkout + invoking it, so the
+# process lives in ONE place, versioned with the rest of the platform.
+#
+# Consumed as a workflow_call target. Minimal caller:
+#   jobs:
+#     env-drift:
+#       uses: dsj1984/mandrel-platform/.github/workflows/env-drift.yml@<sha> # <tag>
+#       with:
+#         manifest: env.manifest.json
+#         environments: staging,production
+#       secrets:
+#         INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+#         INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+#         ENV_DRIFT_GITHUB_TOKEN: ${{ secrets.ENV_DRIFT_GITHUB_TOKEN }}
+#         CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+#
+# Graceful degradation: every credential is optional. An absent one marks its
+# surface `unchecked`, raises a ::notice, and leaves the exit code alone — the
+# offline arm (manifest vs. workflow references, `.env.example`, wrangler vars)
+# still runs and still fails on real drift. The job is never `if:`-skipped:
+# GitHub renders an `if:`-skipped job as neither pass nor fail, which is a worse
+# signal than a visible skip-with-notice in the log.
+#
+# Note on ENV_DRIFT_GITHUB_TOKEN: it is a fine-grained PAT, not the workflow's
+# own GITHUB_TOKEN, and that is not an oversight. GitHub's `permissions:` block
+# has NO scope covering Actions secrets or variables, so the default token
+# cannot list either collection at any permission level. Reading those names
+# requires a PAT with `Secrets: read` and `Variables: read`.
+#
+# SHA-pinned third-party actions.
+name: Env drift
+
+on:
+  workflow_call:
+    inputs:
+      manifest:
+        description: >
+          Path (relative to the caller repo root) to the JSON residency
+          manifest. See docs/reusable-workflows.md (`env-drift.yml`) for the
+          schema, which `scripts/env-doctor.mjs` exports as MANIFEST_SCHEMA.
+        required: true
+        type: string
+      environments:
+        description: >
+          Comma-separated environment slugs to check (e.g.
+          'staging,production'). Defaults to the manifest's own
+          `environments[]` when empty.
+        required: false
+        type: string
+        default: ''
+      exceptions:
+        description: >
+          Optional path (relative to the caller repo root) to a JSON exceptions
+          document. Every entry needs a `revisit-date`: a future date
+          suppresses its finding and lists it in the summary, a past one FAILS
+          the run. An exception with no expiry is a permanent silence, which is
+          how drift becomes invisible.
+        required: false
+        type: string
+        default: ''
+      strict-orphans:
+        description: >
+          When 'true', a store key with no manifest entry fails the run.
+          Default 'false' reports orphans without changing the exit code —
+          adopt the manifest first, tighten afterwards.
+        required: false
+        type: string
+        default: 'false'
+      runner:
+        description: 'Runs-on label for the drift job. Default ubuntu-latest.'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+
+    secrets:
+      INFISICAL_TOKEN:
+        description: >
+          A pre-issued Infisical access token. Supply this OR the universal-auth
+          pair below — either reaches the same read-only listing calls. Absent
+          both, the Infisical surface (names AND value shapes) is unchecked.
+        required: false
+      INFISICAL_CLIENT_ID:
+        description: 'Universal-auth machine identity client id (read-only project access).'
+        required: false
+      INFISICAL_CLIENT_SECRET:
+        description: 'Universal-auth machine identity client secret.'
+        required: false
+      ENV_DRIFT_GITHUB_TOKEN:
+        description: >
+          Fine-grained PAT with `Secrets: read` and `Variables: read`. The
+          workflow GITHUB_TOKEN cannot serve this probe — no `permissions:`
+          scope grants access to either collection. Absent, the GitHub surface
+          is unchecked.
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        description: >
+          Cloudflare API token with Workers Scripts read. Absent, the
+          Cloudflare surface is unchecked.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  env-drift:
+    name: env-drift
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    timeout-minutes: 10
+    steps:
+      - name: Resolve platform ref
+        id: platform-ref
+        shell: bash
+        env:
+          # `job.workflow_sha` is the commit of the workflow FILE that defines
+          # this job — for a reusable workflow, exactly what the caller's
+          # `uses: …@<ref>` pin resolved to. Asserting it is what makes the pin
+          # real: an empty value makes `actions/checkout` omit the ref and fall
+          # back to this repo's default branch, so every consumer would silently
+          # run platform scripts from `main` instead of the SHA they pinned
+          # (Story #415).
+          PLATFORM_SHA: ${{ job.workflow_sha }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve this reusable workflow's own commit (job.workflow_sha='${PLATFORM_SHA}', caller='${CALLER_WORKFLOW_REF}'). Refusing to continue — a checkout with an empty ref silently falls back to mandrel-platform's default branch and would run platform scripts the caller never pinned."
+            exit 1
+          fi
+          echo "sha=${PLATFORM_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout (shared script)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: dsj1984/mandrel-platform
+          ref: ${{ steps.platform-ref.outputs.sha }}
+          # `sparse-checkout-cone-mode: false` makes this list EXHAUSTIVE, so a
+          # script's own module graph has to be listed with it: without
+          # `scripts/lib/` the first `./lib/*` import fails every consumer with
+          # ERR_MODULE_NOT_FOUND (Story #415).
+          sparse-checkout: |
+            scripts/env-doctor.mjs
+            scripts/lib/
+            .nvmrc
+          sparse-checkout-cone-mode: false
+          path: _mandrel-platform-env-drift
+          persist-credentials: false
+
+      - name: Checkout (caller — manifest)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: _caller
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: _mandrel-platform-env-drift/.nvmrc
+
+      - name: Check environment drift
+        shell: bash
+        env:
+          # Credentials reach the doctor through the environment, never through
+          # a flag — a flag value lands in the process table.
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          ENV_DRIFT_GITHUB_TOKEN: ${{ secrets.ENV_DRIFT_GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MANIFEST: ${{ inputs.manifest }}
+          ENVIRONMENTS: ${{ inputs.environments }}
+          EXCEPTIONS: ${{ inputs.exceptions }}
+          STRICT_ORPHANS: ${{ inputs.strict-orphans }}
+        run: |
+          set -euo pipefail
+          # `strict-orphans` is a string input, so any value other than exactly
+          # 'true' or 'false' would silently fall through to the permissive
+          # default — a caller that wrote 'True' would believe orphans were
+          # gating when they were not.
+          case "${STRICT_ORPHANS}" in
+            true) STRICT_FLAG=(--strict-orphans) ;;
+            false) STRICT_FLAG=() ;;
+            *)
+              echo "::error::env-drift: invalid \`strict-orphans\` input '${STRICT_ORPHANS}' — expected exactly 'true' or 'false'." >&2
+              exit 1
+              ;;
+          esac
+
+          ARGS=(
+            --manifest "${GITHUB_WORKSPACE}/_caller/${MANIFEST}"
+            --repo-root "${GITHUB_WORKSPACE}/_caller"
+          )
+          if [[ -n "${ENVIRONMENTS}" ]]; then
+            ARGS+=(--environments "${ENVIRONMENTS}")
+          fi
+          if [[ -n "${EXCEPTIONS}" ]]; then
+            ARGS+=(--exceptions "${GITHUB_WORKSPACE}/_caller/${EXCEPTIONS}")
+          fi
+
+          node "${GITHUB_WORKSPACE}/_mandrel-platform-env-drift/scripts/env-doctor.mjs" \
+            "${ARGS[@]}" "${STRICT_FLAG[@]}"

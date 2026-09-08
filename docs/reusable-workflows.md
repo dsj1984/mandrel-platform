@@ -3536,6 +3536,250 @@ contract, ahead of and independent from the cross-repo
 
 ---
 
+## `env-drift.yml`
+
+> Story #451. Lifts domio's env/secrets doctor (`scripts/env/`) into the
+> platform as one shared unit on the same thin-caller model as
+> [`uptime-apply.yml`](#uptime-applyyml). A consumer ships only a JSON
+> **residency manifest**; the workflow answers "does every declared key
+> actually live where the manifest says, in every store, and nowhere else?"
+> The manifest schema, the five surface probes, the value-shape stage and the
+> exit contract all live in `scripts/env-doctor.mjs` on this repo — see its
+> module docblock for the implementation contract.
+
+The doctor probes **five surfaces**, each bidirectionally (missing keys =
+readiness, extra keys = orphans):
+
+| Surface      | What it reads                                            | Values? |
+| ------------ | -------------------------------------------------------- | ------- |
+| `offline`    | Workflow `secrets.*`/`vars.*` references, `.env.example`, wrangler `[vars]` | n/a — repo files |
+| `github`     | Actions secret + variable **names**, repository and environment scope | Never — the API exposes no values |
+| `cloudflare` | Worker secret **names** per resolved script name          | Never — the API exposes no values |
+| `infisical`  | Secret **names** per environment and folder               | Only in the shape stage (below) |
+
+### Minimal caller
+
+```yaml
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  env-drift:
+    uses: dsj1984/mandrel-platform/.github/workflows/env-drift.yml@<sha> # <tag>
+    with:
+      manifest: env.manifest.json
+      environments: staging,production
+    secrets:
+      INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+      INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+      ENV_DRIFT_GITHUB_TOKEN: ${{ secrets.ENV_DRIFT_GITHUB_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+```
+
+A ready-to-copy version ships at
+[`templates/workflows/env-drift.yml`](../templates/workflows/env-drift.yml).
+
+Nightly is the intended cadence: drift accumulates between deploys, so a
+per-PR run would mostly re-answer a question nothing changed.
+
+### Inputs
+
+| Input            | Type   | Default           | When to override                                                                                          |
+| ---------------- | ------ | ----------------- | --------------------------------------------------------------------------------------------------------- |
+| `manifest`       | string | *(required)*      | Path (relative to the caller repo root) to the JSON residency manifest. See [Manifest schema](#manifest-schema) below. |
+| `environments`   | string | `''`              | Comma-separated environment slugs to check. Empty uses the manifest's own `environments[]`.                |
+| `exceptions`     | string | `''`              | Path to a JSON exceptions document. See [Exceptions](#exceptions-and-revisit-dates) below.                 |
+| `strict-orphans` | string | `'false'`         | `'true'` makes a store key with no manifest entry fail the run. Leave `'false'` while adopting the manifest — orphans are reported either way. Any value other than exactly `'true'`/`'false'` is rejected rather than silently defaulting. |
+| `runner`         | string | `'ubuntu-latest'` | Runs-on label for the drift job (single string or JSON label-array string — see [`runner` label shapes](#runner-label-shapes)). |
+
+### Secrets
+
+Every credential is **optional**, and each one only unlocks its own surface.
+
+| Secret                    | Required | Purpose                                                                                             |
+| ------------------------- | -------- | ----------------------------------------------------------------------------------------------------- |
+| `INFISICAL_TOKEN`         | No       | A pre-issued Infisical access token. Supply this **or** the universal-auth pair below — either reaches the same read-only listing calls. Absent both, the Infisical surface (names *and* value shapes) is `unchecked`. |
+| `INFISICAL_CLIENT_ID`     | No       | Universal-auth machine-identity client id, read-only project access.                                 |
+| `INFISICAL_CLIENT_SECRET` | No       | Universal-auth machine-identity client secret.                                                       |
+| `ENV_DRIFT_GITHUB_TOKEN`  | No       | Fine-grained PAT with `Secrets: read` and `Variables: read`. **Not** the workflow `GITHUB_TOKEN` — see below. Absent, the GitHub surface is `unchecked`. |
+| `CLOUDFLARE_API_TOKEN`    | No       | Cloudflare API token with Workers Scripts read. Absent, the Cloudflare surface is `unchecked`.        |
+
+#### Why the GitHub probe needs a PAT
+
+`GITHUB_TOKEN` cannot serve it at any permission level. GitHub's
+`permissions:` block has **no scope** covering Actions secrets or variables —
+the key simply does not exist, so there is nothing to grant. Listing either
+collection requires a fine-grained PAT with `Secrets: read` and
+`Variables: read` (repository scope, plus environment access for the
+environment-scoped calls). Provisioning steps are in the
+[environments-provisioning runbook](runbooks/environments-provisioning.md).
+
+### The exit contract
+
+The distinction that makes this gate meaningful:
+
+- **An absent credential is not a failure.** That surface is marked
+  `unchecked`, a `::notice` is raised naming it, and the exit code is
+  untouched — a consumer with no Cloudflare token still gets the offline arm.
+- **A failed probe always is.** Once a credential *is* supplied, any probe
+  error becomes an `error` surface that fails the run. Only a `404` may
+  degrade to "this resource is absent". Without that rule a `401` from an
+  expired PAT returns an empty name list, every key reads as a clean match,
+  and the doctor reports "no drift" precisely because it could not look.
+
+| Condition                                        | Exit |
+| ------------------------------------------------ | ---- |
+| Clean, or only `unchecked` surfaces              | 0    |
+| Orphan found, `strict-orphans: 'false'`          | 0    |
+| Key missing from a **checked** surface           | 1    |
+| Value fails its declared `shape`                 | 1    |
+| Any probe failed (non-404)                       | 1    |
+| An exception's `revisit-date` has passed         | 1    |
+| Orphan found, `strict-orphans: 'true'`           | 1    |
+
+### Skip-with-notice (graceful degradation)
+
+The job **always runs** — never `if:`-skipped at the job level, because GitHub
+renders a skipped job as neither pass nor fail, a worse signal than a visible
+notice in the log. With no credentials at all the run still executes the
+offline arm, prints one `::notice` per unchecked surface, and exits 0.
+
+### Manifest schema
+
+`scripts/env-doctor.mjs` exports `MANIFEST_SCHEMA` and `KEY_SCHEMA`, so the
+script and this document describe exactly one shape.
+
+```jsonc
+{
+  "environments": ["staging", "production"],
+
+  // Worker id -> config path + script name. `{env}` is substituted per
+  // environment, so a one-Worker consumer and an eight-Worker one use the
+  // same schema.
+  "workers": {
+    "site": { "config": "wrangler.toml", "scriptName": "acme-site-{env}" }
+  },
+
+  "keys": [
+    {
+      "name": "PUBLIC_SITE_URL",
+      "kind": "var",                 // "var" | "secret"
+      "sensitivity": "public",       // "public" | "secret"
+      "residency": {
+        "local": "var",              // "var" | "secret" | "file" | null
+        "github": { "scope": "environment", "kind": "var" },
+        "cloudflare": { "workers": ["site"], "kind": "var" }
+      },
+      "infisical": { "folder": "/", "environments": ["staging", "production"] },
+      "shape": "url",
+      "placeholderPattern": "changeme",
+      "note": "Free text."
+    }
+  ]
+}
+```
+
+`infisical` is either `{folder, environments}` or the literal string
+`"unmanaged"`. A `residency` member is `null` when the key does not belong in
+that store.
+
+#### `shape` is a closed vocabulary
+
+`shape` names one of a fixed set, **not** a regex you supply:
+
+`non-empty`, `url`, `https-url`, `e164`, `uuid`, `email`, `integer`, `hex`,
+`base64`
+
+An unknown name is a manifest **validation error** naming the offending value
+and listing the vocabulary — never a silently-unchecked key. This is a
+deliberate constraint, not an unfinished feature: Semgrep blocks
+`new RegExp(<non-literal>)` on new JavaScript in this repo, with no exemption
+for test files, so a manifest-supplied pattern cannot ship. Need a shape the
+vocabulary lacks? Add it to `SHAPE_VOCABULARY` as a literal, anchored RegExp
+and it becomes available to every consumer.
+
+`placeholderPattern` is likewise a **literal, case-insensitive substring**
+(`"changeme"`, `"xxx"`), not a pattern — same constraint, same reason.
+
+### The shape stage — the only place a value is read
+
+Four of the five surfaces cannot return values at all. Infisical can, which
+makes it the one place a doctor could leak, so:
+
+- the **residency** probe passes `viewSecretValue=false` — a value never
+  enters the process;
+- the **shape** stage is the only caller that requests values, compares them
+  in-process, and reduces each to a pass/fail verdict before anything renders;
+- a verdict is built from the shape *name* and the placeholder marker only,
+  never from the value.
+
+`scripts/env-doctor.test.mjs` asserts this rather than asserting to it: a test
+runs the real CLI against a local mock Infisical and greps the full captured
+stdout **and** stderr for every injected fixture value, including one the run
+read but had no finding for — the easiest kind of leak to ship unnoticed.
+
+This is the check that catches a scheme-less `PUBLIC_SITE_URL` reaching
+production: `shape: "url"`, verdict `shape-fail`, exit 1, and the value itself
+never printed.
+
+### Exceptions and revisit dates
+
+An `--exceptions` document defers a known finding:
+
+```json
+{
+  "exceptions": [
+    {
+      "key": "LEGACY_API_KEY",
+      "surface": "github",
+      "environment": "staging",
+      "reason": "Retired with the v1 API; removal tracked in #### .",
+      "revisit-date": "2026-12-01"
+    }
+  ]
+}
+```
+
+`revisit-date` is **required** on every entry. A future date suppresses the
+finding and lists it in the run summary; a past date **fails the run**. An
+exception with no expiry is a permanent silence, which is how drift becomes
+invisible — and expiring loudly is the point, since lapsing quietly would
+re-raise a finding the operator deliberately deferred without anyone noticing
+the deferral had run out. Omitting `surface`/`environment` widens the
+exception to every occurrence of that key.
+
+### Standalone usage
+
+The doctor is a plain Node script with no build step, so a consumer can run it
+outside CI against the published package:
+
+```bash
+node node_modules/mandrel-platform/scripts/env-doctor.mjs \
+  --manifest env.manifest.json --offline
+```
+
+Credentials are read from the environment (`INFISICAL_TOKEN`,
+`INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`, `ENV_DRIFT_GITHUB_TOKEN`,
+`CLOUDFLARE_API_TOKEN`), never from a flag — a flag value lands in the process
+table. `--json` emits the machine report; `--help` lists every option.
+
+### Out of scope
+
+- **Writes.** Every surface is read-only. The doctor reports drift; it never
+  converges it.
+- **Value comparison across stores.** GitHub and Cloudflare expose no values
+  by design, so "is the staging token the same string in both places?" is
+  unanswerable and deliberately unattempted. The shape stage reads Infisical
+  only.
+- **The interactive fixer.** domio's `fix.mjs` and its Astro-specific
+  `resolver-lint.mjs` stay consumer-local.
+- **Consumer cut-over.** Migrating domio and swarm-os onto this unit is
+  tracked as separate, per-consumer stories.
+
+---
+
 ## `release-automation.yml`
 
 The consumer **release-lifecycle** channel: a `workflow_call` wrapper around
