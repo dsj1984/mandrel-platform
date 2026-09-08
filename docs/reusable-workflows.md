@@ -3671,6 +3671,11 @@ script and this document describe exactly one shape.
 {
   "environments": ["staging", "production"],
 
+  // Optional. Surface name -> {environment: slug}, for a store whose
+  // environment namespace is not the deploy-environment namespace. Only
+  // `infisical` is honored — see "Infisical environment slugs" below.
+  "environmentSlugs": { "infisical": { "production": "prod" } },
+
   // Worker id -> config path + script name. `{env}` is substituted per
   // environment, so a one-Worker consumer and an eight-Worker one use the
   // same schema.
@@ -3692,6 +3697,8 @@ script and this document describe exactly one shape.
 
         "cloudflare": { "workers": ["site"], "kind": "var" }
       },
+      // Either a single {folder, environments}, or a `folders` array — see
+      // "Infisical folder residency" below.
       "infisical": { "folder": "/", "environments": ["staging", "production"] },
       "shape": "url",
       "placeholderPattern": "changeme",
@@ -3701,9 +3708,100 @@ script and this document describe exactly one shape.
 }
 ```
 
-`infisical` is either `{folder, environments}` or the literal string
-`"unmanaged"`. A `residency` member is `null` when the key does not belong in
-that store.
+`infisical` is `{folder, environments}`, `{folders: [...]}`, or the literal
+string `"unmanaged"`. A `residency` member is `null` when the key does not
+belong in that store.
+
+#### Infisical environment slugs
+
+`manifest.environments` names **deploy** environments, and it is substituted
+into three namespaces that are not the same namespace: the Worker script name,
+the GitHub Environment API path, and the Infisical environment slug. A project
+whose Infisical slugs differ from its deploy names — slugs `staging` / `prod`
+against environments `staging` / `production` — could not be probed at all:
+the request 404s, the surface goes to `error`, and an `error` surface is
+deliberately unsuppressable, so the lane stays red with no downstream fix.
+
+`environmentSlugs` maps a manifest environment to the slug a surface uses:
+
+```jsonc
+"environments": ["staging", "production"],
+"environmentSlugs": { "infisical": { "production": "prod" } }
+```
+
+An unmapped environment resolves to **itself**, so omitting the container
+leaves every existing manifest behaving exactly as it did. Findings keep
+reporting the *manifest* environment, not the slug — the slug is a wire
+detail, and `--exceptions` entries stay keyed to the vocabulary you authored.
+
+**Only `infisical` is honored, and naming another surface is a validation
+error** rather than a silently ignored field. Cloudflare already has its own
+escape hatch — `workers[].scriptName` substitutes `{env}`, so
+`acme-site-{env}` resolves whatever the deploy name is — and a slug map there
+would be two mechanisms for one job; the GitHub Environment API is read at
+`manifest.environments` verbatim. The container is nonetheless keyed by
+surface so a surface that ever does diverge adopts it without a second idiom.
+
+#### Infisical folder residency
+
+`infisical` accepts **either** a single `{folder, environments}` object **or**
+a `folders` array whose entries are a bare folder path or a
+`{folder, environments}` object:
+
+```jsonc
+"infisical": { "folder": "/shared" }                        // unchanged, still valid
+"infisical": { "folders": ["/shared", "/cloudflare"] }      // multi-folder residency
+"infisical": { "folders": [
+  { "folder": "/operator" },
+  { "folder": "/github", "environments": ["staging"] }       // per-environment
+]}
+```
+
+Two residencies occur in practice that one folder cannot say:
+
+**Multi-folder residency.** A key can legitimately be resident in more than
+one folder, and folder **imports** are what make that normal rather than
+sloppy: when `/cloudflare` imports `/shared`, a value entering at `/shared` is
+genuinely read through `/cloudflare` as well. Both statements are true, one
+field could hold only one, and the surplus was dropped — so the same
+misplacement was counted **twice**, `missing` from the declared folder and
+`orphan` in the folder that actually held it.
+
+**Per-environment residency.** A key can live in a different folder per
+environment — an operator-held credential that arrives via `/github` in
+staging only. With no per-entry `environments`, one of the two folders was
+always wrong.
+
+`environments` **defaults to all of `manifest.environments`**, which is why the
+single-object form keeps behaving exactly as it always did. Under `folders`
+each entry carries its own; a container-level `environments` beside `folders`
+is a validation error rather than an ambiguous default, as are an empty
+`folders` array (use `"unmanaged"`), a repeated folder, declaring both `folder`
+and `folders`, and an environment slug outside `manifest.environments`.
+
+##### Orphans across folders
+
+Infisical is probed once per (environment, folder) pair, so the surface
+suppresses one specific false orphan: **a name declared in one folder is never
+reported as an orphan in a sibling declared folder of the same environment.**
+This is the `declaredElsewhere` treatment the GitHub surface has had since
+Story #459; its absence here is why a single misplacement was reported twice,
+and why `--strict-orphans` was unadoptable for any consumer using imports — an
+orphan is not suppressible by an exception (`applyExceptions` suppresses only
+`severity: "fail"`), so a manifest merely imprecise about placement reddened a
+strict lane permanently.
+
+The suppression is deliberately no wider than that:
+
+| Case | Reported? |
+| --- | --- |
+| Declared in `/shared`, present in declared sibling `/cloudflare`, same environment | **No** — this is multi-folder residency |
+| Declared for staging only, present in production | **Yes** — undeclared presence in that environment |
+| Declared in no folder at all | **Yes** — unchanged |
+
+A key resident in several folders is *read* in each of them, but it is one
+value, so it earns at most **one shape verdict per environment** — scoring it
+per folder would re-introduce double-reporting in the shape stage.
 
 #### GitHub residency: dual scope and per-environment presence
 

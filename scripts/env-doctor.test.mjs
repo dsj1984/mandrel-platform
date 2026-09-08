@@ -31,7 +31,9 @@ import { promisify } from "node:util";
 import { test } from "node:test";
 
 import {
+  KEY_SCHEMA,
   MANIFEST_SCHEMA,
+  SLUG_MAPPED_SURFACES,
   SHAPE_NAMES,
   SHAPE_VOCABULARY,
   applyExceptions,
@@ -49,6 +51,7 @@ import {
   redactUrl,
   renderReport,
   resolveScriptName,
+  resolveSurfaceEnvironment,
   runDoctor,
   runOfflineChecks,
 } from "./env-doctor.mjs";
@@ -1034,6 +1037,388 @@ test("no secret VALUE reaches stdout or stderr on a real run against a mock Infi
     // served on the same values-bearing response that produced the verdict
     // above — so a leak of it would be a leak of a value the doctor read but
     // had no finding for, the easiest kind to ship unnoticed.
+    for (const [name, value] of Object.entries(INJECTED)) {
+      assert.ok(!captured.includes(value), `the VALUE of ${name} leaked into the doctor's output`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    await new Promise((r) => server.close(r));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Infisical environment slugs and folder residency (Story #464)
+// ---------------------------------------------------------------------------
+
+/**
+ * A manifest with no local residency and no GitHub residency, so every finding
+ * under test comes from the Infisical probe. One Worker is kept so the
+ * Cloudflare surface can be asserted to keep the DEPLOY name while Infisical
+ * is asked for the mapped slug.
+ */
+function infisicalOnlyManifest(infisical, { environmentSlugs, keys } = {}) {
+  return parseManifest({
+    environments: ["staging", "production"],
+    ...(environmentSlugs ? { environmentSlugs } : {}),
+    workers: { site: { scriptName: "acme-site-{env}" } },
+    keys:
+      keys ??
+      [
+        {
+          name: "SHARED_TOKEN",
+          kind: "secret",
+          sensitivity: "secret",
+          residency: { local: null, github: null, cloudflare: null },
+          infisical,
+        },
+      ],
+  });
+}
+
+/**
+ * Run the Infisical probe against a `{ "<environment-slug><folder>": [names] }`
+ * map, recording every (environment, folder) pair the client was asked for.
+ * The map is keyed by the slug the CLIENT sees, which is the whole point: a
+ * remapped environment must be looked up under its store slug.
+ */
+async function infisicalRun({ manifest, present, environments = ["staging", "production"], cloudflare = null }) {
+  const root = makeRepo({});
+  const asked = [];
+  try {
+    const report = await runDoctor({
+      manifest,
+      repoRoot: root,
+      environments,
+      cloudflare,
+      infisical: {
+        listNames: async ({ environment, folder }) => {
+          asked.push(`${environment}${folder}`);
+          return present[`${environment}${folder}`] ?? [];
+        },
+        listValues: async () => new Map(),
+      },
+    });
+    return { asked, findings: report.findings.filter((f) => f.surface === "infisical"), report };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("a remapped Infisical slug is probed at the slug while Cloudflare keeps the deploy name", async () => {
+  // The motivating case: deploy environments are staging/production, but the
+  // Infisical project's slugs are staging/prod. Before this, `production`
+  // reached Infisical verbatim and 404'd the whole surface into `error`.
+  const scripts = [];
+  const { asked } = await infisicalRun({
+    manifest: infisicalOnlyManifest(
+      { folder: "/shared" },
+      { environmentSlugs: { infisical: { production: "prod" } } }
+    ),
+    present: { "staging/shared": ["SHARED_TOKEN"], "prod/shared": ["SHARED_TOKEN"] },
+    cloudflare: {
+      secretNames: async (scriptName) => {
+        scripts.push(scriptName);
+        return [];
+      },
+    },
+  });
+
+  assert.deepEqual(asked, ["staging/shared", "prod/shared"]);
+  assert.ok(!asked.some((a) => a.startsWith("production")), "the deploy name must not reach Infisical");
+  // The Cloudflare surface resolves {env} from the DEPLOY name, unmapped —
+  // which is why it needs no slug map of its own.
+  assert.deepEqual(scripts, []);
+});
+
+test("a manifest declaring a Cloudflare secret still resolves {env} from the unmapped deploy name", async () => {
+  const scripts = [];
+  await infisicalRun({
+    manifest: infisicalOnlyManifest(undefined, {
+      environmentSlugs: { infisical: { production: "prod" } },
+      keys: [
+        {
+          name: "SHARED_TOKEN",
+          kind: "secret",
+          sensitivity: "secret",
+          residency: { local: null, github: null, cloudflare: { workers: ["site"], kind: "secret" } },
+          infisical: { folder: "/shared" },
+        },
+      ],
+    }),
+    present: {},
+    cloudflare: {
+      secretNames: async (scriptName) => {
+        scripts.push(scriptName);
+        return ["SHARED_TOKEN"];
+      },
+    },
+  });
+  assert.deepEqual(scripts, ["acme-site-staging", "acme-site-production"]);
+});
+
+test("environmentSlugs rejects a surface that is not slug-mapped, and names it", () => {
+  assert.throws(
+    () =>
+      infisicalOnlyManifest({ folder: "/" }, { environmentSlugs: { cloudflare: { production: "prod" } } }),
+    (err) => {
+      assert.match(err.message, /"cloudflare" is not a slug-mapped surface/);
+      assert.match(err.message, /infisical/);
+      // The message must say WHY, or the author re-files the same request.
+      assert.match(err.message, /scriptName/);
+      return true;
+    }
+  );
+});
+
+test("environmentSlugs rejects an unmapped environment and a slug that is not a non-empty string", () => {
+  assert.throws(
+    () => infisicalOnlyManifest({ folder: "/" }, { environmentSlugs: { infisical: { preview: "prev" } } }),
+    /maps "preview", absent from manifest.environments/
+  );
+  assert.throws(
+    () => infisicalOnlyManifest({ folder: "/" }, { environmentSlugs: { infisical: { production: "" } } }),
+    /must be a non-empty slug string/
+  );
+  assert.throws(
+    () => infisicalOnlyManifest({ folder: "/" }, { environmentSlugs: { infisical: { production: 7 } } }),
+    /must be a non-empty slug string/
+  );
+  assert.throws(
+    () => infisicalOnlyManifest({ folder: "/" }, { environmentSlugs: { infisical: ["prod"] } }),
+    /must be an object mapping environment -> slug/
+  );
+});
+
+test("with no environmentSlugs every environment resolves to itself", async () => {
+  const manifest = infisicalOnlyManifest({ folder: "/shared" });
+  // The container is normalized to a total-but-empty map, so no caller has to
+  // distinguish "absent" from "empty".
+  assert.deepEqual(manifest.environmentSlugs, { infisical: {} });
+  assert.equal(resolveSurfaceEnvironment(manifest, "infisical", "production"), "production");
+  const { asked } = await infisicalRun({ manifest, present: { "staging/shared": ["SHARED_TOKEN"] } });
+  assert.deepEqual(asked, ["staging/shared", "production/shared"]);
+});
+
+test("parseManifest normalizes the single-object infisical form to a one-entry folders array", () => {
+  // The pre-#464 authored shape, parsed: one shape reaches probeInfisical, the
+  // same treatment residency.github received in #459.
+  const m = infisicalOnlyManifest({ folder: "/shared", environments: ["production"] });
+  assert.deepEqual(m.keys[0].infisical, { folders: [{ folder: "/shared", environments: ["production"] }] });
+
+  const defaulted = infisicalOnlyManifest({ folder: "/shared" });
+  assert.deepEqual(defaulted.keys[0].infisical, {
+    folders: [{ folder: "/shared", environments: ["staging", "production"] }],
+  });
+});
+
+test("the folders array accepts bare paths and per-entry environments", () => {
+  const m = infisicalOnlyManifest({
+    folders: ["/shared", { folder: "/github", environments: ["staging"] }],
+  });
+  assert.deepEqual(m.keys[0].infisical, {
+    folders: [
+      { folder: "/shared", environments: ["staging", "production"] },
+      { folder: "/github", environments: ["staging"] },
+    ],
+  });
+});
+
+test("a key resident in two folders and present in both reports no finding", async () => {
+  // The folder-import case: /cloudflare imports /shared, so the value is
+  // genuinely readable through both. Both statements are true.
+  const { findings } = await infisicalRun({
+    manifest: infisicalOnlyManifest({ folders: ["/shared", "/cloudflare"] }),
+    present: {
+      "staging/shared": ["SHARED_TOKEN"],
+      "staging/cloudflare": ["SHARED_TOKEN"],
+      "production/shared": ["SHARED_TOKEN"],
+      "production/cloudflare": ["SHARED_TOKEN"],
+    },
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("a misplacement across two declared folders is reported ONCE, as the missing", async () => {
+  // Declared in /shared, actually resident in /cloudflare. Before #464 this
+  // was two findings for one fact — a missing AND an orphan — and the orphan
+  // was unsuppressable by an exception, so --strict-orphans could never go
+  // green on a manifest that was merely imprecise about placement.
+  const { findings } = await infisicalRun({
+    manifest: infisicalOnlyManifest({ folders: ["/shared", "/cloudflare"] }),
+    present: {
+      "staging/cloudflare": ["SHARED_TOKEN"],
+      "production/cloudflare": ["SHARED_TOKEN"],
+    },
+    environments: ["staging"],
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "missing");
+  assert.equal(findings[0].key, "SHARED_TOKEN");
+  assert.match(findings[0].detail, /folder \/shared/);
+  assert.equal(
+    findings.filter((f) => f.kind === "orphan").length,
+    0,
+    "the sibling declared folder must not also orphan the same key"
+  );
+});
+
+test("suppression does not cross environment — a staging-only key found in production orphans", async () => {
+  // SHARED_TOKEN is declared in /github for staging only. Finding it in
+  // /shared in production is undeclared presence in that environment, which
+  // is the most interesting thing this surface can report.
+  const { findings } = await infisicalRun({
+    manifest: infisicalOnlyManifest({
+      folders: [{ folder: "/github", environments: ["staging"] }, { folder: "/shared", environments: ["staging"] }],
+    }),
+    present: {
+      "staging/github": ["SHARED_TOKEN"],
+      "staging/shared": ["SHARED_TOKEN"],
+      "production/shared": ["SHARED_TOKEN"],
+    },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "orphan");
+  assert.equal(findings[0].environment, "production");
+});
+
+test("a per-environment folder entry reports no missing for an environment it never names", async () => {
+  const { findings } = await infisicalRun({
+    manifest: infisicalOnlyManifest({ folders: [{ folder: "/operator", environments: ["production"] }] }),
+    present: { "production/operator": ["SHARED_TOKEN"] },
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("infisical folder residency fails closed on every malformed shape", () => {
+  const bad = (infisical) => () => infisicalOnlyManifest(infisical);
+  assert.throws(bad({ folders: [] }), /folders must be a non-empty array/);
+  assert.throws(bad({ folders: ["/shared", "/shared"] }), /repeats the folder "\/shared"/);
+  assert.throws(bad({ folders: [{ folder: "/s", environments: ["preview"] }] }), /absent from manifest.environments/);
+  assert.throws(bad({ folder: "/s", folders: ["/t"] }), /declares both "folder" and "folders"/);
+  assert.throws(bad({ folders: ["/s"], environments: ["staging"] }), /meaningful only beside a single "folder"/);
+  assert.throws(bad({}), /must declare "folder" or "folders"/);
+  assert.throws(bad({ folders: [""] }), /must be a non-empty folder path string/);
+  assert.throws(bad({ folders: [42] }), /must be a folder path string or \{folder, environments\}/);
+  assert.throws(bad("nope"), /must be "unmanaged", \{folder, environments\} or \{folders: \[\.\.\.\]\}/);
+  // Unchanged from before #464: the single-object form's own env validation.
+  assert.throws(bad({ folder: "/s", environments: ["preview"] }), /absent from manifest.environments/);
+});
+
+test("a multi-folder key with a shape earns ONE verdict per environment, not one per folder", async () => {
+  // A key resident in two folders is READ twice, but it is one value — so
+  // scoring it per folder would re-introduce double-reporting in the shape
+  // stage, the very defect #464 removes from the residency stage.
+  const root = makeRepo({});
+  try {
+    const manifest = infisicalOnlyManifest(undefined, {
+      keys: [
+        {
+          name: "SHARED_TOKEN",
+          kind: "var",
+          sensitivity: "public",
+          residency: { local: null, github: null, cloudflare: null },
+          infisical: { folders: ["/shared", "/cloudflare"] },
+          shape: "url",
+        },
+      ],
+    });
+    const report = await runDoctor({
+      manifest,
+      repoRoot: root,
+      environments: ["staging"],
+      infisical: {
+        listNames: async () => ["SHARED_TOKEN"],
+        listValues: async () => new Map([["SHARED_TOKEN", "example.test"]]),
+      },
+    });
+    const shapeFails = report.findings.filter((f) => f.kind === "shape-fail");
+    assert.equal(shapeFails.length, 1, "one value, one verdict");
+    assert.equal(shapeFails[0].key, "SHARED_TOKEN");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("MANIFEST_SCHEMA and KEY_SCHEMA describe the slug container and the folders array", () => {
+  assert.ok(Object.hasOwn(MANIFEST_SCHEMA, "environmentSlugs"));
+  assert.match(MANIFEST_SCHEMA.environmentSlugs, /infisical/);
+  assert.match(KEY_SCHEMA.infisical, /folders/);
+  assert.deepEqual(SLUG_MAPPED_SURFACES, ["infisical"]);
+});
+
+test("the documented manifest schema block names the new shapes", () => {
+  // The script exports the schema so the doc and the code describe one shape;
+  // this asserts the DOC kept its half of that bargain.
+  const doc = readFileSync(join(HERE, "..", "docs", "reusable-workflows.md"), "utf8");
+  assert.match(doc, /"environmentSlugs"/);
+  assert.match(doc, /"folders"/);
+});
+
+test("no secret VALUE reaches stdout or stderr through the remapped-slug, multi-folder path", async () => {
+  // The values-safety guarantee, re-asserted over the shapes #464 adds: a
+  // remapped environment slug and a key resident in two folders. Same
+  // low-entropy dictionary canaries as the sibling leak test, for the same
+  // reason (a key-shaped fixture is a true positive for gitleaks).
+  const INJECTED = {
+    PUBLIC_SITE_URL: "example.test/no-scheme-here",
+    TURSO_AUTH_TOKEN: "second-canary-that-must-never-be-printed",
+  };
+  const requested = [];
+
+  const server = createServer((req, res) => {
+    if (req.method === "POST" && req.url.startsWith("/api/v1/auth/universal-auth/login")) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ accessToken: "mock-token", expiresIn: 3600, tokenType: "Bearer" }));
+      return;
+    }
+    if (req.url.startsWith("/api/v4/secrets")) {
+      const params = new URL(req.url, "http://localhost").searchParams;
+      requested.push(`${params.get("environment")}${params.get("secretPath")}`);
+      const withValues = params.get("viewSecretValue") === "true";
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          secrets: Object.entries(INJECTED).map(([secretKey, secretValue]) => ({
+            secretKey,
+            ...(withValues ? { secretValue } : {}),
+          })),
+        })
+      );
+      return;
+    }
+    res.writeHead(404).end("{}");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const site = `http://127.0.0.1:${server.address().port}`;
+
+  const raw = singleWorkerManifest();
+  raw.environmentSlugs = { infisical: { production: "prod" } };
+  for (const key of raw.keys) key.infisical = { folders: ["/", "/shared"] };
+
+  const root = makeRepo(CONSISTENT_REPO);
+  const manifestPath = join(root, "env.manifest.json");
+  writeFileSync(manifestPath, JSON.stringify(raw));
+
+  try {
+    const run = await runCli(
+      [
+        "--manifest", manifestPath,
+        "--repo-root", root,
+        "--environments", "production",
+        "--infisical-project", "proj-1",
+        "--infisical-site", site,
+        "--json",
+      ],
+      { env: { INFISICAL_CLIENT_ID: "id", INFISICAL_CLIENT_SECRET: "sec", ENV_DRIFT_GITHUB_TOKEN: "", CLOUDFLARE_API_TOKEN: "" } }
+    );
+
+    // End-to-end proof that the slug reaches the wire through the real CLI:
+    // every request names `prod`, never the `production` deploy name.
+    assert.ok(requested.length > 0, "the mock store should have been asked for something");
+    assert.deepEqual([...new Set(requested.map((r) => r.split("/")[0]))], ["prod"]);
+
+    const captured = run.stdout + run.stderr;
+    assert.ok(captured.includes("PUBLIC_SITE_URL"), "the failing key's NAME should be reported");
     for (const [name, value] of Object.entries(INJECTED)) {
       assert.ok(!captured.includes(value), `the VALUE of ${name} leaked into the doctor's output`);
     }
