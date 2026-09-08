@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.8.0...mandrel-platform-v1.8.1) (2026-09-08)
+
+
+### Fixed
+
+* pass the Cloudflare account id and Infisical project id to env-doctor (refs [#455](https://github.com/dsj1984/mandrel-platform/issues/455)) ([#456](https://github.com/dsj1984/mandrel-platform/issues/456)) ([c25eab2](https://github.com/dsj1984/mandrel-platform/commit/c25eab2118ccf15309b9085d2ad78c99d33a96c6))
+
 ## [1.8.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.7.0...mandrel-platform-v1.8.0) (2026-09-08)
 
 
