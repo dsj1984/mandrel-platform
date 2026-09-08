@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.10.0...mandrel-platform-v1.11.0) (2026-09-08)
+
+
+### Added
+
+* assert the coverage floor once across every tier's coverage (refs [#468](https://github.com/dsj1984/mandrel-platform/issues/468)) ([#469](https://github.com/dsj1984/mandrel-platform/issues/469)) ([4429dea](https://github.com/dsj1984/mandrel-platform/commit/4429dea4cc48e35678936839a48585becdaea1ac))
+
 ## [1.10.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.9.0...mandrel-platform-v1.10.0) (2026-09-08)
 
 
