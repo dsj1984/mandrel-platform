@@ -164,11 +164,25 @@ test("every requirement is == pinned and carries a sha256 hash", () => {
 test("no requirement is pinned with a loose operator", () => {
   // `--require-hashes` rejects these at install time; catching it here names
   // the offending line instead of failing inside CI's pip.
+  //
+  // The operator is matched by string comparison, NOT by a regex alternating
+  // `<` and `>`. CodeQL reads such a pattern as an attempted HTML-tag filter
+  // and raises js/bad-tag-filter at HIGH — which blocks the merge, since
+  // code-scanning gates on high. Comparing prefixes says the same thing with
+  // nothing for that query to match on.
+  const LOOSE_OPERATORS = [">=", "<=", "~=", "!=", ">", "<"];
   for (const line of lockfile.split("\n")) {
     const trimmed = line.trim();
     if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith("--hash")) continue;
-    if (!/^[A-Za-z0-9._-]+/.test(trimmed)) continue;
-    assert.doesNotMatch(trimmed, /^[A-Za-z0-9._-]+\s*(>=|<=|~=|>|<)/, `loose pin: ${trimmed}`);
+    const name = trimmed.match(/^[A-Za-z0-9._-]+/);
+    if (!name) continue;
+    const operator = trimmed.slice(name[0].length).trimStart();
+    for (const loose of LOOSE_OPERATORS) {
+      assert.ok(
+        !operator.startsWith(loose),
+        `loose pin (${loose}) — --require-hashes needs an exact ==: ${trimmed}`,
+      );
+    }
   }
 });
 
