@@ -1,24 +1,51 @@
 # Hash-pinned lockfile for the pr-quality SAST (semgrep) step.
 #
 # Target platform : Linux x86_64 / CPython 3.12 (GitHub Actions ubuntu-latest)
-# Tool            : semgrep 1.97.0 (+ complete transitive closure)
+# Tool            : semgrep 1.176.1 (+ complete transitive closure)
 # Consumed via    : pip install --require-hashes -r scripts/semgrep-requirements.txt
 #
 # Every requirement below is pinned with `==` and carries at least one
 # sha256 hash, as `--require-hashes` demands. The closure was resolved for
 # the linux/cp312 target specifically (via `pip download` with explicit
-# --platform manylinux/musllinux + --python-version 3.12 --abi cp312), NOT
-# from the local interpreter, so the native wheels (semgrep, protobuf,
-# rpds-py, wrapt, charset-normalizer, ruamel.yaml.clib) are the linux x86_64
-# cp312-compatible artifacts.
+# --platform manylinux + --python-version 3.12 --abi cp312), NOT from the
+# local interpreter, so the native wheels (semgrep, protobuf, rpds-py, wrapt,
+# charset-normalizer, ruamel.yaml.clib) are the linux x86_64 cp312-compatible
+# artifacts.
 #
-# setuptools is intentionally included: the workflow installs it alongside
-# semgrep so opentelemetry's transitive `pkg_resources` import works on
-# Python >=3.12 (which no longer ships setuptools by default).
+# WHEEL TAG — read before regenerating. semgrep moved its Linux wheel tag from
+# `manylinux2014_x86_64` to `manylinux_2_34_x86_64` after 1.157.0. A
+# `pip download` whose --platform list omits `manylinux_2_34_x86_64` silently
+# resolves NOTHING newer than 1.157.0 and reports it as "no matching
+# distribution" — it does not say the tag is the reason. glibc 2.34 is
+# satisfied by ubuntu-latest (2.39) and by 22.04 (2.35). Keep the older tags
+# listed too: the rest of the closure still ships manylinux2014 wheels
+# (protobuf among them).
 #
-# Regenerate with `pip download semgrep==<ver> setuptools --only-binary=:all:
-# --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64
-# --platform any --python-version 3.12 --implementation cp --abi cp312`.
+# setuptools is NO LONGER included, and its absence is deliberate. It used to
+# be pinned to 80.9.0 because semgrep 1.97.0's transitive
+# `opentelemetry-instrumentation==0.46b0` imported `pkg_resources` at load, and
+# a py3.12 venv seeds no setuptools. `opentelemetry-instrumentation` 0.58b0
+# (pulled by semgrep 1.176.1) no longer imports it, verified by installing this
+# closure with --require-hashes in a clean python:3.12 container and running a
+# real scan. Do not re-add setuptools without a reason: 80.9.0 was the last
+# release shipping pkg_resources and it carries its own advisories.
+#
+# Regenerate with:
+#   pip download semgrep==<ver> \
+#     --only-binary=:all: \
+#     --platform manylinux_2_34_x86_64 \
+#     --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+#     --platform any \
+#     --python-version 3.12 --implementation cp --abi cp312 -d <dir>
+# then emit `<Name>==<Version>` + the wheel's sha256 for each artifact, reading
+# Name/Version from each wheel's own dist-info METADATA rather than parsing
+# filenames (they normalize dots and hyphens differently).
+
+annotated-types==0.8.0 \
+    --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
+
+anyio==4.15.1 \
+    --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101
 
 attrs==26.1.0 \
     --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
@@ -26,14 +53,17 @@ attrs==26.1.0 \
 boltons==21.0.0 \
     --hash=sha256:b9bb7b58b2b420bbe11a6025fdef6d3e5edc9f76a42fb467afe7ca212ef9948b
 
-bracex==3.0 \
-    --hash=sha256:3833e61c2f092d5aa0468fa2e6c6e990a306185abf763b6d122f0158e59c58a5
+bracex==3.0.1 \
+    --hash=sha256:6523ad83aeb5098a4ee597cff0f964442ff74e460bd3fafaffab6a013ff2288c
 
-certifi==2026.6.17 \
-    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+certifi==2026.7.22 \
+    --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
 
-charset-normalizer==3.4.7 \
-    --hash=sha256:5649fd1c7bade02f320a462fdefd0b4bd3ce036065836d4f42e0de958038e116
+cffi==2.1.1 \
+    --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf
+
+charset-normalizer==3.5.1 \
+    --hash=sha256:b9af956078716df40d985fb0dfeb2c2120c5ca92ba4ff4b388acfd01cdc14d08
 
 click==8.4.2 \
     --hash=sha256:e6f9f66136c816745b9d65817da91d61d957fb16e02e4dcd0552553c5a197b76
@@ -44,11 +74,8 @@ click-option-group==0.5.9 \
 colorama==0.4.6 \
     --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
 
-defusedxml==0.7.1 \
-    --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
-
-deprecated==1.3.1 \
-    --hash=sha256:597bfef186b6f60181535a29fbe44865ce137a5079f295b479886c82729d5f3f
+cryptography==50.0.1 \
+    --hash=sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a
 
 exceptiongroup==1.2.2 \
     --hash=sha256:3111b9d131c238bec2f8f516e123e14ba243563fb135d3fe885990585aa7795b
@@ -56,20 +83,32 @@ exceptiongroup==1.2.2 \
 face==26.0.1 \
     --hash=sha256:ab0a83c37c9789dce658a67a9a80eafaa113c9ec37c5a9d950ff5480542a062d
 
-glom==22.1.0 \
-    --hash=sha256:5339da206bf3532e01a83a35aca202960ea885156986d190574b779598e9e772
+glom==25.12.0 \
+    --hash=sha256:b9f21e77f71a6576a43864e85066b8cc3f0f778d0d50961563f8981377a6dcb1
 
-googleapis-common-protos==1.75.0 \
-    --hash=sha256:961ed60399c457ceb0ee8f285a84c870aabc9c6a832b9d37bb281b5bebde43ed
+googleapis-common-protos==1.75.3 \
+    --hash=sha256:a018d2bf098ca9fb6faa08d5bb780e2a2c2f73c566f069761331386c9596d3f2
 
-idna==3.18 \
-    --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2
+h11==0.16.0 \
+    --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
 
-importlib-metadata==7.1.0 \
-    --hash=sha256:30962b96c0c223483ed6cc7280e7f0199feb01a0e40cfae4d4450fc6fab1f570
+httpcore==1.0.9 \
+    --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55
 
-jsonschema==4.26.0 \
-    --hash=sha256:d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce
+httpx==0.28.1 \
+    --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+
+httpx-sse==0.4.3 \
+    --hash=sha256:0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc
+
+idna==3.19 \
+    --hash=sha256:815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4
+
+importlib_metadata==8.7.1 \
+    --hash=sha256:5a1f80bf1daa489495071efbb095d75a634cf28a8bc299581244063b53176151
+
+jsonschema==4.25.1 \
+    --hash=sha256:3fba0169e345c7175110351d456342c364814cfcf3b964ba4587f22915230a63
 
 jsonschema-specifications==2025.9.1 \
     --hash=sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe
@@ -77,47 +116,74 @@ jsonschema-specifications==2025.9.1 \
 markdown-it-py==4.2.0 \
     --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
 
+mcp==1.29.0 \
+    --hash=sha256:f5a075bb611f23d6f4d080c6a1699fa62772eebc562ba9e66b306ddde1c755f7
+
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
 
-opentelemetry-api==1.25.0 \
-    --hash=sha256:757fa1aa020a0f8fa139f8959e53dec2051cc26b832e76fa839a6d76ecefd737
+opentelemetry-api==1.37.0 \
+    --hash=sha256:accf2024d3e89faec14302213bc39550ec0f4095d1cf5ca688e1bfb1c8612f47
 
-opentelemetry-exporter-otlp-proto-common==1.25.0 \
-    --hash=sha256:15637b7d580c2675f70246563363775b4e6de947871e01d0f4e3881d1848d693
+opentelemetry-exporter-otlp-proto-common==1.37.0 \
+    --hash=sha256:53038428449c559b0c564b8d718df3314da387109c4d36bd1b94c9a641b0292e
 
-opentelemetry-exporter-otlp-proto-http==1.25.0 \
-    --hash=sha256:2eca686ee11b27acd28198b3ea5e5863a53d1266b91cda47c839d95d5e0541a6
+opentelemetry-exporter-otlp-proto-http==1.37.0 \
+    --hash=sha256:54c42b39945a6cc9d9a2a33decb876eabb9547e0dcb49df090122773447f1aef
 
-opentelemetry-instrumentation==0.46b0 \
-    --hash=sha256:89cd721b9c18c014ca848ccd11181e6b3fd3f6c7669e35d59c48dc527408c18b
+opentelemetry-instrumentation==0.58b0 \
+    --hash=sha256:50f97ac03100676c9f7fc28197f8240c7290ca1baa12da8bfbb9a1de4f34cc45
 
-opentelemetry-instrumentation-requests==0.46b0 \
-    --hash=sha256:a8c2472800d8686f3f286cd524b8746b386154092e85a791ba14110d1acc9b81
+opentelemetry-instrumentation-requests==0.58b0 \
+    --hash=sha256:672a0be0bb5b52bea0c11820b35e27edcf4cd22d34abe4afc59a92a80519f8a8
 
-opentelemetry-proto==1.25.0 \
-    --hash=sha256:f07e3341c78d835d9b86665903b199893befa5e98866f63d22b00d0b7ca4972f
+opentelemetry-instrumentation-threading==0.58b0 \
+    --hash=sha256:eacc072881006aceb5b9b6831bcdce718c67ef6f31ac0b32bd6a23a94d979b4a
 
-opentelemetry-sdk==1.25.0 \
-    --hash=sha256:d97ff7ec4b351692e9d5a15af570c693b8715ad78b8aafbec5c7100fe966b4c9
+opentelemetry-proto==1.37.0 \
+    --hash=sha256:8ed8c066ae8828bbf0c39229979bdf583a126981142378a9cbe9d6fd5701c6e2
 
-opentelemetry-semantic-conventions==0.46b0 \
-    --hash=sha256:6daef4ef9fa51d51855d9f8e0ccd3a1bd59e0e545abe99ac6203804e36ab3e07
+opentelemetry-sdk==1.37.0 \
+    --hash=sha256:8f3c3c22063e52475c5dbced7209495c2c16723d016d39287dfc215d1771257c
 
-opentelemetry-util-http==0.46b0 \
-    --hash=sha256:8dc1949ce63caef08db84ae977fdc1848fe6dc38e6bbaad0ae3e6ecd0d451629
+opentelemetry-semantic-conventions==0.58b0 \
+    --hash=sha256:5564905ab1458b96684db1340232729fce3b5375a06e140e8904c78e4f815b28
 
-packaging==26.2 \
-    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+opentelemetry-util-http==0.58b0 \
+    --hash=sha256:6c6b86762ed43025fbd593dc5f700ba0aa3e09711aedc36fd48a13b23d8cb1e7
+
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
 
 peewee==3.19.0 \
     --hash=sha256:de220b94766e6008c466e00ce4ba5299b9a832117d9eb36d45d0062f3cfd7417
 
-protobuf==4.25.9 \
-    --hash=sha256:438c636de8fb706a0de94a12a268ef1ae8f5ba5ae655a7671fcda5968ba3c9be
+protobuf==6.33.6 \
+    --hash=sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593
 
-pygments==2.20.0 \
-    --hash=sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+
+pydantic==2.13.5 \
+    --hash=sha256:346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73
+
+pydantic-settings==2.15.0 \
+    --hash=sha256:0ba092c291c94baceb5eff768aa0d56400a457585bc0175925a5a5510303da42
+
+pydantic_core==2.46.5 \
+    --hash=sha256:0fc5be0abd4a407e200d844b404e33639a554e7bd0d448e7b9ae181be4789ac2
+
+Pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+
+PyJWT==2.13.0 \
+    --hash=sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728
+
+python-dotenv==1.2.3 \
+    --hash=sha256:904552145e8bfed22162c09dab1c2b9b54fefa7b23ba780f4f26ca0316b0f0d9
+
+python-multipart==0.0.32 \
+    --hash=sha256:ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23
 
 referencing==0.37.0 \
     --hash=sha256:381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231
@@ -125,39 +191,44 @@ referencing==0.37.0 \
 requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
 
-rich==13.5.3 \
-    --hash=sha256:9257b468badc3d347e146a4faa268ff229039d4c2d176ab0cffb4c4fbc73d5d9
+rich==15.0.0 \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb
 
 rpds-py==2026.6.3 \
     --hash=sha256:ecabd69db66de867690f9797f2f8fa27ba501bbc24540cbdbdc649cd15888ba6
 
-ruamel.yaml==0.17.40 \
-    --hash=sha256:b16b6c3816dff0a93dca12acf5e70afd089fa5acb80604afd1ffa8b465b7722c
+ruamel.yaml==0.19.1 \
+    --hash=sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93
 
 ruamel.yaml.clib==0.2.15 \
     --hash=sha256:11e5499db1ccbc7f4b41f0565e4f799d863ea720e01d3e99fa0b7b5fcd7802c9
 
-semgrep==1.97.0 \
-    --hash=sha256:996fe0b2bfac3a4d4511e470fdf5f3bca96b1f794f398e0336c8388802c218de
+semantic-version==2.10.0 \
+    --hash=sha256:de78a3b8e0feda74cabc54aab2da702113e33ac9d9eb9d2389bcf1f58b7d9177
 
-# PINNED to 80.9.0 (the last release that still SHIPS `pkg_resources`):
-# setuptools 81+ removed the vendored `pkg_resources` module, but
-# semgrep 1.97.0's transitive `opentelemetry-instrumentation==0.46b0` imports
-# it at load. A py3.12 venv seeds no setuptools, so the lockfile must supply a
-# pkg_resources-bearing one — 83.0.0 broke the SAST step at runtime with
-# `ModuleNotFoundError: No module named 'pkg_resources'`. Do NOT bump past 80.x
-# without confirming pkg_resources is present (or bumping opentelemetry off it).
-setuptools==80.9.0 \
-    --hash=sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922
+semgrep==1.176.1 \
+    --hash=sha256:00bc0f167564443d7ce4ad7a896d2251ed3c5c17e0b176de9b39bd0fb6abc2a9
 
-tomli==2.0.2 \
-    --hash=sha256:2ebe24485c53d303f690b0ec092806a085f07af5a5aa1464f3931eec36caaa38
+sse-starlette==3.4.11 \
+    --hash=sha256:c7b2244bdff016fe7f64e10075e89a3e6bbf899649cc89b0fe884b5545042453
 
-typing-extensions==4.16.0 \
+starlette==1.6.0 \
+    --hash=sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c
+
+tomli==2.4.1 \
+    --hash=sha256:136443dbd7e1dee43c68ac2694fde36b2849865fa258d39bf822c10e8068eac5
+
+typing-inspection==0.4.4 \
+    --hash=sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147
+
+typing_extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
 
 urllib3==2.7.0 \
     --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
+
+uvicorn==0.52.4 \
+    --hash=sha256:f86e41a149d7d05a9969337e3946a9c171c06a5d42680896daaba624aeac8da1
 
 wcmatch==8.5.2 \
     --hash=sha256:17d3ad3758f9d0b5b4dedc770b65420d4dac62e680229c287bf24c9db856a478
@@ -167,3 +238,4 @@ wrapt==1.17.3 \
 
 zipp==4.1.0 \
     --hash=sha256:25ad4e16390cd314347dd8f1de67a2ac538ae658ed4ab9db16029c07c188e97f
+

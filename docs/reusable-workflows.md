@@ -902,7 +902,7 @@ Toggle matrix:
 `'p/default'` silently grew a family of pnpm supply-chain rules
 (`pnpm-block-exotic-sub-dependencies`, `pnpm-trust-policy`,
 `pnpm-minimum-release-age`) plus `secrets-inherit`. The security tier already
-pinned the Semgrep **binary** (`1.97.0`), but `--config p/default` still
+pinned the Semgrep **binary** (`1.176.1`), but `--config p/default` still
 pulled **live, unpinned rules** from the registry — so a full-tree (non-PR)
 scan turned red with **zero code change** on our side. The Semgrep binary pin
 alone was not the deterministic-input guarantee it looked like.
@@ -911,7 +911,7 @@ alone was not the deterministic-input guarantee it looked like.
 resolves to a **committed snapshot** of the registry ruleset at
 [`.semgrep/rules.json`](../.semgrep/rules.json) — not the live alias. The
 snapshot is the FULL `p/default` rule set resolved once against the pinned
-Semgrep `1.97.0` binary, then **filtered to the languages this platform's
+Semgrep `1.176.1` binary, then **filtered to the languages this platform's
 reusable workflows and consumer trees actually scan**: `js`, `ts`,
 `typescript`, `yaml`, `json`, `bash`, `dockerfile`, `generic`, and `regex`.
 Full `p/default` ships 1074 rules across every language Semgrep supports

@@ -2327,11 +2327,14 @@ jobs:
           # ruleset deliberately via `scripts/update-semgrep-rules.mjs` (see
           # docs/reusable-workflows.md).
           #
-          # `setuptools` provides `pkg_resources`, which semgrep's transitive
-          # opentelemetry dependency imports but does not declare — absent by
-          # default on Python ≥3.12. It is IN the hash-pinned lockfile (Linux
-          # path) and installed alongside the top-pin (darwin fallback), so the
-          # run works on a 3.12+ interpreter either way.
+          # `setuptools` is NO LONGER installed on either path, and its absence
+          # is deliberate. semgrep 1.97.0's transitive
+          # `opentelemetry-instrumentation==0.46b0` imported `pkg_resources` at
+          # load and a py3.12 venv seeds no setuptools, so both paths had to
+          # supply one. `opentelemetry-instrumentation` 0.58b0 — pulled by
+          # semgrep 1.176.1 — no longer imports it. Do not re-add setuptools
+          # without a reason: 80.9.0 was the last release shipping
+          # `pkg_resources` and it carries its own advisories.
           #
           # Install strategy — an EPHEMERAL `python3 -m venv` on every path
           # (Story #92). We deliberately do NOT use `pip install --user`:
@@ -2352,7 +2355,7 @@ jobs:
           # never reads/writes the shared user site. `pipx` is no longer used:
           # it cannot consume a `--require-hashes` requirements file, and the
           # M7 hash-pinning is the reason the whole tree now flows through pip.
-          SEMGREP_PIN='semgrep==1.97.0'
+          SEMGREP_PIN='semgrep==1.176.1'
 
           # Build the `--exclude` argument list. The vendored framework tree
           # `.agents/` is ALWAYS excluded: it is materialized from the pinned
@@ -2436,7 +2439,7 @@ jobs:
           if [ "$(uname -s)" = "Linux" ] && [ "${pyver}" = "312" ] && [ -f "${LOCKFILE}" ]; then
             echo "Installing hash-pinned Semgrep from ${LOCKFILE} (Linux cp${pyver}, --require-hashes)."
             # `--require-hashes -r` installs semgrep + its ENTIRE transitive
-            # closure (setuptools included) only if every artifact matches a
+            # closure only if every artifact matches a
             # pinned sha256 in the lockfile — no floating transitive can slip
             # in. `--only-binary :all:` keeps pip on the pinned wheels rather
             # than building an sdist whose artifact hash would differ.
@@ -2445,12 +2448,12 @@ jobs:
           else
             # Fallback for non-Linux (self-hosted darwin) runners: the linux
             # lockfile's wheels cannot satisfy this platform, so install the
-            # top-pin directly with setuptools. This path is NOT hash-pinned by
-            # design — the M7 lockfile is scoped to the linux CI target; mac
-            # hashes are deliberately not generated.
-            echo "Non-Linux runner (or no lockfile): installing ${SEMGREP_PIN} (+ setuptools) without hash-pinning."
+            # top-pin directly. This path is NOT hash-pinned by design — the M7
+            # lockfile is scoped to the linux CI target; mac hashes are
+            # deliberately not generated.
+            echo "Non-Linux runner (or no lockfile): installing ${SEMGREP_PIN} without hash-pinning."
             "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
-              --retries 3 setuptools "${SEMGREP_PIN}"
+              --retries 3 "${SEMGREP_PIN}"
           fi
           # Put the venv's bin dir first so the `semgrep` resolved by
           # `run_semgrep` is the hermetic one, not any shared/user-site copy.
