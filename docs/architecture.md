@@ -91,7 +91,7 @@ warning stays worth reading.
 | Area                | Choice                                                                        |
 | ------------------- | ----------------------------------------------------------------------------- |
 | Runtime             | Node.js 24.16.0 (pinned in `.nvmrc`, `engines.node`)                          |
-| Package manager     | pnpm 11.5.2 (`packageManager`, `engines.pnpm`)                                |
+| Package manager     | **npm** for this repo (`package-lock.json`, `npm ci`); the shipped `setup-toolchain` targets **pnpm** consumer apps |
 | Test runner         | `node:test` (`node --test "scripts/**/*.test.mjs"`)                           |
 | CI/CD               | GitHub Actions — reusable `workflow_call` workflows, SHA-pinned               |
 | Release             | release-please + `release-automation.yml` (conventional commits)              |
@@ -100,6 +100,15 @@ warning stays worth reading.
 | Deploy target       | Cloudflare via Wrangler (`deploy-cloudflare.yml`, `check-wrangler-baseline.mjs`) |
 | Runtime middleware  | Edge-security ESM modules (`config/edge-security/`)                           |
 | Distribution        | Published npm package (`exports` map + `files` allowlist), provenance-signed  |
+
+> **The two package managers are not interchangeable, and the split is easy to
+> misread.** This repo installs with npm; the reusable workflows it ships assume
+> a pnpm consumer app, because that is what every consumer is. `package.json`
+> still declares `packageManager: pnpm@…` and `engines.pnpm` — published-package
+> metadata that consumers' installers read, not a statement about how this repo
+> builds. Pointing a pnpm-only path at this repo fails at `actions/setup-node`
+> with "Dependencies lock file is not found", which is how `advisory-scan.yml`
+> came to need its `setup: node` input (Story #471).
 
 There is no application database, ORM, web framework, or auth provider — the
 platform is a toolchain and workflow package, not a service.

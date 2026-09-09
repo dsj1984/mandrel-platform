@@ -99,6 +99,31 @@ on:
         required: false
         type: string
         default: ''
+      setup:
+        description: >
+          How the job provisions Node: 'toolchain' (the default) runs the
+          shared setup-toolchain composite — pnpm from the packageManager
+          field, Node from .nvmrc, and a frozen `pnpm install`; 'node'
+          provisions Node from .nvmrc alone and installs NOTHING.
+
+          Pick 'node' when the repo being scanned is not a pnpm app. The scan
+          itself never needs a dependency tree: the osv-scan composite runs
+          `osv-scanner scan source -r .`, which reads lockfiles and manifests
+          off disk, and both composites' gate scripts import only node
+          builtins and their own relative siblings. An npm repo passed the
+          'toolchain' default fails at setup-node with "Dependencies lock file
+          is not found ... Supported file patterns: pnpm-lock.yaml" before the
+          scan ever runs.
+
+          The 'node' path requires a committed .nvmrc; it forwards none of
+          `toolchain-cache`, `pnpm-dest` or `packages-read-token`, which are
+          setup-toolchain's inputs and are ignored on that path. Default
+          'toolchain' — a literal, because a workflow_call default may not hold
+          an Actions expression (portability lint Rule 2), and because every
+          existing consumer must keep today's behaviour.
+        required: false
+        type: string
+        default: 'toolchain'
       tracking-issue-title:
         description: Title used when opening a new advisory tracking issue.
         required: false
@@ -146,7 +171,27 @@ jobs:
           # the token while the OSV binary and node run.
           persist-credentials: false
 
+      # Fail closed on an unrecognized `setup` value. Without this, a typo
+      # matches NEITHER provisioning branch, both steps skip silently, and the
+      # composites' gate scripts run against whatever ambient Node the runner
+      # image happens to carry — a green run on an unpinned toolchain, which is
+      # exactly the class of silent degradation this workflow exists to catch.
+      - name: Validate setup input
+        shell: bash
+        env:
+          SETUP: ${{ inputs.setup }}
+        run: |
+          set -eu
+          case "${SETUP}" in
+            toolchain|node) echo "setup: ${SETUP}" ;;
+            *)
+              echo "::error::Invalid setup '${SETUP}' (expected: toolchain, node)."
+              exit 1
+              ;;
+          esac
+
       - name: Setup toolchain
+        if: inputs.setup == 'toolchain'
         uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@edd3a2713e0a37acf9fceda4e1436bef2d58c266
         with:
           # Resolves the 'auto' default at the use site — see the input's note
@@ -156,6 +201,18 @@ jobs:
           cache: ${{ inputs.toolchain-cache != 'auto' && inputs.toolchain-cache || (contains(inputs.runner, 'self-hosted') && 'false' || 'true') }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
           packages-read-token: ${{ secrets.packages-read-token }}
+
+      # The install-free branch. Deliberately carries NO cache key at all —
+      # not an empty one. scripts/check-toolchain-cache-default.test.mjs
+      # extracts the FIRST cache expression in this file and asserts it against
+      # pr-quality.yml's; a second site here would silently pin the wrong
+      # expression while that suite stayed green. There is also nothing to
+      # cache — this path installs no dependencies.
+      - name: Setup Node.js (install-free)
+        if: inputs.setup == 'node'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
 
       # `scan-mode: full` is pinned, not inherited (Story #325). The PR tier
       # now defaults to diff-aware attribution, which deliberately demotes a
