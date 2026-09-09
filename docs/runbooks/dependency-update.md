@@ -72,12 +72,14 @@ Every CI run executes a CVE audit against the production dependency graph:
 
 ```bash
 # Run locally to see what CI sees
-pnpm run audit:check
-# or
 node scripts/audit-check.mjs
 ```
 
-The gate **blocks** on any High or Critical severity vulnerability in the production dependency graph (`--prod`) that is not listed in the CVE allowlist.
+The gate detects the package manager from the committed lockfile and audits
+with it, so the command above works in this repo (npm, `package-lock.json`) and
+in a pnpm consumer app unchanged. Its first line names what it detected.
+
+The gate **blocks** on any High or Critical severity vulnerability in the production dependency graph that is not listed in the CVE allowlist.
 
 ### Resolving a CVE gate failure
 
@@ -99,7 +101,11 @@ The gate **blocks** on any High or Critical severity vulnerability in the produc
 ### Checking which packages are affected
 
 ```bash
-pnpm audit --prod --json | jq '.vulnerabilities | keys[]'
+# npm (this repo) — advisories are nested under `vulnerabilities`
+npm audit --omit=dev --json | jq '.vulnerabilities | keys[]'
+
+# pnpm (consumer apps) — the legacy schema keys them under `advisories`
+pnpm audit --prod --json | jq '.advisories | keys[]'
 ```
 
 ---

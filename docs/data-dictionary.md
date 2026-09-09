@@ -72,7 +72,9 @@ error and is never suppressed by the hold window.
 ## Audit CVE allowlist (`audit-allowlist.json`)
 
 `scripts/audit-check.mjs` is the CVE gate: it blocks all unsuppressed High and
-Critical vulnerabilities in the production dependency graph. A **self-expiring
+Critical vulnerabilities in the production dependency graph, auditing with
+whichever package manager the committed lockfile names (pnpm or npm) and
+matching allowlist entries by advisory id across both report schemas. A **self-expiring
 allowlist** lets teams record known, accepted CVEs. The file path defaults to
 `audit-allowlist.json` in the invocation directory (override with `--allowlist`).
 It is a JSON array of entries:

@@ -1512,6 +1512,10 @@ warning, and blocking findings apart at a glance:
 
 #### Unbounded dependency overrides (`scripts/audit-check.mjs`)
 
+That gate is package-manager aware: it audits with whichever manager the
+committed lockfile names (pnpm or npm), reads either report schema, and fails
+closed on a report matching neither.
+
 The CVE gate also lints the `overrides` / `resolutions` / `pnpm.overrides`
 blocks of `package.json` and **fails on any override expressed as an unbounded
 lower bound**, naming the package and the bound.
@@ -1533,7 +1537,7 @@ in the toolchain looked for one.
 | `"^1.0.0 \|\| >=2.0.0"` | **Fails** — a union is only as bounded as its loosest arm |
 
 A dependent-scoped nested override is checked too and reported by its full
-path (`overrides.some-dep.left-pad`). The check runs **before** `pnpm audit`,
+path (`overrides.some-dep.left-pad`). The check runs **before** the audit,
 so it costs nothing and reports even when the audit itself cannot run. Point it
 at a non-default manifest with `--package-json <path>`.
 

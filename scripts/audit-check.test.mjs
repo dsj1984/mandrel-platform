@@ -46,6 +46,9 @@ import {
   isBoundedOverride,
   findUnboundedOverrides,
   lintOverrides,
+  detectPackageManager,
+  ghsaIdFromUrl,
+  recognizeReport,
 } from "./audit-check.mjs";
 
 const TODAY = "2026-07-02";
@@ -319,10 +322,29 @@ test("evaluateReport: uninterpretable report + non-zero pnpm exit → exit 1 (fa
   assert.equal(result.reason, "uninterpretable-failclosed");
 });
 
-test("evaluateReport: uninterpretable report + zero exit → exit 0 (clean, nothing to report)", () => {
+test("evaluateReport: unrecognized report + ZERO exit → exit 1 (fail closed)", () => {
+  // This assertion is the inverse of the one it replaces (Story #475), and the
+  // inversion is the point. The old contract read "no advisories key" as "no
+  // advisories" and passed on a zero exit. That is safe only while every report
+  // this gate can meet is the legacy shape — and it is not: `npm audit --json`
+  // reports v7+ advisories under `vulnerabilities` and exits 0 when clean, so
+  // the old branch would have reported an npm graph clean without reading one
+  // advisory, and would have kept doing so as highs landed.
+  //
+  // A report is clean only when a schema was RECOGNIZED and found nothing.
   const result = evaluateReport({ metadata: {} }, 0, new Set());
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.reason, "clean-no-advisories");
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.reason, "uninterpretable-failclosed");
+  assert.equal(result.schema, null);
+});
+
+test("evaluateReport: an unrecognized report fails closed on EVERY exit code", () => {
+  // Exit code must not be able to rescue an unreadable report from either side.
+  for (const exitCode of [0, 1, 2, 127]) {
+    const result = evaluateReport({ nonsense: true }, exitCode, new Set());
+    assert.equal(result.exitCode, 1, `exit ${exitCode}`);
+    assert.equal(result.reason, "uninterpretable-failclosed", `exit ${exitCode}`);
+  }
 });
 
 test("evaluateReport: validly-suppressed high (GHSA) → exit 0", () => {
@@ -836,4 +858,187 @@ test("parseArgs defaults the package.json path alongside the allowlist path", ()
   const { allowlistPath, packageJsonPath } = parseArgs([], "/tmp/proj");
   assert.equal(allowlistPath, "/tmp/proj/audit-allowlist.json");
   assert.equal(packageJsonPath, "/tmp/proj/package.json");
+});
+
+// ---------------------------------------------------------------------------
+// Package-manager detection (Story #475)
+//
+// The lockfile is the discriminator, not `packageManager` / `engines`: it is
+// what the audit actually reads, and this very repo declares one manager in
+// metadata while committing the other's lockfile.
+// ---------------------------------------------------------------------------
+
+/** existsSync stub answering true for exactly the named basenames. */
+function lockfilesPresent(...names) {
+  return (path) => names.some((name) => path.endsWith(`/${name}`));
+}
+
+test("detectPackageManager: a pnpm lockfile selects pnpm", () => {
+  const result = detectPackageManager("/proj", {
+    existsSyncImpl: lockfilesPresent("pnpm-lock.yaml"),
+  });
+  assert.equal(result.manager, "pnpm");
+  assert.equal(result.error, undefined);
+});
+
+test("detectPackageManager: an npm lockfile selects npm", () => {
+  const result = detectPackageManager("/proj", {
+    existsSyncImpl: lockfilesPresent("package-lock.json"),
+  });
+  assert.equal(result.manager, "npm");
+  assert.equal(result.error, undefined);
+});
+
+test("detectPackageManager: no lockfile is a loud error, never a default", () => {
+  // Defaulting to either manager would make the gate's verdict a claim about a
+  // graph nobody chose.
+  const result = detectPackageManager("/proj", { existsSyncImpl: () => false });
+  assert.equal(result.manager, undefined);
+  assert.match(result.error, /No lockfile found/);
+});
+
+test("detectPackageManager: two lockfiles are a loud error, never a guess", () => {
+  const result = detectPackageManager("/proj", {
+    existsSyncImpl: lockfilesPresent("pnpm-lock.yaml", "package-lock.json"),
+  });
+  assert.equal(result.manager, undefined);
+  assert.match(result.error, /Ambiguous lockfiles/);
+});
+
+// ---------------------------------------------------------------------------
+// GHSA id extraction — npm exposes the id ONLY inside the advisory url
+// ---------------------------------------------------------------------------
+
+test("ghsaIdFromUrl: reads the id from a GitHub advisory url", () => {
+  assert.equal(
+    ghsaIdFromUrl("https://github.com/advisories/GHSA-aaaa-bbbb-cccc"),
+    "GHSA-AAAA-BBBB-CCCC",
+  );
+});
+
+test("ghsaIdFromUrl: only the last path segment counts, never the host", () => {
+  // Matching a GHSA-shaped substring anywhere in a caller-controlled URL would
+  // let a hostile host or query string mint an id that silences an allowlist
+  // lookup. Only the final path segment is tested.
+  assert.equal(ghsaIdFromUrl("https://GHSA-aaaa-bbbb-cccc.example.com/x"), null);
+  assert.equal(
+    ghsaIdFromUrl("https://example.com/p?id=GHSA-aaaa-bbbb-cccc"),
+    null,
+  );
+});
+
+test("ghsaIdFromUrl: rejects non-urls, empty values and non-GHSA segments", () => {
+  for (const value of ["", "not a url", null, undefined, 42, "https://example.com/x"]) {
+    assert.equal(ghsaIdFromUrl(value), null, String(value));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The npm v7+ (`auditReportVersion` 2) report shape
+//
+// Fixture-driven of necessity: this repo has zero vulnerabilities tree-wide,
+// so no live npm sample carrying an advisory can be captured from it.
+// ---------------------------------------------------------------------------
+
+const NPM_HIGH_URL = "https://github.com/advisories/GHSA-dddd-eeee-ffff";
+
+/** An npm v2 report with one high advisory reached through `pkg`. */
+function npmReportWithHigh({ severity = "high", cve = [] } = {}) {
+  return {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      pkg: {
+        name: "pkg",
+        severity,
+        via: [
+          {
+            source: 123456,
+            name: "pkg",
+            title: "Prototype pollution in pkg",
+            url: NPM_HIGH_URL,
+            severity,
+            cve,
+          },
+        ],
+      },
+    },
+    metadata: { vulnerabilities: { high: 1, total: 1 } },
+  };
+}
+
+test("recognizeReport: identifies each schema and normalizes its advisories", () => {
+  assert.equal(recognizeReport(reportWith({ 1: HIGH_GHSA })).schema, "legacy");
+
+  const npm = recognizeReport(npmReportWithHigh());
+  assert.equal(npm.schema, "npm");
+  assert.equal(npm.advisories.length, 1);
+  assert.deepEqual(npm.advisories[0].ids, ["GHSA-DDDD-EEEE-FFFF"]);
+  assert.equal(npm.advisories[0].severity, "high");
+});
+
+test("recognizeReport: an empty npm report is RECOGNIZED, not unreadable", () => {
+  // The real shape this repo produces today. It must read as a genuine clean —
+  // reached by inspecting `vulnerabilities`, not by failing to find
+  // `advisories`.
+  const result = recognizeReport({
+    auditReportVersion: 2,
+    vulnerabilities: {},
+    metadata: { vulnerabilities: { total: 0 } },
+  });
+  assert.equal(result.schema, "npm");
+  assert.deepEqual(result.advisories, []);
+});
+
+test("evaluateReport: an unsuppressed high in the NPM shape blocks", () => {
+  const result = evaluateReport(npmReportWithHigh(), 1, new Set());
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.reason, "unsuppressed");
+  assert.equal(result.schema, "npm");
+  assert.equal(result.blocking.length, 1);
+  assert.equal(result.blocking[0].id, "GHSA-DDDD-EEEE-FFFF");
+});
+
+test("evaluateReport: an allowlisted GHSA id suppresses in the NPM shape", () => {
+  // The id exists only inside `via[].url` here, so this is the assertion that
+  // the allowlist still means something once the schema changes.
+  const result = evaluateReport(
+    npmReportWithHigh(),
+    1,
+    new Set(["GHSA-DDDD-EEEE-FFFF"]),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.reason, "clean");
+});
+
+test("evaluateReport: a CVE id suppresses in the NPM shape too", () => {
+  const report = npmReportWithHigh({ cve: ["CVE-2026-9999"] });
+  assert.equal(
+    evaluateReport(report, 1, new Set(["CVE-2026-9999"])).exitCode,
+    0,
+  );
+  assert.equal(evaluateReport(report, 1, new Set()).exitCode, 1);
+});
+
+test("evaluateReport: below-gate npm severities never block", () => {
+  for (const severity of ["moderate", "low", "info"]) {
+    const result = evaluateReport(npmReportWithHigh({ severity }), 0, new Set());
+    assert.equal(result.exitCode, 0, severity);
+    assert.equal(result.reason, "clean", severity);
+  }
+});
+
+test("recognizeReport: a transitive npm chain counts its advisory once", () => {
+  // `via` carries STRING edges for transitive chains alongside advisory
+  // objects. Counting an edge as an advisory would inflate the finding set;
+  // counting the same advisory once per reaching package would duplicate it.
+  const report = {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      pkg: npmReportWithHigh().vulnerabilities.pkg,
+      dependent: { name: "dependent", severity: "high", via: ["pkg"] },
+      other: npmReportWithHigh().vulnerabilities.pkg,
+    },
+    metadata: {},
+  };
+  assert.equal(recognizeReport(report).advisories.length, 1);
 });
