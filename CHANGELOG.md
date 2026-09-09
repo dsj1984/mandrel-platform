@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.12.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.11.0...mandrel-platform-v1.12.0) (2026-09-09)
+
+
+### Added
+
+* give advisory-scan an install-free node setup path (refs [#471](https://github.com/dsj1984/mandrel-platform/issues/471)) ([#473](https://github.com/dsj1984/mandrel-platform/issues/473)) ([d0c7203](https://github.com/dsj1984/mandrel-platform/commit/d0c7203b8e140e748ee50d49a6b3c9d21419eb25))
+* make the audit-check CVE gate package-manager aware (refs [#475](https://github.com/dsj1984/mandrel-platform/issues/475)) ([#476](https://github.com/dsj1984/mandrel-platform/issues/476)) ([546d6e8](https://github.com/dsj1984/mandrel-platform/commit/546d6e8f2e3c31044aec9e26984663ac2378ad27))
+
+
+### Fixed
+
+* bump SAST to semgrep 1.176.1 and regenerate the hash-pinned closure, clearing both advisories on [#472](https://github.com/dsj1984/mandrel-platform/issues/472) ([#477](https://github.com/dsj1984/mandrel-platform/issues/477)) ([#478](https://github.com/dsj1984/mandrel-platform/issues/478)) ([b77258c](https://github.com/dsj1984/mandrel-platform/commit/b77258cf3cf5d48e6a91ecd613fafbc72fbb5450))
+* **deps:** override smol-toml to ~1.7.1, clearing GHSA-7w5x-hrqm-74c2 (refs [#472](https://github.com/dsj1984/mandrel-platform/issues/472)) ([#479](https://github.com/dsj1984/mandrel-platform/issues/479)) ([af2c44e](https://github.com/dsj1984/mandrel-platform/commit/af2c44e01f8d1bfa4aa0aa260a98dd6c231a48db))
+
 ## [1.11.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.10.0...mandrel-platform-v1.11.0) (2026-09-08)
 
 
