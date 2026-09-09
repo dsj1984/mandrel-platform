@@ -11,12 +11,26 @@
  *   whose expiry has passed are treated as un-suppressed and will cause
  *   the script to exit non-zero.
  *
+ * Package managers (Story #475):
+ *   The audit runs under whichever manager the COMMITTED LOCKFILE names —
+ *   `pnpm-lock.yaml` → pnpm, `package-lock.json` → npm — not what
+ *   `packageManager` or `engines` declares, because the lockfile is what the
+ *   audit reads and metadata can disagree with it. Neither lockfile, or both,
+ *   is a loud configuration error: this gate's output is a claim about a
+ *   specific dependency graph, and guessing which graph would make that claim
+ *   unfalsifiable.
+ *
  * Fail-closed contract:
- *   When `pnpm audit` exits non-zero AND the report it produced cannot be
- *   interpreted as a recognizable advisories document, the gate exits
- *   non-zero. A non-zero audit exit is a signal that something is wrong;
- *   an uninterpretable report means the gate cannot prove the graph is
- *   clean, so it must fail closed rather than wave the build through.
+ *   A report counts as clean only when its schema was POSITIVELY RECOGNIZED
+ *   and found nothing blocking. A report that parsed but matches neither known
+ *   schema fails the gate on ANY audit exit code, including zero.
+ *
+ *   That last clause is load-bearing. The two managers report differently — a
+ *   legacy `advisories` map (pnpm / npm v6) versus npm v7+, which nests
+ *   advisories under `vulnerabilities` — and the earlier contract passed an
+ *   unrecognized report whenever the audit exited zero. Since `npm audit`
+ *   exits zero when clean, that branch would have reported an npm graph clean
+ *   without reading a single advisory, and kept doing so as highs landed.
  *
  * Unbounded-override lint (Story #365):
  *   A dependency override REWRITES a transitive dependent's declared range.
@@ -38,8 +52,9 @@
  *       valid, non-expired allowlist entries, or none found) and every
  *       dependency override carries an upper bound
  *   1 — one or more unsuppressed High/Critical CVEs, expired allowlist
- *       entries were encountered, an override was unbounded, or the audit
- *       report was uninterpretable while pnpm audit exited non-zero
+ *       entries were encountered, an override was unbounded, the package
+ *       manager could not be determined from a lockfile, or the audit report
+ *       matched no known schema
  *
  * Allowlist format (JSON):
  *   [
@@ -63,7 +78,7 @@
 
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Pure core (unit-testable — no process.exit, no filesystem, no child process)
@@ -441,33 +456,241 @@ export function findUnboundedOverrides(pkgJson) {
 }
 
 /**
- * True when `report` has the recognizable pnpm-audit shape: an object with
- * an `advisories` object. This is the discriminator the fail-closed contract
- * hangs on — a parsed-but-unrecognizable report (e.g. an error envelope) is
- * NOT interpretable.
+ * Lockfiles this gate knows how to audit, in the order they are probed.
+ *
+ * The lockfile — not `packageManager`, not `engines` — is the discriminator,
+ * because it is the thing the audit actually reads. A repo can declare one
+ * manager in metadata and commit the other's lockfile (this one does), and it
+ * is the lockfile that decides whether an audit can run at all.
+ */
+const LOCKFILES = [
+  { file: "pnpm-lock.yaml", manager: "pnpm" },
+  { file: "package-lock.json", manager: "npm" },
+];
+
+/**
+ * Resolve which package manager's audit to run for the project rooted at
+ * `projectDir`.
+ *
+ * Returns `{ manager }` on a clean read, or `{ error }` naming what is wrong.
+ * Both ambiguity (two lockfiles) and absence (none) are errors rather than a
+ * best guess: this gate's whole output is a claim about a specific dependency
+ * graph, and guessing which graph would make that claim unfalsifiable.
+ *
+ * `existsSyncImpl` is injectable so the decision is unit-testable without
+ * materializing a fixture tree per case.
+ *
+ * @param {string} projectDir directory holding the audited package.json
+ * @param {{ existsSyncImpl?: (p: string) => boolean }} [deps]
+ * @returns {{ manager: "pnpm" | "npm"; error?: undefined } | { manager?: undefined; error: string }}
+ */
+export function detectPackageManager(projectDir, { existsSyncImpl = existsSync } = {}) {
+  const found = LOCKFILES.filter(({ file }) =>
+    existsSyncImpl(resolve(projectDir, file)),
+  );
+
+  if (found.length === 1) {
+    return { manager: /** @type {"pnpm" | "npm"} */ (found[0].manager) };
+  }
+
+  if (found.length === 0) {
+    return {
+      error:
+        `No lockfile found in ${projectDir}. Expected one of: ` +
+        `${LOCKFILES.map(({ file }) => file).join(", ")}. The audit reads the ` +
+        `lockfile, so without one there is no dependency graph to prove.`,
+    };
+  }
+
+  return {
+    error:
+      `Ambiguous lockfiles in ${projectDir}: ${found.map(({ file }) => file).join(" and ")}. ` +
+      `Remove the one that is not authoritative — this gate will not guess ` +
+      `which dependency graph its verdict is about.`,
+  };
+}
+
+/**
+ * The GHSA id embedded in an advisory URL, or `null`.
+ *
+ * npm's report never exposes a bare `ghsa_id`; the only place the id appears
+ * is the advisory `url` (`https://github.com/advisories/GHSA-xxxx-xxxx-xxxx`),
+ * and the allowlist matches on that id. The URL is parsed and its LAST PATH
+ * SEGMENT tested against an anchored literal — never pattern-matched as a
+ * whole string, which would match a GHSA-shaped substring anywhere in a
+ * caller-controlled URL, host included.
+ *
+ * @param {unknown} url
+ * @returns {string|null}
+ */
+export function ghsaIdFromUrl(url) {
+  if (typeof url !== "string" || url === "") {
+    return null;
+  }
+
+  let segment;
+  try {
+    const segments = new URL(url).pathname.split("/").filter(Boolean);
+    segment = segments[segments.length - 1];
+  } catch {
+    return null;
+  }
+
+  if (typeof segment !== "string") {
+    return null;
+  }
+
+  return /^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$/i.test(segment)
+    ? segment.toUpperCase()
+    : null;
+}
+
+/**
+ * @typedef {{ ids: string[]; severity: string; title: string; url: string }} NormalizedAdvisory
+ */
+
+/**
+ * Normalize the legacy (npm v6 / pnpm) `advisories` map.
+ *
+ * @param {Record<string, unknown>} report
+ * @returns {NormalizedAdvisory[]}
+ */
+function normalizeLegacyReport(report) {
+  /** @type {NormalizedAdvisory[]} */
+  const out = [];
+  const advisories = /** @type {Record<string, unknown>} */ (report.advisories);
+
+  for (const advisory of Object.values(advisories)) {
+    if (advisory === null || typeof advisory !== "object" || !("severity" in advisory)) {
+      continue;
+    }
+    const adv = /** @type {Record<string, unknown>} */ (advisory);
+    const ghsaId = String(adv["ghsa_id"] ?? "");
+    const cveIds = Array.isArray(adv["cve"]) ? adv["cve"].map((c) => String(c)) : [];
+
+    out.push({
+      ids: [ghsaId, ...cveIds].filter(Boolean),
+      severity: String(adv["severity"] ?? "").toLowerCase(),
+      title: String(adv["title"] ?? "(no title)"),
+      url: String(adv["url"] ?? ""),
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Normalize an npm v7+ (`auditReportVersion` 2) report.
+ *
+ * Advisories are not a top-level map here: they are nested in
+ * `vulnerabilities[<pkg>].via[]`, where an entry is either a STRING (the name
+ * of another vulnerable package, for a transitive chain) or an advisory
+ * object. Only the objects carry an advisory; the strings are edges and are
+ * skipped, so a transitive chain is counted once at its source rather than
+ * once per hop.
+ *
+ * @param {Record<string, unknown>} report
+ * @returns {NormalizedAdvisory[]}
+ */
+function normalizeNpmReport(report) {
+  /** @type {Map<string, NormalizedAdvisory>} */
+  const bySource = new Map();
+  const vulnerabilities = /** @type {Record<string, unknown>} */ (report.vulnerabilities);
+
+  for (const entry of Object.values(vulnerabilities)) {
+    if (entry === null || typeof entry !== "object") {
+      continue;
+    }
+    const via = /** @type {Record<string, unknown>} */ (entry)["via"];
+    if (!Array.isArray(via)) {
+      continue;
+    }
+
+    for (const item of via) {
+      if (item === null || typeof item !== "object") {
+        continue; // a string edge in a transitive chain, not an advisory
+      }
+      const adv = /** @type {Record<string, unknown>} */ (item);
+      const url = String(adv["url"] ?? "");
+      const ghsaId = ghsaIdFromUrl(url);
+      const source = adv["source"] === undefined ? "" : String(adv["source"]);
+      const cveIds = Array.isArray(adv["cve"]) ? adv["cve"].map((c) => String(c)) : [];
+      const ids = [ghsaId ?? "", ...cveIds].filter(Boolean);
+
+      // Key on the advisory's own identity so one advisory reachable through
+      // several packages is reported once.
+      const key = ghsaId ?? source ?? url;
+      if (key === "" || bySource.has(key)) {
+        continue;
+      }
+
+      bySource.set(key, {
+        ids,
+        severity: String(adv["severity"] ?? "").toLowerCase(),
+        title: String(adv["title"] ?? "(no title)"),
+        url,
+      });
+    }
+  }
+
+  return [...bySource.values()];
+}
+
+/**
+ * Positively identify a parsed audit report and normalize its advisories.
+ *
+ * **Recognition is positive, and that is the load-bearing property.** A report
+ * counts as clean only when a schema was RECOGNIZED and found nothing
+ * blocking; a report that parsed but matches nothing returns
+ * `{ schema: null }` and the caller fails closed on it regardless of the audit
+ * process's exit code. The alternative — treating "no advisories key" as "no
+ * advisories" — is how an npm report (which keeps them under
+ * `vulnerabilities`) would read as clean without ever being inspected.
+ *
+ * @param {unknown} report
+ * @returns {{ schema: "legacy" | "npm" | null; advisories: NormalizedAdvisory[] }}
+ */
+export function recognizeReport(report) {
+  if (report === null || typeof report !== "object") {
+    return { schema: null, advisories: [] };
+  }
+
+  const obj = /** @type {Record<string, unknown>} */ (report);
+
+  if (obj.advisories !== null && typeof obj.advisories === "object") {
+    return { schema: "legacy", advisories: normalizeLegacyReport(obj) };
+  }
+
+  if (obj.vulnerabilities !== null && typeof obj.vulnerabilities === "object") {
+    return { schema: "npm", advisories: normalizeNpmReport(obj) };
+  }
+
+  return { schema: null, advisories: [] };
+}
+
+/**
+ * True when `report` has the recognizable legacy (npm v6 / pnpm) shape: an
+ * object with an `advisories` object.
+ *
+ * Retained as the narrow legacy-shape predicate it always was. It is NOT the
+ * fail-closed discriminator any more — `recognizeReport` is, because a report
+ * this returns `false` for may still be a perfectly readable npm report.
  *
  * @param {unknown} report
  * @returns {boolean}
  */
 export function isInterpretableReport(report) {
-  return (
-    report !== null &&
-    typeof report === "object" &&
-    "advisories" in report &&
-    /** @type {Record<string, unknown>} */ (report).advisories !== null &&
-    typeof (/** @type {Record<string, unknown>} */ (report).advisories) ===
-      "object"
-  );
+  return recognizeReport(report).schema === "legacy";
 }
 
 /**
- * Extract the blocking (unsuppressed High/Critical) advisories from an
- * interpretable pnpm-audit report. An advisory is suppressed when any of its
- * ids (GHSA id or CVE ids) is present in `suppressed`.
+ * Extract the blocking (unsuppressed High/Critical) advisories from a report
+ * in EITHER schema. An advisory is suppressed when any of its ids (GHSA or
+ * CVE) is present in `suppressed`.
  *
- * Callers MUST gate this behind `isInterpretableReport` — an
- * uninterpretable report yields an empty array here, which is exactly the
- * fail-open trap the CLI guards against separately.
+ * An unrecognized report yields an empty array here; callers MUST gate on
+ * `recognizeReport(...).schema` rather than on emptiness, which is exactly the
+ * fail-open trap `evaluateReport` closes.
  *
  * @param {unknown} report
  * @param {Set<string>} suppressed active (non-expired) suppressed ids
@@ -477,79 +700,67 @@ export function extractBlockingAdvisories(report, suppressed) {
   /** @type {Array<{ id: string; severity: string; title: string; url: string }>} */
   const blocking = [];
 
-  if (!isInterpretableReport(report)) {
-    return blocking;
-  }
-
-  const advisories = /** @type {Record<string, unknown>} */ (
-    /** @type {Record<string, unknown>} */ (report).advisories
-  );
-
-  for (const [, advisory] of Object.entries(advisories)) {
-    if (
-      advisory === null ||
-      typeof advisory !== "object" ||
-      !("severity" in advisory)
-    ) {
+  for (const advisory of recognizeReport(report).advisories) {
+    if (!BLOCKING_SEVERITIES.has(advisory.severity)) {
       continue;
     }
-
-    const adv = /** @type {Record<string, unknown>} */ (advisory);
-    const severity = String(adv["severity"] ?? "").toLowerCase();
-
-    if (!BLOCKING_SEVERITIES.has(severity)) {
+    if (advisory.ids.some((id) => suppressed.has(id))) {
       continue;
     }
-
-    // Collect all IDs this advisory is known by for allowlist matching.
-    const ghsaId = String(adv["ghsa_id"] ?? "");
-    const cveIds = Array.isArray(adv["cve"])
-      ? adv["cve"].map((c) => String(c))
-      : [];
-    const allIds = [ghsaId, ...cveIds].filter(Boolean);
-
-    const isSuppressed = allIds.some((id) => suppressed.has(id));
-
-    if (!isSuppressed) {
-      blocking.push({
-        id: ghsaId || cveIds[0] || "(unknown)",
-        severity,
-        title: String(adv["title"] ?? "(no title)"),
-        url: String(adv["url"] ?? ""),
-      });
-    }
+    blocking.push({
+      id: advisory.ids[0] ?? "(unknown)",
+      severity: advisory.severity,
+      title: advisory.title,
+      url: advisory.url,
+    });
   }
 
   return blocking;
 }
 
 /**
- * Pure evaluation of a parsed audit report against the active suppression
- * set and the pnpm-audit exit code. This is the fail-closed decision core,
- * lifted out of the CLI so it is unit-testable without spawning pnpm.
+ * Pure evaluation of a parsed audit report against the active suppression set
+ * and the audit process's exit code. This is the fail-closed decision core,
+ * lifted out of the CLI so it is unit-testable without spawning a package
+ * manager.
+ *
+ * An unrecognized report fails closed on ANY exit code, including zero. It
+ * used to pass on a zero exit — the branch that would have let an npm report
+ * (advisories under `vulnerabilities`, exit 0 when clean) report clean without
+ * being read at all.
+ *
+ * `_auditExitCode` is retained but no longer consulted, and deliberately so on
+ * both counts. It is retained because this function is exported from a
+ * published package, so dropping the parameter would break an importer's call.
+ * It is not consulted because the decision no longer has anything to ask it:
+ * an unrecognized report fails closed whatever the exit code, and a recognized
+ * one is judged on the advisories it actually contains. Do not reintroduce
+ * "exit code 0 means clean" — that is precisely the branch this Story removed,
+ * and `npm audit` exits 0 whenever it finds nothing, including when the gate
+ * never understood the report it was handed.
  *
  * @param {unknown} report parsed audit JSON (or `null`)
- * @param {number} auditExitCode pnpm audit exit code
+ * @param {number} _auditExitCode audit process exit code (unused — see above)
  * @param {Set<string>} suppressed active (non-expired) suppressed ids
- * @returns {{ exitCode: number; reason: "clean" | "uninterpretable-failclosed" | "unsuppressed" | "clean-no-advisories"; blocking: Array<{ id: string; severity: string; title: string; url: string }> }}
+ * @returns {{ exitCode: number; reason: "clean" | "uninterpretable-failclosed" | "unsuppressed"; schema: "legacy" | "npm" | null; blocking: Array<{ id: string; severity: string; title: string; url: string }> }}
  */
-export function evaluateReport(report, auditExitCode, suppressed) {
-  if (!isInterpretableReport(report)) {
-    if (auditExitCode !== 0) {
-      return {
-        exitCode: 1,
-        reason: "uninterpretable-failclosed",
-        blocking: [],
-      };
-    }
-    return { exitCode: 0, reason: "clean-no-advisories", blocking: [] };
+export function evaluateReport(report, _auditExitCode, suppressed) {
+  const { schema } = recognizeReport(report);
+
+  if (schema === null) {
+    return {
+      exitCode: 1,
+      reason: "uninterpretable-failclosed",
+      schema,
+      blocking: [],
+    };
   }
 
   const blocking = extractBlockingAdvisories(report, suppressed);
   if (blocking.length === 0) {
-    return { exitCode: 0, reason: "clean", blocking };
+    return { exitCode: 0, reason: "clean", schema, blocking };
   }
-  return { exitCode: 1, reason: "unsuppressed", blocking };
+  return { exitCode: 1, reason: "unsuppressed", schema, blocking };
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +826,7 @@ export function loadAllowlist(allowlistPath) {
  * exit code (0 clean, 1 blocking) and prints what is wrong and how to fix it.
  *
  * Split out of `runCli` so BOTH outcomes are executable in a test: the clean
- * path returns here without ever reaching `pnpm audit`, which needs a real
+ * path returns here without ever reaching the audit, which needs a real
  * lockfile and a network. A missing package.json is not this gate's business —
  * the audit is what proves the graph.
  *
@@ -662,21 +873,35 @@ export function lintOverrides(packageJsonPath) {
 }
 
 /**
- * Run `pnpm audit --prod --json`, returning the raw stdout and exit code.
- * pnpm audit exits non-zero when vulnerabilities are found; we want the JSON
+ * Audit invocation per manager. Both are restricted to the PRODUCTION graph:
+ * this gate's claim is about what ships, and a dev-only advisory would make it
+ * unactionable noise. `--omit=dev` is npm's documented spelling of that.
+ */
+const AUDIT_COMMANDS = {
+  pnpm: "pnpm audit --prod --json",
+  npm: "npm audit --omit=dev --json",
+};
+
+/**
+ * Run the detected manager's audit, returning raw stdout and exit code. Both
+ * managers exit non-zero when vulnerabilities are found; the JSON is wanted
  * regardless of the exit code.
  *
- * @returns {{ output: string; exitCode: number }}
+ * @param {"pnpm" | "npm"} manager
+ * @returns {{ command: string; output: string; exitCode: number }}
  */
-function runPnpmAudit() {
+function runAudit(manager) {
+  const command = AUDIT_COMMANDS[manager];
   try {
-    const output = execSync("pnpm audit --prod --json 2>/dev/null", {
-      encoding: "utf8",
-    });
-    return { output, exitCode: 0 };
+    const output = execSync(`${command} 2>/dev/null`, { encoding: "utf8" });
+    return { command, output, exitCode: 0 };
   } catch (err) {
     const execError = /** @type {{ stdout?: string; status?: number }} */ (err);
-    return { output: execError.stdout ?? "", exitCode: execError.status ?? 1 };
+    return {
+      command,
+      output: execError.stdout ?? "",
+      exitCode: execError.status ?? 1,
+    };
   }
 }
 
@@ -745,10 +970,27 @@ export function runCli(argv) {
     return 1;
   }
 
-  // --- Run pnpm audit (production graph only) ------------------------------
+  // --- Run the detected manager's audit (production graph only) ------------
 
-  console.log("[audit-check] Running pnpm audit --prod --json ...");
-  const { output: auditOutput, exitCode: auditExitCode } = runPnpmAudit();
+  // --- Detect the package manager ------------------------------------------
+  //
+  // From the committed lockfile, not from `packageManager` / `engines`: the
+  // lockfile is what the audit reads, and metadata can disagree with it.
+  const detected = detectPackageManager(dirname(packageJsonPath));
+  if (detected.error) {
+    console.error(`[audit-check] ERROR: ${detected.error}`);
+    return 1;
+  }
+  const manager = detected.manager;
+
+  console.log(
+    `[audit-check] Detected ${manager} from its lockfile; running ${AUDIT_COMMANDS[manager]} ...`,
+  );
+  const {
+    command: auditCommand,
+    output: auditOutput,
+    exitCode: auditExitCode,
+  } = runAudit(manager);
 
   // --- Parse audit JSON ----------------------------------------------------
 
@@ -763,7 +1005,7 @@ export function runCli(argv) {
       return 0;
     }
     console.error(
-      "[audit-check] ERROR: pnpm audit produced non-JSON output (exit code " +
+      `[audit-check] ERROR: ${auditCommand} produced non-JSON output (exit code ` +
         auditExitCode +
         ").",
     );
@@ -773,11 +1015,11 @@ export function runCli(argv) {
 
   // --- Evaluate: fail closed on an uninterpretable report + non-zero exit --
   //
-  // The report parsed as JSON. If it lacks a recognizable `advisories` shape
-  // (e.g. an error envelope) AND pnpm audit exited non-zero, we cannot prove
-  // the graph is clean — fail closed. A zero exit with no advisories key is
-  // the genuine "clean, nothing to report" case and passes.
-  const { exitCode, reason, blocking } = evaluateReport(
+  // The report parsed as JSON. If it matches NEITHER known schema — a legacy
+  // `advisories` map or an npm `vulnerabilities` map — the gate cannot prove
+  // the graph is clean, so it fails closed no matter what the audit exited
+  // with. An empty-but-recognized report is the genuine clean case and passes.
+  const { exitCode, reason, schema, blocking } = evaluateReport(
     report,
     auditExitCode,
     suppressed,
@@ -785,22 +1027,19 @@ export function runCli(argv) {
 
   if (reason === "uninterpretable-failclosed") {
     console.error(
-      "[audit-check] ERROR: pnpm audit exited non-zero (" +
-        auditExitCode +
-        ") and produced a report without a recognizable `advisories` shape. Failing closed.",
+      `[audit-check] ERROR: ${auditCommand} (exit ${auditExitCode}) produced a ` +
+        "report matching no known audit schema — neither a legacy `advisories` " +
+        "map nor an npm `vulnerabilities` map. Failing closed: a report that " +
+        "cannot be read cannot show the graph is clean.",
     );
     console.error(auditOutput.slice(0, 2000));
     return exitCode;
   }
 
-  if (reason === "clean-no-advisories") {
-    console.log("[audit-check] No vulnerabilities found. Exit 0.");
-    return exitCode;
-  }
-
   if (blocking.length === 0) {
     console.log(
-      `[audit-check] No unsuppressed High/Critical vulnerabilities in the prod graph. Exit 0.`,
+      `[audit-check] No unsuppressed High/Critical vulnerabilities in the prod graph ` +
+        `(${manager}, ${schema} schema). Exit 0.`,
     );
     return exitCode;
   }

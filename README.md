@@ -496,13 +496,22 @@ Dependency gate script with **two independent blocking conditions**. It exits
 non-zero when *either* fires — a clean CVE scan does not excuse an unbounded
 override, and vice versa:
 
-1. **CVE gate.** Runs `pnpm audit --prod` and blocks on any **unsuppressed**
-   High or Critical vulnerability in the production dependency graph. This is
-   the stricter athportal/swarm-os policy: all unsuppressed High/Critical are
-   blocking, not just fixable ones.
+1. **CVE gate.** Detects the package manager from the committed lockfile —
+   `pnpm-lock.yaml` means pnpm, `package-lock.json` means npm — runs that
+   manager's audit over the production graph, and blocks on any
+   **unsuppressed** High or Critical vulnerability in it. This is the stricter
+   athportal/swarm-os policy: all unsuppressed High/Critical are blocking, not
+   just fixable ones. The two managers report in different schemas (a legacy
+   `advisories` map; npm v7+ nests advisories under `vulnerabilities`), and
+   both are read — a report matching **neither** fails the gate closed rather
+   than reading as clean.
 2. **Unbounded-override lint.** Blocks on any dependency override written
    without an upper bound — **independently of the CVE scan, and with zero
-   CVEs present**. It runs *first*, before `pnpm audit` is invoked at all.
+   CVEs present**. It runs *first*, before any audit is invoked at all.
+
+> Neither lockfile present, or both, is a configuration error the gate reports
+> and exits non-zero on. It will not guess which dependency graph its verdict
+> is about.
 
 Known/accepted CVEs are suppressed via a **dated, self-expiring allowlist**
 (`audit-allowlist.json` in the project root). Expired entries are treated as
