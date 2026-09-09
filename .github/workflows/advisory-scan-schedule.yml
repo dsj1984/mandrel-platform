@@ -35,6 +35,11 @@ jobs:
       issues: write
     with:
       runner: ubuntu-latest
+      # This repo is npm (package-lock.json, `npm ci` in ci.yml) — it has no
+      # pnpm-lock.yaml, so the 'toolchain' default dies at setup-node before
+      # the scan runs. Nothing here needs a dependency tree: osv-scanner reads
+      # package-lock.json off disk.
+      setup: node
       osv-fail-on-severity: high
       tracking-issue-labels: 'audit::dependencies,meta::framework-gap'
     # No `secrets: inherit` — least privilege (the SAST secrets-inherit rule).
