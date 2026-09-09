@@ -47,7 +47,7 @@
  *
  * Usage:
  *   node scripts/update-semgrep-rules.mjs
- *   node scripts/update-semgrep-rules.mjs --semgrep-pin semgrep==1.97.0
+ *   node scripts/update-semgrep-rules.mjs --semgrep-pin semgrep==1.176.1
  *   node scripts/update-semgrep-rules.mjs --out .semgrep/rules.json --dry-run
  *
  * Requires network egress to PyPI (to install the pinned `semgrep` package,
@@ -77,7 +77,7 @@ const REPO_ROOT = resolve(__dirname, "..");
 // resolved AGAINST this exact Semgrep version's registry-resolution logic,
 // so scanning with a different installed version than the one used to
 // generate the file is a (harmless but inconsistent) version skew.
-const DEFAULT_SEMGREP_PIN = "semgrep==1.97.0";
+const DEFAULT_SEMGREP_PIN = "semgrep==1.176.1";
 
 // SHA-256 hashes for every `DEFAULT_SEMGREP_PIN` distribution published on
 // PyPI (the four platform wheels + the sdist). pip's `--require-hashes` mode
@@ -90,6 +90,19 @@ const DEFAULT_SEMGREP_PIN = "semgrep==1.97.0";
 // values) — a version with no hash entry here fails fast rather than
 // installing unverified.
 const SEMGREP_HASHES = {
+  "1.176.1": [
+    "sha256:e1f78275f13c11bd9b6af1143befd79d333d948bd4af96768be3494ab342d8f3",
+    "sha256:ce35dc0b9c34bb95e16f487699646a461e9b2aceda073e773526e0836dbf73ba",
+    "sha256:9baed01491cbe1de00f862f73349bf1c9045598bae2923f6a19ef453b3092015",
+    "sha256:00bc0f167564443d7ce4ad7a896d2251ed3c5c17e0b176de9b39bd0fb6abc2a9",
+    "sha256:2214b71919b825766844ce3dc8c868965d98c3109628882357461ba2a1b8def7",
+    "sha256:5f1127deb8df4e671bae2ec6c811cb069df29fae66bf4880bdad135f38629b23",
+    "sha256:5ca9822b9b8d645b6f078160139b966bd66a3829b87c4e63e1bb5f8d7f71732f",
+    "sha256:670e2dc84cc9b7a3b42e42e0b7137b06638cad49cb3166a57377257137d21bad",
+  ],
+  // Retained so an explicit `--semgrep-pin semgrep==1.97.0` still verifies
+  // rather than failing the fast-fail guard. Superseded as the default by
+  // 1.176.1 (Story #477).
   "1.97.0": [
     "sha256:0ddaa25ee45e669e1fef87e88dcef73b2aee0874b507e09f618862c42452a205",
     "sha256:9184500bf8c49ad19d0fb2d84923abb4aa53058b0ece7008b57a3b0b5e6ce3ee",
