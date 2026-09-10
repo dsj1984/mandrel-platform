@@ -3660,7 +3660,7 @@ per-PR run would mostly re-answer a question nothing changed.
 | Input            | Type   | Default           | When to override                                                                                          |
 | ---------------- | ------ | ----------------- | --------------------------------------------------------------------------------------------------------- |
 | `manifest`       | string | *(required)*      | Path (relative to the caller repo root) to the JSON residency manifest. See [Manifest schema](#manifest-schema) below. |
-| `environments`   | string | `''`              | Comma-separated environment slugs to check. Empty uses the manifest's own `environments[]`.                |
+| `environments`   | string | `''`              | Comma-separated environment slugs to check. Empty uses the manifest's own `environments[]`. A slug the manifest does not declare **fails the run** — see [Requested environments fail closed](#requested-environments-fail-closed). |
 | `exceptions`     | string | `''`              | Path to a JSON exceptions document. See [Exceptions](#exceptions-and-revisit-dates) below.                 |
 | `strict-orphans` | string | `'false'`         | `'true'` makes a store key with no manifest entry fail the run. Leave `'false'` while adopting the manifest — orphans are reported either way. Any value other than exactly `'true'`/`'false'` is rejected rather than silently defaulting. |
 | `infisical-site` | string | `''`              | Base URL of a **self-hosted** Infisical instance. Empty keeps the hosted default (`https://app.infisical.com`). An input rather than a secret: a hostname is not confidential, and a caller benefits from seeing which instance a run probed. |
@@ -3706,16 +3706,48 @@ The distinction that makes this gate meaningful:
   degrade to "this resource is absent". Without that rule a `401` from an
   expired PAT returns an empty name list, every key reads as a clean match,
   and the doctor reports "no drift" precisely because it could not look.
+- **A probe that never answers is a failed probe.** Every request carries a
+  deadline (15s) raced against its own timer rather than trusting the transport
+  to honour an `AbortSignal`, and retries a `429` or `5xx` twice with backoff.
+  A timeout is never retried — the surface's contract is that it fails inside
+  its budget, not eventually.
 
 | Condition                                        | Exit |
 | ------------------------------------------------ | ---- |
 | Clean, or only `unchecked` surfaces              | 0    |
 | Orphan found, `strict-orphans: 'false'`          | 0    |
+| Orphan suppressed by a `severity: "orphan"` exception | 0 |
 | Key missing from a **checked** surface           | 1    |
 | Value fails its declared `shape`                 | 1    |
-| Any probe failed (non-404)                       | 1    |
+| Any probe failed (non-404), including a timeout  | 1    |
 | An exception's `revisit-date` has passed         | 1    |
 | Orphan found, `strict-orphans: 'true'`           | 1    |
+| `environments` names a slug the manifest does not declare | 1 |
+
+#### Requested environments fail closed
+
+An `environments` value naming a slug that is **not** in the manifest's own
+`environments[]` is a usage error: the run exits 1 before contacting any store,
+naming the unknown slug and the declared list.
+
+It fails rather than warning because the alternative is the most convincing
+possible clean report. `environments: prodcution` against a manifest declaring
+`production` narrows every reconcile to a slug no key claims — so `expected` is
+empty on every surface, each store is asked about environments and folders that
+do not exist, and the run exits **0 with every surface `checked` and zero
+findings**. Nothing distinguishes that from a genuinely clean project, and in a
+nightly `schedule:` the typo can hold the state for months.
+
+The empty default is unaffected: an empty input means "use the manifest's own
+list", which is exactly what an unset `environments` interpolates to.
+
+#### Machine output goes to stdout, annotations to stderr
+
+`--json` writes **exactly one** JSON document to stdout. Every `::notice` and
+`::error` workflow command goes to stderr, in text mode too — Actions reads
+annotations from both streams, so nothing is lost in the run log, and
+`node env-doctor.mjs --json | jq` stays parseable on a run that has an
+unchecked surface (which is most of them).
 
 ### Skip-with-notice (graceful degradation)
 
@@ -4031,10 +4063,29 @@ An `--exceptions` document defers a known finding:
       "environment": "staging",
       "reason": "Retired with the v1 API; removal tracked in #### .",
       "revisit-date": "2026-12-01"
+    },
+    {
+      "key": "BUILDER_SCRATCH_TOKEN",
+      "surface": "infisical",
+      "severity": "orphan",
+      "reason": "Owned by the platform team's tooling, not this project.",
+      "revisit-date": "2026-12-01"
     }
   ]
 }
 ```
+
+`severity` selects **which** finding an entry silences, and defaults to
+`"fail"`. The second entry above is the `"orphan"` form: it suppresses an
+orphan — a key present in a store that no manifest entry declares — and leaves
+every `missing` and `shape` failure for that same key untouched.
+
+It exists because the only other way to silence one known orphan under
+`strict-orphans: 'true'` was to add a manifest key for a secret the project
+does not actually declare. That buys quiet by making the manifest describe a
+residency nobody intends, and a manifest that lies is the exact false
+"no drift" this whole gate is built to refuse. An orphan exception expires on
+its `revisit-date` like any other.
 
 `revisit-date` is **required** on every entry. A future date suppresses the
 finding and lists it in the run summary; a past date **fails the run**. An
