@@ -89,13 +89,20 @@ The gate **blocks** on any High or Critical severity vulnerability in the produc
    ```json
    // In the CVE allowlist (project-specific location — see docs/environments.md)
    {
-     "id": "GHSA-xxxx-xxxx-xxxx",
+     "id": "GHSA-7w5x-hrqm-74c2",
      "expires": "<YYYY-MM-DD>",
      "reason": "No fix available; upstream tracking issue: <URL>"
    }
    ```
 
    Allowlist entries **must** include an expiry date and a reason. The gate will re-fail when the entry expires.
+
+   **Ids compare case-insensitively.** Write the id in the canonical form
+   GitHub renders and links — an uppercase `GHSA-` prefix with a lowercase
+   body, as `GHSA-7w5x-hrqm-74c2` above — and paste it as you find it; the
+   gate normalises both the allowlist entry and the advisory id before
+   comparing them, so an entry written in any case suppresses under either
+   package manager. The same holds for a `CVE-` id.
 3. If the CVE is in a dev-only dependency (not in the `--prod` graph), the gate will not fire — but you should still update it.
 
 ### Checking which packages are affected

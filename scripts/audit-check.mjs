@@ -25,7 +25,14 @@
  *   and found nothing blocking. A report that parsed but matches neither known
  *   schema fails the gate on ANY audit exit code, including zero.
  *
- *   That last clause is load-bearing. The two managers report differently — a
+ *   Nor is silence. Output that does not parse as JSON fails the gate on any
+ *   exit code too, and the audit's stderr is captured and printed alongside
+ *   it. Every way the audit can fail to run at all — a missing binary, a
+ *   killed child, an output ceiling hit mid-write — arrives as exit 0 with
+ *   nothing readable on stdout, which the earlier contract reported as "No
+ *   vulnerabilities found".
+ *
+ *   That first clause is load-bearing. The two managers report differently — a
  *   legacy `advisories` map (pnpm / npm v6) versus npm v7+, which nests
  *   advisories under `vulnerabilities` — and the earlier contract passed an
  *   unrecognized report whenever the audit exited zero. Since `npm audit`
@@ -47,19 +54,25 @@
  *   node scripts/audit-check.mjs --allowlist path/to/allowlist.json
  *   node scripts/audit-check.mjs --package-json path/to/package.json
  *
+ * Advisory ids (Story #488):
+ *   Every advisory id and every allowlist id passes through one normalizer, so
+ *   the allowlist compares case-insensitively by construction. The canonical
+ *   `GHSA-` rendering — uppercase prefix, lowercase body, exactly as GitHub
+ *   shows it and as operators paste it — is both what matches and what prints.
+ *
  * Exit codes:
  *   0 — no blocking vulnerabilities (all High/Critical suppressed with
  *       valid, non-expired allowlist entries, or none found) and every
  *       dependency override carries an upper bound
  *   1 — one or more unsuppressed High/Critical CVEs, expired allowlist
  *       entries were encountered, an override was unbounded, the package
- *       manager could not be determined from a lockfile, or the audit report
- *       matched no known schema
+ *       manager could not be determined from a lockfile, the audit produced
+ *       no readable JSON, or the report matched no known schema
  *
  * Allowlist format (JSON):
  *   [
  *     {
- *       "id": "GHSA-xxxx-xxxx-xxxx",  // GitHub Advisory ID or CVE ID
+ *       "id": "GHSA-7w5x-hrqm-74c2",  // GitHub Advisory ID or CVE ID (case-insensitive)
  *       "reason": "No fix available; mitigated by X",
  *       "expires": "2026-12-31"        // REQUIRED — strictly YYYY-MM-DD
  *     }
@@ -76,7 +89,7 @@
  * Override with `--allowlist <path>`.
  */
 
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -85,6 +98,44 @@ import { dirname, resolve } from "node:path";
 // ---------------------------------------------------------------------------
 
 const BLOCKING_SEVERITIES = new Set(["high", "critical"]);
+
+/**
+ * Canonicalize an advisory id so allowlist matching is case-insensitive BY
+ * CONSTRUCTION rather than by remembering to fold case at each comparison
+ * site.
+ *
+ * GitHub renders and links advisory ids with an uppercase `GHSA-` prefix and a
+ * lowercase body (`GHSA-7w5x-hrqm-74c2`), and that is the form operators copy
+ * into the allowlist. The npm path used to uppercase the id it parsed out of
+ * `via[].url` while the pnpm path kept `ghsa_id` verbatim, and the allowlist
+ * was matched with an exact `Set.has` — so the canonical form everybody writes
+ * suppressed under pnpm and silently did nothing under npm. A suppression
+ * mechanism that is inert for the spelling its own runbook shows is worse than
+ * none: the entry looks applied.
+ *
+ * Both the advisory ids and every allowlist id pass through here, so the two
+ * sides cannot disagree. The GHSA form is normalized to its canonical
+ * rendering (uppercase prefix, lowercase body) because it is also what gets
+ * PRINTED; anything else (a CVE id, a bare vendor id) folds to upper case,
+ * which is canonical for CVE and case-insensitive for the rest.
+ *
+ * @param {unknown} id
+ * @returns {string} canonical id, or `""` when there is nothing to normalize
+ */
+export function normalizeAdvisoryId(id) {
+  if (typeof id !== "string") {
+    return "";
+  }
+
+  const trimmed = id.trim();
+  if (trimmed === "") {
+    return "";
+  }
+
+  return /^GHSA-/i.test(trimmed)
+    ? `GHSA-${trimmed.slice("GHSA-".length).toLowerCase()}`
+    : trimmed.toUpperCase();
+}
 
 /**
  * @typedef {{ id: string; reason?: string; expires: string }} AllowlistEntry
@@ -203,7 +254,7 @@ export function partitionAllowlist(allowlist, today) {
     if (expiresMs < todayMs) {
       expired.push(entry);
     } else {
-      suppressed.add(entry.id);
+      suppressed.add(normalizeAdvisoryId(entry.id));
     }
   }
 
@@ -541,7 +592,7 @@ export function ghsaIdFromUrl(url) {
   }
 
   return /^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$/i.test(segment)
-    ? segment.toUpperCase()
+    ? normalizeAdvisoryId(segment)
     : null;
 }
 
@@ -565,8 +616,10 @@ function normalizeLegacyReport(report) {
       continue;
     }
     const adv = /** @type {Record<string, unknown>} */ (advisory);
-    const ghsaId = String(adv["ghsa_id"] ?? "");
-    const cveIds = Array.isArray(adv["cve"]) ? adv["cve"].map((c) => String(c)) : [];
+    const ghsaId = normalizeAdvisoryId(adv["ghsa_id"]);
+    const cveIds = Array.isArray(adv["cve"])
+      ? adv["cve"].map((c) => normalizeAdvisoryId(c))
+      : [];
 
     out.push({
       ids: [ghsaId, ...cveIds].filter(Boolean),
@@ -596,6 +649,7 @@ function normalizeNpmReport(report) {
   /** @type {Map<string, NormalizedAdvisory>} */
   const bySource = new Map();
   const vulnerabilities = /** @type {Record<string, unknown>} */ (report.vulnerabilities);
+  let anonymousCount = 0;
 
   for (const entry of Object.values(vulnerabilities)) {
     if (entry === null || typeof entry !== "object") {
@@ -614,13 +668,36 @@ function normalizeNpmReport(report) {
       const url = String(adv["url"] ?? "");
       const ghsaId = ghsaIdFromUrl(url);
       const source = adv["source"] === undefined ? "" : String(adv["source"]);
-      const cveIds = Array.isArray(adv["cve"]) ? adv["cve"].map((c) => String(c)) : [];
+      // npm's bundled advisory calculator does not emit a `cve` key on a
+      // `via[]` advisory — the read is kept because a report produced by
+      // another tool may carry one, not because npm's does.
+      const cveIds = Array.isArray(adv["cve"])
+        ? adv["cve"].map((c) => normalizeAdvisoryId(c))
+        : [];
       const ids = [ghsaId ?? "", ...cveIds].filter(Boolean);
 
       // Key on the advisory's own identity so one advisory reachable through
-      // several packages is reported once.
-      const key = ghsaId ?? source ?? url;
-      if (key === "" || bySource.has(key)) {
+      // several packages is reported once. Each fallback is tried on its own
+      // value rather than chained with `??`: `source` is coerced to `""` when
+      // absent and `"" ?? url` is `""`, which made the url fallback dead code
+      // and gave every id-less advisory the same empty key.
+      //
+      // An advisory with nothing identifying left still counts. It gets a
+      // unique per-report key so it survives to be reported as `(unknown)` —
+      // dropping a Critical for lacking a name is the one failure this gate
+      // must never have, and the empty-key `continue` did exactly that.
+      let key = ghsaId ?? "";
+      if (key === "" && source !== "") {
+        key = `source:${source}`;
+      }
+      if (key === "") {
+        key = url;
+      }
+      if (key === "") {
+        anonymousCount += 1;
+        key = `anonymous:${anonymousCount}`;
+      }
+      if (bySource.has(key)) {
         continue;
       }
 
@@ -873,45 +950,122 @@ export function lintOverrides(packageJsonPath) {
 }
 
 /**
- * Audit invocation per manager. Both are restricted to the PRODUCTION graph:
- * this gate's claim is about what ships, and a dev-only advisory would make it
- * unactionable noise. `--omit=dev` is npm's documented spelling of that.
+ * Audit invocation per manager, as an ARGV rather than a shell string. Both
+ * are restricted to the PRODUCTION graph: this gate's claim is about what
+ * ships, and a dev-only advisory would make it unactionable noise.
+ * `--omit=dev` is npm's documented spelling of that.
+ *
+ * The argv form is not cosmetic. The previous shell string appended
+ * `2>/dev/null`, which discarded the one channel that says WHY an audit
+ * produced nothing — and a shell is an injection surface Semgrep's
+ * `spawn-shell-true` rule blocks outright.
  */
 const AUDIT_COMMANDS = {
-  pnpm: "pnpm audit --prod --json",
-  npm: "npm audit --omit=dev --json",
+  pnpm: { bin: "pnpm", args: ["audit", "--prod", "--json"] },
+  npm: { bin: "npm", args: ["audit", "--omit=dev", "--json"] },
 };
 
 /**
- * Run the detected manager's audit, returning raw stdout and exit code. Both
- * managers exit non-zero when vulnerabilities are found; the JSON is wanted
- * regardless of the exit code.
+ * How long the audit may run before it is killed. An audit resolves the whole
+ * production graph against a registry, so the budget is generous — but it is
+ * bounded, because the previous call had no timeout at all and a hung
+ * registry connection would hang the gate (and the CI leg holding it) forever.
+ */
+const AUDIT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Output ceiling for the audit's stdout. Node's default is 1 MiB, and an
+ * `npm audit --json` over a large graph clears that easily — at which point
+ * the child is killed and its truncated stdout is unparseable JSON. That used
+ * to reach the "non-JSON output, exit 0 → clean" branch, so an audit too big
+ * to read reported the graph clean. 64 MiB is far past any real report.
+ */
+const AUDIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Human-readable rendering of a manager's audit invocation, for log lines.
  *
  * @param {"pnpm" | "npm"} manager
- * @returns {{ command: string; output: string; exitCode: number }}
+ * @returns {string}
  */
-function runAudit(manager) {
-  const command = AUDIT_COMMANDS[manager];
-  try {
-    const output = execSync(`${command} 2>/dev/null`, { encoding: "utf8" });
-    return { command, output, exitCode: 0 };
-  } catch (err) {
-    const execError = /** @type {{ stdout?: string; status?: number }} */ (err);
-    return {
-      command,
-      output: execError.stdout ?? "",
-      exitCode: execError.status ?? 1,
-    };
+function describeAuditCommand(manager) {
+  const { bin, args } = AUDIT_COMMANDS[manager];
+  return [bin, ...args].join(" ");
+}
+
+/**
+ * Run the detected manager's audit, returning raw stdout, captured stderr and
+ * an exit code. Both managers exit non-zero when vulnerabilities are found;
+ * the JSON is wanted regardless of the exit code.
+ *
+ * `projectDir` is the directory whose lockfile decided the manager — not
+ * `process.cwd()`, which is what the shell call inherited. Those differ
+ * whenever `--package-json` points elsewhere, and when they differ the gate
+ * audited a graph other than the one it named. Its whole output is a claim
+ * about a specific dependency graph, so auditing a different tree than the one
+ * detected makes the claim unfalsifiable.
+ *
+ * `spawnImpl` is the injectable seam (`.agents/rules/test-seams.md`): it
+ * defaults to the real `spawnSync`, so production callers are unchanged, and a
+ * test substitutes a recording stub instead of spawning a package manager.
+ *
+ * @param {"pnpm" | "npm"} manager
+ * @param {string} projectDir directory holding the detected lockfile
+ * @param {typeof spawnSync} spawnImpl
+ * @returns {{ command: string; output: string; stderr: string; exitCode: number }}
+ */
+function runAudit(manager, projectDir, spawnImpl) {
+  const { bin, args } = AUDIT_COMMANDS[manager];
+  const command = describeAuditCommand(manager);
+
+  const result = spawnImpl(bin, args, {
+    cwd: projectDir,
+    encoding: "utf8",
+    timeout: AUDIT_TIMEOUT_MS,
+    maxBuffer: AUDIT_MAX_BUFFER_BYTES,
+  });
+
+  const output = typeof result?.stdout === "string" ? result.stdout : "";
+  let stderr = typeof result?.stderr === "string" ? result.stderr : "";
+
+  // A spawn that never produced an exit status — the binary is missing, the
+  // timeout fired, the output ceiling blew — reports through `error`. It is
+  // a failure, and the reason belongs on stderr with everything else.
+  if (result?.error) {
+    const detail =
+      result.error instanceof Error ? result.error.message : String(result.error);
+    stderr = stderr === "" ? detail : `${stderr}\n${detail}`;
+    return { command, output, stderr, exitCode: 1 };
   }
+
+  return { command, output, stderr, exitCode: result?.status ?? 1 };
+}
+
+/**
+ * Echo whatever the audit wrote to stderr, bounded. Every failure path calls
+ * this: the old shell string sent stderr to `/dev/null`, so an audit that
+ * failed for an nameable reason (no registry, a corrupt lockfile, an
+ * unsupported flag) surfaced as an unexplained empty report.
+ *
+ * @param {string} stderr
+ */
+function printAuditStderr(stderr) {
+  const text = typeof stderr === "string" ? stderr.trim() : "";
+  if (text === "") {
+    return;
+  }
+  console.error("[audit-check] audit stderr:");
+  console.error(text.slice(0, 2000));
 }
 
 /**
  * CLI entrypoint. Returns the process exit code (0 clean, 1 blocking).
  *
  * @param {string[]} argv argv minus `node` and the script path
+ * @param {{ spawnImpl?: typeof spawnSync }} [deps] injectable subprocess seam
  * @returns {number}
  */
-export function runCli(argv) {
+export function runCli(argv, { spawnImpl = spawnSync } = {}) {
   const { allowlistPath, packageJsonPath } = parseArgs(argv);
 
   // --- Lint dependency overrides -------------------------------------------
@@ -976,7 +1130,8 @@ export function runCli(argv) {
   //
   // From the committed lockfile, not from `packageManager` / `engines`: the
   // lockfile is what the audit reads, and metadata can disagree with it.
-  const detected = detectPackageManager(dirname(packageJsonPath));
+  const projectDir = dirname(packageJsonPath);
+  const detected = detectPackageManager(projectDir);
   if (detected.error) {
     console.error(`[audit-check] ERROR: ${detected.error}`);
     return 1;
@@ -984,13 +1139,15 @@ export function runCli(argv) {
   const manager = detected.manager;
 
   console.log(
-    `[audit-check] Detected ${manager} from its lockfile; running ${AUDIT_COMMANDS[manager]} ...`,
+    `[audit-check] Detected ${manager} from its lockfile; running ` +
+      `${describeAuditCommand(manager)} in ${projectDir} ...`,
   );
   const {
     command: auditCommand,
     output: auditOutput,
+    stderr: auditStderr,
     exitCode: auditExitCode,
-  } = runAudit(manager);
+  } = runAudit(manager, projectDir, spawnImpl);
 
   // --- Parse audit JSON ----------------------------------------------------
 
@@ -999,17 +1156,22 @@ export function runCli(argv) {
   try {
     report = JSON.parse(auditOutput);
   } catch {
-    if (auditExitCode === 0) {
-      // No JSON and a clean exit means nothing to audit — clean.
-      console.log("[audit-check] No vulnerabilities found. Exit 0.");
-      return 0;
-    }
+    // Silence is NOT clean. This branch used to return 0 whenever the audit
+    // exited 0 with unparseable stdout — and every way the audit can fail to
+    // run at all lands exactly there: a missing binary, a killed child, a
+    // truncated write, an audit that printed a human-readable notice instead
+    // of JSON. "Clean" is only ever a positively recognized schema with
+    // nothing blocking in it, so this fails closed on any exit code and shows
+    // the stderr that says why.
     console.error(
-      `[audit-check] ERROR: ${auditCommand} produced non-JSON output (exit code ` +
-        auditExitCode +
-        ").",
+      `[audit-check] ERROR: ${auditCommand} (exit ${auditExitCode}) produced no ` +
+        "readable JSON. Failing closed: an audit whose output cannot be read " +
+        "has not shown the dependency graph is clean.",
     );
-    console.error(auditOutput.slice(0, 2000));
+    printAuditStderr(auditStderr);
+    if (auditOutput.trim() !== "") {
+      console.error(auditOutput.slice(0, 2000));
+    }
     return 1;
   }
 
@@ -1032,6 +1194,7 @@ export function runCli(argv) {
         "map nor an npm `vulnerabilities` map. Failing closed: a report that " +
         "cannot be read cannot show the graph is clean.",
     );
+    printAuditStderr(auditStderr);
     console.error(auditOutput.slice(0, 2000));
     return exitCode;
   }
