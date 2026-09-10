@@ -1,0 +1,10 @@
+# Conventional-commit gate (Story #513).
+#
+# `rules/git-conventions.md` has always said this hook runs commitlint on
+# every local commit; until #513 the hook did not exist, so nothing enforced
+# the contract locally and a malformed subject was only ever caught — if at
+# all — by the PR title that release-please parses.
+#
+# `--no-install` keeps the gate offline and deterministic: it fails loudly if
+# commitlint is missing rather than silently fetching some other version.
+npx --no-install commitlint --edit "$1"
