@@ -1,0 +1,66 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "fixture-lib": {
+      "name": "fixture-lib",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1105678,
+          "name": "fixture-lib",
+          "dependency": "fixture-lib",
+          "title": "Prototype pollution in fixture-lib",
+          "url": "https://github.com/advisories/GHSA-fixt-ure0-0001",
+          "severity": "high",
+          "cwe": ["CWE-1321"],
+          "cvss": {
+            "score": 8.2,
+            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:H"
+          },
+          "range": "<1.4.2"
+        }
+      ],
+      "effects": ["fixture-consumer"],
+      "range": "<1.4.2",
+      "nodes": ["node_modules/fixture-lib"],
+      "fixAvailable": {
+        "name": "fixture-lib",
+        "version": "1.4.2",
+        "isSemVerMajor": false
+      }
+    },
+    "fixture-consumer": {
+      "name": "fixture-consumer",
+      "severity": "high",
+      "isDirect": true,
+      "via": ["fixture-lib"],
+      "effects": [],
+      "range": "*",
+      "nodes": ["node_modules/fixture-consumer"],
+      "fixAvailable": {
+        "name": "fixture-lib",
+        "version": "1.4.2",
+        "isSemVerMajor": false
+      }
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 2,
+      "critical": 0,
+      "total": 2
+    },
+    "dependencies": {
+      "prod": 214,
+      "dev": 0,
+      "optional": 0,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 214
+    }
+  }
+}

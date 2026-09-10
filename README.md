@@ -504,7 +504,9 @@ override, and vice versa:
    just fixable ones. The two managers report in different schemas (a legacy
    `advisories` map; npm v7+ nests advisories under `vulnerabilities`), and
    both are read — a report matching **neither** fails the gate closed rather
-   than reading as clean.
+   than reading as clean, as does output that does not parse as JSON at all
+   (an audit that never ran exits 0 with an empty stdout, which is not a
+   clean graph).
 2. **Unbounded-override lint.** Blocks on any dependency override written
    without an upper bound — **independently of the CVE scan, and with zero
    CVEs present**. It runs *first*, before any audit is invoked at all.
@@ -516,7 +518,9 @@ override, and vice versa:
 Known/accepted CVEs are suppressed via a **dated, self-expiring allowlist**
 (`audit-allowlist.json` in the project root). Expired entries are treated as
 un-suppressed and cause the script to exit non-zero — forcing teams to
-periodically re-evaluate accepted risk.
+periodically re-evaluate accepted risk. Advisory ids compare
+case-insensitively, so the canonical `GHSA-7w5x-hrqm-74c2` form GitHub renders
+suppresses under either package manager.
 
 **Consumer usage (`package.json`):**
 

@@ -13,7 +13,10 @@
  *
  * The five surfaces:
  *
- *   1. local     — `.env` / `.env.example` in the caller repo
+ *   1. local     — `.env.example` in the caller repo (the onboarding
+ *                  contract). The doctor never reads a developer's real
+ *                  local file: it holds live values, and a surface this
+ *                  script reports on must be one every run can see.
  *   2. wrangler  — `[vars]` in each Worker's wrangler config
  *   3. github    — Actions secret/variable NAMES (repo + environment scope)
  *   4. cloudflare— Worker secret NAMES per resolved script name
@@ -666,25 +669,179 @@ export function checkShape({ value, shape, placeholderPattern = null }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Perform a JSON request and tag any HTTP failure with `.httpStatus`, so a
- * caller can apply the 404-only degradation rule (see the module docblock).
+ * Production request bounds. Every one is a CLIENT-CONSTRUCTOR option so the
+ * sibling suite can pass millisecond-scale values: a suite that had to wait
+ * out the real budget would simply not assert the timeout at all.
+ *
+ * A nightly drift gate hanging on one unresponsive store is the fail-open this
+ * module exists to refuse in a slower disguise — the job burns its runner
+ * minutes and reports nothing, which reads in the Actions UI as a run that has
+ * not finished rather than a probe that failed.
+ */
+export const DEFAULT_TIMEOUT_MS = 15_000;
+export const DEFAULT_RETRY_DELAY_MS = 500;
+
+/** Attempts per request, INCLUDING the first. */
+export const MAX_ATTEMPTS = 3;
+
+/**
+ * Pages a single listing may follow before the probe fails closed. A store
+ * that keeps handing back a `rel="next"` is malfunctioning, and truncating its
+ * listing silently would report every un-fetched name as an orphan-free match
+ * — the same "no drift because we stopped looking" this module refuses.
+ */
+export const MAX_PAGES = 50;
+
+/**
+ * Which HTTP failures are worth a second attempt. 429 and 5xx are transient by
+ * definition; everything else is a statement about the request itself. Retrying
+ * a 401 just spends the budget three times to learn what the first attempt said,
+ * and retrying a 404 would fight the one degradation rule this module allows.
+ *
+ * @param {number} status
+ * @returns {boolean}
+ */
+export function isRetryableStatus(status) {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+/**
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fetch with a deadline that does not depend on the fetch honouring it.
+ *
+ * An `AbortSignal` alone is a REQUEST to stop, and it is only as good as the
+ * implementation reading it — a stub, a polyfill, or a wrapper that rebuilds
+ * `init` can drop `init.signal` without any error, and the await then never
+ * returns. So the signal is passed (real `fetch` uses it to release the socket)
+ * AND raced against a timer, and the timer is what actually bounds the call.
+ *
+ * @param {typeof fetch} fetchImpl
+ * @param {string} url
+ * @param {RequestInit} init
+ * @param {number} timeoutMs
+ * @returns {Promise<Response>}
+ */
+async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
+  const controller = new AbortController();
+  let timer = null;
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      const err = new Error(`${init.method ?? "GET"} ${redactUrl(url)} timed out after ${timeoutMs}ms`);
+      err.timedOut = true;
+      reject(err);
+    }, timeoutMs);
+  });
+  // Resolve.then keeps a fetchImpl that THROWS synchronously on the same
+  // rejection path as one that returns a rejected promise.
+  const pending = Promise.resolve().then(() => fetchImpl(url, { ...init, signal: controller.signal }));
+  // The loser of the race still settles. Absorbing its rejection here is what
+  // keeps a post-timeout abort from surfacing as an unhandled rejection and
+  // tearing down a process that has already handled the timeout.
+  pending.catch(() => {});
+  try {
+    return await Promise.race([pending, deadline]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Perform one bounded, retried request and return the raw `Response`.
+ *
+ * Any HTTP failure is tagged with `.httpStatus`, so a caller can apply the
+ * 404-only degradation rule (see the module docblock).
+ *
+ * **A timeout is never retried.** Retrying it would multiply the wall clock by
+ * the attempt count, and the surface's whole contract is that it fails within
+ * its budget rather than eventually.
  *
  * @param {typeof fetch} fetchImpl
  * @param {string} url
  * @param {RequestInit} [init]
- * @returns {Promise<unknown>}
+ * @param {{timeoutMs?: number, retryDelayMs?: number, maxAttempts?: number}} [options]
+ * @returns {Promise<Response>}
  */
-export async function requestJson(fetchImpl, url, init = {}) {
-  const res = await fetchImpl(url, init);
-  if (!res.ok) {
+export async function requestResponse(fetchImpl, url, init = {}, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+  const maxAttempts = options.maxAttempts ?? MAX_ATTEMPTS;
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let res;
+    try {
+      res = await fetchWithTimeout(fetchImpl, url, init, timeoutMs);
+    } catch (err) {
+      if (err?.timedOut) throw err;
+      lastError = err;
+      if (attempt === maxAttempts) throw err;
+      await sleep(retryDelayMs * 2 ** (attempt - 1));
+      continue;
+    }
+    if (res.ok) return res;
     // The body can echo request context; it is never a secret VALUE (these are
     // name-listing endpoints), but it is also not needed — the status is what
     // routes the decision, so only the status and a redacted URL are surfaced.
     const err = new Error(`${init.method ?? "GET"} ${redactUrl(url)} failed: ${res.status} ${res.statusText}`);
     err.httpStatus = res.status;
-    throw err;
+    lastError = err;
+    if (!isRetryableStatus(res.status) || attempt === maxAttempts) throw err;
+    await sleep(retryDelayMs * 2 ** (attempt - 1));
   }
+  /* c8 ignore next 2 -- unreachable: every loop exit above returns or throws. */
+  throw lastError ?? new Error(`${redactUrl(url)} failed with no attempt recorded`);
+}
+
+/**
+ * `requestResponse`, decoded as JSON — what every non-paginating call wants.
+ *
+ * @param {typeof fetch} fetchImpl
+ * @param {string} url
+ * @param {RequestInit} [init]
+ * @param {{timeoutMs?: number, retryDelayMs?: number, maxAttempts?: number}} [options]
+ * @returns {Promise<unknown>}
+ */
+export async function requestJson(fetchImpl, url, init = {}, options = {}) {
+  const res = await requestResponse(fetchImpl, url, init, options);
   return res.json();
+}
+
+/**
+ * The `rel="next"` URL of an RFC 8288 `Link` header, or `null`.
+ *
+ * Parsed by splitting rather than by regex, deliberately twice over: a pattern
+ * over a header carrying a URL is the shape CodeQL flags as an unanchored host
+ * match, and the grammar here — comma-separated `<uri>; param=value` — is
+ * cleanly separable without one.
+ *
+ * @param {string | null | undefined} header
+ * @returns {string | null}
+ */
+export function linkNextUrl(header) {
+  if (typeof header !== "string" || header.length === 0) return null;
+  for (const part of header.split(",")) {
+    const segment = part.trim();
+    if (!segment.startsWith("<")) continue;
+    const close = segment.indexOf(">");
+    if (close === -1) continue;
+    const url = segment.slice(1, close);
+    for (const param of segment.slice(close + 1).split(";")) {
+      const [rawName, ...rest] = param.split("=");
+      if (rawName.trim().toLowerCase() !== "rel") continue;
+      let value = rest.join("=").trim();
+      if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+      if (value.toLowerCase() === "next" && url.length > 0) return url;
+    }
+  }
+  return null;
 }
 
 /**
@@ -718,8 +875,9 @@ export function isAbsentStatus(err) {
 
 /**
  * Parse a dotenv-style file into a name -> value map. Used for the local
- * surface; values are read (a local `.env` is already on the developer's disk)
- * but only names cross the boundary unless the shape stage asks.
+ * surface, whose only input is the committed `.env.example` — a placeholder
+ * file by construction. Values are parsed because the format has them, and
+ * only names cross the boundary.
  *
  * @param {string} text
  * @returns {Record<string, string>}
@@ -746,25 +904,97 @@ export function parseDotenv(text) {
 }
 
 /**
+ * Reduce a JSONC document to JSON: drop `//` and block comments, drop trailing
+ * commas, and leave everything inside a string literal untouched.
+ *
+ * A character scanner rather than a substitution, for two independent reasons.
+ * The correctness one: a pattern cannot tell a `//` that opens a comment from
+ * one inside `"https://example.test"`, and the line-comment substitution this
+ * replaces truncated exactly that value — quietly, since the result usually
+ * still parsed. The policy one: this repo's SAST refuses a dynamically built
+ * `RegExp` outright, so the parsing rules a config like this needs are written
+ * as code or not at all.
+ *
+ * `wrangler.jsonc` is a real shape, not a hypothetical: create-cloudflare's own
+ * template emits trailing commas, and until Story #487 every one of them made
+ * this function return an empty set — which the caller then read as "this
+ * worker declares no vars", the false no-drift verdict.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripJsonc(text) {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") {
+        out += text[i + 1] ?? "";
+        i += 1;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i += 1;
+      // Keep the newline: JSON ignores it, but a preserved line count keeps a
+      // `JSON.parse` position error pointing at the author's own line.
+      out += "\n";
+      continue;
+    }
+    if (ch === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) {
+        if (text[i] === "\n") out += "\n";
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < text.length && (text[j] === " " || text[j] === "\t" || text[j] === "\n" || text[j] === "\r")) j += 1;
+      if (text[j] === "}" || text[j] === "]") continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * Extract the `[vars]` block key names from a wrangler config. Supports both
  * TOML (`[vars]` / `[env.<name>.vars]`) and JSON/JSONC (`"vars": {…}`) — the
  * two shapes wrangler accepts.
  *
+ * **Throws** when a `.json`/`.jsonc` config cannot be parsed even after the
+ * JSONC reduction. Returning `[]` there — as this did until Story #487 — is
+ * indistinguishable from a config that genuinely declares nothing, so the
+ * caller reported no drift precisely because it could not read the file. The
+ * caller turns the throw into one `fail` finding on the `wrangler` surface.
+ *
  * @param {string} text
  * @param {string} path  Used only to pick the parser by extension.
  * @returns {string[]} Sorted var names.
+ * @throws {Error} With `.wranglerParseFailure === true` on unparseable JSONC.
  */
 export function parseWranglerVars(text, path) {
   const names = new Set();
   if (/\.jsonc?$/.test(path)) {
-    // Strip line comments so JSONC parses; block comments are not used by
-    // wrangler's own generated configs.
-    const stripped = text.replace(/^\s*\/\/.*$/gm, "");
     let doc;
     try {
-      doc = JSON.parse(stripped);
-    } catch {
-      return [];
+      doc = JSON.parse(stripJsonc(text));
+    } catch (err) {
+      const failure = new Error(`is not parseable as JSON/JSONC even after comment and trailing-comma removal: ${err.message}`);
+      failure.wranglerParseFailure = true;
+      throw failure;
     }
     collectJsonVars(doc, names);
     return [...names].sort();
@@ -809,41 +1039,73 @@ function collectJsonVars(node, names) {
  * access to either collection, so the default token can never serve this probe
  * (verified against the workflow-syntax permissions reference, 2026-09).
  *
+ * `per_page=100` bounds a PAGE, not the collection. A repository with more
+ * than a hundred Actions secrets returns the first hundred and a `Link` header
+ * naming the rest, and reading only page one reports every name beyond it as
+ * `missing` while every genuine orphan past the boundary goes unseen — drift
+ * invented and drift hidden by the same omission. So every listing follows
+ * `rel="next"` to completion, and a listing that will not end fails closed.
+ *
  * @param {object} opts
  * @param {string} opts.token
  * @param {string} opts.repo  "owner/name"
  * @param {typeof fetch} [opts.fetchImpl]
  * @param {string} [opts.apiBase]
+ * @param {number} [opts.timeoutMs]
+ * @param {number} [opts.retryDelayMs]
  */
-export function createGitHubClient({ token, repo, fetchImpl = fetch, apiBase = GITHUB_API_BASE }) {
+export function createGitHubClient({
+  token,
+  repo,
+  fetchImpl = fetch,
+  apiBase = GITHUB_API_BASE,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+}) {
   const headers = {
     Authorization: `Bearer ${token}`,
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  const get = (path) => requestJson(fetchImpl, `${apiBase}${path}`, { headers });
+  const bounds = { timeoutMs, retryDelayMs };
+
+  /**
+   * @param {string} path
+   * @param {(body: any) => Array<{name: string}>} pick
+   * @returns {Promise<string[]>}
+   */
+  async function listAll(path, pick) {
+    const names = [];
+    let url = `${apiBase}${path}`;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const res = await requestResponse(fetchImpl, url, { headers }, bounds);
+      const body = await res.json();
+      for (const entry of pick(body) ?? []) if (entry?.name) names.push(entry.name);
+      const next = linkNextUrl(typeof res.headers?.get === "function" ? res.headers.get("link") : null);
+      if (!next) return names.sort();
+      url = next;
+    }
+    throw new Error(`${redactUrl(`${apiBase}${path}`)} still offered a rel="next" after ${MAX_PAGES} pages`);
+  }
+
+  /**
+   * @param {string} prefix
+   * @returns {Promise<{secret: string[], var: string[]}>}
+   */
+  async function namesUnder(prefix) {
+    const [secret, vars] = await Promise.all([
+      listAll(`${prefix}/secrets?per_page=100`, (b) => b.secrets ?? []),
+      listAll(`${prefix}/variables?per_page=100`, (b) => b.variables ?? []),
+    ]);
+    return { secret, var: vars };
+  }
 
   return {
-    async repositoryNames() {
-      const [secrets, variables] = await Promise.all([
-        get(`/repos/${repo}/actions/secrets?per_page=100`),
-        get(`/repos/${repo}/actions/variables?per_page=100`),
-      ]);
-      return {
-        secret: (secrets.secrets ?? []).map((s) => s.name).sort(),
-        var: (variables.variables ?? []).map((v) => v.name).sort(),
-      };
+    repositoryNames() {
+      return namesUnder(`/repos/${repo}/actions`);
     },
-    async environmentNames(environment) {
-      const env = encodeURIComponent(environment);
-      const [secrets, variables] = await Promise.all([
-        get(`/repos/${repo}/environments/${env}/secrets?per_page=100`),
-        get(`/repos/${repo}/environments/${env}/variables?per_page=100`),
-      ]);
-      return {
-        secret: (secrets.secrets ?? []).map((s) => s.name).sort(),
-        var: (variables.variables ?? []).map((v) => v.name).sort(),
-      };
+    environmentNames(environment) {
+      return namesUnder(`/repos/${repo}/environments/${encodeURIComponent(environment)}`);
     },
   };
 }
@@ -857,19 +1119,69 @@ export function createGitHubClient({ token, repo, fetchImpl = fetch, apiBase = G
  * @param {string} opts.accountId
  * @param {typeof fetch} [opts.fetchImpl]
  * @param {string} [opts.apiBase]
+ * @param {number} [opts.timeoutMs]
+ * @param {number} [opts.retryDelayMs]
  */
-export function createCloudflareClient({ token, accountId, fetchImpl = fetch, apiBase = CLOUDFLARE_API_BASE }) {
+export function createCloudflareClient({
+  token,
+  accountId,
+  fetchImpl = fetch,
+  apiBase = CLOUDFLARE_API_BASE,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+}) {
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  const bounds = { timeoutMs, retryDelayMs };
   return {
     async secretNames(scriptName) {
       const body = await requestJson(
         fetchImpl,
         `${apiBase}/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(scriptName)}/secrets`,
-        { headers }
+        { headers },
+        bounds
       );
       return (body.result ?? []).map((s) => s.name).sort();
     },
   };
+}
+
+/**
+ * Flatten a v4 secrets response into the secrets RESIDENT AT THE REQUESTED
+ * FOLDER — its own entries plus everything reaching it through an import.
+ *
+ * The v4 list endpoint answers in two parts: `secrets[]` holds what the queried
+ * folder defines itself, and a separate top-level `imports[]` holds one group
+ * per import, each carrying the SOURCE folder in `secretPath`. Reading only the
+ * first part is what made a folder that imports its whole content report every
+ * key `missing` — the store had the secret, the Worker would resolve it, and
+ * the doctor said it was absent.
+ *
+ * `imports[].secretPath` is deliberately DISCARDED rather than used to
+ * re-attribute the name. The manifest declares where a key must be RESOLVABLE,
+ * which is the folder the deploy reads; attributing an imported key back to
+ * `/shared` would report it missing from the folder that legitimately resolves
+ * it and orphaned in a folder the manifest never asked about.
+ *
+ * A name defined directly in the queried folder wins over an imported one of
+ * the same name, matching Infisical's own precedence — so the shape stage
+ * checks the value the deploy would actually see.
+ *
+ * @param {unknown} body
+ * @returns {Array<{secretKey: string, secretValue?: string}>}
+ */
+export function collectInfisicalSecrets(body) {
+  const merged = new Map();
+  const add = (entry) => {
+    if (entry && typeof entry.secretKey === "string" && entry.secretKey.length > 0) {
+      merged.set(entry.secretKey, entry);
+    }
+  };
+  const imports = Array.isArray(body?.imports) ? body.imports : [];
+  for (const group of imports) {
+    for (const entry of Array.isArray(group?.secrets) ? group.secrets : []) add(entry);
+  }
+  for (const entry of Array.isArray(body?.secrets) ? body.secrets : []) add(entry);
+  return [...merged.values()];
 }
 
 /**
@@ -891,6 +1203,8 @@ export function createCloudflareClient({ token, accountId, fetchImpl = fetch, ap
  * @param {string} opts.projectId
  * @param {string} [opts.siteUrl]
  * @param {typeof fetch} [opts.fetchImpl]
+ * @param {number} [opts.timeoutMs]
+ * @param {number} [opts.retryDelayMs]
  */
 export function createInfisicalClient({
   token = null,
@@ -899,17 +1213,25 @@ export function createInfisicalClient({
   projectId,
   siteUrl = INFISICAL_DEFAULT_SITE,
   fetchImpl = fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  retryDelayMs = DEFAULT_RETRY_DELAY_MS,
 }) {
   const base = siteUrl.replace(/\/+$/, "");
+  const bounds = { timeoutMs, retryDelayMs };
   let accessToken = token;
 
   async function auth() {
     if (accessToken) return accessToken;
-    const body = await requestJson(fetchImpl, `${base}/api/v1/auth/universal-auth/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientId, clientSecret }),
-    });
+    const body = await requestJson(
+      fetchImpl,
+      `${base}/api/v1/auth/universal-auth/login`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId, clientSecret }),
+      },
+      bounds
+    );
     if (!body.accessToken) throw new Error("Infisical universal-auth login returned no accessToken");
     accessToken = body.accessToken;
     return accessToken;
@@ -922,11 +1244,19 @@ export function createInfisicalClient({
       environment,
       secretPath: folder || "/",
       viewSecretValue: withValues ? "true" : "false",
+      // Sent EXPLICITLY. The upstream default is documented as true, and a
+      // default is not a contract — a server-side change to it would silently
+      // hide every imported secret and report each one `missing`, which is the
+      // false-drift twin of the false no-drift this module is built against.
+      includeImports: "true",
     });
-    const body = await requestJson(fetchImpl, `${base}/api/v4/secrets?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${t}` },
-    });
-    return body.secrets ?? [];
+    const body = await requestJson(
+      fetchImpl,
+      `${base}/api/v4/secrets?${params.toString()}`,
+      { headers: { Authorization: `Bearer ${t}` } },
+      bounds
+    );
+    return collectInfisicalSecrets(body);
   }
 
   return {
@@ -954,17 +1284,35 @@ export function createInfisicalClient({
  * parse: a reference can appear anywhere an expression can, including inside
  * a `run:` block's shell, and a structural walk would miss those.
  *
+ * Two narrowings keep that reach from over-claiming, and each one had produced
+ * a manifest key that had to exist for a variable that does not:
+ *
+ *   - **A whole-line YAML comment is prose, not a reference.** The `#` line
+ *     documenting which secret a caller should pass is the single most common
+ *     place either token appears, and demanding a manifest entry for it makes
+ *     the doctor fail on its own documentation.
+ *   - **`vars` reached as a property of something else is not the `vars`
+ *     context.** `steps.build.outputs.vars.PROFILE` is a step output that
+ *     happens to be named `vars`; `\b` matched it, because a `.` is a word
+ *     boundary. The lookbehind refuses any match preceded by a `.` or an
+ *     identifier character, which is exactly the set of ways a longer path
+ *     can end just before this one starts.
+ *
  * @param {string} text
  * @returns {{secrets: string[], vars: string[]}}
  */
 export function collectWorkflowReferences(text) {
   const secrets = new Set();
   const vars = new Set();
-  const re = /\b(secrets|vars)\.([A-Za-z_][A-Za-z0-9_]*)/g;
-  let m = re.exec(text);
+  const scannable = text
+    .split(/\r?\n/)
+    .map((line) => (line.trimStart().startsWith("#") ? "" : line))
+    .join("\n");
+  const re = /(?<![\w.])(secrets|vars)\.([A-Za-z_][A-Za-z0-9_]*)/g;
+  let m = re.exec(scannable);
   while (m !== null) {
     (m[1] === "secrets" ? secrets : vars).add(m[2]);
-    m = re.exec(text);
+    m = re.exec(scannable);
   }
   return { secrets: [...secrets].sort(), vars: [...vars].sort() };
 }
@@ -1061,8 +1409,24 @@ export function runOfflineChecks({ manifest, repoRoot }) {
       });
       continue;
     }
+    let present;
+    try {
+      present = new Set(parseWranglerVars(readFileSync(configPath, "utf8"), configPath));
+    } catch (err) {
+      // One finding, and the worker's expected/orphan reconciliation is
+      // skipped entirely: reporting every declared var as `missing` from a
+      // file nobody could read blames the manifest for the config's syntax.
+      findings.push({
+        severity: "fail",
+        kind: "unreadable",
+        key: null,
+        surface: "wrangler",
+        environment: null,
+        detail: `manifest.workers["${id}"].config ${worker.config} ${err.message}`,
+      });
+      continue;
+    }
     checked.push(`wrangler:${id}`);
-    const present = new Set(parseWranglerVars(readFileSync(configPath, "utf8"), configPath));
     const expected = manifest.keys.filter(
       // Environment-agnostic by design: this check reports `environment: null`
       // and `parseWranglerVars` flattens `[env.X.vars]` into one set, so there
@@ -1170,6 +1534,13 @@ export function reconcileNames({ expected, present, surface, environment, scope 
  * lapsing quietly would re-raise a finding the operator already chose to defer
  * without anyone noticing the deferral had run out.
  *
+ * `severity` selects WHICH finding an entry silences and defaults to `"fail"`.
+ * The `"orphan"` form exists because the alternative was worse: the only way
+ * to silence one known orphan under `--strict-orphans` was to add a manifest
+ * key for a secret the project does not actually declare, which buys quiet by
+ * making the manifest lie — and a lying manifest is the exact false no-drift
+ * this whole module refuses. An orphan exception still expires on its date.
+ *
  * @param {unknown} raw
  * @returns {object[]}
  */
@@ -1186,10 +1557,18 @@ export function parseExceptions(raw) {
     if (Number.isNaN(Date.parse(`${revisit}T00:00:00Z`))) {
       throw new Error(`exceptions[${i}] ("${e.key}") has an unparseable revisit-date "${revisit}"`);
     }
+    const severity = e.severity ?? "fail";
+    if (severity !== "fail" && severity !== "orphan") {
+      throw new Error(
+        `exceptions[${i}] ("${e.key}").severity must be "fail" or "orphan" — got "${severity}". ` +
+          `Omit it to default to "fail".`
+      );
+    }
     return {
       key: e.key,
       surface: e.surface ?? null,
       environment: e.environment ?? null,
+      severity,
       reason: typeof e.reason === "string" ? e.reason : "",
       revisitDate: revisit,
     };
@@ -1216,10 +1595,11 @@ export function applyExceptions({ findings, exceptions, now = new Date() }) {
     const match = active.find(
       (e) =>
         e.key === f.key &&
+        e.severity === f.severity &&
         (e.surface === null || e.surface === f.surface) &&
         (e.environment === null || e.environment === f.environment)
     );
-    if (match && f.severity === "fail") {
+    if (match) {
       suppressed.push({ ...f, exception: match });
     } else {
       kept.push(f);
@@ -1231,6 +1611,48 @@ export function applyExceptions({ findings, exceptions, now = new Date() }) {
 // ---------------------------------------------------------------------------
 // Exit contract
 // ---------------------------------------------------------------------------
+
+/**
+ * Resolve the environments to check, failing CLOSED on one the manifest does
+ * not declare.
+ *
+ * Nothing downstream can catch a misspelling. `--environments prodcution`
+ * against a manifest declaring `production` narrows every reconcile to a slug
+ * no key claims, so `expected` is empty everywhere, the stores are asked for
+ * folders and environments that do not exist, and the run exits 0 with every
+ * surface `checked` and zero findings — the most convincing possible report
+ * that nothing is wrong, produced by a run that examined nothing. A typo in a
+ * cron-scheduled workflow input can hold that state indefinitely.
+ *
+ * An empty request is not an error: it means "use the manifest's own list",
+ * which is exactly what the reusable workflow's empty `environments` input
+ * interpolates to.
+ *
+ * @param {object} opts
+ * @param {string | null | undefined} opts.requested  Raw comma-separated CLI/input value.
+ * @param {{environments: string[]}} opts.manifest
+ * @returns {string[]}
+ * @throws {Error} When a requested slug is not in `manifest.environments`.
+ */
+export function resolveEnvironments({ requested, manifest }) {
+  const wanted =
+    typeof requested === "string"
+      ? requested
+          .split(",")
+          .map((slug) => slug.trim())
+          .filter(Boolean)
+      : [];
+  if (wanted.length === 0) return manifest.environments;
+  const unknown = wanted.filter((slug) => !manifest.environments.includes(slug));
+  if (unknown.length > 0) {
+    throw new Error(
+      `--environments requested ${unknown.map((slug) => `"${slug}"`).join(", ")}, which manifest.environments ` +
+        `does not declare. Declared environments: ${manifest.environments.join(", ")}. ` +
+        `Nothing was probed — an undeclared environment would report zero findings on every surface.`
+    );
+  }
+  return wanted;
+}
 
 /**
  * Decide the process exit code from a completed report.
@@ -1292,7 +1714,8 @@ export function renderReport(report) {
     lines.push("Suppressed by an active exception:");
     for (const s of report.suppressed) {
       lines.push(
-        `  - ${s.key} [${s.surface}${s.environment ? `/${s.environment}` : ""}] — revisit ${s.exception.revisitDate}${s.exception.reason ? `: ${s.exception.reason}` : ""}`
+        `  - ${s.key} [${s.surface}${s.environment ? `/${s.environment}` : ""}] (${s.severity}) — ` +
+          `revisit ${s.exception.revisitDate}${s.exception.reason ? `: ${s.exception.reason}` : ""}`
       );
     }
   }
@@ -1873,12 +2296,13 @@ async function main() {
     }
   }
 
-  const environments = opts.environments
-    ? opts.environments
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean)
-    : manifest.environments;
+  let environments;
+  try {
+    environments = resolveEnvironments({ requested: opts.environments, manifest });
+  } catch (err) {
+    process.stderr.write(`[env-doctor] ERROR: ${err.message}\n`);
+    process.exit(1);
+  }
 
   // Offline builds no clients at all; `runDoctor` marks the live surfaces
   // skipped-because-offline rather than reaching for an unavailability reason.
@@ -1906,12 +2330,19 @@ async function main() {
     process.stdout.write(renderReport(report));
   }
 
+  // Annotations go to STDERR in every mode, not just under `--json`. Actions
+  // reads workflow commands from both streams, so nothing is lost — but stdout
+  // is the machine channel, and `--json` promising one JSON document while
+  // appending `::notice` lines to it made `JSON.parse(stdout)` throw for every
+  // consumer whose run had an unchecked surface, which is most of them.
+  // Splitting by mode would leave the text mode's stdout un-pipeable for the
+  // same reason, so the rule is unconditional.
   for (const s of report.surfaces) {
     if (s.status === "unchecked") {
-      process.stdout.write(`::notice title=env-doctor surface unchecked::${s.surface}: ${s.notice}\n`);
+      process.stderr.write(`::notice title=env-doctor surface unchecked::${s.surface}: ${s.notice}\n`);
     }
     if (s.status === "error") {
-      process.stdout.write(`::error title=env-doctor probe failed::${s.surface}: ${s.notice}\n`);
+      process.stderr.write(`::error title=env-doctor probe failed::${s.surface}: ${s.notice}\n`);
     }
   }
 

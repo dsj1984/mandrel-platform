@@ -1584,11 +1584,23 @@ jobs:
       # its own subdirectory (no `merge-multiple`), so same-named files from
       # different tiers and shards cannot overwrite one another. The gate's own
       # recursive scan finds every coverage-summary.json beneath the workspace.
+      #
+      # The pattern names the two coverage-producing tiers EXACTLY — this job
+      # `needs:` unit and contract, and those upload `unit-results-<shard>` and
+      # `contract-results-<shard>`. It used to read `*-results-*`, which is
+      # wider than the set it depends on: any future job uploading a
+      # `<something>-results-*` artifact would silently join the aggregate the
+      # floor is asserted on, without appearing in this job's `needs:` and
+      # without anyone choosing it. `{unit,contract}-results-*` is one
+      # minimatch brace group — download-artifact v4 filters with a plain
+      # `new Minimatch(pattern)` (brace expansion on by default) and a pattern
+      # matching zero artifacts downloads nothing rather than failing, so a
+      # consumer running with `enable-contract: false` is unaffected.
       - name: Download tier coverage artifacts
         if: ${{ inputs.coverage-threshold != 0 && !inputs.affected }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: '*-results-*'
+          pattern: '{unit,contract}-results-*'
           path: _tier-coverage
 
       - name: Resolve platform ref (coverage gate scripts)
