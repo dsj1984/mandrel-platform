@@ -141,7 +141,7 @@ permissions:
 jobs:
   env-drift:
     name: env-drift
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: 10
     steps:
       - name: Resolve platform ref

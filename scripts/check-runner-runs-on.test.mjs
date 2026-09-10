@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * check-runner-runs-on.test.mjs — regression guard for the `runner` input's
- * two documented shapes (Story #421).
+ * check-runner-runs-on.test.mjs — regression guard for every shape the
+ * `runner` input can arrive in (Stories #421, #493).
  *
  * The bug this pins: every `runs-on:` site consumed the input raw as
  * `${{ inputs.runner }}`. GitHub does not parse a JSON-array *string* in that
@@ -20,6 +20,15 @@
  * would pin the wording and not the behaviour. So this EXTRACTS each real
  * expression from the workflow and EVALUATES it under Actions semantics, the
  * same read-then-execute approach as check-toolchain-cache-default.test.mjs.
+ *
+ * The same failure had a second door, closed by #493: `runner: ''`. A
+ * workflow_call `default:` fires only when the key is ABSENT, so a caller
+ * who passes the key with an empty value — threading an unset input or a
+ * matrix value through — got the label `""` rather than `ubuntu-latest`, and
+ * with it the identical never-scheduled job. The fallback therefore lives at
+ * the `runs-on` site, and the byte-identical assertion below is what stops a
+ * fix that reaches six of the seven workflows from shipping as if it reached
+ * all seven.
  *
  * Run: node --test scripts/check-runner-runs-on.test.mjs
  */
@@ -56,6 +65,28 @@ function runsOnExpressions(text) {
     out.push({ line: idx + 1, expr: m[1].trim() });
   }
   return out;
+}
+
+/**
+ * The `default:` this workflow declares for its `runner` workflow_call input.
+ *
+ * Read from the YAML rather than hardcoded so the empty-input assertion below
+ * pins the real contract: whatever label a caller gets by omitting `runner`
+ * is the label an explicitly-empty `runner` must get too. Scanned line by
+ * line — the block boundary is indentation, and a dynamically-constructed
+ * regex is a SAST finding that buys nothing here.
+ */
+function declaredRunnerDefault(text) {
+  const lines = text.split("\n");
+  const start = lines.indexOf("      runner:");
+  assert.notEqual(start, -1, "no `runner:` workflow_call input found");
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() !== "" && !line.startsWith("        ")) break;
+    const m = line.match(/^\s+default:\s*'([^']*)'\s*$/);
+    if (m) return m[1];
+  }
+  return assert.fail("the `runner` input declares no `default:` to fall back to");
 }
 
 const WORKFLOWS = runnerWorkflows();
@@ -127,6 +158,38 @@ for (const { file, text } of WORKFLOWS) {
     }
   });
 
+  test(`${file}: an empty runner resolves to this workflow's documented default`, () => {
+    // The silent-queue shape #421 left behind. `runner: ''` is not exotic — a
+    // caller threading `runner: ${{ inputs.runner }}` or a matrix value that
+    // resolves to nothing passes it without meaning to, and `format('"{0}"',
+    // '')` yielded the label `""`. An empty label matches no runner, so the
+    // job sat `queued` with no logs and no red, exactly as the JSON-array
+    // string did. The fallback belongs at the `runs-on` site because the
+    // input `default:` only fires when the key is ABSENT, never when it is
+    // present and empty.
+    const fallback = declaredRunnerDefault(text);
+    assert.notEqual(fallback, "", `${file}: the declared default is itself empty`);
+    for (const { line, expr } of sites) {
+      const resolved = evaluate(expr, { runner: "" });
+      assert.equal(
+        typeof resolved,
+        "string",
+        `${file}:${line}: an empty runner must resolve to a single label, not ${JSON.stringify(resolved)}`,
+      );
+      assert.notEqual(
+        resolved,
+        "",
+        `${file}:${line}: an empty runner resolves to an empty label — no runner ` +
+          `carries it, so the job queues until the 24-hour timeout with nothing to read`,
+      );
+      assert.equal(
+        resolved,
+        fallback,
+        `${file}:${line}: an empty runner must land on the input's documented default`,
+      );
+    }
+  });
+
   test(`${file}: every runs-on site resolves identically`, () => {
     // One workflow must not drift into two dialects of the same decision.
     const rendered = sites.map(({ expr }) =>
@@ -135,6 +198,25 @@ for (const { file, text } of WORKFLOWS) {
     assert.equal(new Set(rendered).size, 1, `${file}: runs-on sites disagree: ${rendered.join(" | ")}`);
   });
 }
+
+
+test("every runs-on expression across the seven workflows is byte-identical", () => {
+  // The per-workflow tests above each score one file, so a fix applied to six
+  // of the seven passes every one of them and ships the seventh still broken.
+  // This is the assertion a partial edit cannot survive: one decision, spelled
+  // one way, everywhere it is made.
+  const distinct = new Map();
+  for (const { file, text } of WORKFLOWS) {
+    for (const { line, expr } of runsOnExpressions(text)) {
+      if (!distinct.has(expr)) distinct.set(expr, []);
+      distinct.get(expr).push(`${file}:${line}`);
+    }
+  }
+  const report = [...distinct.entries()]
+    .map(([expr, at]) => `${expr}  @ ${at.join(", ")}`)
+    .join("\n  ");
+  assert.equal(distinct.size, 1, `runs-on expressions have drifted apart:\n  ${report}`);
+});
 
 test("the documented array form resolves AND derives toolchain-cache 'false'", () => {
   // The coupling the gap report found: before this fix the only `runner` value

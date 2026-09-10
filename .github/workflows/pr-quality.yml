@@ -860,7 +860,7 @@ jobs:
   lint:
     name: Lint & format
     if: ${{ inputs.enable-lint }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['lint'] || 15 }}
     # Per-job (see the note above `jobs:`): a unique per-tier group keyed on
     # the caller's ref cancels a superseded run's lint job without serializing
@@ -1333,7 +1333,7 @@ jobs:
   workflow-lint:
     name: Workflow lint
     if: ${{ inputs.enable-workflow-lint }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['workflow-lint'] || 10 }}
     concurrency:
       group: pr-quality-workflow-lint-${{ github.ref }}
@@ -1365,7 +1365,7 @@ jobs:
   typecheck:
     name: Typecheck
     if: ${{ inputs.enable-typecheck }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['typecheck'] || 15 }}
     concurrency:
       group: pr-quality-typecheck-${{ github.ref }}
@@ -1407,7 +1407,7 @@ jobs:
   unit:
     name: Unit (${{ matrix.shard }}/${{ strategy.job-total }})
     if: ${{ inputs.enable-unit }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['unit'] || 20 }}
     # Keyed on the shard too so parallel shards of the SAME run keep distinct
     # groups (a shared group would serialize them); across runs a superseded
@@ -1466,7 +1466,7 @@ jobs:
   contract:
     name: Contract (${{ matrix.shard }}/${{ strategy.job-total }})
     if: ${{ inputs.enable-contract }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['contract'] || 20 }}
     concurrency:
       group: pr-quality-contract-${{ matrix.shard }}-${{ github.ref }}
@@ -1568,7 +1568,7 @@ jobs:
     needs:
       - unit
       - contract
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['coverage-floor'] || 5 }}
     steps:
       - *harden-runner
@@ -1664,7 +1664,7 @@ jobs:
   e2e:
     name: E2E / Smoke (${{ matrix.shard }}/${{ strategy.job-total }})
     if: ${{ inputs.enable-e2e }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['e2e'] || 45 }}
     concurrency:
       group: pr-quality-e2e-${{ matrix.shard }}-${{ github.ref }}
@@ -1817,7 +1817,7 @@ jobs:
   migration-guard:
     name: Destructive-migration guard
     if: ${{ inputs.enable-migration-guard }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['migration-guard'] || 10 }}
     concurrency:
       group: pr-quality-migration-guard-${{ github.ref }}
@@ -2039,7 +2039,7 @@ jobs:
   security:
     name: Security (secret scan + SAST)
     if: ${{ inputs.enable-security }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['security'] || 20 }}
     concurrency:
       group: pr-quality-security-${{ github.ref }}
@@ -2592,7 +2592,7 @@ jobs:
   osv-scan:
     name: OSV advisory scan
     if: ${{ inputs.enable-osv-scan }}
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['osv-scan'] || 15 }}
     concurrency:
       group: pr-quality-osv-scan-${{ github.ref }}
@@ -2770,7 +2770,7 @@ jobs:
     # a self-hosted consumer whose GitHub-hosted minutes are unavailable (e.g. a
     # billing/spending-limit block) could get every tier green yet still fail
     # the required aggregate. Defaults to ubuntu-latest via the input default.
-    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
     timeout-minutes: ${{ fromJSON(inputs.tier-timeouts)['ci-required'] || 5 }}
     if: always()
     needs:

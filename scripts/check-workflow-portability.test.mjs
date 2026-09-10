@@ -223,7 +223,7 @@ function runnerWorkflow(value) {
 
 const NORMALIZED =
   "${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner " +
-  "|| format('\"{0}\"', inputs.runner)) }}";
+  "|| format('\"{0}\"', inputs.runner || 'ubuntu-latest')) }}";
 
 test("Rule 4: a raw `runs-on: ${{ inputs.runner }}` is a violation", () => {
   const violations = checkWorkflowContent(runnerWorkflow("${{ inputs.runner }}"));

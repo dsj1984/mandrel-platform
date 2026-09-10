@@ -165,7 +165,7 @@ reusable workflow here normalizes it:
 
 ```yaml
 runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner
-                      || format('"{0}"', inputs.runner)) }}
+                      || format('"{0}"', inputs.runner || 'ubuntu-latest')) }}
 ```
 
 | You pass | `runs-on` receives |
@@ -173,6 +173,18 @@ runs-on: ${{ fromJSON(startsWith(inputs.runner, '[') && inputs.runner
 | `'ubuntu-latest'` | the label `ubuntu-latest` |
 | `'my-runner'` | the label `my-runner` |
 | `'["self-hosted","my-runner"]'` | the labels `self-hosted` **and** `my-runner` |
+| `''` (or the key omitted) | the label `ubuntu-latest` |
+
+**An empty string is not the same as omitting the key — so the site falls back
+too.** A `workflow_call` `default:` fires only when the input is **absent**.
+Pass `runner: ''` — which is what a caller gets from threading through an unset
+`inputs.runner`, a `vars.RUNNER` that was never defined, or a matrix value that
+resolves to nothing — and the declared `'ubuntu-latest'` default never applies.
+Before #493 that produced the label `""`: a label no runner carries, and
+therefore the same silent never-scheduled job the JSON-array bug caused. The
+`|| 'ubuntu-latest'` inside `format()` is what makes an empty value land on the
+documented default rather than on nothing. It is the only fallback in the
+expression: a value that is present and non-empty is always used as written.
 
 **A malformed array is a hard error, on purpose.** A value that opens with
 `[` but is not valid JSON fails the workflow immediately rather than falling
