@@ -39,9 +39,14 @@ import {
   applyExceptions,
   buildClients,
   checkShape,
+  collectInfisicalSecrets,
   collectWorkflowReferences,
   computeExitCode,
+  createGitHubClient,
+  createInfisicalClient,
   isAbsentStatus,
+  isRetryableStatus,
+  linkNextUrl,
   parseCliArgs,
   parseDotenv,
   parseExceptions,
@@ -50,10 +55,12 @@ import {
   reconcileNames,
   redactUrl,
   renderReport,
+  resolveEnvironments,
   resolveScriptName,
   resolveSurfaceEnvironment,
   runDoctor,
   runOfflineChecks,
+  stripJsonc,
 } from "./env-doctor.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -1923,4 +1930,481 @@ test("CLI: the reusable workflow's env shape reaches the identifiers without any
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Story #487 — the edges where the doctor answered wrongly, or unparseably
+// ---------------------------------------------------------------------------
+
+/**
+ * A minimal `Response` stand-in. `headers.get` is included because the GitHub
+ * pagination reads `Link` off it, and a fake that omits headers is exactly the
+ * shape the client must survive rather than throw on.
+ *
+ * @param {unknown} body
+ * @param {{status?: number, headers?: Record<string, string>}} [opts]
+ */
+function fakeResponse(body, { status = 200, headers = {} } = {}) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: `synthetic ${status}`,
+    headers: { get: (name) => headers[name.toLowerCase()] ?? null },
+    json: async () => body,
+  };
+}
+
+// --- AC-1: an undeclared environment fails closed --------------------------
+
+test("resolveEnvironments refuses a slug the manifest does not declare, and defaults to the manifest's own", () => {
+  const manifest = parseManifest(singleWorkerManifest());
+  assert.deepEqual(resolveEnvironments({ requested: null, manifest }), ["staging", "production"]);
+  assert.deepEqual(resolveEnvironments({ requested: "", manifest }), ["staging", "production"]);
+  assert.deepEqual(resolveEnvironments({ requested: " production , staging ", manifest }), ["production", "staging"]);
+  assert.throws(() => resolveEnvironments({ requested: "prodcution", manifest }), /prodcution/);
+});
+
+test("CLI: an environment absent from the manifest exits 1 before any probe, naming both sides", async () => {
+  // The defect this closes is not a crash — it is a PASS. Before Story #487
+  // this exact argv exited 0 with every surface `checked` and zero findings,
+  // because a slug no key claims narrows every reconcile to the empty set.
+  const root = makeRepo(CONSISTENT_REPO);
+  const manifestPath = join(root, "env.manifest.json");
+  writeFileSync(manifestPath, JSON.stringify(singleWorkerManifest()));
+  try {
+    const run = await runCli([
+      "--manifest",
+      manifestPath,
+      "--repo-root",
+      root,
+      "--environments",
+      "prodcution",
+      "--offline",
+    ]);
+    assert.equal(run.code, 1, `expected a usage failure, got:\n${run.stdout}${run.stderr}`);
+    assert.ok(run.stderr.includes("prodcution"), `stderr must name the rejected slug:\n${run.stderr}`);
+    assert.ok(
+      run.stderr.includes("staging, production"),
+      `stderr must name the declared environments:\n${run.stderr}`
+    );
+    assert.equal(run.stdout, "", "nothing was probed, so no report may be emitted");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- AC-2: imported Infisical secrets are resident where they were asked for
+
+test("an imported secret counts in the folder that was ASKED for, is shape-checked there, and never prints", async () => {
+  // A deliberately dull, obviously-non-credential placeholder: this string is
+  // grepped out of the captured output, and uniqueness is all the assertion
+  // needs — key-shaped entropy here would be a true positive for the secret
+  // scan, which reads entropy beside a secret-shaped name.
+  const IMPORTED_VALUE = "https://imported-from-the-shared-folder.test";
+  const requested = [];
+  const fetchImpl = async (url) => {
+    requested.push(url);
+    const withValues = new URL(url).searchParams.get("viewSecretValue") === "true";
+    return fakeResponse({
+      // The queried folder defines NOTHING itself. Everything it resolves
+      // arrives through the import — the shape that reported every key
+      // missing while the deploy would have resolved all of them.
+      secrets: [],
+      imports: [
+        {
+          secretPath: "/shared",
+          environment: "staging",
+          folderId: "folder-shared",
+          secrets: [{ secretKey: "PUBLIC_SITE_URL", ...(withValues ? { secretValue: IMPORTED_VALUE } : {}) }],
+        },
+      ],
+    });
+  };
+  const infisical = createInfisicalClient({
+    token: "test-access-token",
+    projectId: "proj-1",
+    siteUrl: "https://infisical.test",
+    fetchImpl,
+  });
+  const manifest = parseManifest({
+    environments: ["staging"],
+    workers: {},
+    keys: [
+      {
+        name: "PUBLIC_SITE_URL",
+        kind: "var",
+        sensitivity: "public",
+        residency: { local: null, github: null, cloudflare: null },
+        infisical: { folder: "/cloudflare", environments: ["staging"] },
+        shape: "url",
+      },
+    ],
+  });
+
+  const root = makeRepo({});
+  try {
+    const report = await runDoctor({ manifest, repoRoot: root, environments: ["staging"], infisical });
+    const surface = report.surfaces.find((s) => s.surface === "infisical");
+    assert.deepEqual(
+      report.findings.filter((f) => f.surface === "infisical"),
+      [],
+      "an imported secret is resident at the folder that resolves it"
+    );
+    assert.equal(surface.status, "checked");
+    assert.match(surface.notice, /1 value shape\(s\) verified/, "the imported value must reach the shape stage");
+    assert.ok(requested.length > 0, "the client must have been called");
+    for (const url of requested) {
+      assert.ok(url.includes("includeImports=true"), `every listing must send includeImports explicitly: ${url}`);
+      assert.ok(url.includes("secretPath=%2Fcloudflare"), `the REQUESTED folder is what is asked for: ${url}`);
+    }
+    const captured = renderReport(report) + JSON.stringify(report);
+    assert.ok(!captured.includes(IMPORTED_VALUE), "an imported VALUE reached the doctor's output");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("collectInfisicalSecrets gives a directly-defined name precedence over an imported one", () => {
+  const merged = collectInfisicalSecrets({
+    secrets: [{ secretKey: "OVERRIDDEN", secretValue: "local-wins" }],
+    imports: [
+      { secretPath: "/shared", secrets: [{ secretKey: "OVERRIDDEN", secretValue: "import-loses" }] },
+      { secretPath: "/base", secrets: [{ secretKey: "ONLY_IMPORTED", secretValue: "from-base" }] },
+    ],
+  });
+  assert.deepEqual(
+    merged.map((s) => s.secretKey).sort(),
+    ["ONLY_IMPORTED", "OVERRIDDEN"],
+    "each name appears once, whichever parts of the response carried it"
+  );
+  assert.equal(merged.find((s) => s.secretKey === "OVERRIDDEN").secretValue, "local-wins");
+});
+
+test("collectInfisicalSecrets is total over a response missing either half", () => {
+  assert.deepEqual(collectInfisicalSecrets({}), []);
+  assert.deepEqual(collectInfisicalSecrets({ imports: null, secrets: undefined }), []);
+  assert.deepEqual(collectInfisicalSecrets({ imports: [{ secrets: "not-an-array" }] }), []);
+});
+
+// --- AC-3: the JSONC wrangler actually emits -------------------------------
+
+test("parseWranglerVars reads the JSONC wrangler emits — trailing comma, block and inline comments", () => {
+  const config = [
+    "{",
+    '  // Generated by create-cloudflare.',
+    '  "name": "acme-site",',
+    "  /* A block comment,",
+    '     which may contain "quotes" and , commas. */',
+    '  "vars": {',
+    '    "PUBLIC_SITE_URL": "https://example.test", // an inline comment after a value',
+    '    "PUBLIC_BUILD_CHANNEL": "stable",',
+    "  },",
+    "}",
+  ].join("\n");
+  assert.deepEqual(parseWranglerVars(config, "wrangler.jsonc"), ["PUBLIC_BUILD_CHANNEL", "PUBLIC_SITE_URL"]);
+});
+
+test("stripJsonc leaves comment-looking and comma-looking text inside strings alone", () => {
+  const parsed = JSON.parse(stripJsonc('{"url": "https://example.test/a//b", "trailing": "a, b",}'));
+  assert.equal(parsed.url, "https://example.test/a//b", "a // inside a string is not a comment");
+  assert.equal(parsed.trailing, "a, b");
+});
+
+test("an unparseable wrangler config is ONE fail finding on the wrangler surface, never an empty var set", () => {
+  const root = mkdtempSync(join(tmpdir(), "env-doctor-jsonc-"));
+  writeFileSync(join(root, "wrangler.jsonc"), '{ "vars": { "PUBLIC_SITE_URL": } }');
+  const manifest = parseManifest({
+    environments: ["staging"],
+    workers: { site: { config: "wrangler.jsonc", scriptName: "acme-site-{env}" } },
+    keys: [
+      {
+        name: "PUBLIC_SITE_URL",
+        kind: "var",
+        sensitivity: "public",
+        residency: { local: null, github: null, cloudflare: { workers: ["site"], kind: "var" } },
+        infisical: "unmanaged",
+      },
+    ],
+  });
+  try {
+    assert.throws(() => parseWranglerVars('{ "vars": }', "wrangler.jsonc"), /not parseable as JSON\/JSONC/);
+    const { findings, checked } = runOfflineChecks({ manifest, repoRoot: root });
+    const wrangler = findings.filter((f) => f.surface === "wrangler");
+    assert.equal(wrangler.length, 1, `expected exactly one wrangler finding, got ${JSON.stringify(wrangler)}`);
+    assert.equal(wrangler[0].severity, "fail");
+    assert.match(wrangler[0].detail, /not parseable as JSON\/JSONC/);
+    assert.ok(!checked.includes("wrangler:site"), "a file that could not be read was not checked");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- AC-4: GitHub listings complete past page one --------------------------
+
+test("linkNextUrl reads rel=\"next\" out of an RFC 8288 header and ignores every other rel", () => {
+  const header =
+    '<https://api.github.test/x?page=2>; rel="next", <https://api.github.test/x?page=9>; rel="last"';
+  assert.equal(linkNextUrl(header), "https://api.github.test/x?page=2");
+  assert.equal(linkNextUrl('<https://api.github.test/x?page=1>; rel="prev"'), null);
+  assert.equal(linkNextUrl(""), null);
+  assert.equal(linkNextUrl(null), null);
+});
+
+test("a GitHub listing follows Link pagination — 150 secrets across two pages, no false missing", async () => {
+  const names = Array.from({ length: 150 }, (_, i) => `REPO_SECRET_${String(i + 1).padStart(3, "0")}`);
+  const apiBase = "https://api.github.test";
+  const nextUrl = `${apiBase}/repos/o/r/actions/secrets?per_page=100&page=2`;
+  const fetched = [];
+  const fetchImpl = async (url) => {
+    fetched.push(url);
+    if (!url.includes("/actions/secrets")) return fakeResponse({ secrets: [], variables: [] });
+    if (url.includes("page=2")) {
+      return fakeResponse({ total_count: 150, secrets: names.slice(100).map((name) => ({ name })) });
+    }
+    return fakeResponse(
+      { total_count: 150, secrets: names.slice(0, 100).map((name) => ({ name })) },
+      { headers: { link: `<${nextUrl}>; rel="next", <${nextUrl}>; rel="last"` } }
+    );
+  };
+  const github = createGitHubClient({ token: "test-pat", repo: "o/r", fetchImpl, apiBase });
+  const manifest = parseManifest({
+    environments: ["staging"],
+    keys: names.map((name) => ({
+      name,
+      kind: "secret",
+      sensitivity: "secret",
+      residency: { local: null, github: { scope: "repository", kind: "secret" } },
+      infisical: "unmanaged",
+    })),
+  });
+
+  const root = makeRepo({});
+  try {
+    const report = await runDoctor({ manifest, repoRoot: root, environments: ["staging"], github });
+    assert.equal(report.surfaces.find((s) => s.surface === "github").status, "checked");
+    assert.deepEqual(
+      report.findings.filter((f) => f.surface === "github"),
+      [],
+      "every name past the page boundary must be seen — page one alone invents 50 missing keys"
+    );
+    assert.ok(fetched.includes(nextUrl), "the rel=\"next\" page must actually be requested");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- AC-5: one JSON document on stdout -------------------------------------
+
+test("CLI --json emits exactly one parseable document, with every annotation on stderr", async () => {
+  const root = makeRepo(CONSISTENT_REPO);
+  const manifestPath = join(root, "env.manifest.json");
+  writeFileSync(manifestPath, JSON.stringify(singleWorkerManifest()));
+  try {
+    const run = await runCli(["--manifest", manifestPath, "--repo-root", root, "--json"], {
+      env: {
+        ENV_DRIFT_GITHUB_TOKEN: "",
+        CLOUDFLARE_API_TOKEN: "",
+        INFISICAL_TOKEN: "",
+        INFISICAL_CLIENT_ID: "",
+        INFISICAL_CLIENT_SECRET: "",
+      },
+    });
+    assert.equal(run.code, 0, run.stdout + run.stderr);
+    const report = JSON.parse(run.stdout);
+    assert.equal(report.exitCode, 0);
+    assert.equal(report.surfaces.filter((s) => s.status === "unchecked").length, 3);
+    assert.ok(!run.stdout.includes("::notice"), "an annotation on stdout is what made JSON.parse throw");
+    assert.ok(!run.stdout.includes("::error"), "an annotation on stdout is what made JSON.parse throw");
+    const notices = run.stderr.split("\n").filter((l) => l.startsWith("::notice title=env-doctor surface unchecked::"));
+    assert.equal(notices.length, 3, `every unchecked surface still annotates, on stderr:\n${run.stderr}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- AC-6: every probe is bounded and retried ------------------------------
+
+/** Drive one GitHub client through `runDoctor` and return its surface record. */
+async function githubSurface(github, environments = ["staging"]) {
+  const root = makeRepo({});
+  try {
+    const report = await runDoctor({
+      manifest: githubOnlyManifest({ scope: "repository", kind: "secret" }),
+      repoRoot: root,
+      environments,
+      github,
+    });
+    return report.surfaces.find((s) => s.surface === "github");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("a fetchImpl that never settles AND ignores init.signal still fails its surface inside the budget", async () => {
+  // The signal alone is a request to stop, honoured at the transport's
+  // discretion. This fake accepts it and does nothing with it — the shape a
+  // stub, a polyfill, or an init-rebuilding wrapper produces — so only the
+  // raced timer can end the call.
+  const timeoutMs = 150;
+  let signalled = false;
+  const fetchImpl = (_url, init) => {
+    signalled = Boolean(init?.signal);
+    return new Promise(() => {});
+  };
+  const github = createGitHubClient({ token: "test-pat", repo: "o/r", fetchImpl, timeoutMs, retryDelayMs: 1 });
+  const startedAt = Date.now();
+  const surface = await githubSurface(github);
+  const elapsed = Date.now() - startedAt;
+  assert.equal(surface.status, "error");
+  assert.match(surface.notice, /timed out after 150ms/);
+  assert.ok(signalled, "the signal is still passed — a real fetch uses it to release the socket");
+  assert.ok(elapsed < timeoutMs * 2, `expected a failure inside twice the timeout, took ${elapsed}ms`);
+});
+
+test("a 503 twice then a 200 reports checked — the retry is bounded, not absent", async () => {
+  const attempts = new Map();
+  const fetchImpl = async (url) => {
+    const n = (attempts.get(url) ?? 0) + 1;
+    attempts.set(url, n);
+    if (n <= 2) return fakeResponse({ message: "unavailable" }, { status: 503 });
+    return fakeResponse({ secrets: [{ name: "SHARED_TOKEN" }], variables: [] });
+  };
+  const github = createGitHubClient({ token: "test-pat", repo: "o/r", fetchImpl, retryDelayMs: 1 });
+  const surface = await githubSurface(github);
+  assert.equal(surface.status, "checked", surface.notice ?? "");
+  for (const [url, n] of attempts) assert.equal(n, 3, `${url} should have taken three attempts`);
+});
+
+test("a 401 is not retried — one attempt per request, and the surface errors", async () => {
+  const attempts = new Map();
+  const fetchImpl = async (url) => {
+    attempts.set(url, (attempts.get(url) ?? 0) + 1);
+    return fakeResponse({ message: "Bad credentials" }, { status: 401 });
+  };
+  const github = createGitHubClient({ token: "expired-pat", repo: "o/r", fetchImpl, retryDelayMs: 1 });
+  const surface = await githubSurface(github);
+  assert.equal(surface.status, "error");
+  assert.match(surface.notice, /401/);
+  assert.ok(attempts.size > 0, "the client must have been called");
+  for (const [url, n] of attempts) assert.equal(n, 1, `${url} must not be retried on a 401`);
+});
+
+test("isRetryableStatus covers 429 and the 5xx band, and nothing else", () => {
+  assert.ok(isRetryableStatus(429));
+  assert.ok(isRetryableStatus(500));
+  assert.ok(isRetryableStatus(503));
+  assert.ok(!isRetryableStatus(401));
+  assert.ok(!isRetryableStatus(404));
+  assert.ok(!isRetryableStatus(422));
+});
+
+// --- AC-7: a dated orphan exception ----------------------------------------
+
+test('a severity: "orphan" exception suppresses its orphan and clears --strict-orphans', () => {
+  const findings = [
+    {
+      severity: "orphan",
+      kind: "orphan",
+      key: "BUILDER_SCRATCH_TOKEN",
+      surface: "infisical",
+      environment: "staging",
+      detail: "present in infisical but declared by no manifest key",
+    },
+  ];
+  const exceptions = parseExceptions([
+    { key: "BUILDER_SCRATCH_TOKEN", severity: "orphan", "revisit-date": "2027-01-01", reason: "platform tooling" },
+  ]);
+  const applied = applyExceptions({ findings, exceptions, now: new Date("2026-09-10T00:00:00Z") });
+  assert.deepEqual(applied.findings, [], "the orphan moves out of the reported set");
+  assert.equal(applied.suppressed.length, 1);
+  assert.equal(applied.suppressed[0].severity, "orphan");
+  assert.equal(
+    computeExitCode({ findings: applied.findings, expired: applied.expired, surfaces: [], strictOrphans: true }),
+    0,
+    "the whole point: --strict-orphans passes without widening the manifest"
+  );
+});
+
+test("severity defaults to fail, and a fail exception never silences an orphan", () => {
+  const [entry] = parseExceptions([{ key: "LEGACY_API_KEY", "revisit-date": "2027-01-01" }]);
+  assert.equal(entry.severity, "fail");
+  const orphan = { severity: "orphan", kind: "orphan", key: "LEGACY_API_KEY", surface: "github", environment: null };
+  const applied = applyExceptions({
+    findings: [orphan],
+    exceptions: [entry],
+    now: new Date("2026-09-10T00:00:00Z"),
+  });
+  assert.equal(applied.suppressed.length, 0, "a default exception defers a failure, not an orphan");
+  assert.deepEqual(applied.findings, [orphan]);
+});
+
+test("an expired orphan exception still fails the run, and an unknown severity is refused", () => {
+  const exceptions = parseExceptions([
+    { key: "BUILDER_SCRATCH_TOKEN", severity: "orphan", "revisit-date": "2026-01-01" },
+  ]);
+  const applied = applyExceptions({ findings: [], exceptions, now: new Date("2026-09-10T00:00:00Z") });
+  assert.equal(applied.expired.length, 1);
+  assert.equal(
+    computeExitCode({ findings: [], expired: applied.expired, surfaces: [], strictOrphans: false }),
+    1,
+    "an orphan exception expires as loudly as any other"
+  );
+  assert.throws(
+    () => parseExceptions([{ key: "X", severity: "warn", "revisit-date": "2027-01-01" }]),
+    /severity must be "fail" or "orphan"/
+  );
+});
+
+// --- AC-8: the docblock and the reference narrowing ------------------------
+
+test("the docblock names .env.example as the local surface and claims no real .env is read", () => {
+  const source = readFileSync(SCRIPT, "utf8");
+  const docblock = source.slice(source.indexOf("/**"), source.indexOf("*/") + 2);
+  assert.ok(docblock.includes("`.env.example` in the caller repo"), "the local surface must name .env.example");
+  assert.ok(
+    !docblock.includes("`.env` /") && !docblock.includes("`.env`\n"),
+    "the docblock must not claim a developer's real .env is a probed surface"
+  );
+});
+
+test("collectWorkflowReferences ignores a `vars` reached as a property, and whole-line comment prose", () => {
+  assert.deepEqual(collectWorkflowReferences("steps.x.outputs.vars.Y"), { secrets: [], vars: [] });
+  assert.deepEqual(collectWorkflowReferences("        # supply secrets.LEGACY_TOKEN if you still have one"), {
+    secrets: [],
+    vars: [],
+  });
+  // Only a WHOLE-line comment is prose. A trailing `#` on a line that also
+  // carries YAML is not worth a parser: narrowing to the start of the line is
+  // the rule that cannot accidentally drop a real reference.
+  assert.deepEqual(collectWorkflowReferences("SITE: ${{ vars.PUBLIC_SITE_URL }} # see vars.TRAILING_NOTE"), {
+    secrets: [],
+    vars: ["PUBLIC_SITE_URL", "TRAILING_NOTE"].sort(),
+  });
+  assert.deepEqual(collectWorkflowReferences("          run: echo ${{ secrets.TURSO_AUTH_TOKEN }}"), {
+    secrets: ["TURSO_AUTH_TOKEN"],
+    vars: [],
+  });
+});
+
+// --- AC-9: the documented contract -----------------------------------------
+
+test("the env-drift docs carry the fail-closed environments rule and the orphan exception form", () => {
+  const doc = readFileSync(join(HERE, "..", "docs", "reusable-workflows.md"), "utf8");
+  // `includes` + a message, not `assert.match`: a regex miss here dumps the
+  // whole document into the failure output and buries the reason.
+  const start = doc.indexOf("## `env-drift.yml`");
+  assert.notEqual(start, -1, "the env-drift section must exist");
+  const section = doc.slice(start, doc.indexOf("\n## ", start + 1));
+  assert.ok(
+    section.includes("#### Requested environments fail closed"),
+    "the env-drift section must document that an undeclared environment fails the run"
+  );
+  assert.ok(
+    section.includes("| `environments` names a slug the manifest does not declare | 1 |"),
+    "the exit-contract table must carry the undeclared-environment row"
+  );
+  assert.ok(
+    section.includes('"severity": "orphan"'),
+    "the exceptions section must show the orphan-suppressing entry form"
+  );
 });
