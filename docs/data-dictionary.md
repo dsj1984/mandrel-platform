@@ -81,7 +81,7 @@ It is a JSON array of entries:
 
 | Field       | Type   | Meaning                                                                       |
 | ----------- | ------ | ----------------------------------------------------------------------------- |
-| `id`        | string | GitHub Advisory ID (`GHSA-…`) or CVE ID. **Required.**                         |
+| `id`        | string | GitHub Advisory ID (`GHSA-…`) or CVE ID, compared **case-insensitively** — write the canonical `GHSA-7w5x-hrqm-74c2` form. **Required.** |
 | `reason`    | string | Why the CVE is accepted (e.g. "no fix available; mitigated by X"). **Required.** |
 | `expires`   | string | ISO-8601 date. **Required** — a passed expiry is treated as un-suppressed and fails the gate. |
 
