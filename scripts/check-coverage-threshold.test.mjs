@@ -45,6 +45,8 @@ import {
   toRepoRelativeKey,
   normalizeSummary,
   mergeNormalized,
+  sharedDirPrefix,
+  formatPctForVerdict,
 } from "./check-coverage-threshold.mjs";
 
 // Build a minimal Istanbul/c8/vitest-shaped coverage-summary object.
@@ -936,4 +938,337 @@ test("pr-quality gate step still hard-fails when threshold set but no summary ex
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Boundary arithmetic and single-counting (Story #489)
+//
+// Two ways a floor can assert something other than the floor it prints:
+//
+//   • It false-FAILS at its own boundary. `(covered / total) * 100` forms a
+//     ratio in [0,1] first, and 57/100 has no exact binary representation —
+//     it stores as 0.5699999999999999, so scaling by 100 gives
+//     56.99999999999999. The inclusive `>= 57` compare then fails on a run
+//     that IS at 57%, while the verdict line rounds for display and prints
+//     "57% (floor 57%)". A gate whose printed number contradicts its own exit
+//     code is unactionable.
+//   • It false-PASSES on a double count. The merge maxes only on EQUAL keys,
+//     so a file that normalizes to two keys is SUMMED, inflating the
+//     aggregate. That is the one direction the header's lower-bound argument
+//     rules out, so it has to be structurally impossible rather than
+//     incidentally absent.
+// ---------------------------------------------------------------------------
+
+test("mergeNormalized: an exactly-at-floor percentage is exact, not a hair below", () => {
+  // The literal regression: these three ratios all lose their last bit under
+  // `(covered / total) * 100` and land just under an integer.
+  for (const [covered, total, expected] of [
+    [57, 100, 57],
+    [29, 100, 29],
+    [58, 100, 58],
+  ]) {
+    const merged = mergeNormalized([
+      { files: new Map([["src/a.ts", { covered, total }]]), unresolved: 0, unresolvedKeys: [], opaque: null },
+    ]);
+    assert.equal(
+      merged.pct,
+      expected,
+      `${covered}/${total} must be exactly ${expected}, not ${expected} minus an epsilon`,
+    );
+  }
+});
+
+test("meetsThreshold: exactly at the floor passes; one point under does not", () => {
+  for (const [covered, floor] of [
+    [57, 57],
+    [29, 29],
+    [58, 58],
+  ]) {
+    const merged = mergeNormalized([
+      { files: new Map([["src/a.ts", { covered, total: 100 }]]), unresolved: 0, unresolvedKeys: [], opaque: null },
+    ]);
+    assert.equal(
+      meetsThreshold(merged.pct, floor),
+      true,
+      `${covered}% must meet a ${floor}% floor — the compare is inclusive`,
+    );
+  }
+  const below = mergeNormalized([
+    { files: new Map([["src/a.ts", { covered: 56, total: 100 }]]), unresolved: 0, unresolvedKeys: [], opaque: null },
+  ]);
+  assert.equal(meetsThreshold(below.pct, 57), false, "56% must not meet a 57% floor");
+});
+
+test("evaluateGate: a run measured exactly at the floor PASSES end to end", () => {
+  const exists = existsIn(["src/a.ts"]);
+  const run = (covered, threshold) =>
+    evaluateGate(
+      { threshold, metric: "lines", cwd: "/repo", coverageDirs: [] },
+      {
+        exists,
+        findSummaries: () => ["coverage/coverage-summary.json"],
+        read: () => fileSummary({ "/ws/repo/src/a.ts": { covered, total: 100 } }),
+      },
+    );
+
+  for (const [covered, floor] of [
+    [57, 57],
+    [29, 29],
+    [58, 58],
+  ]) {
+    const verdict = run(covered, floor);
+    assert.equal(verdict.ok, true, `${covered}/100 must clear a floor of ${floor}`);
+    // The printed line and the exit code must tell the same story.
+    assert.match(
+      formatVerdict(verdict).join("\n"),
+      /meets the/,
+      "a passing verdict must read as passing",
+    );
+  }
+  assert.equal(run(56, 57).ok, false, "56/100 must still fail a floor of 57");
+});
+
+test("formatPctForVerdict never prints a number on the wrong side of the floor", () => {
+  // Exactly at the floor: printed plainly.
+  assert.equal(formatPctForVerdict(57, 57), "57");
+  // Below the floor but 2dp-rounds ONTO it — the display must widen rather
+  // than manufacture a "57% (floor 57%)" line above a failing exit code.
+  const shown = formatPctForVerdict(56.999, 57);
+  assert.ok(Number(shown) < 57, `printed ${shown}% must read as below a 57% floor`);
+  // Above the floor but 2dp-rounds BELOW it — the same rule in reverse.
+  const shownUp = formatPctForVerdict(57.0001, 57);
+  assert.ok(Number(shownUp) >= 57, `printed ${shownUp}% must read as at or above a 57% floor`);
+});
+
+test("sharedDirPrefix is computed over every summary's keys at once", () => {
+  const unit = fileSummary({
+    "/ws/repo/packages/web/src/ui.ts": { covered: 1, total: 1 },
+    "/ws/repo/packages/api/dist/gen.js": { covered: 1, total: 1 },
+  });
+  const contract = fileSummary({
+    "/ws/repo/packages/api/src/db.ts": { covered: 1, total: 1 },
+    "/ws/repo/packages/api/dist/gen.js": { covered: 1, total: 1 },
+  });
+  // Each summary ALONE bottoms out at a different depth…
+  assert.equal(commonDirPrefix(summaryFileKeys(unit)), "/ws/repo/packages/");
+  assert.equal(commonDirPrefix(summaryFileKeys(contract)), "/ws/repo/packages/api/");
+  // …so only the union gives both tiers the same amount to strip.
+  assert.equal(sharedDirPrefix([unit, contract]), "/ws/repo/packages/");
+});
+
+test("evaluateGate: an unresolved file at two depths counts ONCE, at the max", () => {
+  // `dist/gen.js` is generated: it exists in neither tier's checkout, so
+  // neither key resolves and both fall back to prefix-stripping. The unit
+  // tier spans the repo and the contract tier is scoped to packages/api, so
+  // their own prefixes differ in depth — the file used to land under
+  // "api/dist/gen.js" and "dist/gen.js" and be SUMMED.
+  const exists = existsIn(["packages/web/src/ui.ts", "packages/api/src/db.ts"]);
+  const unit = fileSummary({
+    "/ws/repo/packages/web/src/ui.ts": { covered: 80, total: 100 },
+    "/ws/repo/packages/api/dist/gen.js": { covered: 30, total: 100 },
+  });
+  const contract = fileSummary({
+    "/ws/repo/packages/api/src/db.ts": { covered: 60, total: 100 },
+    "/ws/repo/packages/api/dist/gen.js": { covered: 50, total: 100 },
+  });
+
+  const verdict = evaluateGate(
+    { threshold: 60, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists,
+      findSummaries: () => ["unit-results-1/coverage-summary.json", "contract-results-1/coverage-summary.json"],
+      read: (f) => (f.startsWith("unit") ? unit : contract),
+    },
+  );
+
+  const m = verdict.merged;
+  assert.equal(m.fileCount, 3, "the generated file must merge into ONE entry, not two");
+  assert.equal(m.covered, 190, "80 + 60 + max(30, 50) — never 80 + 60 + 30 + 50");
+  assert.equal(m.total, 300, "a 100-line file must contribute 100 denominators, not 200");
+  assert.deepEqual(m.unresolvedKeys, ["api/dist/gen.js"], "the unresolved path is named once");
+
+  // …and the verdict NAMES it, so a residual double count is visible.
+  const out = formatVerdict(verdict).join("\n");
+  assert.match(out, /api\/dist\/gen\.js/, "the verdict must name the unresolved file");
+  assert.match(out, /never resolved/, "and say what is uncertain about it");
+});
+
+test("a per-summary prefix double-counts, and can carry the aggregate OVER a floor", () => {
+  // Vacuity guard for the test above, and the reason it matters. With each
+  // summary given its OWN prefix — the pre-#489 behaviour — the generated file
+  // lands under two keys and is SUMMED. When that file is better covered than
+  // the rest of the tree, the artifact lifts the aggregate: here 61.67% (one
+  // count) becomes 68.75% (two), which false-PASSES a 65% floor. That is the
+  // one direction the header's lower-bound argument says cannot happen.
+  const exists = existsIn(["packages/web/src/ui.ts", "packages/api/src/db.ts"]);
+  const summaries = [
+    fileSummary({
+      "/ws/repo/packages/web/src/ui.ts": { covered: 80, total: 100 },
+      "/ws/repo/packages/api/dist/gen.js": { covered: 90, total: 100 },
+    }),
+    fileSummary({
+      "/ws/repo/packages/api/src/db.ts": { covered: 10, total: 100 },
+      "/ws/repo/packages/api/dist/gen.js": { covered: 95, total: 100 },
+    }),
+  ];
+  const perSummary = summaries.map((sum) =>
+    normalizeSummary(sum, "lines", {
+      exists,
+      cwd: "/repo",
+      prefix: commonDirPrefix(summaryFileKeys(sum)),
+    }),
+  );
+  const inflated = mergeNormalized(perSummary);
+  assert.equal(inflated.fileCount, 4, "per-summary prefixes give the generated file two keys");
+  assert.equal(inflated.covered, 275, "…which the union then SUMS (80 + 10 + 90 + 95)");
+  assert.equal(meetsThreshold(inflated.pct, 65), true, "the inflated number clears a 65% floor");
+
+  // The shared prefix counts it once, and the same tree correctly fails.
+  const verdict = evaluateGate(
+    { threshold: 65, metric: "lines", cwd: "/repo", coverageDirs: [] },
+    {
+      exists,
+      findSummaries: () => ["unit/coverage-summary.json", "contract/coverage-summary.json"],
+      read: (f) => (f.startsWith("unit") ? summaries[0] : summaries[1]),
+    },
+  );
+  assert.equal(verdict.merged.fileCount, 3);
+  assert.equal(verdict.merged.covered, 185, "80 + 10 + max(90, 95)");
+  assert.equal(verdict.ok, false, "counted once, the tree is below the 65% floor and must fail");
+});
+
+// ---------------------------------------------------------------------------
+// The coverage-floor job's own wiring (Story #489)
+//
+// Job-SCOPED, not file-wide: `pr-quality.yml` legitimately carries job-level
+// `permissions:` on other jobs and legitimately downloads other artifacts, so
+// a repo-wide grep answers a question nobody asked. Each assertion below
+// resolves the `coverage-floor` block and inspects only what is inside it.
+// (Same technique as scripts/check-workflow-lint-tier.test.mjs.)
+// ---------------------------------------------------------------------------
+
+const PR_QUALITY = readFileSync(WORKFLOW_FILE, "utf8");
+
+/**
+ * The lines belonging to one top-level job — from `  <name>:` until the next
+ * key at the same indentation. A plain line comparison rather than a built
+ * regex: Semgrep's detect-non-literal-regexp rejects a RegExp built from a
+ * non-literal, and a job header is an exact line anyway.
+ */
+function jobBlock(text, job) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.trimEnd() === `  ${job}:`);
+  assert.notEqual(start, -1, `job '${job}' not found`);
+  const block = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^ {2}\S/.test(lines[i])) break;
+    block.push(lines[i]);
+  }
+  return block;
+}
+
+/** Keys declared directly on a job (indent 4), ignoring nested mappings. */
+function jobKeys(block) {
+  return block.filter((l) => /^ {4}[A-Za-z_-]+:/.test(l)).map((l) => l.trim().split(":")[0]);
+}
+
+/**
+ * Expand one minimatch brace group into the concrete globs it resolves to, so
+ * `{unit,contract}-results-*` can be compared against an exact expected SET
+ * rather than matched as a string. String slicing, not a built regex.
+ */
+function expandPatternGroups(pattern) {
+  const open = pattern.indexOf("{");
+  if (open === -1) return [pattern];
+  const close = pattern.indexOf("}", open);
+  assert.notEqual(close, -1, `unbalanced brace group in pattern '${pattern}'`);
+  const head = pattern.slice(0, open);
+  const tail = pattern.slice(close + 1);
+  const out = [];
+  for (const alt of pattern.slice(open + 1, close).split(",")) {
+    out.push(...expandPatternGroups(`${head}${alt.trim()}${tail}`));
+  }
+  return out;
+}
+
+/** Every `pattern:` value declared inside a job block, brace groups expanded. */
+function resolvedDownloadPatterns(job) {
+  const raw = jobBlock(PR_QUALITY, job)
+    .map((l) => l.match(/^\s*pattern:\s*'(.+)'\s*$/))
+    .filter((m) => m !== null)
+    .map((m) => m[1]);
+  assert.ok(raw.length > 0, `job '${job}' declares no download pattern`);
+  return new Set(raw.flatMap(expandPatternGroups));
+}
+
+test("the coverage-floor job downloads exactly the unit and contract tiers", () => {
+  assert.deepEqual(
+    [...resolvedDownloadPatterns("coverage-floor")].sort(),
+    ["contract-results-*", "unit-results-*"],
+    "the floor is asserted on whatever this step downloads, so the download set must " +
+      "be exactly the tiers the job needs: — a wider glob like '*-results-*' silently " +
+      "admits any future <x>-results-* artifact into the aggregate, and dropping a " +
+      "tier asserts the floor on a partial measurement",
+  );
+});
+
+test("the download set matches what the needed tiers actually upload", () => {
+  const patterns = resolvedDownloadPatterns("coverage-floor");
+  for (const tier of ["unit", "contract"]) {
+    assert.ok(
+      PR_QUALITY.includes(`name: ${tier}-results-\${{ matrix.shard }}`),
+      `the ${tier} tier must still upload ${tier}-results-<shard>`,
+    );
+    assert.ok(
+      patterns.has(`${tier}-results-*`),
+      `dropping ${tier} from the download set drops it from the aggregate`,
+    );
+  }
+  // Nothing else: the e2e tier's artifact must not be in the resolved set.
+  assert.ok(
+    !patterns.has("playwright-report-*") && !patterns.has("*-results-*"),
+    "no wider glob may stand in for the two named tiers",
+  );
+});
+
+test("the coverage-floor job needs exactly the tiers it downloads", () => {
+  const block = jobBlock(PR_QUALITY, "coverage-floor").join("\n");
+  const needs = block.slice(block.indexOf("needs:"), block.indexOf("runs-on:"));
+  assert.match(needs, /^\s*- unit$/m);
+  assert.match(needs, /^\s*- contract$/m);
+});
+
+test("the coverage-floor job declares NO job-level permissions", () => {
+  const keys = jobKeys(jobBlock(PR_QUALITY, "coverage-floor"));
+  assert.ok(
+    !keys.includes("permissions"),
+    "GitHub validates a called reusable workflow's declared job permissions against " +
+      "the caller's grant at COMPILE time, regardless of the job's `if:` gate — so a " +
+      "scope added here fails the ENTIRE call with startup_failure (zero jobs) for " +
+      "every consumer that has not granted it, including consumers with the floor off " +
+      "(Story #292). The workflow-level grant already covers same-run artifact download.",
+  );
+});
+
+test("the permissions scoping is real: other pr-quality jobs DO declare permissions", () => {
+  // Without this, the assertion above would quietly become vacuous the moment
+  // `jobBlock` stopped scoping.
+  const withPermissions = ["migration-guard", "security", "osv-scan"].filter((job) =>
+    jobKeys(jobBlock(PR_QUALITY, job)).includes("permissions"),
+  );
+  assert.ok(
+    withPermissions.length > 0,
+    "expected at least one job to declare permissions, else the guard above proves nothing",
+  );
+});
+
+test("coverage-floor is a needs: of ci-required", () => {
+  const block = jobBlock(PR_QUALITY, "ci-required").join("\n");
+  const needs = block.slice(block.indexOf("needs:"), block.indexOf("steps:"));
+  assert.match(
+    needs,
+    /^\s*- coverage-floor$/m,
+    "the floor is only load-bearing because the aggregate depends on it — dropped " +
+      "from ci-required's needs:, a red floor leaves the required context green",
+  );
 });

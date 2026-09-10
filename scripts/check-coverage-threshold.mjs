@@ -31,6 +31,25 @@
  * scoped to disjoint projects — the case this exists for — overlap on nothing
  * and merge exactly.
  *
+ * That never-false-pass claim rests on TWO invariants the gate now enforces
+ * outright (Story #489), because each was violable on its own:
+ *
+ *   1. A file is counted ONCE. `max(covered)` only applies to entries that
+ *      merged under the SAME key, so any normalization that gives one file two
+ *      keys turns the max into a SUM — which inflates the aggregate and lets
+ *      the floor false-pass, the exact failure the paragraph above rules out.
+ *      Keys that resolve against the checkout were always safe; keys that do
+ *      not (a generated or since-deleted file) fall back to prefix-stripping,
+ *      and that prefix is now computed ONCE across every summary rather than
+ *      per summary — see `sharedDirPrefix`. Anything still unresolved after
+ *      that is NAMED in the verdict, so a residual double-count is visible
+ *      rather than silent.
+ *   2. The percentage is EXACT at every integer. `(covered * 100) / total`,
+ *      never `(covered / total) * 100` — see `mergeNormalized`. The floor
+ *      compare is inclusive, so a boundary run must land exactly on the floor
+ *      rather than a rounding step below it, and the printed number must be
+ *      the number the decision was made on (`formatPctForVerdict`).
+ *
  * Design constraints:
  *   • OPT-IN. A threshold of 0 (the default) is a no-op: the gate prints a
  *     skip note and exits 0, preserving today's behaviour for non-adopters.
@@ -182,6 +201,25 @@ export function meetsThreshold(pct, threshold) {
 }
 
 /**
+ * Render a measured pct for the log at the LOWEST precision that still agrees
+ * with the decision `meetsThreshold` made on it.
+ *
+ * A verdict that prints "57% (floor 57%)" and then fails is not a report, it
+ * is a contradiction — and rounding for readability is what manufactures one:
+ * 56.999% displayed at 2dp is "57". So the displayed value is widened until
+ * its side of the floor matches the real one, and only then printed.
+ */
+export function formatPctForVerdict(pct, threshold) {
+  const met = meetsThreshold(pct, threshold);
+  for (const digits of [2, 4, 6]) {
+    const factor = 10 ** digits;
+    const rounded = Math.round(pct * factor) / factor;
+    if ((rounded >= threshold) === met) return String(rounded);
+  }
+  return String(pct);
+}
+
+/**
  * The per-file keys of a coverage-summary.json (everything but `total`).
  * json-summary emits one entry per source file, keyed by the ABSOLUTE path it
  * had in the workspace that produced it.
@@ -198,11 +236,12 @@ export function summaryFileKeys(summary) {
  * "" when there is none). Filenames are excluded from the comparison so a
  * single-entry summary yields its own directory rather than the file itself.
  *
- * This is the FALLBACK normalizer only — see `toRepoRelativeKey`. It is not
- * safe on its own across summaries: two tiers whose file sets bottom out at
- * different depths (one scoped to `packages/api`, one spanning the repo)
- * produce prefixes of different lengths, so the same file normalizes to two
- * different keys and the union double-counts it.
+ * This is the FALLBACK normalizer only — see `toRepoRelativeKey`. Feed it the
+ * keys of EVERY summary at once (`sharedDirPrefix`), never one summary's keys:
+ * two tiers whose file sets bottom out at different depths (one scoped to
+ * `packages/api`, one spanning the repo) produce prefixes of different lengths,
+ * so the same file normalizes to two different keys and the union
+ * double-counts it.
  */
 export function commonDirPrefix(keys) {
   const lists = keys.map((k) => String(k).replace(/\\/g, "/").split("/").slice(0, -1));
@@ -215,6 +254,22 @@ export function commonDirPrefix(keys) {
     prefix = prefix.slice(0, n);
   }
   return prefix.length > 0 ? prefix.join("/") + "/" : "";
+}
+
+/**
+ * The ONE prefix every summary's unresolved keys are stripped against: the
+ * longest common directory prefix over the union of every summary's file keys.
+ *
+ * Computing this per summary is the double-count bug: the prefix is a function
+ * of the key set it is given, so a repo-spanning tier and a `packages/api`
+ * tier strip different amounts from the SAME absolute path and the file lands
+ * under two keys, which `mergeNormalized` sums instead of maxing. One prefix
+ * across all summaries strips the same amount everywhere, so the file merges.
+ */
+export function sharedDirPrefix(summaries) {
+  const keys = [];
+  for (const summary of summaries) keys.push(...summaryFileKeys(summary));
+  return commonDirPrefix(keys);
 }
 
 /**
@@ -249,6 +304,12 @@ export function toRepoRelativeKey(key, { exists = existsSync, cwd = process.cwd(
  * Reduce one parsed summary to the per-file {covered, total} counts for
  * `metric`, keyed by normalized path.
  *
+ * `prefix` is the SHARED prefix from `sharedDirPrefix`, computed once across
+ * every summary in the run. It defaults to "" — meaning an unresolved key is
+ * kept whole — rather than to this summary's own prefix, so a caller that
+ * forgets to thread it through under-merges (two long keys) instead of
+ * silently reintroducing the per-summary double-count.
+ *
  * A summary carrying ONLY a `total` block (no per-file entries) cannot be
  * merged per file, so it is kept as an OPAQUE contribution keyed by nothing —
  * its counts are added to the aggregate whole. That can double-count a file
@@ -256,8 +317,13 @@ export function toRepoRelativeKey(key, { exists = existsSync, cwd = process.cwd(
  * supported shape; the opaque path exists so a reduced summary degrades to
  * today's arithmetic rather than vanishing from the measurement.
  */
-export function normalizeSummary(summary, metric, { exists = existsSync, cwd = process.cwd() } = {}) {
+export function normalizeSummary(
+  summary,
+  metric,
+  { exists = existsSync, cwd = process.cwd(), prefix = "" } = {}
+) {
   const files = new Map();
+  const unresolvedKeys = [];
   let unresolved = 0;
   const keys = summaryFileKeys(summary);
 
@@ -269,11 +335,11 @@ export function normalizeSummary(summary, metric, { exists = existsSync, cwd = p
     return {
       files,
       unresolved,
+      unresolvedKeys,
       opaque: covered !== null && denom !== null ? { covered, total: denom } : null,
     };
   }
 
-  const prefix = commonDirPrefix(keys);
   for (const key of keys) {
     const entry = summary[key][metric];
     if (!entry || !Number.isFinite(entry.covered) || !Number.isFinite(entry.total)) continue;
@@ -282,6 +348,7 @@ export function normalizeSummary(summary, metric, { exists = existsSync, cwd = p
       unresolved += 1;
       const raw = String(key).replace(/\\/g, "/");
       normalized = prefix && raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+      unresolvedKeys.push(normalized);
     }
     const prev = files.get(normalized);
     files.set(
@@ -299,7 +366,7 @@ export function normalizeSummary(summary, metric, { exists = existsSync, cwd = p
         : { covered: entry.covered, total: entry.total }
     );
   }
-  return { files, unresolved, opaque: null };
+  return { files, unresolved, unresolvedKeys, opaque: null };
 }
 
 /**
@@ -308,12 +375,12 @@ export function normalizeSummary(summary, metric, { exists = existsSync, cwd = p
  */
 export function mergeNormalized(parts) {
   const files = new Map();
+  const unresolvedKeys = new Set();
   let covered = 0;
   let total = 0;
-  let unresolved = 0;
 
   for (const part of parts) {
-    unresolved += part.unresolved || 0;
+    for (const key of part.unresolvedKeys || []) unresolvedKeys.add(key);
     for (const [key, value] of part.files) {
       const prev = files.get(key);
       files.set(
@@ -335,12 +402,23 @@ export function mergeNormalized(parts) {
     covered += value.covered;
     total += value.total;
   }
+  const unresolvedList = [...unresolvedKeys].sort();
   return {
     covered,
     total,
-    pct: total > 0 ? (covered / total) * 100 : null,
+    // `(covered * 100) / total`, NOT `(covered / total) * 100`. The latter
+    // forms a ratio in [0,1] first, and most such ratios are unrepresentable
+    // in binary: 57/100 is stored as 0.5699999999999999, so scaling by 100
+    // yields 56.99999999999999 and the inclusive `>= 57` compare FAILS on a
+    // run that is exactly at its floor. Multiplying first keeps the numerator
+    // an exact integer, so every integer percentage is exact.
+    pct: total > 0 ? (covered * 100) / total : null,
     fileCount: files.size,
-    unresolved,
+    // Unique unresolved FILES, not unresolved contributions: the same
+    // generated file seen by two tiers is one unresolved path, and reporting
+    // it twice would misdescribe how much of the aggregate is uncertain.
+    unresolved: unresolvedList.length,
+    unresolvedKeys: unresolvedList,
   };
 }
 
@@ -446,12 +524,18 @@ export function evaluateGate(
   // artifact carried which numbers, so a tier that quietly stopped producing
   // coverage is visible in the log. They are no longer individually asserted:
   // the floor is one verdict over the union (see the header note).
+  // Parse every summary BEFORE normalizing any of them: the prefix unresolved
+  // keys are stripped against is computed once over the union of all their
+  // keys (`sharedDirPrefix`). Computed per summary it is a function of that
+  // summary's own depth, so one file gets two keys and the union sums it.
+  const parsed = files.map((file) => ({ file, summary: read(file) }));
+  const prefix = sharedDirPrefix(parsed.map((entry) => entry.summary));
+
   const results = [];
   const parts = [];
-  for (const file of files) {
-    const summary = read(file);
+  for (const { file, summary } of parsed) {
     const pct = extractPct(summary, metric);
-    const part = normalizeSummary(summary, metric, { exists, cwd });
+    const part = normalizeSummary(summary, metric, { exists, cwd, prefix });
     parts.push(part);
     results.push({
       file,
@@ -526,12 +610,23 @@ export function formatVerdict(verdict) {
     return lines;
   }
 
-  const rounded = Math.round(m.pct * 100) / 100;
+  const shownPct = formatPctForVerdict(m.pct, verdict.threshold);
   lines.push(
     `[coverage-threshold] Σ merged across ${verdict.results.length} summary(ies): ` +
       `${m.covered}/${m.total} ${verdict.metric} over ${m.fileCount} unique file(s) ` +
-      `= ${rounded}% (floor ${verdict.threshold}%)`
+      `= ${shownPct}% (floor ${verdict.threshold}%)`
   );
+  // Name every path that never resolved against the checkout. Such a key is
+  // merged on its prefix-stripped form, which is a weaker identity than a
+  // checkout-anchored one — so if a residual double-count IS inflating the
+  // aggregate, the file responsible is in the log rather than inferred.
+  if (m.unresolvedKeys && m.unresolvedKeys.length > 0) {
+    lines.push(
+      `[coverage-threshold] ⚠️  ${m.unresolvedKeys.length} path(s) never resolved ` +
+        `against the checkout and were merged on their normalized key: ` +
+        m.unresolvedKeys.join(", ")
+    );
+  }
   if (verdict.ok) {
     lines.push(
       `[coverage-threshold] ✅ merged ${verdict.metric} coverage meets the ${verdict.threshold}% floor.`
