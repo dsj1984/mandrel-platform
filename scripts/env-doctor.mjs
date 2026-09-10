@@ -133,7 +133,7 @@ export const KEY_SCHEMA = Object.freeze({
   kind: "'var' | 'secret'",
   sensitivity: "'public' | 'secret'",
   residency:
-    "object — {local: 'var'|'secret'|'file'|null, github: G|G[]|null where G = {scope,kind,environments?}, cloudflare: {workers,kind}|null}",
+    "object — {local: 'var'|'secret'|'file'|null, github: G|G[]|null where G = {scope,kind,environments?}, cloudflare: {workers: (string | {worker, environments})[], kind}|null}",
   infisical:
     "{folder, environments} | {folders: (string | {folder, environments})[]} | 'unmanaged'",
   shape: `string? — one of ${SHAPE_NAMES.join(", ")}`,
@@ -457,6 +457,103 @@ function normalizeInfisicalResidency(raw, { at, name, environments }) {
 }
 
 /**
+ * Normalize `residency.cloudflare` to its canonical
+ * `{workers: [{worker, environments}], kind}` form.
+ *
+ * `workers` accepts a bare worker id — the shape every manifest written before
+ * Story #483 uses — or a `{worker, environments}` object, because a key can be
+ * deliberately resident on one Worker in one environment only: a peer-database
+ * credential scoped that tightly to bound its blast radius, or a recipient
+ * allowlist that exists only where non-production sending is gated. With no
+ * per-entry `environments`, `probeCloudflare` reconciled ONE expected-name list
+ * against EVERY environment, so a deliberate single-environment placement had
+ * to report `missing` from the others — ten findings on one consumer's correct
+ * manifest, every one of them false (Story #481).
+ *
+ * A bare entry keeps meaning "every environment". That is the load-bearing
+ * constraint rather than a convenience: every manifest in existence declares
+ * `workers` as a bare string array, so any other reading would break them all.
+ *
+ * Both authored shapes normalize to one array of `{worker, environments}` with
+ * `environments` defaulted and materialized to `manifest.environments`, so
+ * `probeCloudflare` has exactly one shape to read — the same
+ * normalize-at-parse treatment `residency.github` received in Story #459 and
+ * `infisical` in Story #464. Cloudflare is the surface that never got it, and
+ * matching them matters more than the field shape itself: three expressive
+ * residencies with one idiom, not three.
+ *
+ * One deliberate divergence from those two: an **empty** `environments` array
+ * is rejected rather than read as "resident nowhere". That state is
+ * indistinguishable from omitting the residency altogether, and silently
+ * accepting it is precisely how a manifest author comes to believe they have
+ * scoped something they have not — the same fail-closed posture this module
+ * takes on an unknown `shape`.
+ *
+ * @param {unknown} raw
+ * @param {{at: string, name: string, workers: Record<string, object>, environments: string[]}} ctx
+ * @returns {{workers: Array<{worker: string, environments: string[]}>, kind: string} | null}
+ */
+function normalizeCloudflareResidency(raw, { at, name, workers, environments }) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`${at}.residency.cloudflare must be an object with {workers, kind} (key ${name})`);
+  }
+  if (!Array.isArray(raw.workers) || raw.workers.length === 0) {
+    throw new Error(`${at}.residency.cloudflare.workers must be a non-empty array of worker ids (key ${name})`);
+  }
+  if (raw.kind !== "secret" && raw.kind !== "var") {
+    throw new Error(`${at}.residency.cloudflare.kind must be "secret" or "var" (key ${name})`);
+  }
+
+  const seenWorkers = new Set();
+  const normalized = raw.workers.map((entry, j) => {
+    const where = `${at}.residency.cloudflare.workers[${j}]`;
+    let worker;
+    let authoredEnvs;
+    if (typeof entry === "string") {
+      worker = entry;
+    } else if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      worker = entry.worker;
+      authoredEnvs = entry.environments;
+    } else {
+      throw new Error(`${where} must be a worker id string or {worker, environments} (key ${name})`);
+    }
+
+    if (typeof worker !== "string" || !Object.hasOwn(workers, worker)) {
+      throw new Error(
+        `${at}.residency.cloudflare.workers references unknown worker id ${JSON.stringify(worker)} (key ${name})`
+      );
+    }
+    if (seenWorkers.has(worker)) {
+      throw new Error(
+        `${at}.residency.cloudflare repeats the worker "${worker}" — declare one entry per worker (key ${name})`
+      );
+    }
+    seenWorkers.add(worker);
+
+    if (authoredEnvs !== undefined) {
+      if (!Array.isArray(authoredEnvs) || !authoredEnvs.every((e) => typeof e === "string")) {
+        throw new Error(`${where}.environments must be an array of environment slugs (key ${name})`);
+      }
+      if (authoredEnvs.length === 0) {
+        throw new Error(
+          `${where}.environments must not be empty — omit it to mean every environment, or drop the entry (key ${name})`
+        );
+      }
+      for (const e of authoredEnvs) {
+        if (!environments.includes(e)) {
+          throw new Error(`${where}.environments names "${e}", absent from manifest.environments (key ${name})`);
+        }
+      }
+    }
+
+    return { worker, environments: authoredEnvs ? [...authoredEnvs] : [...environments] };
+  });
+
+  return { workers: normalized, kind: raw.kind };
+}
+
+/**
  * @param {unknown} entry
  * @param {number} index
  * @param {Record<string, object>} workers
@@ -494,20 +591,7 @@ function validateKeyEntry(entry, index, workers, environments, seen) {
 
   const github = normalizeGitHubResidency(residency.github, { at, name, environments });
 
-  const cloudflare = residency.cloudflare ?? null;
-  if (cloudflare !== null) {
-    if (!Array.isArray(cloudflare.workers) || cloudflare.workers.length === 0) {
-      throw new Error(`${at}.residency.cloudflare.workers must be a non-empty array of worker ids (key ${name})`);
-    }
-    for (const id of cloudflare.workers) {
-      if (!Object.hasOwn(workers, id)) {
-        throw new Error(`${at}.residency.cloudflare.workers references unknown worker id "${id}" (key ${name})`);
-      }
-    }
-    if (cloudflare.kind !== "secret" && cloudflare.kind !== "var") {
-      throw new Error(`${at}.residency.cloudflare.kind must be "secret" or "var" (key ${name})`);
-    }
-  }
+  const cloudflare = normalizeCloudflareResidency(residency.cloudflare, { at, name, workers, environments });
 
   const infisical = normalizeInfisicalResidency(entry.infisical, { at, name, environments });
 
@@ -530,7 +614,7 @@ function validateKeyEntry(entry, index, workers, environments, seen) {
     residency: {
       local,
       github,
-      cloudflare: cloudflare ? { workers: [...cloudflare.workers], kind: cloudflare.kind } : null,
+      cloudflare,
     },
     infisical,
     shape: entry.shape ?? null,
@@ -980,7 +1064,13 @@ export function runOfflineChecks({ manifest, repoRoot }) {
     checked.push(`wrangler:${id}`);
     const present = new Set(parseWranglerVars(readFileSync(configPath, "utf8"), configPath));
     const expected = manifest.keys.filter(
-      (k) => k.residency.cloudflare?.kind === "var" && k.residency.cloudflare.workers.includes(id)
+      // Environment-agnostic by design: this check reports `environment: null`
+      // and `parseWranglerVars` flattens `[env.X.vars]` into one set, so there
+      // is no environment axis to narrow against. A var declared for ANY
+      // environment stays expected in that worker's config.
+      (k) =>
+        k.residency.cloudflare?.kind === "var" &&
+        k.residency.cloudflare.workers.some((w) => w.worker === id)
     );
     for (const key of expected) {
       if (!present.has(key.name)) {
@@ -1417,10 +1507,37 @@ async function probeGitHub({ manifest, environments, github, surfaces, findings,
 }
 
 /**
+ * Reconcile the Cloudflare surface per `(worker, environment)` pair.
+ *
+ * `expected` is narrowed to the keys whose residency names BOTH this worker
+ * and this environment, so a deliberate single-environment placement no longer
+ * reports `missing` from the environments it never claimed (Story #481).
+ *
+ * Two consequences of that narrowing are load-bearing, and neither is
+ * incidental:
+ *
+ *   1. **A worker is still probed in an environment it expects nothing in**,
+ *      as long as it expects something SOMEWHERE. Skipping it would take the
+ *      surface's most interesting finding with it: a production-only key
+ *      turning up in staging is undeclared presence, and only an
+ *      empty-`expected` reconcile against a non-empty `present` reports it.
+ *      Cross-environment orphans go unsuppressed here exactly as they do on
+ *      the GitHub and Infisical surfaces. A worker that declares nothing in
+ *      any environment is still skipped entirely — that is the manifest
+ *      saying it has no opinion, which is not the same statement.
+ *   2. **A 404 is only a finding where something WAS expected.** A worker
+ *      deployed to one environment by design 404s in the other, and with
+ *      nothing declared there that agrees with the manifest rather than
+ *      contradicting it. Reporting it would re-introduce, one layer down, the
+ *      same false failure this narrowing removes.
+ *
  * @param {object} ctx
  */
 async function probeCloudflare({ manifest, environments, cloudflare, surfaces, findings, unavailability = {} }) {
   const cfKeys = manifest.keys.filter((k) => k.residency.cloudflare?.kind === "secret");
+  /** Does any key declare this worker in any environment at all? */
+  const declaresWorker = (id) =>
+    cfKeys.some((k) => k.residency.cloudflare.workers.some((w) => w.worker === id));
   if (!cloudflare) {
     surfaces.push({
       surface: "cloudflare",
@@ -1432,8 +1549,12 @@ async function probeCloudflare({ manifest, environments, cloudflare, surfaces, f
   try {
     for (const environment of environments) {
       for (const [id, worker] of Object.entries(manifest.workers)) {
-        const expected = cfKeys.filter((k) => k.residency.cloudflare.workers.includes(id)).map((k) => k.name);
-        if (expected.length === 0) continue;
+        const expected = cfKeys
+          .filter((k) =>
+            k.residency.cloudflare.workers.some((w) => w.worker === id && w.environments.includes(environment))
+          )
+          .map((k) => k.name);
+        if (!declaresWorker(id)) continue;
         const scriptName = resolveScriptName(worker.scriptName, environment);
         let present;
         try {
@@ -1441,15 +1562,20 @@ async function probeCloudflare({ manifest, environments, cloudflare, surfaces, f
         } catch (err) {
           if (!isAbsentStatus(err)) throw err;
           // A 404 is the one status that legitimately means "absent": the
-          // Worker has not been deployed to this environment yet.
-          findings.push({
-            severity: "fail",
-            kind: "missing",
-            key: null,
-            surface: "cloudflare",
-            environment,
-            detail: `Worker script "${scriptName}" does not exist (404) — ${expected.length} declared secret(s) cannot be verified`,
-          });
+          // Worker has not been deployed to this environment yet. That is only
+          // drift where the manifest expected something here; a worker
+          // deliberately absent from an environment it declares nothing in is
+          // agreement, not a finding.
+          if (expected.length > 0) {
+            findings.push({
+              severity: "fail",
+              kind: "missing",
+              key: null,
+              surface: "cloudflare",
+              environment,
+              detail: `Worker script "${scriptName}" does not exist (404) — ${expected.length} declared secret(s) cannot be verified`,
+            });
+          }
           continue;
         }
         findings.push(
