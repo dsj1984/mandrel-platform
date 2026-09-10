@@ -18,6 +18,14 @@
  * because the defect class here is an expression that reads correctly and
  * evaluates wrong.
  *
+ * The install-free assertion is JOB-wide (Story #494). It used to slice the
+ * "Setup Node.js (install-free)" step alone, which proves nothing: the step
+ * that provisions Node was never the one likely to grow an install. What the
+ * path promises is that NOTHING in the job installs when `setup: node` is
+ * selected, so the check enumerates every step of the job, keeps the ones
+ * whose `if:` guard actually selects them under that input, and asserts the
+ * absence across the set.
+ *
  * Run: node --test scripts/check-advisory-scan-setup.test.mjs
  */
 
@@ -59,11 +67,114 @@ function stepByName(text, name) {
   return out.join("\n");
 }
 
+/** Strip a `${{ … }}` wrapper, leaving the bare Actions expression. */
+function bareExpression(raw) {
+  return raw.trim().replace(/^\$\{\{/, "").replace(/\}\}$/, "").trim();
+}
+
 /** The `${{ … }}`-free body of a step's `if:` condition. */
 function ifExpression(step, name) {
   const m = step.match(/^\s*if:\s*(.+)$/m);
   assert.ok(m, `step "${name}" has no \`if:\` guard`);
-  return m[1].trim().replace(/^\$\{\{/, "").replace(/\}\}$/, "").trim();
+  return bareExpression(m[1]);
+}
+
+/**
+ * The line span of one top-level job — from its `  <id>:` header to the next
+ * key at that indent, trailing blank lines excluded. A plain line comparison
+ * rather than a regex built around `job`: a dynamically-constructed RegExp is
+ * a SAST finding, and a job header is an exact line anyway.
+ */
+function jobRange(text, job) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => l.trimEnd() === `  ${job}:`);
+  assert.notEqual(start, -1, `${ADVISORY}: job '${job}' not found`);
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^ {2}\S/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  while (end > start + 1 && lines[end - 1].trim() === "") end--;
+  return { lines, start, end };
+}
+
+/**
+ * Every step of a job, in order, as its own block of text. Steps are split on
+ * the `- ` bullets under `steps:` at the bullet's own indent, so a nested
+ * `with:` / `env:` mapping stays with the step that owns it.
+ */
+function jobSteps(text, job) {
+  const { lines, start, end } = jobRange(text, job);
+  const body = lines.slice(start + 1, end);
+  const stepsIdx = body.findIndex((l) => l.trim() === "steps:");
+  assert.notEqual(stepsIdx, -1, `${ADVISORY}: job '${job}' declares no \`steps:\``);
+  const rest = body.slice(stepsIdx + 1);
+  const first = rest.findIndex((l) => /^\s*-\s/.test(l));
+  assert.notEqual(first, -1, `${ADVISORY}: job '${job}' declares no steps`);
+  const indent = rest[first].match(/^(\s*)/)[1].length;
+  const steps = [];
+  for (const line of rest.slice(first)) {
+    const bullet = /^\s*-\s/.test(line) && line.match(/^(\s*)/)[1].length === indent;
+    if (bullet) steps.push([]);
+    steps[steps.length - 1].push(line);
+  }
+  return steps.map((step) => step.join("\n"));
+}
+
+/** A step's `name:`, else its opening line — for a readable failure message. */
+function stepLabel(step) {
+  const m = step.match(/^\s*(?:-\s*)?name:\s*(.+)$/m);
+  return m ? m[1].trim() : step.split("\n")[0].trim();
+}
+
+/** Whether a step is selected for the run under the given `inputs` context. */
+function runsWhen(step, inputs) {
+  const m = step.match(/^\s*if:\s*(.+)$/m);
+  if (!m) return true;
+  try {
+    return evaluate(bareExpression(m[1]), inputs) === true;
+  } catch {
+    // A guard this evaluator cannot run counts as SELECTED. Fail closed: an
+    // expression nobody can evaluate must never be the reason an install slips
+    // past the check below — at worst it costs a loud failure a human reads.
+    return true;
+  }
+}
+
+// Install commands, matched against the step's YAML with comment-only lines
+// removed: the job's comments discuss `pnpm install` at length, and prose is
+// not a command. Literal patterns, never a built RegExp.
+const INSTALL_COMMANDS = [
+  { label: "pnpm install", pattern: /\bpnpm install\b/ },
+  { label: "npm ci", pattern: /\bnpm ci\b/ },
+  { label: "npm install", pattern: /\bnpm install\b/ },
+  { label: "yarn install", pattern: /\byarn install\b/ },
+];
+
+/** Every step selected by `setup` that runs an install, with what it runs. */
+function installingSteps(text, setup) {
+  return jobSteps(text, JOB)
+    .filter((step) => runsWhen(step, { setup }))
+    .map((step) => ({
+      step: stepLabel(step),
+      commands: INSTALL_COMMANDS.filter(({ pattern }) =>
+        pattern.test(
+          step
+            .split("\n")
+            .filter((l) => !l.trim().startsWith("#"))
+            .join("\n"),
+        ),
+      ).map(({ label }) => label),
+    }))
+    .filter(({ commands }) => commands.length > 0);
+}
+
+/** `text` with one extra step spliced in after the job's last existing step. */
+function withStepAppended(text, job, step) {
+  const { lines, end } = jobRange(text, job);
+  return [...lines.slice(0, end), ...step.split("\n"), ...lines.slice(end)].join("\n");
 }
 
 /** The literal `default:` of the named workflow_call input. */
@@ -80,6 +191,7 @@ function inputDefault(text, name) {
   return assert.fail(`${ADVISORY}: input \`${name}\` has no default`);
 }
 
+const JOB = "advisory-scan";
 const TOOLCHAIN_STEP = "Setup toolchain";
 const NODE_STEP = "Setup Node.js (install-free)";
 const GUARD_STEP = "Validate setup input";
@@ -135,12 +247,54 @@ test("the install-free step pins Node from .nvmrc via a SHA-pinned setup-node", 
   );
 });
 
-test("no dependency install runs on the install-free path", () => {
+// ---------------------------------------------------------------------------
+// Story #494 — "install-free" is a property of the JOB, not of one step.
+// ---------------------------------------------------------------------------
+
+test("no dependency install runs ANYWHERE in the job on the install-free path", () => {
   // The whole point of the path: osv-scanner reads lockfiles off disk, and both
   // composites' gate scripts import only node builtins and relative siblings.
-  const step = stepByName(advisory, NODE_STEP);
-  assert.doesNotMatch(step, /pnpm install/, "the install-free path must not install");
-  assert.doesNotMatch(step, /npm ci|npm install/, "the install-free path must not install");
+  // So nothing in the job needs a dependency tree — and the step that
+  // provisions Node was never the step likely to grow an install anyway.
+  assert.deepEqual(
+    installingSteps(advisory, "node"),
+    [],
+    "a step selected by `setup: node` installs dependencies",
+  );
+});
+
+test("the check is job-wide: an install appended after the last step is caught", () => {
+  // The mutation the step-scoped version missed — it sliced the install-free
+  // step alone, so this fixture passed while the path's one promise was broken.
+  const mutated = withStepAppended(
+    advisory,
+    JOB,
+    ["      - name: Restore dependencies", "        run: npm ci"].join("\n"),
+  );
+  assert.deepEqual(installingSteps(mutated, "node"), [
+    { step: "Restore dependencies", commands: ["npm ci"] },
+  ]);
+});
+
+test("an install guarded onto the toolchain path is not charged to the node path", () => {
+  // The other half of the mutation, and the proof that the `if:` guards are
+  // still EVALUATED here rather than grepped: the same appended step is
+  // invisible under `setup: node` and visible under `setup: toolchain`. Drop
+  // the evaluation and this check either flags every guarded install or, if it
+  // ignored guards entirely, would have to ignore unguarded ones too.
+  const mutated = withStepAppended(
+    advisory,
+    JOB,
+    [
+      "      - name: Restore pnpm dependencies",
+      "        if: inputs.setup == 'toolchain'",
+      "        run: pnpm install --frozen-lockfile",
+    ].join("\n"),
+  );
+  assert.deepEqual(installingSteps(mutated, "node"), []);
+  assert.deepEqual(installingSteps(mutated, "toolchain"), [
+    { step: "Restore pnpm dependencies", commands: ["pnpm install"] },
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -220,6 +374,33 @@ test("this repo really is the npm case the caller claims", () => {
     () => readFileSync("pnpm-lock.yaml", "utf8"),
     "a pnpm-lock.yaml would mean setup: node is no longer the right call here",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Story #494 — the copy-paste path documents the input that decides the job.
+// ---------------------------------------------------------------------------
+
+test("the header's consumer snippet shows `setup:` and names both accepted values", () => {
+  // The snippet is what a consumer copies; an input missing from it is one they
+  // never learn they had. `setup` is the input whose wrong value kills the job
+  // at setup-node before the scan runs — the seven silent weeks above — so the
+  // copy path has to carry it, and has to name the other value it accepts.
+  const header = advisory.split("\nname:")[0];
+  const snippet = header.split("\n").filter((l) => l.startsWith("#"));
+  const withIdx = snippet.findIndex((l) => /^#\s+with:\s*$/.test(l));
+  assert.notEqual(withIdx, -1, `${ADVISORY}: the consumer snippet has no \`with:\` block`);
+  const withBlock = snippet.slice(withIdx).join("\n");
+  assert.match(
+    withBlock,
+    /^#\s+setup:\s*(toolchain|node)\s*$/m,
+    "the consumer snippet must pass `setup:`",
+  );
+  for (const value of ["toolchain", "node"]) {
+    assert.ok(
+      withBlock.includes(value),
+      `the consumer snippet must name the accepted value '${value}'`,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------

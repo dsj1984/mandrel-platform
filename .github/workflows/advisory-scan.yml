@@ -31,6 +31,13 @@
 #       with:
 #         runner: ubuntu-latest
 #         osv-fail-on-severity: high
+#         # How the job provisions Node. 'toolchain' (shown here, and the
+#         # default) runs the shared setup-toolchain composite: pnpm, Node from
+#         # .nvmrc, a frozen install. 'node' provisions Node from .nvmrc alone
+#         # and installs NOTHING — an npm repo needs that one, because the pnpm
+#         # default dies at setup-node before the scan ever runs. The 'node'
+#         # path ignores toolchain-cache, pnpm-dest and packages-read-token.
+#         setup: toolchain
 #       # Forward only what is needed (least privilege — avoid `secrets:
 #       # inherit`). packages-read-token is optional; omit the block entirely
 #       # when the consumer's install needs no private-registry token:
