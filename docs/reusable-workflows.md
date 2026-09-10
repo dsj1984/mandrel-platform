@@ -109,7 +109,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `affected-base`    | string  | `''`             | Optional base git ref/SHA that overrides the event-derived `TURBO_SCM_BASE` in affected mode (e.g. `'origin/main'`). Empty (default) uses the event-agnostic derivation. Ignored when `affected` is `false`. |
 | `enable-lint`      | boolean | `true`           | Set `false` to skip the lint + format-check tier.                                                                                              |
 | `enable-workflow-lint` | boolean | `true`       | Enable the workflow-lint tier (SHA-pinned actionlint + zizmor over your `.github/` tree). **Advisory by default** — findings are reported but never block. See [Workflow lint tier](#workflow-lint-tier-enable-workflow-lint). |
-| `workflow-lint-enforce` | boolean | `false`     | Make workflow-lint findings **block** the merge. Default `false`; download/checksum/tool failures always fail the tier regardless. See [Workflow lint tier](#workflow-lint-tier-enable-workflow-lint). |
+| `workflow-lint-enforce` | boolean | `false`     | Make workflow-lint findings **block** the merge. Default `false`. Infrastructure failures (download, checksum mismatch, unmapped platform) follow the same dial — a warning while advisory, blocking once enforced; a tool failure (a linter that ran and crashed) is red regardless. See [Workflow lint tier](#workflow-lint-tier-enable-workflow-lint). |
 | `enable-typecheck` | boolean | `true`           | Set `false` to skip the typecheck tier.                                                                                                        |
 | `enable-unit`      | boolean | `true`           | Set `false` to skip the unit-test tier.                                                                                                        |
 | `enable-contract`  | boolean | `true`           | Set `false` to skip the contract-test tier.                                                                                                    |
@@ -1629,11 +1629,25 @@ a [`needs:` of `ci-required`](#the-ci-required-aggregator), so enforcing needs
 **no new required check registered** — the aggregate context you already have
 becomes load-bearing for it.
 
-> **Two failure classes, and only one is advisory.** A *finding* obeys the
-> dial. A **download, checksum or tool failure always fails the tier**,
-> whatever the dial says: a linter that did not run is a broken gate, not a
-> clean one. The gate script refuses to report "no findings" for a report that
-> never arrived.
+> **Three failure classes, and only one is red whatever you set.** A
+> *finding* obeys the dial. An **infrastructure failure** — the tool never
+> arrived, because the release download failed, its checksum did not match, or
+> your platform has no pinned entry — obeys the **same dial**: it emits a
+> `::warning`, says plainly that nothing was linted, and exits 0 while the tier
+> is advisory; set `workflow-lint-enforce: true` (or either per-tool override)
+> and it becomes a `::error` that fails the tier. A **tool failure** — a linter
+> that ran and then crashed, or wrote a report that cannot be parsed — fails
+> the tier regardless of the dial, because something in *your* tree provoked it.
+>
+> Infrastructure failures were red regardless until
+> [#496](https://github.com/dsj1984/mandrel-platform/issues/496). They are not
+> any more, for one reason: a blip on a third-party release CDN is not evidence
+> about your workflows, and an advisory tier whose only blocking behaviour was
+> someone else's outage reddened the required check of every consumer at once.
+> What has **not** changed is trust — an archive whose checksum does not match
+> is never extracted or executed, so the demotion is only about how loudly a
+> gate that could not run reports itself, never about running an unverified
+> binary.
 
 #### On upgrade — what changes when you bump your pin
 
@@ -1642,8 +1656,10 @@ carrying it adds a `workflow-lint` job you did not have before. What to expect:
 
 - **It cannot fail your build.** Findings are reported as warnings and the tier
   stays green. Nothing to do if you would rather not act on them yet.
-- **It can still fail on infrastructure.** A download, checksum or tool failure
-  fails the tier regardless of the dial — that is a broken gate, not a finding.
+- **A CDN blip will not fail it either.** A download, checksum or
+  unmapped-platform failure warns and exits 0 while the tier is advisory; it
+  blocks only once you enforce. A tool failure — a linter that ran and crashed
+  — is still red regardless, because that one is about your tree.
 - **Expect findings on first contact.** A corpus with no prior workflow linter
   typically reports tens of them; this repo saw 0 actionlint and 23 zizmor
   (4 high, 19 medium), and the corpus that prompted the tier saw 20 and 6.

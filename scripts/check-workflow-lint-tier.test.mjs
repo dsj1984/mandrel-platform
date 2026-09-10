@@ -66,6 +66,44 @@ export function jobKeys(block) {
 }
 
 /**
+ * The composite's single `run:` block — everything after its `run: |` line.
+ * The infra-failure assertions below are about SHELL CONTROL FLOW, so they
+ * must not be able to match the action's header comments, which describe that
+ * flow in prose using the same words.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function runBlock(text) {
+  const marker = "\n      run: |\n";
+  const start = text.indexOf(marker);
+  assert.notEqual(start, -1, "the composite's run: block was not found");
+  const block = text.slice(start + marker.length);
+  assert.ok(block.includes("set -euo pipefail"), "run: block did not resolve to the script");
+  return block;
+}
+
+/**
+ * The body of one shell function defined at the run-block's own indent.
+ * Scoped like `jobBlock`: the point is to assert what `infra_fail` does, not
+ * that the two words appear somewhere in a 300-line file.
+ *
+ * @param {string} run @param {string} name
+ * @returns {string}
+ */
+export function shellFunction(run, name) {
+  const lines = run.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.trim() === `${name}() {`);
+  assert.notEqual(start, -1, `shell function '${name}' not defined`);
+  const body = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === "}") return body.join("\n");
+    body.push(lines[i]);
+  }
+  assert.fail(`shell function '${name}' is unterminated`);
+}
+
+/**
  * The block declaring one composite-action input. Anchored to a line start
  * because the action's header carries USAGE COMMENTS that contain the same
  * `  <input>:` text — an unanchored indexOf reads the comment instead.
@@ -321,4 +359,142 @@ test("the docs explain the advisory posture, the dial, shellcheck and provenance
   assert.match(section, /shellcheck/i);
   assert.match(section, /checksum/i);
   assert.match(section, /no checksums file/i, "the zizmor provenance caveat must be recorded");
+});
+
+// ---------------------------------------------------------------------------
+// Infrastructure failure routes to the gate, not to `exit 1` (Story #496, AC-2)
+// ---------------------------------------------------------------------------
+//
+// Before #496 a release-CDN blip on either binary `exit 1`-ed inside this
+// inline bash BEFORE the gate script was ever invoked, so the enforcement dial
+// the gate owns could not see it: an advisory tier reddened every consumer's
+// required check on someone else's outage. These assertions pin the routing —
+// the behaviour on the other side of it is unit-tested end-to-end in
+// `workflow-lint-gate.test.mjs`, which runs the real gate.
+
+test("the gate is the ONE exit from this step — every path funnels through it", () => {
+  const run = runBlock(ACTION);
+  assert.equal(
+    run.split("workflow-lint-gate.mjs").length - 1,
+    1,
+    "the gate must be invoked from exactly one place (`run_gate`), or the infra " +
+      "path and the normal path can drift into disagreeing about the dial",
+  );
+  const gate = shellFunction(run, "run_gate");
+  assert.match(
+    gate,
+    /WORKFLOW_LINT_INFRA_FAILURE="\$\{1:-\}"/,
+    "the reason travels to the gate as an env var, empty on the normal path",
+  );
+  assert.match(gate, /WORKFLOW_LINT_ENFORCE="\$\{WORKFLOW_LINT_ENFORCE\}"/);
+  assert.match(gate, /node "\$\{ACTION_PATH\}\/workflow-lint-gate\.mjs"/);
+  assert.match(run, /^\s*run_gate ""$/m, "the normal path still invokes the gate");
+});
+
+test("infra_fail writes empty reports and hands the reason to the gate", () => {
+  const body = shellFunction(runBlock(ACTION), "infra_fail");
+  assert.match(body, /echo "\[\]" > "\$\{al_report\}"/);
+  assert.match(body, /echo "\[\]" > "\$\{zz_report\}"/);
+  assert.match(body, /run_gate "\$1"/, "the failure reason is forwarded, not swallowed");
+  assert.match(
+    body,
+    /exit "\$infra_code"/,
+    "the step's exit code is the GATE's verdict, not a hard-coded 1",
+  );
+});
+
+test("the download branches route to infra_fail rather than exiting 1", () => {
+  const run = runBlock(ACTION);
+  // curl's failure must be CAPTURED — an unguarded curl under `set -e` aborts
+  // the step before any of this routing can run.
+  for (const varName of ["al_curl", "zz_curl"]) {
+    assert.ok(run.includes(`${varName}=$?`), `${varName} does not capture curl's exit code`);
+    assert.ok(
+      run.includes(`if [ "$${varName}" -ne 0 ]; then`),
+      `${varName} is captured but never branched on`,
+    );
+  }
+  assert.equal(
+    run.split('infra_fail "download-failed:').length - 1,
+    2,
+    "both downloads (actionlint and zizmor) must route to infra_fail",
+  );
+});
+
+test("the checksum-mismatch branches route to infra_fail rather than exiting 1", () => {
+  const run = runBlock(ACTION);
+  assert.equal(
+    run.split('infra_fail "checksum-mismatch:').length - 1,
+    2,
+    "both checksum comparisons must route to infra_fail",
+  );
+  // Trust is unchanged: a mismatch still never reaches extract/execute.
+  const mismatch = run.slice(run.indexOf('infra_fail "checksum-mismatch: actionlint'));
+  assert.ok(
+    mismatch.indexOf("tar -xzf") > 0,
+    "the mismatch branch must precede extraction — an unverified archive is never opened",
+  );
+});
+
+test("an unmapped platform routes to infra_fail from all four sites", () => {
+  const run = runBlock(ACTION);
+  assert.equal(
+    run.split('infra_fail "unmapped-platform:').length - 1,
+    4,
+    "unsupported OS, unsupported arch, and the two unmapped checksum slugs",
+  );
+});
+
+test("no infrastructure path exits 1 directly any more", () => {
+  const run = runBlock(ACTION);
+  const hardExits = run
+    .split(/\r?\n/)
+    .filter((l) => l.trim() === "exit 1" || l.trim().endsWith("; exit 1 ;;"));
+  assert.deepEqual(
+    hardExits,
+    [],
+    "a bare `exit 1` here bypasses the gate's dial entirely, which is the defect " +
+      "Story #496 removed. Route the failure through infra_fail instead.",
+  );
+});
+
+test("a genuine TOOL failure still exits non-zero regardless of the dial", () => {
+  // The split matters: a linter that RAN and crashed is about the caller's
+  // tree, not about a third-party CDN, so it is red either way.
+  const run = runBlock(ACTION);
+  assert.match(run, /exit "\$al_code"/);
+  assert.match(run, /exit "\$zz_code"/);
+});
+
+// ---------------------------------------------------------------------------
+// The posture is documented on both surfaces (Story #496, AC-3)
+// ---------------------------------------------------------------------------
+
+test("the enforce input describes the advisory infra-failure posture", () => {
+  const desc = actionInput(ACTION, "enforce").replace(/\s+/g, " ");
+  assert.match(desc, /INFRASTRUCTURE FAILURES follow this same dial/);
+  assert.match(desc, /exits 0 while the tier is advisory/);
+  assert.match(
+    desc,
+    /TOOL failure/,
+    "the description must still name the class that is red regardless",
+  );
+});
+
+test("the docs no longer claim infrastructure failures always fail the tier", () => {
+  assert.ok(
+    !/always fails? the tier/i.test(DOCS),
+    "the retired sentence (download/checksum/tool failures always fail the tier) " +
+      "is now wrong for two of those three classes",
+  );
+  const start = DOCS.indexOf("### Workflow lint tier (`enable-workflow-lint`)");
+  assert.notEqual(start, -1);
+  const section = DOCS.slice(start, start + 9000);
+  assert.match(section, /infrastructure failure/i);
+  assert.match(
+    section,
+    /exits 0 while the tier\s+is advisory/,
+    "the section must state the advisory-until-enforced behaviour explicitly",
+  );
+  assert.match(section, /never extracted or executed/, "the trust caveat must survive");
 });

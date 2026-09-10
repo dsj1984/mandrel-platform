@@ -11,6 +11,15 @@
 // The other invariant these tests hold: a missing or malformed report is a
 // TOOL FAILURE and exits non-zero even in advisory mode. A gate that reports
 // "no findings" because the linter never ran is worse than no gate at all.
+//
+// Story #496 adds the third class and pins its split from the second: an
+// INFRASTRUCTURE failure — a tool that never arrived at all, because the
+// release CDN blipped, the checksum did not match, or the platform has no
+// pinned entry — obeys the same dial findings do. It used to `exit 1` inside
+// the composite's inline bash, so a CDN blip reddened every consumer's
+// required check while this tier was documented as advisory. What it must
+// never become is silent: an advisory infra failure still says, loudly, that
+// nothing was linted.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -30,8 +39,20 @@ import {
   loadReport,
   severityRank,
   resolveEnforcement,
+  classifyInfraFailure,
+  renderInfraSummary,
+  INFRA_FAILURE_ENV,
   WorkflowLintGateError,
 } from "../.github/actions/workflow-lint/workflow-lint-gate.mjs";
+
+// A composite-supplied reason, in the shape action.yml actually emits. Kept
+// free of any URL-shaped literal on purpose: asserting a substring against one
+// is CodeQL js/incomplete-url-substring-sanitization, so the marker asserted
+// on below is the slug prefix, never a host.
+const INFRA_REASON =
+  "download-failed: curl exited 22 fetching actionlint_1.7.12_linux_amd64.tar.gz " +
+  "from the actionlint release assets.";
+const INFRA_MARKER = "download-failed";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const GATE = join(repoRoot, ".github/actions/workflow-lint/workflow-lint-gate.mjs");
@@ -422,4 +443,111 @@ test("CLI: only the literal string 'true' enables enforcement", () => {
     const res = runGate({ WORKFLOW_LINT_ENFORCE: value }, { zizmor: [zizmorRow()] });
     assert.equal(res.status, 0, `enforce=${JSON.stringify(value)} must stay advisory`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Infrastructure failure — a tool that never arrived (Story #496, AC-1)
+// ---------------------------------------------------------------------------
+
+test("classifyInfraFailure: no reason means there is nothing to report", () => {
+  assert.equal(classifyInfraFailure(undefined, false), null);
+  assert.equal(classifyInfraFailure("", true), null);
+  assert.equal(classifyInfraFailure("   \n ", true), null, "whitespace is not a reason");
+});
+
+test("classifyInfraFailure: advisory tier warns and does NOT fail", () => {
+  const infra = classifyInfraFailure(INFRA_REASON, { actionlint: false, zizmor: false });
+  assert.equal(infra.enforced, false);
+  assert.equal(infra.level, "warning");
+  assert.equal(infra.exitCode, 0, "a CDN blip must not red an advisory tier");
+  assert.ok(infra.message.includes(INFRA_MARKER), infra.message);
+});
+
+test("classifyInfraFailure: an enforcing tier fails — tier-wide or per tool", () => {
+  assert.equal(classifyInfraFailure(INFRA_REASON, true).exitCode, 1);
+  assert.equal(classifyInfraFailure(INFRA_REASON, true).level, "error");
+  // A consumer who enforced ONE tool still asked this tier to block, so a
+  // gate that could not run is a failure for them.
+  const perTool = classifyInfraFailure(INFRA_REASON, { actionlint: true, zizmor: false });
+  assert.equal(perTool.enforced, true);
+  assert.equal(perTool.exitCode, 1);
+});
+
+test("renderInfraSummary states the posture and that nothing was linted", () => {
+  const advisory = renderInfraSummary(classifyInfraFailure(INFRA_REASON, false));
+  assert.match(advisory, /advisory/);
+  assert.match(advisory, /no workflows were linted/i);
+  assert.ok(advisory.includes(INFRA_MARKER), advisory);
+  const enforcing = renderInfraSummary(classifyInfraFailure(INFRA_REASON, true));
+  assert.match(enforcing, /enforcing/);
+  assert.doesNotMatch(enforcing, /does \*\*not\*\* fail/);
+});
+
+test("CLI: an infra failure exits 0 and warns while nothing is enforced", () => {
+  const res = runGate({
+    [INFRA_FAILURE_ENV]: INFRA_REASON,
+    WORKFLOW_LINT_ENFORCE: "false",
+    WORKFLOW_LINT_ENFORCE_ACTIONLINT: "false",
+    WORKFLOW_LINT_ENFORCE_ZIZMOR: "false",
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /::warning::/);
+  assert.doesNotMatch(res.stdout, /::error::/);
+  assert.ok(res.stdout.includes(INFRA_MARKER), res.stdout);
+});
+
+test("CLI: the same infra failure exits 1 and errors when the tier is enforced", () => {
+  const res = runGate({
+    [INFRA_FAILURE_ENV]: INFRA_REASON,
+    WORKFLOW_LINT_ENFORCE: "true",
+  });
+  assert.equal(res.status, 1);
+  assert.match(res.stdout, /::error::/);
+  assert.ok(res.stdout.includes(INFRA_MARKER), res.stdout);
+});
+
+test("CLI: a per-tool enforce alone makes an infra failure blocking", () => {
+  const res = runGate({
+    [INFRA_FAILURE_ENV]: INFRA_REASON,
+    WORKFLOW_LINT_ENFORCE: "false",
+    WORKFLOW_LINT_ENFORCE_ZIZMOR: "true",
+  });
+  assert.equal(res.status, 1);
+  assert.match(res.stdout, /::error::/);
+});
+
+test("CLI: an advisory infra failure is never reported as a clean run", () => {
+  // The empty reports the composite writes alongside the signal carry no
+  // information. Rendering them as "no findings" would turn a gate that never
+  // ran into a green tick that looks audited.
+  const res = runGate({
+    [INFRA_FAILURE_ENV]: INFRA_REASON,
+    WORKFLOW_LINT_ENFORCE: "false",
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.doesNotMatch(res.stdout, /no findings/);
+  assert.doesNotMatch(res.stdout, /reported no findings/);
+});
+
+test("CLI: an unset infra reason leaves the findings path untouched", () => {
+  const res = runGate({ [INFRA_FAILURE_ENV]: "" }, { zizmor: [zizmorRow()] });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /excessive-permissions/);
+});
+
+test("an infra failure does not relax the missing-report rule", () => {
+  // Different class, different answer: a report that never arrived means the
+  // linter ran and produced nothing readable, which stays fatal.
+  const res = spawnSync(process.execPath, [GATE], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACTIONLINT_REPORT: "/no/such/al.json",
+      ZIZMOR_REPORT: "",
+      WORKFLOW_LINT_ENFORCE: "false",
+      [INFRA_FAILURE_ENV]: "",
+    },
+  });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /::error::workflow-lint gate/);
 });

@@ -12,10 +12,22 @@
 // seam next door.
 //
 // TOOL FAILURE IS NEVER ADVISORY. A missing or unparseable report means the
-// linter did not run; that is a broken gate, not a clean one, so it exits
-// non-zero regardless of the enforcement setting. Only genuine FINDINGS are
-// subject to the dial. The composite enforces the same split on its side by
-// distinguishing each linter's findings exit code from its tool-failure codes.
+// linter ran and produced nothing readable; that is a broken gate, not a clean
+// one, so it exits non-zero regardless of the enforcement setting. The
+// composite enforces the same split on its side by distinguishing each
+// linter's findings exit code from its tool-failure codes.
+//
+// INFRASTRUCTURE FAILURE FOLLOWS THE DIAL (Story #496). A tool that never
+// arrived — a release-CDN blip on the download, a checksum mismatch, a
+// platform with no pinned entry — is a different class again, and it used to
+// `exit 1` inside the composite's inline bash before this script was ever
+// invoked. That made a CDN blip red every consumer's required check while the
+// tier was documented as advisory. The composite now writes empty reports and
+// hands the reason over in WORKFLOW_LINT_INFRA_FAILURE: the gate warns and
+// exits 0 while nothing is enforced, and errors only once a consumer has
+// asked this tier to block. The security property is untouched — an
+// unverified binary is still never executed, so the choice here is only about
+// how loudly a gate that could not run reports itself.
 //
 // ENFORCEMENT IS PER TOOL, because the two linters arrive with different debt.
 // This repo is the worked example: actionlint has been blocking in ci.yml since
@@ -164,6 +176,68 @@ export function resolveEnforcement({ enforce = "", actionlint = "", zizmor = "" 
   return { actionlint: perTool(actionlint), zizmor: perTool(zizmor) };
 }
 
+/**
+ * Env var the composite uses to hand an infrastructure failure to this gate
+ * instead of exiting non-zero in its own inline bash.
+ */
+export const INFRA_FAILURE_ENV = "WORKFLOW_LINT_INFRA_FAILURE";
+
+/**
+ * Decide what an infrastructure failure costs.
+ *
+ * `null` when there is no infrastructure failure to report, so the caller's
+ * check reads as "is there one" rather than "was the env var set to something
+ * whitespace-shaped".
+ *
+ * The dial is the SAME one findings obey, read tier-wide: if EITHER tool is
+ * enforcing, a gate that could not run is a failure, because a consumer who
+ * asked this tier to block did not ask it to block only when convenient.
+ * While nothing is enforcing, the tier is advisory by construction and a
+ * missing binary must not be the one thing in it that reddens a merge.
+ *
+ * @param {string | undefined} reason Free-text reason from the composite.
+ * @param {boolean | {actionlint?: boolean, zizmor?: boolean}} enforce
+ * @returns {{reason: string, enforced: boolean, level: "error" | "warning", exitCode: number, message: string} | null}
+ */
+export function classifyInfraFailure(reason, enforce = false) {
+  const trimmed = String(reason || "").trim();
+  if (trimmed === "") return null;
+  const enforced =
+    typeof enforce === "object" && enforce !== null
+      ? Object.values(enforce).some(Boolean)
+      : Boolean(enforce);
+  const tail = enforced
+    ? "this tier is ENFORCING, so the run fails: it cannot vouch for these workflows."
+    : "this tier is advisory, so the run is NOT failed — but nothing was linted. " +
+      "Set workflow-lint-enforce: true to make an unusable linter blocking.";
+  return {
+    reason: trimmed,
+    enforced,
+    level: enforced ? "error" : "warning",
+    exitCode: enforced ? 1 : 0,
+    message: `workflow-lint could not run (${trimmed}) — ${tail}`,
+  };
+}
+
+/**
+ * Job-summary markdown for an infrastructure failure. Rendered even in the
+ * advisory case: a tier that silently linted nothing is indistinguishable
+ * from a clean one, which is the failure mode this whole gate exists against.
+ *
+ * @param {NonNullable<ReturnType<typeof classifyInfraFailure>>} infra
+ * @param {{heading?: string}} [opts]
+ */
+export function renderInfraSummary(infra, { heading = "Workflow lint" } = {}) {
+  return [
+    `## ${heading}`,
+    "",
+    infra.enforced
+      ? `❌ **Infrastructure failure** — ${escapeCell(infra.reason)}. The tier is **enforcing**, so this fails the build.`
+      : `⚠️ **Infrastructure failure** — ${escapeCell(infra.reason)}. The tier is **advisory**, so this does **not** fail the build, but **no workflows were linted**.`,
+    "",
+  ].join("\n");
+}
+
 /** @param {Array<object>} findings */
 export function countBySeverity(findings) {
   const counts = { high: 0, medium: 0, low: 0, informational: 0, unknown: 0 };
@@ -287,6 +361,24 @@ export function main() {
     zizmor: process.env.WORKFLOW_LINT_ENFORCE_ZIZMOR,
   });
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  const writeSummary = (summary) => {
+    if (!summaryPath) return;
+    try {
+      appendFileSync(summaryPath, `${summary}\n`);
+    } catch (err) {
+      console.error(`::warning::could not write job summary: ${err.message}`);
+    }
+  };
+
+  // An infrastructure failure short-circuits: the composite could not obtain a
+  // working linter, so the empty reports it wrote alongside this signal carry
+  // no information and must not be rendered as "no findings".
+  const infra = classifyInfraFailure(process.env[INFRA_FAILURE_ENV], enforce);
+  if (infra) {
+    writeSummary(renderInfraSummary(infra));
+    console.log(`::${infra.level}::${infra.message}`);
+    return infra.exitCode;
+  }
 
   let findings;
   try {
@@ -305,13 +397,7 @@ export function main() {
   const verdict = classify(findings, { enforce });
   const summary = renderSummary(verdict);
 
-  if (summaryPath) {
-    try {
-      appendFileSync(summaryPath, `${summary}\n`);
-    } catch (err) {
-      console.error(`::warning::could not write job summary: ${err.message}`);
-    }
-  }
+  writeSummary(summary);
   console.log(summary);
   console.log(findingsDigest(verdict));
 
