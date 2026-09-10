@@ -986,7 +986,7 @@ function npmFixtureReport({ severity } = {}) {
   return report;
 }
 
-test("AC-5: the committed fixture is the real npm audit v2 shape", () => {
+test("#488 AC-5: the committed fixture is the real npm audit v2 shape", () => {
   const report = npmFixtureReport();
   assert.equal(report.auditReportVersion, 2);
 
@@ -1011,7 +1011,7 @@ test("AC-5: the committed fixture is the real npm audit v2 shape", () => {
   );
 });
 
-test("AC-5: recognizeReport normalizes the committed npm fixture", () => {
+test("#488 AC-5: recognizeReport normalizes the committed npm fixture", () => {
   const { schema, advisories } = recognizeReport(npmFixtureReport());
   assert.equal(schema, "npm");
   // The fixture's second package reaches the same advisory through a STRING
@@ -1191,7 +1191,7 @@ function captureConsole(fn) {
   }
 }
 
-test("AC-1: a canonical lowercase allowlist id suppresses an npm advisory written in any case", () => {
+test("#488 AC-1: a canonical lowercase allowlist id suppresses an npm advisory written in any case", () => {
   // The npm report exposes its id ONLY inside `via[].url`, and GitHub's own
   // links are mixed-case-tolerant. The allowlist entry is written exactly as
   // the runbook shows it.
@@ -1229,7 +1229,7 @@ test("AC-1: a canonical lowercase allowlist id suppresses an npm advisory writte
   });
 });
 
-test("AC-1: the same canonical id suppresses a pnpm advisory written in any case", () => {
+test("#488 AC-1: the same canonical id suppresses a pnpm advisory written in any case", () => {
   const stdout = JSON.stringify(
     reportWith({
       1: {
@@ -1268,7 +1268,7 @@ test("AC-1: the same canonical id suppresses a pnpm advisory written in any case
   });
 });
 
-test("AC-2: the audit runs in the directory whose lockfile was detected, bounded", () => {
+test("#488 AC-2: the audit runs in the directory whose lockfile was detected, bounded", () => {
   // `detectPackageManager` reads `dirname(--package-json)`; the audit used to
   // run in `process.cwd()`. When those differ the gate reported on a graph it
   // never audited — an unfalsifiable claim, which is the one thing this gate
@@ -1305,7 +1305,7 @@ test("AC-2: the audit runs in the directory whose lockfile was detected, bounded
   });
 });
 
-test("AC-2: the pnpm branch spawns pnpm's own argv in the detected directory", () => {
+test("#488 AC-2: the pnpm branch spawns pnpm's own argv in the detected directory", () => {
   const calls = [];
   const stdout = JSON.stringify({ advisories: {}, metadata: {} });
 
@@ -1320,7 +1320,7 @@ test("AC-2: the pnpm branch spawns pnpm's own argv in the detected directory", (
   });
 });
 
-test("AC-3: an audit that says nothing is never clean, and its stderr is shown", () => {
+test("#488 AC-3: an audit that says nothing is never clean, and its stderr is shown", () => {
   // Exit 0 with unreadable stdout is how EVERY failure to run at all presents:
   // a missing binary, a killed child, an output ceiling hit mid-write. The old
   // contract printed "No vulnerabilities found" and exited 0 for all of them.
@@ -1348,7 +1348,7 @@ test("AC-3: an audit that says nothing is never clean, and its stderr is shown",
   }
 });
 
-test("AC-3: a spawn that never ran at all fails closed with its reason", () => {
+test("#488 AC-3: a spawn that never ran at all fails closed with its reason", () => {
   // `spawnSync` reports a missing binary or a fired timeout through `error`,
   // with no exit status at all.
   withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
@@ -1367,7 +1367,7 @@ test("AC-3: a spawn that never ran at all fails closed with its reason", () => {
   });
 });
 
-test("AC-3: a parsed report matching no known schema still fails closed", () => {
+test("#488 AC-3: a parsed report matching no known schema still fails closed", () => {
   withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
     const { value, output } = captureConsole(() =>
       runCli(argv, {
@@ -1384,7 +1384,7 @@ test("AC-3: a parsed report matching no known schema still fails closed", () => 
   });
 });
 
-test("AC-4: a blocking advisory with no parseable id is reported, never dropped", () => {
+test("#488 AC-4: a blocking advisory with no parseable id is reported, never dropped", () => {
   // The npm identity fallback was `ghsaId ?? source ?? url`, and `source` is
   // coerced to `""` when absent — so `"" ?? url` is `""`, the url arm was dead
   // code, and the empty key hit a `continue` that DISCARDED the advisory. A
@@ -1409,7 +1409,7 @@ test("AC-4: a blocking advisory with no parseable id is reported, never dropped"
   assert.equal(result.blocking[0].title, "Critical with no id");
 });
 
-test("AC-4: two id-less advisories are two findings, not one collapsed key", () => {
+test("#488 AC-4: two id-less advisories are two findings, not one collapsed key", () => {
   const report = {
     auditReportVersion: 2,
     vulnerabilities: {
@@ -1430,7 +1430,7 @@ test("AC-4: two id-less advisories are two findings, not one collapsed key", () 
   assert.equal(evaluateReport(report, 0, new Set()).blocking.length, 2);
 });
 
-test("AC-4: an id-less advisory blocks through the CLI and prints (unknown)", () => {
+test("#488 AC-4: an id-less advisory blocks through the CLI and prints (unknown)", () => {
   const stdout = JSON.stringify({
     auditReportVersion: 2,
     vulnerabilities: {
@@ -1452,7 +1452,7 @@ test("AC-4: an id-less advisory blocks through the CLI and prints (unknown)", ()
   });
 });
 
-test("AC-4: an id-less advisory in the legacy schema blocks too", () => {
+test("#488 AC-4: an id-less advisory in the legacy schema blocks too", () => {
   const report = reportWith({
     1: { severity: "critical", title: "Legacy critical with no id" },
   });
@@ -1461,7 +1461,7 @@ test("AC-4: an id-less advisory in the legacy schema blocks too", () => {
   assert.equal(result.blocking[0].id, "(unknown)");
 });
 
-test("AC-5: the committed fixture blocks through the CLI, naming its canonical id", () => {
+test("#488 AC-5: the committed fixture blocks through the CLI, naming its canonical id", () => {
   const stdout = JSON.stringify(npmFixtureReport());
 
   withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
