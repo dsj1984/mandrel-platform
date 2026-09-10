@@ -25,13 +25,37 @@
  *
  * WHAT COUNTS AS A DOWNLOAD
  * -------------------------
- * A `curl` invocation that writes a fetched artifact to a file — `-o <path>` or
- * `--output <path>`. Deliberately NOT a download, and so not flagged:
- *   • a `curl` with no output flag (a status probe, a POST);
+ * Any fetch that lands in a file, in every spelling a shell author reaches for
+ * — narrowing the scope to one spelling is how a real download escapes the
+ * guard. In scope:
+ *   • `curl -o <path>` / `curl --output <path>` / `curl --output=<path>`;
+ *   • a combined curl short group whose value-taking tail is the output flag,
+ *     e.g. `curl -sSLo <path>` — the same command, written shorter;
+ *   • `curl -O` / `curl --remote-name`, which name the file from the URL
+ *     instead of taking a path (and so may sit anywhere in a short group,
+ *     `-fsSLO` included, because they take no value);
+ *   • `wget -O <path>` / `wget --output-document <path>` — reported against
+ *     curl's flag spelling below, deliberately: the first-party fetches are
+ *     all curl, and a new wget one should join them rather than invent a
+ *     second resilience contract.
+ * Deliberately NOT a download, and so not flagged:
+ *   • a `curl` with no output flag at all (a status probe, a POST, a fetch
+ *     piped straight into another command);
+ *   • a write to stdout — `-o -`, `--output -`, and wget's `-O -`. `-O` is the
+ *     two commands' false friend: curl's takes no argument (so `curl -O -`
+ *     fetches the URL `-`), while wget's is the output path;
  *   • `-o /dev/null`, which is a reachability/status check, not an asset fetch
  *     (`pr-quality.yml`'s fail-fast cancellation POST is exactly this shape).
  * Retrying a POST is a different decision with different safety, and this lint
  * deliberately does not make it.
+ *
+ * HOW FLAGS ARE MATCHED
+ * ---------------------
+ * As whole shell words, never as substrings: `--retry-connrefused` does not
+ * satisfy `--retry`, and a flag sitting inside a trailing `#` comment does not
+ * count. A `#` opens a comment only at start of line or after whitespace and
+ * outside quotes, so `$#`, `${#arr[@]}` and a fragment `#` inside a quoted URL
+ * are left alone. Every pattern here is a literal regex.
  *
  * SCOPE: `.github/actions/**` action manifests. Exit 0 when clean, 1 when any
  * download is missing a required flag (prints file:line and the missing set).
@@ -64,6 +88,21 @@ export const REQUIRED_FLAGS = Object.freeze([
   }),
 ]);
 
+/** `curl` invoked as a command — after whitespace or a shell operator. */
+const CURL_COMMAND = /(^|[\s;&|(])curl(\s|$)/;
+/** `wget` invoked as a command — same boundary rule. */
+const WGET_COMMAND = /(^|[\s;&|(])wget(\s|$)/;
+/** A combined short-option group: one `-` followed by letters only. */
+const SHORT_GROUP = /^-[A-Za-z]+$/;
+/** Quote characters wrapping a word, stripped so a path compares as itself. */
+const LEADING_QUOTES = /^['"]+/;
+const TRAILING_QUOTES = /['"]+$/;
+/** Output targets that are not a fetched asset on disk. */
+const STDOUT_TARGETS = new Set(['-', '/dev/null']);
+/** Long output flags in their `--flag=value` spelling. */
+const CURL_OUTPUT_EQ = '--output=';
+const WGET_OUTPUT_EQ = '--output-document=';
+
 /**
  * Pure: fold shell line-continuations so a `curl` split across several lines is
  * linted as the single command it is. The logical line keeps the 1-based number
@@ -95,18 +134,122 @@ export function collapseContinuations(source) {
 }
 
 /**
- * Pure: does this logical line invoke `curl` to write a fetched artifact to a
- * real file? See the header for what is deliberately excluded.
+ * Pure: drop a shell comment and everything after it.
+ *
+ * `#` only opens a comment at the start of the line or after whitespace, and
+ * only outside quotes — which is what keeps `$#`, `${#arr[@]}` and the fragment
+ * in `"https://host/p#frag"` from truncating the command that carries them.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripShellComment(text) {
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === '\\' && quote !== "'") {
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    const opensComment =
+      char === '#' && (i === 0 || text[i - 1] === ' ' || text[i - 1] === '\t');
+    if (opensComment) return text.slice(0, i);
+  }
+  return text;
+}
+
+/**
+ * Pure: the shell words of a logical line — comment dropped, split on
+ * whitespace, wrapping quotes removed so `"-"` compares equal to `-`.
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function shellWords(text) {
+  return stripShellComment(text)
+    .split(/\s+/)
+    .filter((word) => word.length > 0)
+    .map((word) => word.replace(LEADING_QUOTES, '').replace(TRAILING_QUOTES, ''));
+}
+
+/**
+ * Pure: does this curl invocation write its body to a real file? See the
+ * header for the spellings in scope and the ones deliberately excluded.
+ *
+ * @param {string[]} words
+ * @returns {boolean}
+ */
+function curlWritesFile(words) {
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i];
+    const shortGroup = SHORT_GROUP.test(word);
+    // `-O` takes no value, so it may sit anywhere in a group (`-fsSLO`).
+    if (word === '--remote-name' || (shortGroup && word.includes('O'))) return true;
+    if (word.startsWith(CURL_OUTPUT_EQ)) {
+      return !STDOUT_TARGETS.has(word.slice(CURL_OUTPUT_EQ.length));
+    }
+    // `-o` takes a value, so in a group it must be the tail: `-sSLo <path>`.
+    if (word === '--output' || (shortGroup && word.endsWith('o'))) {
+      return !STDOUT_TARGETS.has(words[i + 1] ?? '-');
+    }
+  }
+  return false;
+}
+
+/**
+ * Pure: does this wget invocation write its body to a real file? Unlike curl,
+ * wget's `-O` IS the output path — `wget -O - "$url"` is a stdout pipe.
+ *
+ * @param {string[]} words
+ * @returns {boolean}
+ */
+function wgetWritesFile(words) {
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i];
+    if (word.startsWith(WGET_OUTPUT_EQ)) {
+      return !STDOUT_TARGETS.has(word.slice(WGET_OUTPUT_EQ.length));
+    }
+    if (word === '-O' || word === '--output-document') {
+      return !STDOUT_TARGETS.has(words[i + 1] ?? '-');
+    }
+  }
+  return false;
+}
+
+/**
+ * Pure: does this logical line fetch an artifact into a file? See the header
+ * for every spelling in scope and for what is deliberately excluded.
  *
  * @param {string} text
  * @returns {boolean}
  */
 export function isAssetDownload(text) {
-  if (!/(^|[\s;&|(])curl(\s|$)/.test(text)) return false;
-  const output = text.match(/(?:^|\s)(?:-o|--output)\s+(\S+)/);
-  if (!output) return false;
-  // `-o /dev/null` is a status probe, not an asset fetch.
-  return !/^["']?\/dev\/null["']?$/.test(output[1]);
+  const command = stripShellComment(text);
+  const words = shellWords(command);
+  if (CURL_COMMAND.test(command)) return curlWritesFile(words);
+  if (WGET_COMMAND.test(command)) return wgetWritesFile(words);
+  return false;
+}
+
+/**
+ * Pure: is `flag` present as its own argument — on its own or as `flag=value`?
+ * Substring matching is what let `--retry-connrefused` satisfy `--retry`.
+ *
+ * @param {string[]} words
+ * @param {string} flag
+ * @returns {boolean}
+ */
+function hasFlag(words, flag) {
+  const assigned = `${flag}=`;
+  return words.some((word) => word === flag || word.startsWith(assigned));
 }
 
 /**
@@ -116,7 +259,8 @@ export function isAssetDownload(text) {
  * @returns {string[]}
  */
 export function missingFlags(text) {
-  return REQUIRED_FLAGS.filter(({ flag }) => !text.includes(flag)).map(
+  const words = shellWords(text);
+  return REQUIRED_FLAGS.filter(({ flag }) => !hasFlag(words, flag)).map(
     ({ flag }) => flag,
   );
 }
