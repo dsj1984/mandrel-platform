@@ -74,8 +74,13 @@ inputs:
       Tier-wide default for whether findings FAIL this step. Default 'false'
       — findings are reported to the run log, the job summary and as PR
       annotations, but the step stays green. Override per tool with
-      enforce-actionlint / enforce-zizmor. Download, checksum and tool failures
-      always fail the step regardless of this setting.
+      enforce-actionlint / enforce-zizmor. INFRASTRUCTURE FAILURES follow this
+      same dial: a download failure, a checksum mismatch or a platform with no
+      pinned entry emits a warning and exits 0 while the tier is advisory, and
+      fails the step only when it is enforced (tier-wide or per tool). An
+      unverified binary is never executed either way. A TOOL failure — a
+      linter that ran and then crashed, or produced an unreadable report —
+      still fails the step regardless of this setting.
     required: false
     default: 'false'
   enforce-actionlint:
@@ -142,17 +147,62 @@ runs:
       run: |
         set -euo pipefail
 
+        # Runner-scoped download dir (issue #343) — a bare `mktemp -d` leaks
+        # into the host-shared $TMPDIR, which nothing reaps on a persistent
+        # self-hosted runner. Created FIRST because `infra_fail` below needs
+        # somewhere to write the empty reports it hands the gate.
+        tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/workflow-lint.XXXXXX")"
+
+        al_report="${tmp}/actionlint-report.json"
+        zz_report="${tmp}/zizmor-report.json"
+
+        # Invoke the gate with the resolved enforcement dial. Both the infra
+        # path and the normal path end here, so there is exactly one place that
+        # knows how this script is called.
+        run_gate() {
+          set +e
+          ACTIONLINT_REPORT="${al_report}" \
+          ZIZMOR_REPORT="${zz_report}" \
+          WORKFLOW_LINT_INFRA_FAILURE="${1:-}" \
+          WORKFLOW_LINT_ENFORCE="${WORKFLOW_LINT_ENFORCE}" \
+          WORKFLOW_LINT_ENFORCE_ACTIONLINT="${WORKFLOW_LINT_ENFORCE_ACTIONLINT}" \
+          WORKFLOW_LINT_ENFORCE_ZIZMOR="${WORKFLOW_LINT_ENFORCE_ZIZMOR}" \
+            node "${ACTION_PATH}/workflow-lint-gate.mjs"
+          gate_code=$?
+          set -e
+          return "$gate_code"
+        }
+
+        # INFRASTRUCTURE FAILURE (Story #496) — a tool that never arrived: a
+        # release-CDN blip on the download, a checksum mismatch, or a platform
+        # with no pinned entry. These used to `exit 1` right here, which made a
+        # CDN blip red every consumer's required check while this tier was
+        # documented as advisory. They now write empty reports and hand the
+        # reason to the gate, which owns the advisory/enforcing decision for
+        # this class exactly as it does for findings. Fail-closed on TRUST is
+        # unchanged: control never reaches the extract/execute lines below, so
+        # an unverified binary is still never run.
+        infra_fail() {
+          echo "[]" > "${al_report}"
+          echo "[]" > "${zz_report}"
+          set +e
+          run_gate "$1"
+          infra_code=$?
+          set -e
+          exit "$infra_code"
+        }
+
         os="$(uname -s)"
         arch="$(uname -m)"
         case "$os" in
           Darwin) al_os="darwin"; zz_os="apple-darwin" ;;
           Linux)  al_os="linux";  zz_os="unknown-linux-gnu" ;;
-          *) echo "::error::Unsupported OS for the workflow-lint asset selector: $os"; exit 1 ;;
+          *) infra_fail "unmapped-platform: the workflow-lint asset selector has no mapping for OS ${os}" ;;
         esac
         case "$arch" in
           arm64|aarch64) al_arch="arm64"; zz_arch="aarch64" ;;
           x86_64|amd64)  al_arch="amd64"; zz_arch="x86_64" ;;
-          *) echo "::error::Unsupported arch for the workflow-lint asset selector: $arch"; exit 1 ;;
+          *) infra_fail "unmapped-platform: the workflow-lint asset selector has no mapping for arch ${arch}" ;;
         esac
 
         # ── Single bump point: actionlint ────────────────────────────────
@@ -167,8 +217,7 @@ runs:
           *) al_expected="" ;;
         esac
         if [ -z "$al_expected" ]; then
-          echo "::error::No pinned checksum for actionlint $al_slug — update the SHA256 map for this version/platform."
-          exit 1
+          infra_fail "unmapped-platform: No pinned checksum for actionlint ${al_slug} — update the SHA256 map for this version/platform."
         fi
 
         # ── Single bump point: zizmor ────────────────────────────────────
@@ -184,25 +233,26 @@ runs:
           *) zz_expected="" ;;
         esac
         if [ -z "$zz_expected" ]; then
-          echo "::error::No pinned checksum for zizmor $zz_slug — update the SHA256 map for this version/platform."
-          exit 1
+          infra_fail "unmapped-platform: No pinned checksum for zizmor ${zz_slug} — update the SHA256 map for this version/platform."
         fi
-
-        # Runner-scoped download dir (issue #343) — a bare `mktemp -d` leaks
-        # into the host-shared $TMPDIR, which nothing reaps on a persistent
-        # self-hosted runner.
-        tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/workflow-lint.XXXXXX")"
 
         al_asset="actionlint_${ACTIONLINT_VERSION}_${al_os}_${al_arch}.tar.gz"
         al_url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${al_asset}"
         echo "Downloading pinned actionlint: ${al_url}"
         # Retry a release-asset blip rather than fail fleet-wide. Fail-closed is
-        # preserved — the SHA-256 check below still gates trust.
+        # preserved — the SHA-256 check below still gates trust. A download that
+        # exhausts its retries is an INFRASTRUCTURE failure, not a finding and
+        # not an automatic red — see `infra_fail` above.
+        set +e
         curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$al_url" -o "${tmp}/${al_asset}"
+        al_curl=$?
+        set -e
+        if [ "$al_curl" -ne 0 ]; then
+          infra_fail "download-failed: curl exited ${al_curl} fetching ${al_asset} from the actionlint release assets."
+        fi
         al_actual="$(shasum -a 256 "${tmp}/${al_asset}" | awk '{print $1}')"
         if [ "$al_actual" != "$al_expected" ]; then
-          echo "::error::actionlint checksum mismatch for ${al_asset}: expected ${al_expected}, got ${al_actual}"
-          exit 1
+          infra_fail "checksum-mismatch: actionlint checksum mismatch for ${al_asset}: expected ${al_expected}, got ${al_actual}"
         fi
         echo "✅ actionlint ${al_asset} checksum verified."
         tar -xzf "${tmp}/${al_asset}" -C "${tmp}" actionlint
@@ -212,11 +262,16 @@ runs:
         zz_asset="zizmor-${zz_arch}-${zz_os}.tar.gz"
         zz_url="https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${zz_asset}"
         echo "Downloading pinned zizmor: ${zz_url}"
+        set +e
         curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$zz_url" -o "${tmp}/${zz_asset}"
+        zz_curl=$?
+        set -e
+        if [ "$zz_curl" -ne 0 ]; then
+          infra_fail "download-failed: curl exited ${zz_curl} fetching ${zz_asset} from the zizmor release assets."
+        fi
         zz_actual="$(shasum -a 256 "${tmp}/${zz_asset}" | awk '{print $1}')"
         if [ "$zz_actual" != "$zz_expected" ]; then
-          echo "::error::zizmor checksum mismatch for ${zz_asset}: expected ${zz_expected}, got ${zz_actual}"
-          exit 1
+          infra_fail "checksum-mismatch: zizmor checksum mismatch for ${zz_asset}: expected ${zz_expected}, got ${zz_actual}"
         fi
         echo "✅ zizmor ${zz_asset} checksum verified."
         tar -xzf "${tmp}/${zz_asset}" -C "${tmp}" zizmor
@@ -266,9 +321,6 @@ runs:
           fi
         fi
 
-        al_report="${tmp}/actionlint-report.json"
-        zz_report="${tmp}/zizmor-report.json"
-
         # actionlint exit codes: 0 clean, 1 problems found, >=2 a genuine tool
         # failure (2 command-line error, 3 fatal). Only 0/1 mean it ran, so
         # anything higher fails the step regardless of the enforce dial.
@@ -306,10 +358,6 @@ runs:
         fi
 
         # The gate script owns the advisory/enforcing decision (Story #425) —
-        # it is unit-tested, unlike an inline shell conditional.
-        ACTIONLINT_REPORT="${al_report}" \
-        ZIZMOR_REPORT="${zz_report}" \
-        WORKFLOW_LINT_ENFORCE="${WORKFLOW_LINT_ENFORCE}" \
-        WORKFLOW_LINT_ENFORCE_ACTIONLINT="${WORKFLOW_LINT_ENFORCE_ACTIONLINT}" \
-        WORKFLOW_LINT_ENFORCE_ZIZMOR="${WORKFLOW_LINT_ENFORCE_ZIZMOR}" \
-          node "${ACTION_PATH}/workflow-lint-gate.mjs"
+        # it is unit-tested, unlike an inline shell conditional. No infra
+        # reason on this path: the linters ran, so these reports are real.
+        run_gate ""
