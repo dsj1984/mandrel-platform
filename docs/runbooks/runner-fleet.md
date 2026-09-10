@@ -36,6 +36,25 @@ The header comment in the script is the full design record: layout
 assumptions, ordering rules, why stopping a busy runner is refused, exit codes,
 and the bash 3.2 portability constraints.
 
+### How "busy" is decided
+
+A runner is **busy** when its own `Runner.Worker` process is running, and that
+is decided by a **literal path match**: the script takes one `ps` snapshot and
+compares `<runner-dir>/bin/Runner.Worker` as a whole command-line token, never
+as a pattern. So a fleet folder whose name contains `+`, `(` or `[` is matched
+exactly like any other — it is a path, not a regex.
+
+That is a fix, not a detail. The check used to be `pgrep -f <path>`, whose
+pattern is an extended regex, so a path holding those characters read the wrong
+processes in both directions: a genuinely busy runner could report idle and be
+stopped mid-job, and an unrelated runner could report busy. A `ps … | grep`
+pipeline is not the alternative either — grep's own command line contains the
+path it is searching for, so it matches itself and every runner reads as busy.
+
+`scripts/runner-toggle.test.mjs` sources the script and drives the real check
+against a stubbed process table; CI's `runner-kit-bash32` job runs that suite
+and `bash -n` over the script under the macOS system bash 3.2.
+
 ### Installing it
 
 Install a **copy**, on PATH:
