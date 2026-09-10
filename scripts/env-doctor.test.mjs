@@ -2325,6 +2325,38 @@ test('a severity: "orphan" exception suppresses its orphan and clears --strict-o
   );
 });
 
+test('an orphan exception clears a whole --strict-orphans run end to end', async () => {
+  // The unit above scores the exit CONTRACT; this one scores the run. The
+  // manifest is deliberately left honest — BUILDER_SCRATCH_TOKEN is declared
+  // nowhere in it — because widening the manifest to buy the same green is
+  // precisely what this exception form exists to avoid.
+  const manifest = infisicalOnlyManifest({ folder: "/", environments: ["staging"] });
+  const root = makeRepo({});
+  try {
+    const report = await runDoctor({
+      manifest,
+      repoRoot: root,
+      environments: ["staging"],
+      strictOrphans: true,
+      exceptions: parseExceptions([
+        { key: "BUILDER_SCRATCH_TOKEN", severity: "orphan", "revisit-date": "2027-01-01" },
+      ]),
+      now: new Date("2026-09-10T00:00:00Z"),
+      infisical: {
+        listNames: async () => ["SHARED_TOKEN", "BUILDER_SCRATCH_TOKEN"],
+        listValues: async () => new Map(),
+      },
+    });
+    assert.equal(report.exitCode, 0, `--strict-orphans should pass:\n${renderReport(report)}`);
+    assert.deepEqual(report.findings, [], "the suppressed orphan leaves the reported set");
+    assert.equal(report.suppressed.length, 1);
+    assert.equal(report.suppressed[0].key, "BUILDER_SCRATCH_TOKEN");
+    assert.match(renderReport(report), /BUILDER_SCRATCH_TOKEN \[infisical\/staging\] \(orphan\) — revisit 2027-01-01/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("severity defaults to fail, and a fail exception never silences an orphan", () => {
   const [entry] = parseExceptions([{ key: "LEGACY_API_KEY", "revisit-date": "2027-01-01" }]);
   assert.equal(entry.severity, "fail");
