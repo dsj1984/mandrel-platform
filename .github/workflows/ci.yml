@@ -286,6 +286,23 @@ jobs:
           RUNNER_KIT_BASH: /bin/bash
         run: node --test scripts/runner-env-drift.test.mjs
 
+      # `runner-toggle.sh` is the other shell the fleet's operator executes, and
+      # the only one that STOPS runners — a bash 3.2 syntax error in it surfaces
+      # at a prompt, mid-scale-down, with no CI in between. `bash -n` is the
+      # cheap half (parse under the fleet's own interpreter, run nothing); the
+      # suite is the half that exercises the real `is_busy` against a stubbed
+      # process table. Split into two steps so a parse failure names itself
+      # rather than arriving as a node:test import error.
+      - name: Syntax-check runner-toggle.sh under bash 3.2
+        shell: bash
+        run: /bin/bash -n docs/runbooks/runner-toggle.sh
+
+      - name: Run the runner-toggle suite under bash 3.2
+        shell: bash
+        env:
+          RUNNER_KIT_BASH: /bin/bash
+        run: node --test scripts/runner-toggle.test.mjs
+
   actionlint:
     name: Lint workflows (actionlint + zizmor)
     runs-on: ubuntu-latest
