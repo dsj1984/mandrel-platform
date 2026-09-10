@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.13.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.12.0...mandrel-platform-v1.13.0) (2026-09-10)
+
+
+### Added
+
+* let residency.cloudflare declare per-environment Worker presence (refs [#483](https://github.com/dsj1984/mandrel-platform/issues/483)) ([#486](https://github.com/dsj1984/mandrel-platform/issues/486)) ([25adc4a](https://github.com/dsj1984/mandrel-platform/commit/25adc4ae4fea7d3a02e0c503bb95d33b4f24d9f9))
+
+
+### Fixed
+
+* give the non-lockfile SAST install path an explicit interpreter floor instead of a raw pip resolver error ([#482](https://github.com/dsj1984/mandrel-platform/issues/482)) ([#484](https://github.com/dsj1984/mandrel-platform/issues/484)) ([9da1316](https://github.com/dsj1984/mandrel-platform/commit/9da13166ac3f386989f87d0c01cb7cb5092e6db8))
+
 ## [1.12.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.11.0...mandrel-platform-v1.12.0) (2026-09-09)
 
 
