@@ -899,10 +899,10 @@ Toggle matrix:
 
 > **Excluding paths from SAST (`sast-exclude`).** The SAST sub-step always
 > excludes the vendored `.agents` framework tree (a consumer cannot edit it)
-> and, when `semgrep-config` is `'vendored'`, the `_mandrel-platform-sast`
-> side-checkout directory that carries the ruleset snapshot (mandrel-platform's
-> own source tree — never the caller's code, so it must never enter the
-> caller's finding set). Use `sast-exclude` to **append** further `--exclude`
+> and every `_mandrel-platform-*` side-checkout — the ruleset snapshot and the
+> Semgrep lockfile plus interpreter selector are checked out from
+> mandrel-platform's own source tree, never the caller's code, so they must
+> never enter the caller's finding set. Use `sast-exclude` to **append** further `--exclude`
 > globs — space- or comma-separated — for generated code, build output, or
 > test fixtures you don't want Semgrep to scan (e.g.
 > `'dist coverage tests/fixtures'`). Empty (the default) leaves only the
@@ -916,6 +916,25 @@ Toggle matrix:
 > bare `python3` when it already satisfies the floor — the common case, and
 > byte-identical to previous behaviour — otherwise the first of
 > `python3.13`, `python3.12`, `python3.11`, `python3.10` found on `PATH`.
+>
+> **On Linux the lockfile's ABI is probed first.** The hash-pinned install
+> below is valid only on a cp312 interpreter, so on a Linux runner the step
+> looks for `python3.12` — the ABI the lockfile was resolved for, passed to
+> the selector as `SEMGREP_LOCKFILE_ABI` — before it falls back to the order
+> above. Without that ordering, the day a CI image ships `python3.13` as its
+> bare `python3` every consumer would quietly lose hash-pinning while an
+> eligible `python3.12` sat on the same `PATH`. It is an ordering preference
+> only: the ABI candidate still has to clear the floor, and a runner that does
+> not have it carries on down the normal list. Darwin keeps the plain order —
+> no darwin hashes are generated, so there is no ABI worth steering toward.
+>
+> **A lost hash pin is audible.** The hash-pinned install requires all three
+> of Linux, `x86_64`, and a cp312 interpreter — the lockfile's wheels are
+> resolved for exactly that target, and PyPI ships a separate `aarch64` wheel
+> no entry in it covers. When any one of them does not hold (or the lockfile
+> itself is absent), the step installs the top pin **without hash-pinning**
+> and emits a `::warning::` naming which precondition failed, so the loss
+> shows up on the run summary rather than only in a folded log line.
 >
 > If nothing on `PATH` satisfies the floor the step **fails with an
 > `::error::`** naming the floor, the pin, the version it found, and the

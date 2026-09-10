@@ -17,7 +17,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildVendoredRuleset } from "./update-semgrep-rules.mjs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { buildVendoredRuleset, selectPythonInterpreter } from "./update-semgrep-rules.mjs";
 
 function rule(id, languages) {
   return { id, languages, message: "m", severity: "ERROR", metadata: {} };
@@ -146,5 +150,37 @@ test("the committed .semgrep/rules.json vendored file is well-formed and non-emp
   assert.ok(
     ids.includes("package_managers.pnpm.pnpm-trust-policy.pnpm-trust-policy"),
     "pnpm trustPolicy rule must remain in force (Story #132 AC)"
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The vendoring venv is built from the shared interpreter selector (#495)
+// ---------------------------------------------------------------------------
+
+test("selectPythonInterpreter returns the selector's choice, not a hard-coded python3", () => {
+  // A fixture PATH rather than the host's real interpreters: the branch that
+  // matters is a below-floor `python3` with a versioned sibling, which no CI
+  // tier here provides and a developer laptop provides only by accident.
+  const dir = mkdtempSync(join(tmpdir(), "updater-python-stubs-"));
+  writeFileSync(join(dir, "python3"), '#!/bin/sh\necho "3 9"\n', { mode: 0o755 });
+  writeFileSync(join(dir, "python3.12"), '#!/bin/sh\necho "3 12"\n', { mode: 0o755 });
+
+  // The stub directory comes FIRST so it shadows the host's real
+  // interpreters; `/bin` follows because the selector is a bash script that
+  // also runs `uname`, and a PATH holding only stubs could resolve neither.
+  assert.equal(selectPythonInterpreter({ env: { PATH: `${dir}:/bin` } }), "python3.12");
+});
+
+test("selectPythonInterpreter fails closed when nothing clears the floor", () => {
+  // Hard-coding `python3` here installed nothing on macOS system Python and
+  // reported pip's resolver error, which names neither the interpreter nor
+  // the floor. Sharing the selector means this script fails the same way the
+  // SAST step does.
+  const dir = mkdtempSync(join(tmpdir(), "updater-python-stubs-"));
+  writeFileSync(join(dir, "python3"), '#!/bin/sh\necho "3 9"\n', { mode: 0o755 });
+
+  assert.throws(
+    () => selectPythonInterpreter({ env: { PATH: `${dir}:/bin` } }),
+    /satisfies Python >= 3\.10/,
   );
 });

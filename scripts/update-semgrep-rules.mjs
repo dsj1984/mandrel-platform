@@ -79,8 +79,19 @@ const REPO_ROOT = resolve(__dirname, "..");
 // generate the file is a (harmless but inconsistent) version skew.
 const DEFAULT_SEMGREP_PIN = "semgrep==1.176.1";
 
-// SHA-256 hashes for every `DEFAULT_SEMGREP_PIN` distribution published on
-// PyPI (the four platform wheels + the sdist). pip's `--require-hashes` mode
+// Minimum interpreter for the pin above — semgrep's own `requires_python`,
+// and the same value `SEMGREP_PYTHON_FLOOR` carries in pr-quality.yml's SAST
+// step. Passed to the shared selector below so this script fails with the
+// same named error a runner gets, rather than pip's "could not find a version
+// that satisfies the requirement", which reads like a registry outage.
+const DEFAULT_SEMGREP_PYTHON_FLOOR = "3.10";
+
+// SHA-256 hashes for all 8 artifacts published on PyPI for
+// `DEFAULT_SEMGREP_PIN` — the platform wheels plus the sdist. The count is
+// asserted against this map by `check-semgrep-lockfile.test.mjs`: it read
+// "the four platform wheels + the sdist" while the array below held eight,
+// which is exactly the kind of stale gloss that makes a reader trust a
+// partial hash set. pip's `--require-hashes` mode
 // verifies the downloaded `semgrep` artifact against this set before it is
 // installed, so a compromised or swapped PyPI artifact for this exact version
 // is rejected at install time — the same "pin the supply-chain input" posture
@@ -171,10 +182,67 @@ function parseArgs(argv) {
 }
 
 /**
+ * Return the interpreter name to build the vendoring venv from, by RUNNING
+ * `scripts/select-semgrep-python.sh` — the same selector `pr-quality.yml`'s
+ * SAST step sources. Executed rather than sourced: run directly, the script
+ * prints `SEMGREP_PYTHON=<name>` / `SEMGREP_PYTHON_VERSION=<x.y>` and exits
+ * with the selection's own status, which is the whole interface a non-shell
+ * caller needs.
+ *
+ * A hard-coded `python3` was the alternative, and it is wrong for the reason
+ * the selector exists: macOS ships `/usr/bin/python3` = 3.9.6, below the pin's
+ * `requires_python`, so this script would install nothing and report pip's
+ * resolver error rather than naming the interpreter. Sharing the selector also
+ * means the two callers cannot drift on what "acceptable" means.
+ *
+ * @param {object} [options]
+ * @param {NodeJS.ProcessEnv} [options.env] environment the selector runs
+ *   under. Defaults to this process's. Injectable so the unit suite can hand
+ *   it a fixture PATH of stub interpreters instead of asserting against
+ *   whatever Python the host running the tests happens to ship.
+ * @returns {string} an interpreter resolvable on PATH
+ */
+export function selectPythonInterpreter({ env = process.env } = {}) {
+  const selector = join(REPO_ROOT, "scripts", "select-semgrep-python.sh");
+  const result = spawnSync("bash", [selector], {
+    encoding: "utf8",
+    env: {
+      ...env,
+      SEMGREP_PIN: DEFAULT_SEMGREP_PIN,
+      SEMGREP_PYTHON_FLOOR: DEFAULT_SEMGREP_PYTHON_FLOOR,
+    },
+  });
+
+  // The selector's own `::error::` explains the failure far better than a
+  // wrapper could — it names the floor, the pin, the version found and the
+  // remedy — so it is surfaced verbatim rather than summarized away.
+  if (result.status !== 0) {
+    process.stderr.write(result.stdout ?? "");
+    process.stderr.write(result.stderr ?? "");
+    throw new Error(
+      `no interpreter on PATH satisfies Python >= ${DEFAULT_SEMGREP_PYTHON_FLOOR} for ${DEFAULT_SEMGREP_PIN}`
+    );
+  }
+
+  const line = (result.stdout ?? "")
+    .split("\n")
+    .find((l) => l.startsWith("SEMGREP_PYTHON="));
+  const selected = line ? line.slice("SEMGREP_PYTHON=".length).trim() : "";
+  if (selected === "") {
+    throw new Error(
+      `${selector} exited 0 without reporting SEMGREP_PYTHON — its run-not-source output contract changed`
+    );
+  }
+  return selected;
+}
+
+/**
  * Resolve `p/default` against a pinned, ephemeral Semgrep install and return
  * the full rule list as parsed JSON objects. Mirrors the hermetic-venv
  * install strategy `pr-quality.yml`'s SAST step uses (Story #92): an
- * ephemeral `python3 -m venv` under `mktemp -d`, never the shared user site.
+ * ephemeral venv under `mktemp -d`, never the shared user site — built from
+ * the interpreter `scripts/select-semgrep-python.sh` picks, so this script and
+ * the SAST step cannot disagree about which Python is acceptable.
  */
 function resolveRegistryRules(semgrepPin) {
   const venvDir = join(mkdtempSync(join(tmpdir(), "semgrep-vendor-")), "venv");
@@ -183,7 +251,7 @@ function resolveRegistryRules(semgrepPin) {
   const reqsFile = join(mkdtempSync(join(tmpdir(), "semgrep-vendor-reqs-")), "semgrep.txt");
 
   try {
-    spawnSync("python3", ["-m", "venv", venvDir], { stdio: "inherit" });
+    spawnSync(selectPythonInterpreter(), ["-m", "venv", venvDir], { stdio: "inherit" });
     const pip = join(venvDir, "bin", "pip");
     const semgrep = join(venvDir, "bin", "semgrep");
 
@@ -234,9 +302,15 @@ function resolveRegistryRules(semgrepPin) {
       );
     }
 
+    // Dependencies only — semgrep itself is already installed, hash-verified,
+    // above. Nothing is added to this list: the package that used to sit here
+    // was needed solely because semgrep 1.97.0's transitive
+    // `opentelemetry-instrumentation==0.46b0` imported `pkg_resources` at
+    // load, which 0.58b0 no longer does. Re-adding it would drag its own
+    // advisories back into a venv this script then runs.
     const install = spawnSync(
       pip,
-      ["install", "--quiet", "--disable-pip-version-check", "setuptools", semgrepPin],
+      ["install", "--quiet", "--disable-pip-version-check", semgrepPin],
       { stdio: "inherit" }
     );
     if (install.status !== 0) {
