@@ -157,18 +157,37 @@ test("the committed .semgrep/rules.json vendored file is well-formed and non-emp
 // The vendoring venv is built from the shared interpreter selector (#495)
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a stub interpreter directory to be used as the WHOLE PATH.
+ *
+ * The fixture must be the whole PATH, not a prefix of it: appending a real
+ * directory leaks that host's interpreters into the probe, and the selector
+ * tries every versioned candidate rather than `python3` alone. On a
+ * merged-usr Linux runner `/bin/python3.12` is real and clears the floor, so
+ * a `${dir}:/bin` PATH quietly passed on macOS and failed in CI — the exact
+ * host-dependence this Story exists to remove from the SAST step.
+ *
+ * A `uname` stub ships with the interpreters because it is the selector's one
+ * external command, and a stub-only PATH could not otherwise resolve it. This
+ * mirrors `select-semgrep-python.test.mjs`'s own fixture builder.
+ */
+function pythonStubDir(versions, { os = "Linux" } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "updater-python-stubs-"));
+  for (const [name, version] of Object.entries(versions)) {
+    const [major, minor] = version.split(".");
+    writeFileSync(join(dir, name), `#!/bin/sh\necho "${major} ${minor}"\n`, { mode: 0o755 });
+  }
+  writeFileSync(join(dir, "uname"), `#!/bin/sh\necho "${os}"\n`, { mode: 0o755 });
+  return dir;
+}
+
 test("selectPythonInterpreter returns the selector's choice, not a hard-coded python3", () => {
   // A fixture PATH rather than the host's real interpreters: the branch that
   // matters is a below-floor `python3` with a versioned sibling, which no CI
   // tier here provides and a developer laptop provides only by accident.
-  const dir = mkdtempSync(join(tmpdir(), "updater-python-stubs-"));
-  writeFileSync(join(dir, "python3"), '#!/bin/sh\necho "3 9"\n', { mode: 0o755 });
-  writeFileSync(join(dir, "python3.12"), '#!/bin/sh\necho "3 12"\n', { mode: 0o755 });
+  const dir = pythonStubDir({ python3: "3.9", "python3.12": "3.12" });
 
-  // The stub directory comes FIRST so it shadows the host's real
-  // interpreters; `/bin` follows because the selector is a bash script that
-  // also runs `uname`, and a PATH holding only stubs could resolve neither.
-  assert.equal(selectPythonInterpreter({ env: { PATH: `${dir}:/bin` } }), "python3.12");
+  assert.equal(selectPythonInterpreter({ env: { PATH: dir } }), "python3.12");
 });
 
 test("selectPythonInterpreter fails closed when nothing clears the floor", () => {
@@ -176,11 +195,10 @@ test("selectPythonInterpreter fails closed when nothing clears the floor", () =>
   // reported pip's resolver error, which names neither the interpreter nor
   // the floor. Sharing the selector means this script fails the same way the
   // SAST step does.
-  const dir = mkdtempSync(join(tmpdir(), "updater-python-stubs-"));
-  writeFileSync(join(dir, "python3"), '#!/bin/sh\necho "3 9"\n', { mode: 0o755 });
+  const dir = pythonStubDir({ python3: "3.9" });
 
   assert.throws(
-    () => selectPythonInterpreter({ env: { PATH: `${dir}:/bin` } }),
+    () => selectPythonInterpreter({ env: { PATH: dir } }),
     /satisfies Python >= 3\.10/,
   );
 });

@@ -204,7 +204,11 @@ function parseArgs(argv) {
  */
 export function selectPythonInterpreter({ env = process.env } = {}) {
   const selector = join(REPO_ROOT, "scripts", "select-semgrep-python.sh");
-  const result = spawnSync("bash", [selector], {
+  // `/bin/bash` absolutely, never a bare `bash`: the PATH this resolves
+  // against is the CALLER'S `env`, so a bare name would make the interpreter
+  // itself a function of the very variable under test — and a caller passing a
+  // narrowed PATH would get a different bash, or none.
+  const result = spawnSync("/bin/bash", [selector], {
     encoding: "utf8",
     env: {
       ...env,
