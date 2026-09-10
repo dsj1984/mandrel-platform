@@ -49,6 +49,7 @@ import {
   detectPackageManager,
   ghsaIdFromUrl,
   recognizeReport,
+  normalizeAdvisoryId,
 } from "./audit-check.mjs";
 
 const TODAY = "2026-07-02";
@@ -909,10 +910,18 @@ test("detectPackageManager: two lockfiles are a loud error, never a guess", () =
 // GHSA id extraction — npm exposes the id ONLY inside the advisory url
 // ---------------------------------------------------------------------------
 
-test("ghsaIdFromUrl: reads the id from a GitHub advisory url", () => {
+test("ghsaIdFromUrl: reads the id from a GitHub advisory url, canonically", () => {
+  // Canonical = uppercase `GHSA-` prefix, lowercase body: what GitHub renders
+  // and what an operator pastes into the allowlist. This used to upper-case
+  // the whole id while the pnpm path kept its `ghsa_id` verbatim, so the two
+  // managers disagreed about what an id even looks like.
   assert.equal(
     ghsaIdFromUrl("https://github.com/advisories/GHSA-aaaa-bbbb-cccc"),
-    "GHSA-AAAA-BBBB-CCCC",
+    "GHSA-aaaa-bbbb-cccc",
+  );
+  assert.equal(
+    ghsaIdFromUrl("https://github.com/advisories/GHSA-AAAA-BbBb-CCCC"),
+    "GHSA-aaaa-bbbb-cccc",
   );
 });
 
@@ -940,39 +949,86 @@ test("ghsaIdFromUrl: rejects non-urls, empty values and non-GHSA segments", () =
 // so no live npm sample carrying an advisory can be captured from it.
 // ---------------------------------------------------------------------------
 
-const NPM_HIGH_URL = "https://github.com/advisories/GHSA-dddd-eeee-ffff";
+// The committed sample of a REAL `npm audit --json` v2 report. Every other
+// fixture in this suite is built inline, and this one deliberately is not:
+// the npm schema is npm's, not ours, and an inline literal drifts toward
+// whatever the test needed rather than what the tool emits. Committing the
+// shape means a future reader can diff it against a live `npm audit --json`.
+//
+// It carries no `via[].cve` key, because npm's bundled advisory calculator
+// never emits one. The normalizer still READS `cve` — another producer may
+// write it — but nothing in this suite asserts a field npm does not emit,
+// which is how a test can otherwise certify a code path against a schema that
+// does not exist.
+const NPM_FIXTURE_URL = new URL("./fixtures/npm-audit-v2.json", import.meta.url);
 
-/** An npm v2 report with one high advisory reached through `pkg`. */
-function npmReportWithHigh({ severity = "high", cve = [] } = {}) {
-  return {
-    auditReportVersion: 2,
-    vulnerabilities: {
-      pkg: {
-        name: "pkg",
-        severity,
-        via: [
-          {
-            source: 123456,
-            name: "pkg",
-            title: "Prototype pollution in pkg",
-            url: NPM_HIGH_URL,
-            severity,
-            cve,
-          },
-        ],
-      },
-    },
-    metadata: { vulnerabilities: { high: 1, total: 1 } },
-  };
+/** The canonical id the fixture's single advisory carries. */
+const NPM_FIXTURE_ID = "GHSA-fixt-ure0-0001";
+
+/**
+ * A fresh parse of the committed fixture, optionally re-severitied so the
+ * below-gate cases exercise the same real shape.
+ *
+ * @param {{ severity?: string }} [opts]
+ */
+function npmFixtureReport({ severity } = {}) {
+  const report = JSON.parse(readFileSync(NPM_FIXTURE_URL, "utf8"));
+  if (severity !== undefined) {
+    for (const entry of Object.values(report.vulnerabilities)) {
+      entry.severity = severity;
+      for (const via of entry.via) {
+        if (typeof via === "object") {
+          via.severity = severity;
+        }
+      }
+    }
+  }
+  return report;
 }
+
+test("AC-5: the committed fixture is the real npm audit v2 shape", () => {
+  const report = npmFixtureReport();
+  assert.equal(report.auditReportVersion, 2);
+
+  const via = report.vulnerabilities["fixture-lib"].via[0];
+  for (const key of [
+    "source",
+    "name",
+    "dependency",
+    "title",
+    "url",
+    "severity",
+    "cwe",
+    "cvss",
+    "range",
+  ]) {
+    assert.ok(key in via, `via[] advisory must carry \`${key}\``);
+  }
+  assert.equal(
+    "cve" in via,
+    false,
+    "npm's advisory calculator emits no `cve` on a via[] advisory",
+  );
+});
+
+test("AC-5: recognizeReport normalizes the committed npm fixture", () => {
+  const { schema, advisories } = recognizeReport(npmFixtureReport());
+  assert.equal(schema, "npm");
+  // The fixture's second package reaches the same advisory through a STRING
+  // edge, so this also pins the transitive chain to one finding.
+  assert.equal(advisories.length, 1);
+  assert.deepEqual(advisories[0].ids, [NPM_FIXTURE_ID]);
+  assert.equal(advisories[0].severity, "high");
+  assert.equal(advisories[0].title, "Prototype pollution in fixture-lib");
+});
 
 test("recognizeReport: identifies each schema and normalizes its advisories", () => {
   assert.equal(recognizeReport(reportWith({ 1: HIGH_GHSA })).schema, "legacy");
 
-  const npm = recognizeReport(npmReportWithHigh());
+  const npm = recognizeReport(npmFixtureReport());
   assert.equal(npm.schema, "npm");
   assert.equal(npm.advisories.length, 1);
-  assert.deepEqual(npm.advisories[0].ids, ["GHSA-DDDD-EEEE-FFFF"]);
+  assert.deepEqual(npm.advisories[0].ids, [NPM_FIXTURE_ID]);
   assert.equal(npm.advisories[0].severity, "high");
 });
 
@@ -990,55 +1046,429 @@ test("recognizeReport: an empty npm report is RECOGNIZED, not unreadable", () =>
 });
 
 test("evaluateReport: an unsuppressed high in the NPM shape blocks", () => {
-  const result = evaluateReport(npmReportWithHigh(), 1, new Set());
+  const result = evaluateReport(npmFixtureReport(), 1, new Set());
   assert.equal(result.exitCode, 1);
   assert.equal(result.reason, "unsuppressed");
   assert.equal(result.schema, "npm");
   assert.equal(result.blocking.length, 1);
-  assert.equal(result.blocking[0].id, "GHSA-DDDD-EEEE-FFFF");
+  assert.equal(result.blocking[0].id, NPM_FIXTURE_ID);
 });
 
 test("evaluateReport: an allowlisted GHSA id suppresses in the NPM shape", () => {
   // The id exists only inside `via[].url` here, so this is the assertion that
   // the allowlist still means something once the schema changes.
   const result = evaluateReport(
-    npmReportWithHigh(),
+    npmFixtureReport(),
     1,
-    new Set(["GHSA-DDDD-EEEE-FFFF"]),
+    new Set([NPM_FIXTURE_ID]),
   );
   assert.equal(result.exitCode, 0);
   assert.equal(result.reason, "clean");
 });
 
-test("evaluateReport: a CVE id suppresses in the NPM shape too", () => {
-  const report = npmReportWithHigh({ cve: ["CVE-2026-9999"] });
-  assert.equal(
-    evaluateReport(report, 1, new Set(["CVE-2026-9999"])).exitCode,
-    0,
-  );
-  assert.equal(evaluateReport(report, 1, new Set()).exitCode, 1);
-});
-
 test("evaluateReport: below-gate npm severities never block", () => {
   for (const severity of ["moderate", "low", "info"]) {
-    const result = evaluateReport(npmReportWithHigh({ severity }), 0, new Set());
+    const result = evaluateReport(npmFixtureReport({ severity }), 0, new Set());
     assert.equal(result.exitCode, 0, severity);
     assert.equal(result.reason, "clean", severity);
   }
 });
 
-test("recognizeReport: a transitive npm chain counts its advisory once", () => {
-  // `via` carries STRING edges for transitive chains alongside advisory
-  // objects. Counting an edge as an advisory would inflate the finding set;
-  // counting the same advisory once per reaching package would duplicate it.
+// ---------------------------------------------------------------------------
+// Story #488 — id normalization
+//
+// The allowlist is this gate's ONLY sanctioned suppression mechanism, and it
+// was inert for the id form GitHub renders and every operator pastes: the npm
+// path upper-cased the id it parsed out of `via[].url`, the pnpm path kept
+// `ghsa_id` verbatim, and `partitionAllowlist` matched with an exact
+// `Set.has`. A canonical `GHSA-7w5x-hrqm-74c2` therefore suppressed under pnpm
+// and silently did nothing under npm — the worst shape of failure available,
+// because the entry LOOKS applied.
+// ---------------------------------------------------------------------------
+
+test("normalizeAdvisoryId: GHSA ids fold to the canonical rendering", () => {
+  for (const spelling of [
+    "GHSA-7w5x-hrqm-74c2",
+    "ghsa-7w5x-hrqm-74c2",
+    "GHSA-7W5X-HRQM-74C2",
+    "GHSA-7W5x-HrQm-74c2",
+    "  GHSA-7w5x-hrqm-74c2  ",
+  ]) {
+    assert.equal(
+      normalizeAdvisoryId(spelling),
+      "GHSA-7w5x-hrqm-74c2",
+      spelling,
+    );
+  }
+});
+
+test("normalizeAdvisoryId: a CVE id folds to its own canonical upper case", () => {
+  assert.equal(normalizeAdvisoryId("cve-2026-0994"), "CVE-2026-0994");
+  assert.equal(normalizeAdvisoryId("CVE-2026-0994"), "CVE-2026-0994");
+});
+
+test("normalizeAdvisoryId: nothing to normalize yields the empty string", () => {
+  for (const value of ["", "   ", null, undefined, 42, {}, []]) {
+    assert.equal(normalizeAdvisoryId(value), "", JSON.stringify(value));
+  }
+});
+
+test("partitionAllowlist: a mixed-case allowlist id lands canonical", () => {
+  const { suppressed } = partitionAllowlist(
+    [{ id: "GHSA-7W5X-HRQM-74C2", reason: "accepted", expires: FUTURE }],
+    TODAY,
+  );
+  assert.ok(suppressed.has("GHSA-7w5x-hrqm-74c2"));
+});
+
+// ---------------------------------------------------------------------------
+// Story #488 — the CLI, driven through its injectable subprocess seam
+//
+// `runCli(argv, { spawnImpl })` is the seam (`.agents/rules/test-seams.md`):
+// production keeps the real `spawnSync`, and these cases substitute a stub so
+// the whole CLI path — allowlist, manager detection, audit invocation, report
+// evaluation, exit code — is executable without spawning a package manager or
+// reaching a registry. Before it existed, every one of those paths was
+// reachable only by running a real audit, which is why the ones below shipped
+// broken.
+// ---------------------------------------------------------------------------
+
+/** A recording `spawnSync` stub returning a canned result. */
+function stubSpawn(result, calls = []) {
+  return (bin, args, options) => {
+    calls.push({ bin, args, options });
+    return { status: 0, stdout: "", stderr: "", ...result };
+  };
+}
+
+/**
+ * Materialize a throwaway project — package.json, one lockfile, an optional
+ * allowlist — and run `fn` against its absolute argv.
+ *
+ * @param {{ lockfile: string; allowlist?: unknown[] }} spec
+ * @param {(ctx: { dir: string; argv: string[] }) => void} fn
+ */
+function withProject({ lockfile, allowlist }, fn) {
+  const dir = mkdtempSync(join(tmpdir(), "audit-check-cli-"));
+  try {
+    const packageJsonPath = join(dir, "package.json");
+    writeFileSync(
+      packageJsonPath,
+      JSON.stringify({ name: "fixture", version: "1.0.0" }),
+    );
+    writeFileSync(
+      join(dir, lockfile),
+      lockfile.endsWith(".json") ? "{}\n" : "lockfileVersion: '9.0'\n",
+    );
+
+    const allowlistPath = join(dir, "audit-allowlist.json");
+    if (allowlist !== undefined) {
+      writeFileSync(allowlistPath, JSON.stringify(allowlist, null, 2));
+    }
+
+    fn({
+      dir,
+      argv: ["--package-json", packageJsonPath, "--allowlist", allowlistPath],
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Run `fn` with console output collected rather than printed. */
+function captureConsole(fn) {
+  /** @type {string[]} */
+  const lines = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args) => lines.push(args.map(String).join(" "));
+  console.error = (...args) => lines.push(args.map(String).join(" "));
+  try {
+    return { value: fn(), output: lines.join("\n") };
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+}
+
+test("AC-1: a canonical lowercase allowlist id suppresses an npm advisory written in any case", () => {
+  // The npm report exposes its id ONLY inside `via[].url`, and GitHub's own
+  // links are mixed-case-tolerant. The allowlist entry is written exactly as
+  // the runbook shows it.
+  const report = npmFixtureReport();
+  report.vulnerabilities["fixture-lib"].via[0].url =
+    "https://github.com/advisories/GHSA-7W5X-HrQm-74C2";
+  const stdout = JSON.stringify(report);
+
+  withProject(
+    {
+      lockfile: "package-lock.json",
+      allowlist: [
+        {
+          id: "GHSA-7w5x-hrqm-74c2",
+          reason: "no fix available upstream yet",
+          expires: FUTURE,
+        },
+      ],
+    },
+    ({ argv }) => {
+      const { value } = captureConsole(() =>
+        runCli(argv, { spawnImpl: stubSpawn({ status: 1, stdout }) }),
+      );
+      assert.equal(value, 0, "the canonical id must suppress under npm");
+    },
+  );
+
+  // Control: the same advisory with nothing allowlisted still blocks, so the
+  // exit 0 above is suppression rather than a report that was never read.
+  withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
+    const { value } = captureConsole(() =>
+      runCli(argv, { spawnImpl: stubSpawn({ status: 1, stdout }) }),
+    );
+    assert.equal(value, 1);
+  });
+});
+
+test("AC-1: the same canonical id suppresses a pnpm advisory written in any case", () => {
+  const stdout = JSON.stringify(
+    reportWith({
+      1: {
+        ghsa_id: "GHSA-7W5x-HrQm-74C2",
+        severity: "high",
+        title: "High severity in a transitive dep",
+        url: "https://github.com/advisories/GHSA-7w5x-hrqm-74c2",
+      },
+    }),
+  );
+
+  withProject(
+    {
+      lockfile: "pnpm-lock.yaml",
+      allowlist: [
+        {
+          id: "GHSA-7w5x-hrqm-74c2",
+          reason: "no fix available upstream yet",
+          expires: FUTURE,
+        },
+      ],
+    },
+    ({ argv }) => {
+      const { value } = captureConsole(() =>
+        runCli(argv, { spawnImpl: stubSpawn({ status: 1, stdout }) }),
+      );
+      assert.equal(value, 0, "the canonical id must suppress under pnpm");
+    },
+  );
+
+  withProject({ lockfile: "pnpm-lock.yaml" }, ({ argv }) => {
+    const { value } = captureConsole(() =>
+      runCli(argv, { spawnImpl: stubSpawn({ status: 1, stdout }) }),
+    );
+    assert.equal(value, 1);
+  });
+});
+
+test("AC-2: the audit runs in the directory whose lockfile was detected, bounded", () => {
+  // `detectPackageManager` reads `dirname(--package-json)`; the audit used to
+  // run in `process.cwd()`. When those differ the gate reported on a graph it
+  // never audited — an unfalsifiable claim, which is the one thing this gate
+  // must not produce.
+  const calls = [];
+  const stdout = JSON.stringify({
+    auditReportVersion: 2,
+    vulnerabilities: {},
+    metadata: {},
+  });
+
+  withProject({ lockfile: "package-lock.json" }, ({ dir, argv }) => {
+    const { value } = captureConsole(() =>
+      runCli(argv, { spawnImpl: stubSpawn({ status: 0, stdout }, calls) }),
+    );
+    assert.equal(value, 0);
+    assert.equal(calls.length, 1);
+
+    const [call] = calls;
+    assert.equal(call.bin, "npm");
+    assert.deepEqual(call.args, ["audit", "--omit=dev", "--json"]);
+    assert.equal(call.options.cwd, dir);
+    assert.ok(
+      typeof call.options.timeout === "number" && call.options.timeout > 0,
+      "the audit must be time-bounded",
+    );
+    assert.ok(
+      call.options.maxBuffer >= 64 * 1024 * 1024,
+      `maxBuffer must be at least 64 MiB, got ${call.options.maxBuffer}`,
+    );
+    // No shell string, ever: the argv form is what keeps this call off an
+    // injection surface, and what kept stderr out of `/dev/null`.
+    assert.equal(call.options.shell, undefined);
+  });
+});
+
+test("AC-2: the pnpm branch spawns pnpm's own argv in the detected directory", () => {
+  const calls = [];
+  const stdout = JSON.stringify({ advisories: {}, metadata: {} });
+
+  withProject({ lockfile: "pnpm-lock.yaml" }, ({ dir, argv }) => {
+    const { value } = captureConsole(() =>
+      runCli(argv, { spawnImpl: stubSpawn({ status: 0, stdout }, calls) }),
+    );
+    assert.equal(value, 0);
+    assert.equal(calls[0].bin, "pnpm");
+    assert.deepEqual(calls[0].args, ["audit", "--prod", "--json"]);
+    assert.equal(calls[0].options.cwd, dir);
+  });
+});
+
+test("AC-3: an audit that says nothing is never clean, and its stderr is shown", () => {
+  // Exit 0 with unreadable stdout is how EVERY failure to run at all presents:
+  // a missing binary, a killed child, an output ceiling hit mid-write. The old
+  // contract printed "No vulnerabilities found" and exited 0 for all of them.
+  const stderrText = "npm error code ENETUNREACH: registry unreachable";
+
+  for (const [label, stdout] of [
+    ["empty stdout", ""],
+    ["whitespace only", "   \n"],
+    ["a human-readable notice", "up to date, audited 214 packages\n"],
+  ]) {
+    withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
+      const { value, output } = captureConsole(() =>
+        runCli(argv, {
+          spawnImpl: stubSpawn({ status: 0, stdout, stderr: stderrText }),
+        }),
+      );
+      assert.equal(value, 1, label);
+      assert.match(output, /Failing closed/, label);
+      assert.ok(output.includes(stderrText), `${label} must show the stderr`);
+      assert.ok(
+        !output.includes("No vulnerabilities found"),
+        `${label} must not report clean`,
+      );
+    });
+  }
+});
+
+test("AC-3: a spawn that never ran at all fails closed with its reason", () => {
+  // `spawnSync` reports a missing binary or a fired timeout through `error`,
+  // with no exit status at all.
+  withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
+    const { value, output } = captureConsole(() =>
+      runCli(argv, {
+        spawnImpl: () => ({
+          status: null,
+          stdout: "",
+          stderr: "",
+          error: new Error("spawnSync npm ENOENT"),
+        }),
+      }),
+    );
+    assert.equal(value, 1);
+    assert.match(output, /ENOENT/);
+  });
+});
+
+test("AC-3: a parsed report matching no known schema still fails closed", () => {
+  withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
+    const { value, output } = captureConsole(() =>
+      runCli(argv, {
+        spawnImpl: stubSpawn({
+          status: 0,
+          stdout: JSON.stringify({ auditReportVersion: 3, findings: [] }),
+          stderr: "npm warn audit schema changed",
+        }),
+      }),
+    );
+    assert.equal(value, 1);
+    assert.match(output, /matching no known audit schema/);
+    assert.match(output, /npm warn audit schema changed/);
+  });
+});
+
+test("AC-4: a blocking advisory with no parseable id is reported, never dropped", () => {
+  // The npm identity fallback was `ghsaId ?? source ?? url`, and `source` is
+  // coerced to `""` when absent — so `"" ?? url` is `""`, the url arm was dead
+  // code, and the empty key hit a `continue` that DISCARDED the advisory. A
+  // Critical silently vanished for lacking a name.
   const report = {
     auditReportVersion: 2,
     vulnerabilities: {
-      pkg: npmReportWithHigh().vulnerabilities.pkg,
-      dependent: { name: "dependent", severity: "high", via: ["pkg"] },
-      other: npmReportWithHigh().vulnerabilities.pkg,
+      nameless: {
+        name: "nameless",
+        severity: "critical",
+        via: [{ name: "nameless", title: "Critical with no id", severity: "critical" }],
+      },
     },
     metadata: {},
   };
-  assert.equal(recognizeReport(report).advisories.length, 1);
+
+  const result = evaluateReport(report, 0, new Set());
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.reason, "unsuppressed");
+  assert.equal(result.blocking.length, 1);
+  assert.equal(result.blocking[0].id, "(unknown)");
+  assert.equal(result.blocking[0].title, "Critical with no id");
+});
+
+test("AC-4: two id-less advisories are two findings, not one collapsed key", () => {
+  const report = {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      first: {
+        name: "first",
+        severity: "high",
+        via: [{ name: "first", title: "First nameless high", severity: "high" }],
+      },
+      second: {
+        name: "second",
+        severity: "critical",
+        via: [{ name: "second", title: "Second nameless critical", severity: "critical" }],
+      },
+    },
+    metadata: {},
+  };
+
+  assert.equal(evaluateReport(report, 0, new Set()).blocking.length, 2);
+});
+
+test("AC-4: an id-less advisory blocks through the CLI and prints (unknown)", () => {
+  const stdout = JSON.stringify({
+    auditReportVersion: 2,
+    vulnerabilities: {
+      nameless: {
+        name: "nameless",
+        severity: "critical",
+        via: [{ name: "nameless", title: "Critical with no id", severity: "critical" }],
+      },
+    },
+    metadata: {},
+  });
+
+  withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
+    const { value, output } = captureConsole(() =>
+      runCli(argv, { spawnImpl: stubSpawn({ status: 1, stdout }) }),
+    );
+    assert.equal(value, 1);
+    assert.match(output, /\(unknown\)/);
+  });
+});
+
+test("AC-4: an id-less advisory in the legacy schema blocks too", () => {
+  const report = reportWith({
+    1: { severity: "critical", title: "Legacy critical with no id" },
+  });
+  const result = evaluateReport(report, 0, new Set());
+  assert.equal(result.blocking.length, 1);
+  assert.equal(result.blocking[0].id, "(unknown)");
+});
+
+test("AC-5: the committed fixture blocks through the CLI, naming its canonical id", () => {
+  const stdout = JSON.stringify(npmFixtureReport());
+
+  withProject({ lockfile: "package-lock.json" }, ({ argv }) => {
+    const { value, output } = captureConsole(() =>
+      runCli(argv, { spawnImpl: stubSpawn({ status: 1, stdout }) }),
+    );
+    assert.equal(value, 1);
+    assert.ok(output.includes(NPM_FIXTURE_ID), output);
+  });
 });
