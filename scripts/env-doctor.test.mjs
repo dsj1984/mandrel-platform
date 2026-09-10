@@ -2000,7 +2000,15 @@ test("an imported secret counts in the folder that was ASKED for, is shape-check
   // grepped out of the captured output, and uniqueness is all the assertion
   // needs — key-shaped entropy here would be a true positive for the secret
   // scan, which reads entropy beside a secret-shaped name.
-  const IMPORTED_VALUE = "https://imported-from-the-shared-folder.test";
+  // The marker is asserted on, not the whole URL: a substring check against a
+  // URL-shaped string CONSTANT is `js/incomplete-url-substring-sanitization`
+  // (CodeQL, high — it cannot tell a leak assertion from a host check). The
+  // sibling suites escape it only because they compare against a loop
+  // variable. Splitting the marker out keeps the value a real URL, so the
+  // `shape: "url"` stage is still exercised, and makes the leak assertion
+  // STRONGER: any fragment of the value failing to be redacted now fails here.
+  const IMPORTED_VALUE_MARKER = "imported-from-the-shared-folder";
+  const IMPORTED_VALUE = `https://${IMPORTED_VALUE_MARKER}.test`;
   const requested = [];
   const fetchImpl = async (url) => {
     requested.push(url);
@@ -2058,7 +2066,7 @@ test("an imported secret counts in the folder that was ASKED for, is shape-check
       assert.ok(url.includes("secretPath=%2Fcloudflare"), `the REQUESTED folder is what is asked for: ${url}`);
     }
     const captured = renderReport(report) + JSON.stringify(report);
-    assert.ok(!captured.includes(IMPORTED_VALUE), "an imported VALUE reached the doctor's output");
+    assert.ok(!captured.includes(IMPORTED_VALUE_MARKER), "an imported VALUE reached the doctor's output");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
