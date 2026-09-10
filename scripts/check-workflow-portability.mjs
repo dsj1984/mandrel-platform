@@ -48,8 +48,11 @@
  *      are no logs, and `gh pr checks` reports `pending 0`, indistinguishable
  *      from a busy fleet. Normalize to
  *      `fromJSON(startsWith(inputs.runner, '[') && inputs.runner ||
- *      format('"{0}"', inputs.runner))`, which accepts both documented
- *      shapes. (Caused #419 / v1.5.0; behaviour is covered by
+ *      format('"{0}"', inputs.runner || 'ubuntu-latest'))`, which accepts both
+ *      documented shapes and lands an EMPTY value on the default label rather
+ *      than on `""` — a `default:` fires only when the key is absent, so an
+ *      empty-but-present value reaches the site and would queue forever too
+ *      (#493). (Caused #419 / v1.5.0; behaviour is covered by
  *      check-runner-runs-on.test.mjs, which evaluates the real expression
  *      rather than matching its spelling.)
  *
@@ -301,7 +304,7 @@ export function checkWorkflowContent(content) {
         `JSON-encoded label-array string resolves to ONE unmatchable label ` +
         `name and the job queues until the 24-hour timeout, silently. ` +
         `Normalize it: \`fromJSON(startsWith(inputs.runner, '[') && ` +
-        `inputs.runner || format('"{0}"', inputs.runner))\`.`,
+        `inputs.runner || format('"{0}"', inputs.runner || 'ubuntu-latest'))\`.`,
     });
   });
 
