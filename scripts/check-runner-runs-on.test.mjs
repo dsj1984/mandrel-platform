@@ -30,6 +30,16 @@
  * fix that reaches six of the seven workflows from shipping as if it reached
  * all seven.
  *
+ * Story #493 also left a downstream door open, closed here: `runs-on` was not
+ * the only site reading `inputs.runner`. `pr-quality.yml`'s harden-runner
+ * egress-audit step gates on `startsWith(inputs.runner, 'ubuntu-')`, which was
+ * unreachable-but-consistent while `runner: ''` never scheduled a job. Once the
+ * empty value resolved to the hosted default, the job ran on ubuntu-latest
+ * while the gate read the raw `''` and skipped — a SECURITY step opting itself
+ * out with nothing red to show for it. So the gate is asserted the same way:
+ * extracted and EVALUATED, and required to AGREE with what `runs-on` resolves
+ * to for the same input.
+ *
  * Run: node --test scripts/check-runner-runs-on.test.mjs
  */
 
@@ -37,6 +47,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { evaluate } from "./lib/actions-expression.mjs";
+import { stepByName } from "./lib/yaml-step.mjs";
 
 const WORKFLOW_DIR = ".github/workflows";
 
@@ -233,4 +244,132 @@ test("the documented array form resolves AND derives toolchain-cache 'false'", (
   const cache = quality.match(/^\s*cache:\s*\$\{\{(.+)\}\}\s*$/m);
   assert.ok(cache, "no `cache: ${{ … }}` value found at the setup-toolchain call site");
   assert.equal(evaluate(cache[1].trim(), { runner, "toolchain-cache": "auto" }), "false");
+});
+
+// ---------------------------------------------------------------------------
+// The harden-runner egress-audit gate (`pr-quality.yml`)
+//
+// `runs-on` was not the only expression reading `inputs.runner`. Anything that
+// branches on the runner class has to resolve the input the SAME way, or the
+// job and the step disagree about which machine they are on. This section
+// pins that agreement behaviourally — extract the real `if:` and run it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The `${{ … }}` body of the harden-runner step's `if:` gate.
+ *
+ * Keyed off the step, not off a line pattern that happens to contain
+ * `startsWith` — the point is to score whatever expression actually guards
+ * that step, including one a future edit spells differently.
+ */
+function hardenRunnerGate(text) {
+  const block = stepByName(text, "Harden runner (egress audit)");
+  assert.match(
+    block,
+    /uses: step-security\/harden-runner@/,
+    "the extracted block is not the harden-runner step",
+  );
+  const m = block.match(/^\s*if:\s*\$\{\{(.+)\}\}\s*$/m);
+  assert.ok(m, "the harden-runner step has no single-expression `if:` gate to score");
+  return m[1].trim();
+}
+
+/**
+ * What `runs-on` resolves to for `runner`, as a hosted-ubuntu predicate.
+ *
+ * A single string label starting with `ubuntu-` is a GitHub-hosted ubuntu
+ * image — the one environment where harden-runner installs its own monitor.
+ * An ARRAY (the documented self-hosted form) is not, regardless of the labels
+ * inside it: harden-runner ships its agent in a self-hosted runner image, so
+ * the step is correctly a no-op there.
+ */
+function resolvesToHostedUbuntu(runsOnExpr, runner) {
+  const resolved = evaluate(runsOnExpr, { runner });
+  return typeof resolved === "string" && resolved.startsWith("ubuntu-");
+}
+
+const QUALITY_FILE = `${WORKFLOW_DIR}/pr-quality.yml`;
+const QUALITY_TEXT = readFileSync(QUALITY_FILE, "utf8");
+
+test("pr-quality.yml: the harden-runner gate reaches every tier through one anchor", () => {
+  // The gate is written once (`&harden-runner`) and aliased into the other
+  // tiers. A second literal copy could carry a stale expression that every
+  // behavioural assertion below would miss, because they score the anchor.
+  assert.match(QUALITY_TEXT, /^ {6}- &harden-runner$/m, "the harden-runner anchor is missing");
+  assert.ok(
+    (QUALITY_TEXT.match(/^ {6}- \*harden-runner$/gm) ?? []).length > 0,
+    "expected the harden-runner anchor to be aliased into the other tiers",
+  );
+  assert.equal(
+    (QUALITY_TEXT.match(/uses: step-security\/harden-runner@/g) ?? []).length,
+    1,
+    "expected exactly one harden-runner step — a second one would bypass the anchor",
+  );
+});
+
+test("pr-quality.yml: an empty runner keeps the egress audit ON", () => {
+  // The regression. `runner: ''` resolves to the hosted ubuntu-latest default
+  // at `runs-on` (#493), so the job DOES run on a GitHub-hosted machine — but
+  // a gate reading the raw input saw `startsWith('', 'ubuntu-')` → false and
+  // skipped. Nothing goes red when a step is skipped, so the egress baseline
+  // silently disappears for exactly the callers who never asked to opt out.
+  const gate = hardenRunnerGate(QUALITY_TEXT);
+  assert.equal(
+    evaluate(gate, { runner: "", "enable-harden-runner": true }),
+    true,
+    "an empty runner lands on hosted ubuntu-latest, so the egress audit must run there",
+  );
+});
+
+test("pr-quality.yml: the gate agrees with what runs-on resolves to", () => {
+  // The real contract, and the one that survives a respelling of either
+  // expression: the step runs precisely when the job is on a hosted ubuntu
+  // image. Scoring both sides against the same input is what makes a future
+  // change to one of them fail here instead of shipping a silent divergence.
+  const gate = hardenRunnerGate(QUALITY_TEXT);
+  const [runsOn] = runsOnExpressions(QUALITY_TEXT);
+  for (const runner of [
+    "",
+    "ubuntu-latest",
+    "ubuntu-24.04",
+    "ubuntu-22.04",
+    "ubuntu-latest-8-cores",
+    "macos-14",
+    "windows-latest",
+    '["self-hosted","beestera-runner"]',
+    '["ubuntu-latest"]',
+  ]) {
+    assert.equal(
+      evaluate(gate, { runner, "enable-harden-runner": true }),
+      resolvesToHostedUbuntu(runsOn.expr, runner),
+      `runner ${JSON.stringify(runner)}: the gate and the resolved runs-on disagree ` +
+        `about whether this job is on a GitHub-hosted ubuntu image`,
+    );
+  }
+});
+
+test("pr-quality.yml: `enable-harden-runner: false` still opts out everywhere", () => {
+  // The documented escape hatch. A fallback added to the runner half of the
+  // gate must not make the boolean half unreachable — `false && …` yields
+  // `false`, but only if the operands stayed in that order.
+  const gate = hardenRunnerGate(QUALITY_TEXT);
+  for (const runner of ["", "ubuntu-latest", "ubuntu-24.04", '["self-hosted","x"]']) {
+    assert.equal(
+      evaluate(gate, { runner, "enable-harden-runner": false }),
+      false,
+      `runner ${JSON.stringify(runner)}: opting out must win regardless of the runner`,
+    );
+  }
+});
+
+test("pr-quality.yml: the toolchain-cache derivation reads an empty runner as hosted", () => {
+  // The sibling `inputs.runner` reader, checked rather than assumed. It is
+  // correct as written for `runner: ''` — but only incidentally, because
+  // `contains('', 'self-hosted')` is false and the derivation is
+  // self-hosted-side. Pinning it here means a future inversion to a
+  // hosted-side test (`contains(runner, 'ubuntu')`) trips instead of quietly
+  // disabling the cache for every empty-runner caller.
+  const cache = QUALITY_TEXT.match(/^\s*cache:\s*\$\{\{(.+)\}\}\s*$/m);
+  assert.ok(cache, "no `cache: ${{ … }}` value found at the setup-toolchain call site");
+  assert.equal(evaluate(cache[1].trim(), { runner: "", "toolchain-cache": "auto" }), "true");
 });

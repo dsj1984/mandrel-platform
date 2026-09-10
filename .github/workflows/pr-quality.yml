@@ -615,11 +615,14 @@ on:
       # it cannot break a build; it can later be tightened to `block` with an
       # allowlist (see docs/reusable-workflows.md). Runner-aware: the step is
       # gated to GitHub-hosted ubuntu-latest, the only runner where the action
-      # installs the monitor. On self-hosted runners (a JSON-array `runner`
-      # string such as the domio/athportal labels) it is a NO-OP — harden-runner
-      # deploys its agent via the runner image there, with no workflow step, so
-      # running the action would be redundant at best. Default true: every
-      # default ubuntu-latest consumer inherits the baseline automatically.
+      # installs the monitor — and the gate resolves `runner` exactly as the
+      # `runs-on:` sites do, so an omitted OR empty `runner` (both of which
+      # land on the hosted default) keeps the baseline. On self-hosted runners
+      # (a JSON-array `runner` string such as the domio/athportal labels) it is
+      # a NO-OP — harden-runner deploys its agent via the runner image there,
+      # with no workflow step, so running the action would be redundant at
+      # best. Default true: every default ubuntu-latest consumer inherits the
+      # baseline automatically.
       enable-harden-runner:
         description: >
           Enable the step-security/harden-runner egress audit (audit mode,
@@ -883,7 +886,15 @@ jobs:
         # lose the egress-audit baseline. `startsWith` is false for a
         # JSON-array self-hosted `runner` string, keeping the step a no-op
         # there (harden-runner ships its agent in the self-hosted image).
-        if: ${{ inputs.enable-harden-runner && startsWith(inputs.runner, 'ubuntu-') }}
+        #
+        # The `|| 'ubuntu-latest'` mirrors the fallback every `runs-on:` site
+        # applies (Story #493) and MUST stay in lockstep with it: a caller
+        # passing `runner: ''` lands on the hosted ubuntu-latest default, so
+        # this gate has to see the same resolved label. Reading `inputs.runner`
+        # raw here made `startsWith('', 'ubuntu-')` false and silently skipped
+        # the egress audit on a hosted runner — a security step opting itself
+        # out with nothing red to show for it.
+        if: ${{ inputs.enable-harden-runner && startsWith(inputs.runner || 'ubuntu-latest', 'ubuntu-') }}
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
