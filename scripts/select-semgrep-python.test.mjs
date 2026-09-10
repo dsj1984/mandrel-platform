@@ -20,7 +20,7 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -38,31 +38,42 @@ const FLOOR = "3.10";
  * an interpreter name to the `major.minor` it should report; a stub ignores
  * its arguments and echoes `"<major> <minor>"`, which is the only thing the
  * script asks of it.
+ *
+ * `os`, when given, additionally plants a `uname` stub that reports it. The
+ * fixture PATH is the process's WHOLE PATH, so a stub `uname` is the only
+ * `uname` the script can resolve — which is what makes the Linux-only
+ * ABI-first branch assertable from a macOS laptop and a Linux runner alike.
+ * Omit it to model a runner where the OS cannot be read at all; the script
+ * must still choose an interpreter rather than dying in a command
+ * substitution.
  */
-function stubPath(versions) {
+function stubPath(versions, { os = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "semgrep-python-stubs-"));
   for (const [name, version] of Object.entries(versions)) {
     const [major, minor] = version.split(".");
     writeFileSync(join(dir, name), `#!/bin/sh\necho "${major} ${minor}"\n`, { mode: 0o755 });
   }
+  if (os !== null) {
+    // `uname -s` and `uname -m` are both answered; the selector only asks for
+    // `-s`, and a stub that ignores its flags cannot drift from that.
+    writeFileSync(join(dir, "uname"), `#!/bin/sh\necho "${os}"\n`, { mode: 0o755 });
+  }
   return dir;
 }
 
 /**
- * Execute the selector with the given PATH and env. Returns the exit status
- * and stdout — the script writes its `::error::` annotation to stdout, which
- * is where GitHub reads workflow commands from.
+ * Execute the selector with the given PATH and env. Returns the exit status,
+ * stdout and stderr — the script writes its `::error::` annotation to stdout,
+ * which is where GitHub reads workflow commands from, and mirrors the reason
+ * (without the prefix) to stderr for callers that capture only that stream.
  */
-function select({ path, floor = FLOOR, pin = PIN }) {
+function select({ path, floor = FLOOR, pin = PIN, lockfileAbi = null }) {
   const env = { PATH: path };
   if (floor !== null) env.SEMGREP_PYTHON_FLOOR = floor;
   if (pin !== null) env.SEMGREP_PIN = pin;
-  try {
-    const stdout = execFileSync("/bin/bash", [SCRIPT], { encoding: "utf8", env });
-    return { status: 0, stdout };
-  } catch (err) {
-    return { status: err.status, stdout: err.stdout ?? "" };
-  }
+  if (lockfileAbi !== null) env.SEMGREP_LOCKFILE_ABI = lockfileAbi;
+  const r = spawnSync("/bin/bash", [SCRIPT], { encoding: "utf8", env });
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 /** Parse the `KEY=value` lines the script emits when it succeeds. */
@@ -214,4 +225,120 @@ test("an unset floor fails closed rather than accepting any interpreter", () => 
 test("a malformed floor fails closed", () => {
   const r = select({ path: stubPath({ python3: "3.12" }), floor: "latest" });
   assert.equal(r.status, 1, "a malformed floor must not be treated as satisfied");
+});
+
+test("a malformed floor is named as malformed, not as bash's integer error", () => {
+  // `3.1O` is the letter O, and it is the exact shape a shape-only check
+  // misses: `[0-9]*.[0-9]*` pins the first character of each field, so the
+  // typo reached `[ ... -ge "1O" ]` and produced bash's own
+  // "integer expression expected" on stderr — a message that names the shell,
+  // never the input, and leaves the step to blame the runner's interpreters
+  // for a typo in its own configuration.
+  const r = select({ path: stubPath({ python3: "3.12" }), floor: "3.1O" });
+  assert.equal(r.status, 1, "a malformed floor must not be treated as satisfied");
+  assert.match(r.stderr, /malformed/, `the reason must reach stderr: ${r.stderr}`);
+  assert.ok(
+    r.stderr.includes("3.1O"),
+    `stderr must quote the offending value back: ${r.stderr}`,
+  );
+  const combined = `${r.stdout}${r.stderr}`;
+  assert.ok(
+    !combined.includes("integer expression expected"),
+    `the input must be rejected before it reaches an arithmetic test: ${combined}`,
+  );
+});
+
+test("a floor with no minor field is malformed rather than half-read", () => {
+  // `310` splits to major "310" and a minor equal to the whole string, which
+  // an unvalidated read would silently treat as 310.310.
+  const r = select({ path: stubPath({ python3: "3.12" }), floor: "310" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /malformed/);
+});
+
+// ---------------------------------------------------------------------------
+// 6. Lockfile-ABI-first probe order on Linux (Story #495)
+// ---------------------------------------------------------------------------
+
+test("on Linux the lockfile's ABI interpreter is probed before bare python3", () => {
+  // The failure this closes: the hash-pinned install is valid only on a cp312
+  // interpreter, so the day a CI image rolls bare `python3` to 3.13 the old
+  // order routed the WHOLE fleet onto the un-hash-pinned fallback while an
+  // eligible python3.12 sat unused on the same PATH.
+  const r = select({
+    path: stubPath({ python3: "3.13", "python3.12": "3.12" }, { os: "Linux" }),
+    lockfileAbi: "3.12",
+  });
+  assert.equal(r.status, 0);
+  const out = parse(r.stdout);
+  assert.equal(out.SEMGREP_PYTHON, "python3.12", "the lockfile ABI must win the probe order");
+  assert.equal(out.SEMGREP_PYTHON_VERSION, "3.12");
+});
+
+test("on Darwin the same fixture still selects bare python3", () => {
+  // The mirror case, and the reason the OS is read rather than assumed: no
+  // darwin hashes are generated, so there is no ABI worth steering toward and
+  // the historical order must stand untouched.
+  const r = select({
+    path: stubPath({ python3: "3.13", "python3.12": "3.12" }, { os: "Darwin" }),
+    lockfileAbi: "3.12",
+  });
+  assert.equal(r.status, 0);
+  assert.equal(parse(r.stdout).SEMGREP_PYTHON, "python3");
+});
+
+test("with no lockfile ABI declared, Linux keeps the historical order", () => {
+  const r = select({
+    path: stubPath({ python3: "3.13", "python3.12": "3.12" }, { os: "Linux" }),
+  });
+  assert.equal(r.status, 0);
+  assert.equal(parse(r.stdout).SEMGREP_PYTHON, "python3");
+});
+
+test("a malformed lockfile ABI is ignored, not fatal", () => {
+  // The ABI only reorders probing; the floor is the check that fails closed.
+  // Turning a bad optimisation hint into a hard stop would take the security
+  // tier down for every consumer over a cosmetic input.
+  const r = select({
+    path: stubPath({ python3: "3.13", "python3.12": "3.12" }, { os: "Linux" }),
+    lockfileAbi: "cp312",
+  });
+  assert.equal(r.status, 0);
+  assert.equal(parse(r.stdout).SEMGREP_PYTHON, "python3");
+});
+
+test("the ABI candidate still has to clear the floor", () => {
+  // Probing it first is an ordering preference, not an exemption: a
+  // below-floor python3.12 must fall through exactly as any other candidate
+  // does, because the install would fail on it either way.
+  const r = select({
+    path: stubPath({ python3: "3.13", "python3.12": "3.9" }, { os: "Linux" }),
+    lockfileAbi: "3.12",
+  });
+  assert.equal(r.status, 0);
+  assert.equal(parse(r.stdout).SEMGREP_PYTHON, "python3");
+});
+
+test("an absent uname does not break selection", () => {
+  // The selector runs under the caller's `set -e`, where an unguarded command
+  // substitution on a missing binary would abort the step before any
+  // interpreter was chosen.
+  const r = select({ path: stubPath({ python3: "3.12" }), lockfileAbi: "3.12" });
+  assert.equal(r.status, 0);
+  assert.equal(parse(r.stdout).SEMGREP_PYTHON, "python3");
+});
+
+test("the fail-closed message reports the order actually probed", () => {
+  // A hard-coded list in the message would go stale the moment the ABI
+  // reorders it, and the log line is the only place a consumer can see which
+  // names were tried.
+  const r = select({
+    path: stubPath({ python3: "3.9" }, { os: "Linux" }),
+    lockfileAbi: "3.12",
+  });
+  assert.equal(r.status, 1);
+  assert.ok(
+    r.stdout.includes("Probed, in order: python3.12 python3 "),
+    `the probe order must be reported as it ran: ${r.stdout}`,
+  );
 });

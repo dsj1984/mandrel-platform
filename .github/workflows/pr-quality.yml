@@ -2322,9 +2322,11 @@ jobs:
           # closure install via `pip install --require-hashes -r`, so a
           # hijacked transitive can no longer alter or disable this fleet-wide
           # gate. The lockfile pins linux x86_64 / cp312 wheels (see its
-          # header); a self-hosted DARWIN runner cannot satisfy those hashes, so
-          # it falls back to the top-pinned install below (the linux-only
-          # lockfile is deliberate per this change's scope — mac hashes are not
+          # header); a self-hosted DARWIN runner, an aarch64 Linux runner, or a
+          # non-cp312 interpreter cannot satisfy those hashes, so each falls
+          # back to the top-pinned install below with a `::warning::` naming
+          # which of the three it was (the narrow lockfile target is deliberate
+          # per this change's scope — mac and aarch64 hashes are not
           # generated).
           LOCKFILE="${GITHUB_WORKSPACE}/_mandrel-platform-semgrep/scripts/semgrep-requirements.txt"
 
@@ -2396,6 +2398,19 @@ jobs:
           # assignment looks unused to it while being the step's whole input.
           SEMGREP_PYTHON_FLOOR='3.10'
 
+          # The interpreter ABI the hash-pinned lockfile was resolved for, in
+          # `major.minor` form. The selector reads it and probes the matching
+          # interpreter FIRST on Linux, which is what keeps a runner on the
+          # hash-pinned install when its bare `python3` has rolled past the
+          # lockfile: without it, the day ubuntu-latest ships python3.13 as
+          # `python3`, every consumer silently drops to the un-hash-pinned
+          # fallback below while an eligible python3.12 sits on the same PATH.
+          # It is an ORDERING hint only — the ABI candidate still has to clear
+          # SEMGREP_PYTHON_FLOOR, and a runner without it falls through to the
+          # normal list. Must agree with the `= "312"` ABI test further down;
+          # `check-semgrep-lockfile.test.mjs` fails the build when it does not.
+          export SEMGREP_LOCKFILE_ABI='3.12'
+
           # Build the `--exclude` argument list. The vendored framework tree
           # `.agents/` is ALWAYS excluded: it is materialized from the pinned
           # `mandrel` package and a consumer cannot edit it, so gating on its
@@ -2403,16 +2418,19 @@ jobs:
           # pattern matched against path components, so `--exclude '.agents'`
           # drops the whole `.agents/**` subtree from the target set (mirroring
           # how it ignores `node_modules` by default). `_mandrel-platform-sast`
-          # is the side-checkout directory the 'vendored' ruleset resolution
-          # step (above) materializes to carry `.semgrep/rules.json` — it is
-          # mandrel-platform's OWN source tree, not the caller's, and must
-          # never enter this caller's finding set regardless of which
-          # `semgrep-config` value is in effect (the directory only exists
-          # when `semgrep-config == 'vendored'`, but excluding it
-          # unconditionally is harmless and keeps this list static). Any
-          # extra globs from the `sast-exclude` input are APPENDED, each as
-          # its own `--exclude` arg.
-          EXCLUDE_ARGS=(--exclude '.agents' --exclude '_mandrel-platform-sast')
+          # `_mandrel-platform-*` covers EVERY side-checkout this job
+          # materializes from mandrel-platform's own tree: `-sast` (the
+          # `.semgrep/rules.json` snapshot) and `-semgrep` (the hash-pinned
+          # lockfile plus the interpreter selector). Both are platform source,
+          # not the caller's, and must never enter this caller's finding set
+          # regardless of which `semgrep-config` value is in effect. The glob
+          # rather than the two literal names on purpose: the `-semgrep`
+          # checkout was added later and went unexcluded, and the next one
+          # would too. Semgrep matches `--exclude` patterns against path
+          # components, so this drops each whole subtree. Any extra globs from
+          # the `sast-exclude` input are APPENDED, each as its own
+          # `--exclude` arg.
+          EXCLUDE_ARGS=(--exclude '.agents' --exclude '_mandrel-platform-*')
           if [ -n "${SAST_EXCLUDE:-}" ]; then
             # Split on whitespace AND commas so 'dist,coverage tests/fixtures'
             # all work. Empty tokens (e.g. from a trailing comma) are skipped.
@@ -2516,8 +2534,18 @@ jobs:
           # fleet's ci-required and force a manual re-run. `--require-hashes`
           # fails closed on any hash mismatch, so retries only widen the
           # availability window, never the trust boundary.
-          if [ "$(uname -s)" = "Linux" ] && [ "${pyver}" = "312" ] && [ -f "${LOCKFILE}" ]; then
-            echo "Installing hash-pinned Semgrep from ${LOCKFILE} (Linux cp${pyver}, --require-hashes)."
+          #
+          # The `x86_64` clause is not redundant with the OS test: the lockfile
+          # was resolved with `--platform manylinux*_x86_64` only, and PyPI
+          # ships a DISTINCT `manylinux_2_34_aarch64` wheel for semgrep that no
+          # entry in it covers. On an arm64 Linux self-hosted runner the
+          # OS+ABI test therefore passed and `--require-hashes --only-binary`
+          # hard-failed with a hash mismatch — a red that reads like tampering
+          # rather than an unsupported architecture.
+          runner_os="$(uname -s)"
+          runner_arch="$(uname -m)"
+          if [ "${runner_os}" = "Linux" ] && [ "${runner_arch}" = "x86_64" ] && [ "${pyver}" = "312" ] && [ -f "${LOCKFILE}" ]; then
+            echo "Installing hash-pinned Semgrep from ${LOCKFILE} (Linux ${runner_arch} cp${pyver}, --require-hashes)."
             # `--require-hashes -r` installs semgrep + its ENTIRE transitive
             # closure only if every artifact matches a
             # pinned sha256 in the lockfile — no floating transitive can slip
@@ -2526,18 +2554,37 @@ jobs:
             "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
               --retries 3 --require-hashes --only-binary :all: -r "${LOCKFILE}"
           else
-            # Fallback for non-Linux (self-hosted darwin) runners, and for any
-            # Linux interpreter that is not cp312: the linux lockfile's wheels
-            # cannot satisfy either, so install the top-pin directly. This path
-            # is NOT hash-pinned by design — the M7 lockfile is scoped to the
-            # linux CI target; mac hashes are deliberately not generated.
+            # Fallback for every runner the lockfile does not describe: a
+            # non-Linux (self-hosted darwin) host, a non-x86_64 Linux host, and
+            # any interpreter that is not cp312. The lockfile's wheels cannot
+            # satisfy any of the three, so install the top-pin directly. This
+            # path is NOT hash-pinned by design — the M7 lockfile is scoped to
+            # the linux x86_64 CI target; mac and aarch64 hashes are
+            # deliberately not generated.
             #
             # The install target is exactly `${SEMGREP_PIN}` and must stay that
             # way: no range, no resolution, no downgrade. The interpreter is
             # already known to satisfy the pin's `requires_python`, because
             # `select-semgrep-python.sh` failed the step otherwise — so pip has
             # no reason to walk backwards through older releases here.
-            echo "Non-Linux runner (or no lockfile): installing ${SEMGREP_PIN} without hash-pinning."
+            #
+            # Losing the hash pin is AUDIBLE and names its true reason. The
+            # one line this replaced said "Non-Linux runner (or no lockfile)"
+            # on every fallback, so the two reasons that actually cost the
+            # fleet its supply-chain pin — a rolled interpreter and an
+            # unsupported architecture — were reported as neither of them, at
+            # log level, on a green job. A `::warning::` surfaces it on the
+            # run summary instead of only in the fold.
+            if [ "${runner_os}" != "Linux" ]; then
+              fallback_reason="runner OS is ${runner_os}, not Linux — no ${runner_os} hashes are generated"
+            elif [ "${runner_arch}" != "x86_64" ]; then
+              fallback_reason="runner architecture is ${runner_arch}, not x86_64 — the lockfile covers x86_64 wheels only"
+            elif [ "${pyver}" != "312" ]; then
+              fallback_reason="the venv interpreter is cp${pyver}, not the lockfile's cp312 — re-pin the lockfile to cp${pyver}, or put a python3.12 on the runner's PATH"
+            else
+              fallback_reason="the hash-pinned lockfile is missing at ${LOCKFILE} — the 'Checkout Semgrep lockfile + interpreter floor' step must run before this one"
+            fi
+            echo "::warning::Semgrep is installing WITHOUT hash-pinning: ${fallback_reason}. Installing ${SEMGREP_PIN} and its transitive closure unverified."
             "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
               --retries 3 "${SEMGREP_PIN}"
           fi

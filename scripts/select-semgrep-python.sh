@@ -48,15 +48,35 @@
 #                            e.g. `semgrep==1.176.1` (diagnostics only)
 #     SEMGREP_PYTHON_FLOOR = minimum `major.minor`, e.g. `3.10` — semgrep's
 #                            own `requires_python` for the pinned version
+#     SEMGREP_LOCKFILE_ABI = optional `major.minor` the hash-pinned lockfile
+#                            was resolved for, e.g. `3.12` (Story #495)
 #
 #   Outputs (set on the caller's shell):
 #     SEMGREP_PYTHON         = the interpreter to build the venv with
 #     SEMGREP_PYTHON_VERSION = its `major.minor`
 #
-# Candidates are probed in order — `python3` first, so a compliant runner
-# behaves exactly as it did before this file existed, then the versioned
-# names newest-first. Returns non-zero after emitting a `::error::` when
-# nothing on PATH qualifies; under the caller's `set -e` that fails the step.
+# PROBE ORDER
+# -----------
+# `python3` first, so a compliant runner behaves exactly as it did before this
+# file existed, then the versioned names newest-first.
+#
+# On LINUX with SEMGREP_LOCKFILE_ABI set, the interpreter matching that ABI is
+# probed FIRST instead. That ordering is what keeps the fleet on the
+# hash-pinned install: the lockfile's wheels are cp312-only, so the moment a
+# CI image rolls its bare `python3` to 3.13 the default order silently routes
+# every consumer onto the un-hash-pinned, un-OSV-scanned fallback while a
+# perfectly good `python3.12` sits unused on the same PATH. The ABI candidate
+# is not privileged beyond order — it still has to clear the floor, and a
+# runner that simply does not have it falls through to the normal list.
+# Darwin keeps the plain order: no darwin hashes are generated, so there is no
+# ABI worth steering toward.
+#
+# The OS is read through a bare `uname` resolved on PATH rather than a builtin,
+# which is what lets the unit suite hand this script a Linux or a Darwin
+# runner deterministically from a fixture directory.
+#
+# Returns non-zero after emitting a `::error::` when nothing on PATH qualifies;
+# under the caller's `set -e` that fails the step.
 
 _semgrep_python_probe() {
   # Echo "<major> <minor>" for the interpreter named by $1, or return non-zero
@@ -66,33 +86,94 @@ _semgrep_python_probe() {
   "${cmd}" -c 'import sys; print("%d %d" % sys.version_info[:2])' 2>/dev/null
 }
 
+_semgrep_is_uint() {
+  # True when $1 is a non-empty run of digits. Used to validate BOTH fields of
+  # a `major.minor` input before either reaches `[ ... -ge ... ]`, which is
+  # where a non-numeric field would otherwise die as bash's own
+  # "integer expression expected" — a message that names the shell rather than
+  # the offending value.
+  case "$1" in
+    "" | *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+_semgrep_fail() {
+  # GitHub parses workflow commands out of the step's output, so the
+  # `::error::` annotation goes to stdout. The same text is mirrored to stderr
+  # WITHOUT that prefix — so the runner does not raise the annotation twice —
+  # because a caller that captures only the error stream (a shell redirect, or
+  # this script's unit suite) would otherwise be handed an empty reason.
+  printf '::error::%s\n' "$1"
+  printf '%s\n' "$1" >&2
+}
+
+_semgrep_python_candidates() {
+  # Echo the probe order for this runner, space-separated. The bare `uname` is
+  # resolved on PATH on purpose (see the header): a fixture shim can then
+  # supply the OS, which is the only way the Linux-only branch below is
+  # testable off a Linux host.
+  local abi="${SEMGREP_LOCKFILE_ABI:-}"
+  local default_order="python3 python3.13 python3.12 python3.11 python3.10"
+  local os abi_major abi_minor
+
+  os="$(uname -s 2>/dev/null || true)"
+  [ "${os}" = "Linux" ] || {
+    printf '%s' "${default_order}"
+    return 0
+  }
+
+  abi_major="${abi%%.*}"
+  abi_minor="${abi#*.}"
+  abi_minor="${abi_minor%%.*}"
+  # An unset or malformed ABI is NOT an error: the lockfile is an optimisation
+  # on this path, and the floor below is the thing that actually fails closed.
+  if [ -z "${abi}" ] || [ "${abi}" = "${abi_major}" ] ||
+    ! _semgrep_is_uint "${abi_major}" || ! _semgrep_is_uint "${abi_minor}"; then
+    printf '%s' "${default_order}"
+    return 0
+  fi
+
+  printf '%s' "python${abi_major}.${abi_minor} ${default_order}"
+}
+
 select_semgrep_python() {
   local floor="${SEMGREP_PYTHON_FLOOR:-}"
   local pin="${SEMGREP_PIN:-<unset>}"
-  local floor_major floor_minor cmd probe major minor system_python
+  local floor_major floor_minor cmd probe major minor system_python candidates
 
   SEMGREP_PYTHON=""
   SEMGREP_PYTHON_VERSION=""
 
-  # A missing or malformed floor must not silently degrade to "anything goes":
-  # that is the exact fail-open this file exists to close.
-  case "${floor}" in
-    [0-9]*.[0-9]*) ;;
-    *)
-      echo "::error::SEMGREP_PYTHON_FLOOR is unset or malformed ('${floor}') — it must be a major.minor version such as 3.10. Without it this step cannot tell whether the runner's Python is new enough to install ${pin}, and it will not guess."
-      return 1
-      ;;
-  esac
   floor_major="${floor%%.*}"
   floor_minor="${floor#*.}"
   floor_minor="${floor_minor%%.*}"
+
+  # A missing or malformed floor must not silently degrade to "anything goes":
+  # that is the exact fail-open this file exists to close. Both fields are
+  # validated as WHOLE integers. A shape test like `[0-9]*.[0-9]*` pins only
+  # the FIRST character of each field, so a typo such as `3.1O` (letter O)
+  # passes it, survives to `[ "${minor}" -ge "1O" ]`, and fails there with
+  # bash's "integer expression expected" — after which the loop falls through
+  # and the step blames the runner's interpreters for a typo in its own input.
+  if [ -z "${floor}" ] || [ "${floor}" = "${floor_major}" ] ||
+    ! _semgrep_is_uint "${floor_major}" || ! _semgrep_is_uint "${floor_minor}"; then
+    _semgrep_fail "SEMGREP_PYTHON_FLOOR is unset or malformed ('${floor}') — it must be a major.minor version such as 3.10, both fields whole numbers. Without it this step cannot tell whether the runner's Python is new enough to install ${pin}, and it will not guess."
+    return 1
+  fi
 
   # Reported in the failure message: the interpreter a consumer would expect to
   # be used, so the error names what they actually have rather than only what
   # is required.
   system_python="absent"
 
-  for cmd in python3 python3.13 python3.12 python3.11 python3.10; do
+  # Probe order — ABI-first on Linux when the lockfile's ABI is known, the
+  # historical order everywhere else. See the header's PROBE ORDER section.
+  candidates="$(_semgrep_python_candidates)"
+
+  # shellcheck disable=SC2086  # deliberate word-splitting: the candidate list
+  # is this file's own space-separated output, never user input.
+  for cmd in ${candidates}; do
     probe="$(_semgrep_python_probe "${cmd}")" || continue
     read -r major minor <<<"${probe}"
     [ -n "${major:-}" ] && [ -n "${minor:-}" ] || continue
@@ -111,8 +192,8 @@ select_semgrep_python() {
     fi
   done
 
-  echo "::error::${pin} requires Python >= ${floor}, but no interpreter on this runner's PATH satisfies it (python3 is ${system_python})."
-  echo "Probed, in order: python3 python3.13 python3.12 python3.11 python3.10."
+  _semgrep_fail "${pin} requires Python >= ${floor}, but no interpreter on this runner's PATH satisfies it (python3 is ${system_python})."
+  echo "Probed, in order: ${candidates}."
   echo "Remedy: put a Python >= ${floor} earlier on the runner's PATH than /usr/bin — e.g. 'brew install python@3.12' plus a python3 symlink in a directory the runner's .path lists first — or set 'enable-sast: false' to skip the Semgrep sub-step."
   echo "Semgrep is deliberately NOT downgraded to fit an older interpreter: the newest release supporting Python 3.9 (1.136.0) pins opentelemetry ~=1.25.0, which caps protobuf below 5.0, and every protobuf 4.x is affected by CVE-2026-0994 (CVSS 8.2). This install path is not hash-pinned and its closure is not OSV-scanned, so the downgrade would be silent."
   return 1
