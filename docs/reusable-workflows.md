@@ -129,7 +129,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `toolchain-cache`  | string  | `'auto'`         | Passed through to `setup-toolchain`'s `cache` input. **`'auto'` derives the value from `runner`**: `'false'` when the runner labels name `self-hosted`, `'true'` otherwise (unchanged hosted behaviour). A self-hosted runner already has a warm store, so the cache only adds a **post-job save** — and that save runs after every work step reports success, inside the job's own `timeout-minutes`, so a slow one is killed as a timeout and recorded as `cancelled`, which `ci-required` reads as a red gate with every step green. Pass `'true'` or `'false'` to pin it explicitly on either runner class. See [Derived `toolchain-cache` default](#derived-toolchain-cache-default). |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
 | `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
-| `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest`; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
+| `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest` — including when `runner` is omitted **or** empty, both of which resolve to that default; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
 | `enable-osv-scan`  | boolean | `true`           | Enable the OSV-scanner advisory tier (scans the lockfile/manifest tree for known dependency advisories via a pinned, checksum-verified binary; no SARIF/GHAS). Set `false` to skip. See [OSV advisory tier](#osv-advisory-tier-enable-osv-scan).                                  |
 | `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
 | `osv-scanner-version` | string | `'2.4.0'`     | Pinned OSV-scanner release version (no leading `v`) for the advisory tier. Bump deliberately; the per-platform asset checksum is pinned to match.                                                                                                                              |
@@ -1203,8 +1203,16 @@ once you have reviewed what each job legitimately talks to, you can tighten to
 
 **Runner-aware (self-hosted no-op).** The harden-runner step is gated to the
 GitHub-hosted `ubuntu-latest` runner — the only environment where the action
-itself installs the monitor. On **self-hosted runners** (when `runner` is a
-JSON-array label string such as `'["self-hosted","domio-runner"]'`) the step is
+itself installs the monitor. The gate resolves `runner` exactly as the
+`runs-on:` sites do, so **omitting `runner` and passing `runner: ''` behave
+identically**: both land on the hosted `ubuntu-latest` default and both keep
+the egress baseline. (The gate previously read the input raw, so an
+explicitly-empty `runner` ran the job on a hosted runner while silently
+skipping the audit step — and a skipped step reports nothing, so the baseline
+disappeared with no red signal. See
+[`runner` label shapes](#runner-label-shapes) for why an empty value is not
+exotic.) On **self-hosted runners** (when `runner` is a JSON-array label
+string such as `'["self-hosted","domio-runner"]'`) the step is
 **skipped entirely**: harden-runner supports self-hosted runners by shipping
 its agent **in the runner image**, with **no workflow step required**, so
 running the action there would be redundant. This keeps the
