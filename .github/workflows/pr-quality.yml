@@ -2379,6 +2379,9 @@ jobs:
           # satisfies the requirement" on blocking `ci-required` — a message
           # that reads like a registry outage and never names the interpreter
           # (issue #480).
+          # shellcheck disable=SC2034  # read by the sourced selector below, whose
+          # follow shellcheck has disabled (SC1090, non-constant path) — so this
+          # assignment looks unused to it while being the step's whole input.
           SEMGREP_PYTHON_FLOOR='3.10'
 
           # Build the `--exclude` argument list. The vendored framework tree
@@ -2464,10 +2467,13 @@ jobs:
             echo "::error::Semgrep interpreter selector not found at ${SELECT_PYTHON} — the 'Checkout Semgrep lockfile + interpreter floor' step must run before this one, and its sparse-checkout must list scripts/select-semgrep-python.sh."
             exit 1
           fi
-          # Pre-declare the selector's outputs so shellcheck sees them assigned
-          # (SC2154); the source path is non-constant, so its follow is
-          # disabled (SC1090) — the same shape the diff-range resolver uses.
-          SEMGREP_PYTHON="" SEMGREP_PYTHON_VERSION=""
+          # Pre-declare the one selector output this step reads, so shellcheck
+          # sees it assigned (SC2154); the source path is non-constant, so its
+          # follow is disabled (SC1090) — the same shape the diff-range resolver
+          # uses. SEMGREP_PYTHON_VERSION is deliberately NOT pre-declared: the
+          # selector sets it for callers that want it, but nothing in this step
+          # reads it, which makes declaring it here an unused assignment.
+          SEMGREP_PYTHON=""
           # shellcheck disable=SC1090
           source "${SELECT_PYTHON}"
 
