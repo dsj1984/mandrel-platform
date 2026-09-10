@@ -1339,6 +1339,236 @@ test("a multi-folder key with a shape earns ONE verdict per environment, not one
   }
 });
 
+// ---------------------------------------------------------------------------
+// Cloudflare Worker residency — per-environment presence (Story #483)
+// ---------------------------------------------------------------------------
+
+/**
+ * A manifest whose workers carry no `config` and whose keys have no local,
+ * GitHub or Infisical residency, so the offline arm over an empty repo root
+ * contributes nothing and every finding under test comes from the Cloudflare
+ * probe.
+ */
+function cloudflareOnlyManifest({ workers, keys, environments = ["staging", "production"] }) {
+  return parseManifest({
+    environments,
+    workers: Object.fromEntries(workers.map((id) => [id, { scriptName: `swarm-${id}-{env}` }])),
+    keys: keys.map((k) => ({
+      kind: "secret",
+      sensitivity: "secret",
+      residency: { local: null, github: null, cloudflare: { workers: k.workers, kind: "secret" } },
+      infisical: "unmanaged",
+      ...k,
+      workers: undefined,
+    })),
+  });
+}
+
+/** Mock `secretNames` from a `{"<worker>-<env>": [names]}` map. */
+function cloudflareProbe(present) {
+  return {
+    secretNames: async (scriptName) => {
+      const key = scriptName.replace(/^swarm-/, "");
+      return present[key] ?? [];
+    },
+  };
+}
+
+async function cloudflareFindings({ manifest, present, environments = ["staging", "production"] }) {
+  const root = makeRepo({});
+  try {
+    const report = await runDoctor({
+      manifest,
+      repoRoot: root,
+      environments,
+      cloudflare: cloudflareProbe(present),
+    });
+    return report.findings.filter((f) => f.surface === "cloudflare");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("a bare worker id still means every environment — every manifest in existence says it that way", () => {
+  const manifest = cloudflareOnlyManifest({
+    workers: ["api"],
+    keys: [{ name: "SHARED_TOKEN", workers: ["api"] }],
+  });
+  assert.deepEqual(manifest.keys[0].residency.cloudflare.workers, [
+    { worker: "api", environments: ["staging", "production"] },
+  ]);
+});
+
+test("the object form narrows one entry while a bare sibling keeps defaulting to every environment", () => {
+  const manifest = cloudflareOnlyManifest({
+    workers: ["staff", "api"],
+    keys: [{ name: "SHARED_TOKEN", workers: [{ worker: "staff", environments: ["production"] }, "api"] }],
+  });
+  assert.deepEqual(manifest.keys[0].residency.cloudflare.workers, [
+    { worker: "staff", environments: ["production"] },
+    { worker: "api", environments: ["staging", "production"] },
+  ]);
+});
+
+test("a production-only key present only in production reports NOTHING — the defect #481 filed", async () => {
+  const findings = await cloudflareFindings({
+    manifest: cloudflareOnlyManifest({
+      workers: ["staff"],
+      keys: [{ name: "PEER_DATABASE_URL", workers: [{ worker: "staff", environments: ["production"] }] }],
+    }),
+    present: { "staff-production": ["PEER_DATABASE_URL"] },
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("cloudflare suppression does not cross environment — a production-only key in staging orphans", async () => {
+  const findings = await cloudflareFindings({
+    manifest: cloudflareOnlyManifest({
+      workers: ["staff"],
+      keys: [{ name: "PEER_DATABASE_URL", workers: [{ worker: "staff", environments: ["production"] }] }],
+    }),
+    present: { "staff-production": ["PEER_DATABASE_URL"], "staff-staging": ["PEER_DATABASE_URL"] },
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "orphan");
+  assert.equal(findings[0].key, "PEER_DATABASE_URL");
+  assert.equal(findings[0].environment, "staging");
+});
+
+test("a narrowed entry still reports a REAL absence in the environment it does name", async () => {
+  const findings = await cloudflareFindings({
+    manifest: cloudflareOnlyManifest({
+      workers: ["staff"],
+      keys: [{ name: "PEER_DATABASE_URL", workers: [{ worker: "staff", environments: ["production"] }] }],
+    }),
+    present: {},
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "missing");
+  assert.equal(findings[0].environment, "production");
+});
+
+test("cloudflare worker residency fails closed on every malformed shape", () => {
+  const bad = (workers) => () =>
+    cloudflareOnlyManifest({ workers: ["api", "staff"], keys: [{ name: "SHARED_TOKEN", workers }] });
+
+  assert.throws(bad([]), /must be a non-empty array of worker ids/);
+  assert.throws(bad([42]), /must be a worker id string or \{worker, environments\}/);
+  assert.throws(bad(["nope"]), /references unknown worker id "nope"/);
+  assert.throws(bad([{ worker: "nope", environments: ["staging"] }]), /references unknown worker id "nope"/);
+  assert.throws(bad(["api", "api"]), /repeats the worker "api"/);
+  assert.throws(bad(["api", { worker: "api", environments: ["staging"] }]), /repeats the worker "api"/);
+  assert.throws(bad([{ worker: "api", environments: ["preview"] }]), /absent from manifest.environments/);
+  assert.throws(bad([{ worker: "api", environments: [] }]), /must not be empty/);
+  assert.throws(bad([{ worker: "api", environments: "staging" }]), /must be an array of environment slugs/);
+});
+
+test("a worker deployed to one environment by design does not 404-fail in the other", async () => {
+  // The narrowing's second consequence: probing a worker in an environment it
+  // expects nothing in must not turn that worker's deliberate absence into a
+  // finding, or the false failure comes back one layer down.
+  const root = makeRepo({});
+  try {
+    const report = await runDoctor({
+      manifest: cloudflareOnlyManifest({
+        workers: ["staff"],
+        keys: [{ name: "PEER_DATABASE_URL", workers: [{ worker: "staff", environments: ["production"] }] }],
+      }),
+      repoRoot: root,
+      environments: ["staging", "production"],
+      cloudflare: {
+        secretNames: async (scriptName) => {
+          if (scriptName === "swarm-staff-staging") {
+            const err = new Error("not found");
+            err.httpStatus = 404;
+            throw err;
+          }
+          return ["PEER_DATABASE_URL"];
+        },
+      },
+    });
+    assert.deepEqual(
+      report.findings.filter((f) => f.surface === "cloudflare"),
+      []
+    );
+    assert.equal(report.surfaces.find((s) => s.surface === "cloudflare").status, "checked");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the six single-environment keys from #481 report zero failures on a correct manifest", async () => {
+  // The consumer evidence that filed the gap, reconstructed: ten false
+  // `missing` findings across six keys whose single-environment placement is
+  // deliberate. Every one of them must now be silent.
+  const production = ["production"];
+  const staging = ["staging"];
+  const manifest = cloudflareOnlyManifest({
+    workers: ["staff", "api", "web"],
+    keys: [
+      { name: "PEER_DATABASE_URL", workers: [{ worker: "staff", environments: production }] },
+      { name: "PEER_TURSO_AUTH_TOKEN", workers: [{ worker: "staff", environments: production }] },
+      { name: "SENTRY_WEBHOOK_SIGNING_SECRET", workers: [{ worker: "api", environments: production }] },
+      { name: "GITHUB_INTAKE_TOKEN", workers: [{ worker: "api", environments: production }] },
+      {
+        name: "EMAIL_RECIPIENT_ALLOWLIST",
+        workers: ["api", "web", "staff"].map((worker) => ({ worker, environments: staging })),
+      },
+      {
+        name: "SMS_RECIPIENT_ALLOWLIST",
+        workers: ["api", "web", "staff"].map((worker) => ({ worker, environments: staging })),
+      },
+    ],
+  });
+  const findings = await cloudflareFindings({
+    manifest,
+    present: {
+      "staff-production": ["PEER_DATABASE_URL", "PEER_TURSO_AUTH_TOKEN"],
+      "api-production": ["SENTRY_WEBHOOK_SIGNING_SECRET", "GITHUB_INTAKE_TOKEN"],
+      "api-staging": ["EMAIL_RECIPIENT_ALLOWLIST", "SMS_RECIPIENT_ALLOWLIST"],
+      "web-staging": ["EMAIL_RECIPIENT_ALLOWLIST", "SMS_RECIPIENT_ALLOWLIST"],
+      "staff-staging": ["EMAIL_RECIPIENT_ALLOWLIST", "SMS_RECIPIENT_ALLOWLIST"],
+    },
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("KEY_SCHEMA names the per-environment worker entry so the script and the docs cannot drift", () => {
+  assert.match(KEY_SCHEMA.residency, /worker, environments/);
+});
+
+test("a var-residency key is unaffected by the environment axis at the wrangler [vars] check", () => {
+  // The wrangler check has no environment axis — it reports `environment: null`
+  // and `parseWranglerVars` flattens `[env.X.vars]` into one set — so a var
+  // declared for ONE environment stays expected in that worker's config.
+  const root = makeRepo({ wrangler: '[env.staging.vars]\nSTAGING_ONLY_FLAG = "1"\n' });
+  try {
+    const manifest = parseManifest({
+      environments: ["staging", "production"],
+      workers: { web: { config: "wrangler.toml", scriptName: "swarm-web-{env}" } },
+      keys: [
+        {
+          name: "STAGING_ONLY_FLAG",
+          kind: "var",
+          sensitivity: "public",
+          residency: {
+            local: null,
+            github: null,
+            cloudflare: { workers: [{ worker: "web", environments: ["staging"] }], kind: "var" },
+          },
+          infisical: "unmanaged",
+        },
+      ],
+    });
+    const findings = runOfflineChecks({ manifest, repoRoot: root }).findings.filter(
+      (f) => f.surface === "wrangler"
+    );
+    assert.deepEqual(findings, []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("MANIFEST_SCHEMA and KEY_SCHEMA describe the slug container and the folders array", () => {
   assert.ok(Object.hasOwn(MANIFEST_SCHEMA, "environmentSlugs"));
   assert.match(MANIFEST_SCHEMA.environmentSlugs, /infisical/);
@@ -1352,6 +1582,19 @@ test("the documented manifest schema block names the new shapes", () => {
   const doc = readFileSync(join(HERE, "..", "docs", "reusable-workflows.md"), "utf8");
   assert.match(doc, /"environmentSlugs"/);
   assert.match(doc, /"folders"/);
+});
+
+test("the docs carry a Cloudflare per-environment residency section beside its two siblings", () => {
+  // Same bargain as the test above, for the third surface to take the
+  // treatment: the doc must describe the entry form the script now accepts.
+  const doc = readFileSync(join(HERE, "..", "docs", "reusable-workflows.md"), "utf8");
+  // `includes` + a message, not `assert.match`: a regex miss here dumps the
+  // whole 250KB document into the failure output and buries the reason.
+  assert.ok(
+    doc.includes("#### Cloudflare Worker residency: per-environment presence"),
+    "docs/reusable-workflows.md must carry the Cloudflare per-environment residency section"
+  );
+  assert.ok(doc.includes('"worker": "staff"'), "the manifest-schema block must show the object entry form");
 });
 
 test("no secret VALUE reaches stdout or stderr through the remapped-slug, multi-folder path", async () => {

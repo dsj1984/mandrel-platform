@@ -3757,7 +3757,10 @@ script and this document describe exactly one shape.
         // "GitHub residency: dual scope and per-environment presence" below.
         "github": { "scope": "environment", "kind": "var" },
 
-        "cloudflare": { "workers": ["site"], "kind": "var" }
+        // Each `workers` entry is a bare id (every environment) or a
+        // {worker, environments} object — see "Cloudflare Worker residency:
+        // per-environment presence" below.
+        "cloudflare": { "workers": [{ "worker": "staff", "environments": ["production"] }, "site"], "kind": "var" }
       },
       // Either a single {folder, environments}, or a `folders` array — see
       // "Infisical folder residency" below.
@@ -3921,6 +3924,60 @@ The suppression is deliberately no wider than that:
 The last two rows are what keep `--strict-orphans` worth enabling: once a
 manifest is authored correctly, a healthy repo reports zero orphans, so any new
 one is a real finding.
+
+#### Cloudflare Worker residency: per-environment presence
+
+Each entry in `residency.cloudflare.workers` is **either a bare worker id or a
+`{worker, environments}` object**:
+
+```jsonc
+"cloudflare": {
+  "kind": "secret",
+  "workers": [
+    { "worker": "staff", "environments": ["production"] },
+    "api"                       // a bare id means every environment
+  ]
+}
+```
+
+**Per-environment presence.** A key can be deliberately resident on one Worker
+in one environment only — a peer-database credential scoped that tightly to
+bound its blast radius, or a recipient allowlist that exists only where
+non-production sending is gated. Without a per-entry `environments`, one
+expected-name list was reconciled against *every* environment, so that
+deliberate placement had to report `missing` from the ones it never claimed.
+
+`environments` **defaults to all of `manifest.environments`**, so a bare id is
+expected everywhere — which is why every manifest written before this existed
+keeps behaving exactly as it did.
+
+Validation rejects rather than silently ignores: an environment slug outside
+`manifest.environments`, a worker id repeated across two entries, an entry that
+is neither a string nor an object, an unknown worker id, an empty `workers`
+array, and an **empty `environments` array** (that would mean "resident
+nowhere", which is indistinguishable from declaring no Cloudflare residency at
+all — omit `environments` to mean every environment, or drop the entry).
+
+##### What a narrowed entry does and does not silence
+
+| Case | Reported? |
+| --- | --- |
+| Declared `environments: ["production"]`, present in production | **No** — this is the per-environment case |
+| Declared `environments: ["production"]`, absent from production | **Yes** — a real absence where it was claimed |
+| Declared `environments: ["production"]`, present in staging | **Yes** — undeclared presence in that environment |
+| Worker declares nothing in *any* environment | Never probed |
+| Worker not deployed (404) where the manifest expects secrets | **Yes** — the declared secrets cannot be verified |
+| Worker not deployed (404) where it declares nothing | **No** — its absence agrees with the manifest |
+
+The third row is the same choice the GitHub and Infisical surfaces make, and
+it is why a worker is still probed in an environment it expects nothing in: an
+empty expected-list reconciled against a non-empty live list is the only thing
+that can surface a key nobody declared there.
+
+`kind: "var"` residency is **unaffected by the environment axis**. Wrangler
+`[vars]` are checked against the worker's config file, which has no environment
+dimension in this doctor (`[env.X.vars]` blocks are read into one flat set), so
+a var declared for any environment stays expected in that worker's config.
 
 #### `shape` is a closed vocabulary
 
