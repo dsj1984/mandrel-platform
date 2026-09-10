@@ -9,7 +9,13 @@
 //   • label discovery pages past the first 200, and a create refused as
 //     already-existing is a skip rather than a failure;
 //   • fire semantics INVERT on configuration — a configured-and-refused fire
-//     reds the run, an unwired one warns and stays green.
+//     reds the run, an unwired one warns and stays green;
+//   • the run is IDEMPOTENT — the trigger label is re-read live before any
+//     write, because a re-run replays a payload that predates the first run's
+//     own label write, and an issue already wearing it is left alone;
+//   • the fire is BOUNDED by a race rather than a forwarded signal, which is
+//     precisely what the fakes below prove: every one of them ignores
+//     `init.signal`, exactly like a wedged endpoint's socket.
 //
 // Everything here runs offline: the `gh` adapter and `fetch` are injected
 // seams, so even the behavioural claims are asserted without network access.
@@ -25,6 +31,8 @@ import { join } from "node:path";
 import {
   ANTHROPIC_BETA,
   ANTHROPIC_VERSION,
+  BOOLEAN_INPUT_VALUES,
+  DEFAULT_FIRE_TIMEOUT_MS,
   DEFAULT_LABEL_PREFIX,
   DUPLICATE,
   IGNORED,
@@ -47,11 +55,16 @@ import {
   lookupPreset,
   main,
   matchesBodyShape,
+  parseBooleanInput,
   parseLogins,
+  parsePayloadLabels,
+  readIssueLabels,
   renderOutputEntry,
   resolveConfig,
   resolveFingerprint,
   resolveFireOutcome,
+  resolveFireTimeoutMs,
+  resolveTriageState,
   selectMissingLabels,
   writeGithubOutput,
 } from "../.github/actions/issue-intake/issue-intake.mjs";
@@ -62,13 +75,21 @@ const LOGINS = [PRODUCER, "second-bot"];
 const PRESET = "structured-report";
 const MATCHING_BODY = ["An alert fired in production.", "", "Fingerprint: alert-7731-cpu", ""].join("\n");
 const NON_MATCHING_BODY = "Hey, the site felt slow this morning. Could someone look?";
+const ISSUE_NUMBER = 412;
+const TRIAGE_LABEL = "intake:triage";
+// The fire endpoint is asserted through MARKER, never by substring-matching the
+// URL itself: `js/incomplete-url-substring-sanitization` fires on a containment
+// check against a URL-shaped constant, and it is a high-severity CodeQL block.
+const FIRE_MARKER = "routine-endpoint";
+const FIRE_URL = `https://${FIRE_MARKER}.test/v1/routines`;
+const FIRE_TOKEN = "not-a-real-token-fixture";
 
 // ---------------------------------------------------------------------------
 // Fake `gh` runner — records every call so "wrote nothing" is assertable.
 // ---------------------------------------------------------------------------
 
 /**
- * @param {{labels?: string[], duplicates?: Array<{number: number, body: string}>, createFails?: (name: string) => Error|null}} [opts]
+ * @param {{labels?: string[], issueLabels?: string[] | (() => string[]), duplicates?: Array<{number: number, body: string}>, createFails?: (name: string) => Error|null}} [opts]
  */
 function fakeRunner(opts = {}) {
   const labels = opts.labels ?? [];
@@ -78,6 +99,17 @@ function fakeRunner(opts = {}) {
   const runner = (args, ctx) => {
     calls.push({ args, ctx });
 
+    // The live read of ONE issue's labels. Matched before the repo-wide label
+    // page below, because `repos/<repo>/issues/<n>/labels` ends in `/labels`
+    // too — a fake that confused the two would answer the wrong question.
+    // Compared segment by segment rather than by substring or regex: CodeQL
+    // blocks both shapes on endpoint-like strings, and equality is clearer.
+    const endpoint = String(args[1]).split("/");
+    if (args[0] === "api" && endpoint.length === 6 && endpoint[3] === "issues" && endpoint[5] === "labels") {
+      const source = opts.issueLabels ?? [];
+      const names = typeof source === "function" ? source() : source;
+      return JSON.stringify(names.map((name) => ({ name })));
+    }
     if (args[0] === "api" && String(args[1]).endsWith("/labels")) {
       const pageArg = args.find((a) => String(a).startsWith("page="));
       const page = Number(String(pageArg).slice("page=".length));
@@ -100,6 +132,7 @@ function fakeRunner(opts = {}) {
   };
 
   runner.calls = calls;
+  runner.reads = () => calls.filter(({ args }) => args[0] === "api");
   runner.mutations = () =>
     calls.filter(
       ({ args }) =>
@@ -140,6 +173,8 @@ const envFor = (overrides = {}) => ({
   INTAKE_FIRE_URL: "",
   INTAKE_FIRE_TOKEN: "",
   INTAKE_DRY_RUN: "false",
+  // What a re-run replays: the labels as they stood when the issue was OPENED.
+  INTAKE_ISSUE_LABELS: "[]",
   ...overrides,
 });
 
@@ -330,17 +365,22 @@ test("AC-3: label discovery pages past the first 200 (313-label fixture)", () =>
 
 test("AC-3: an intake label sitting past page one is never re-created", () => {
   const plan = intakeLabelPlan(DEFAULT_LABEL_PREFIX);
-  const labels = [
-    ...Array.from({ length: 311 }, (_, i) => `label-${i}`),
-    plan[0].name,
-    plan[1].name,
-  ];
+  const labels = [...Array.from({ length: 312 }, (_, i) => `label-${i}`), plan[0].name];
   const runner = fakeRunner({ labels });
   const result = ensureIntakeLabels({ repo: REPO, prefix: DEFAULT_LABEL_PREFIX }, runner);
 
   assert.equal(result.discovered, 313);
-  assert.deepEqual(result.created, [plan[2].name], "only the genuinely absent label is created");
+  assert.deepEqual(result.created, [plan[1].name], "only the genuinely absent label is created");
   assert.deepEqual(result.skipped, []);
+});
+
+test("AC-3: `gh api` is scoped by its endpoint path, never by a --repo flag", () => {
+  const runner = fakeRunner({ labels: [] });
+  listRepoLabels({ repo: REPO }, runner);
+
+  const [{ args }] = runner.reads();
+  assert.ok(!args.includes("--repo"), "`gh api` exits non-zero on an unknown --repo flag");
+  assert.equal(args[1], `repos/${REPO}/labels`, "the repo is spelled into the endpoint instead");
 });
 
 test("AC-3: a create refused as already-existing returns success as a skip", () => {
@@ -354,7 +394,7 @@ test("AC-3: a create refused as already-existing returns success as a skip", () 
   const result = ensureIntakeLabels({ repo: REPO, prefix: DEFAULT_LABEL_PREFIX }, runner);
 
   assert.deepEqual(result.skipped, [labelFor(DEFAULT_LABEL_PREFIX, DUPLICATE)]);
-  assert.equal(result.created.length, 2);
+  assert.deepEqual(result.created, [labelFor(DEFAULT_LABEL_PREFIX, TRIAGE)]);
 });
 
 test("a genuine create failure is still an error", () => {
@@ -373,7 +413,48 @@ test("classifyLabelCreateFailure separates the benign refusal from a real failur
 
 test("missing-label selection ignores case, matching GitHub's own collision rule", () => {
   const plan = intakeLabelPlan("Intake");
-  assert.deepEqual(selectMissingLabels(["intake:triage", "intake:ignored"], plan), [plan[1]]);
+  assert.deepEqual(selectMissingLabels(["intake:triage", "needs-triage"], plan), [plan[1]]);
+});
+
+// ---------------------------------------------------------------------------
+// AC-6 — the label plan owns TWO labels
+// ---------------------------------------------------------------------------
+
+test("AC-6: the label plan owns exactly two labels, and `ignored` is not one", () => {
+  const plan = intakeLabelPlan(DEFAULT_LABEL_PREFIX);
+  assert.deepEqual(
+    plan.map((l) => l.name),
+    [labelFor(DEFAULT_LABEL_PREFIX, TRIAGE), labelFor(DEFAULT_LABEL_PREFIX, DUPLICATE)],
+  );
+  assert.ok(
+    !plan.some((l) => l.name === labelFor(DEFAULT_LABEL_PREFIX, IGNORED)),
+    "an `ignored` label could never be applied — the verdict is inert by invariant",
+  );
+});
+
+test("AC-6: only the two planned labels are ever created, on a repo with none", () => {
+  const runner = fakeRunner({ labels: [] });
+  const result = ensureIntakeLabels({ repo: REPO, prefix: DEFAULT_LABEL_PREFIX }, runner);
+
+  assert.deepEqual(result.created, ["intake:triage", "intake:duplicate"]);
+  assert.equal(
+    runner.calls.filter(({ args }) => args[0] === "label" && args[1] === "create").length,
+    2,
+  );
+});
+
+test("AC-6: an ignored verdict still writes nothing, with the label gone", async () => {
+  const runner = fakeRunner({ labels: [] });
+  const { result } = await withCapturedConsole(() =>
+    main(envFor({ INTAKE_ISSUE_AUTHOR: "stranger" }), {
+      runner,
+      fetchImpl: async () => {
+        throw new Error("an ignored issue must never fire");
+      },
+    }),
+  );
+  assert.equal(result, 0);
+  assert.deepEqual(runner.calls, [], "not even the live label read is worth spending on it");
 });
 
 // ---------------------------------------------------------------------------
@@ -424,8 +505,8 @@ test("AC-5: a configured fire that is refused exits non-zero", async () => {
   const { result, err } = await withCapturedConsole(() =>
     main(
       envFor({
-        INTAKE_FIRE_URL: "https://api.anthropic.test/v1/routines",
-        INTAKE_FIRE_TOKEN: "routine-token",
+        INTAKE_FIRE_URL: FIRE_URL,
+        INTAKE_FIRE_TOKEN: FIRE_TOKEN,
       }),
       { runner, fetchImpl: async () => ({ ok: false, status: 503 }) },
     ),
@@ -458,8 +539,8 @@ test("AC-5: a configured fire that is accepted exits zero", async () => {
   const { result } = await withCapturedConsole(() =>
     main(
       envFor({
-        INTAKE_FIRE_URL: "https://api.anthropic.test/v1/routines",
-        INTAKE_FIRE_TOKEN: "routine-token",
+        INTAKE_FIRE_URL: FIRE_URL,
+        INTAKE_FIRE_TOKEN: FIRE_TOKEN,
       }),
       {
         runner,
@@ -474,7 +555,7 @@ test("AC-5: a configured fire that is accepted exits zero", async () => {
   assert.equal(result, 0);
   assert.equal(seen.length, 1);
   assert.equal(seen[0].init.method, "POST");
-  assert.equal(seen[0].url, "https://api.anthropic.test/v1/routines");
+  assert.equal(seen[0].url, FIRE_URL);
   assert.equal(seen[0].init.headers["anthropic-version"], ANTHROPIC_VERSION);
   assert.equal(seen[0].init.headers["anthropic-beta"], ANTHROPIC_BETA);
   assert.deepEqual(
@@ -518,7 +599,7 @@ test("the fire body is a single `text` field naming the issue, not quoting it", 
 
 test("a transport-level fire failure is a refusal, not a crash", async () => {
   const outcome = await fireRoutine(
-    { url: "https://api.anthropic.test/v1/routines", token: "t", payload: "{}" },
+    { url: FIRE_URL, token: "t", payload: "{}" },
     async () => {
       throw new Error("ECONNREFUSED");
     },
@@ -534,8 +615,8 @@ test("a duplicate never re-fires — that storm is what dedupe exists to stop", 
   const { result } = await withCapturedConsole(() =>
     main(
       envFor({
-        INTAKE_FIRE_URL: "https://api.anthropic.test/v1/routines",
-        INTAKE_FIRE_TOKEN: "routine-token",
+        INTAKE_FIRE_URL: FIRE_URL,
+        INTAKE_FIRE_TOKEN: FIRE_TOKEN,
       }),
       {
         runner,
@@ -549,14 +630,262 @@ test("a duplicate never re-fires — that storm is what dedupe exists to stop", 
 });
 
 // ---------------------------------------------------------------------------
+// AC-1 / AC-2 — the CURRENT labels decide, and they are read LIVE
+// ---------------------------------------------------------------------------
+
+test("AC-1: an issue already carrying the trigger label is inert on a re-run", async () => {
+  const runner = fakeRunner({ labels: [], issueLabels: [TRIAGE_LABEL] });
+  const { result, log } = await withCapturedConsole(() =>
+    main(envFor({ INTAKE_FIRE_URL: FIRE_URL, INTAKE_FIRE_TOKEN: FIRE_TOKEN }), {
+      runner,
+      fetchImpl: async () => {
+        throw new Error("an already-triaged issue must never wake a second routine");
+      },
+    }),
+  );
+
+  assert.equal(result, 0, "a re-run over settled work is a no-op, not a failure");
+  assert.deepEqual(runner.mutations(), [], "no label is created and none is applied");
+  assert.ok(
+    log.some((l) => l.includes("already carries")),
+    "the run says why it stopped, so a reader is not left guessing",
+  );
+});
+
+test("AC-2: the LIVE read decides, not the payload a re-run replays", async () => {
+  // Exactly the re-run shape: `issues.opened` captured an unlabelled issue,
+  // and the first run's own label write happened after that snapshot.
+  const runner = fakeRunner({ labels: [], issueLabels: [TRIAGE_LABEL] });
+  const { result } = await withCapturedConsole(() =>
+    main(
+      envFor({
+        INTAKE_ISSUE_LABELS: "[]",
+        INTAKE_FIRE_URL: FIRE_URL,
+        INTAKE_FIRE_TOKEN: FIRE_TOKEN,
+      }),
+      {
+        runner,
+        fetchImpl: async () => {
+          throw new Error("the stale payload must not be allowed to re-fire");
+        },
+      },
+    ),
+  );
+
+  assert.equal(result, 0);
+  assert.deepEqual(runner.mutations(), []);
+});
+
+test("AC-2: a failed live read falls back to the payload, and says so", async () => {
+  const runner = fakeRunner({
+    labels: [],
+    issueLabels: () => {
+      throw new Error("HTTP 503: upstream unavailable");
+    },
+  });
+  const { result, err } = await withCapturedConsole(() =>
+    main(envFor({ INTAKE_ISSUE_LABELS: JSON.stringify([{ name: TRIAGE_LABEL }]) }), { runner }),
+  );
+
+  assert.equal(result, 0, "the payload still reports the issue as triaged");
+  assert.deepEqual(runner.mutations(), [], "so the fallback answer is honoured");
+  assert.ok(
+    err.some((l) => l.startsWith("::warning::") && l.includes("falling back")),
+    "taking the stale answer is never silent",
+  );
+});
+
+test("AC-2: a live read that fails over an UNLABELLED payload still proceeds", async () => {
+  const runner = fakeRunner({
+    labels: [],
+    issueLabels: () => {
+      throw new Error("HTTP 503: upstream unavailable");
+    },
+  });
+  const { result } = await withCapturedConsole(() => main(envFor(), { runner }));
+
+  assert.equal(result, 0);
+  const edit = runner.calls.find(({ args }) => args[0] === "issue" && args[1] === "edit");
+  assert.ok(edit.args.includes(TRIAGE_LABEL), "a read outage must not strand intake entirely");
+});
+
+test("the live read asks about ONE issue, not the repo's label catalogue", () => {
+  const runner = fakeRunner({ issueLabels: ["bug", TRIAGE_LABEL] });
+  const names = readIssueLabels({ repo: REPO, issueNumber: ISSUE_NUMBER }, runner);
+
+  assert.deepEqual(names, ["bug", TRIAGE_LABEL]);
+  assert.equal(runner.calls[0].args[1], `repos/${REPO}/issues/${ISSUE_NUMBER}/labels`);
+  assert.ok(!runner.calls[0].args.includes("--repo"), "`gh api` takes no --repo flag");
+});
+
+test("the trigger-label comparison is case-insensitive, as GitHub's own is", () => {
+  const runner = fakeRunner({ issueLabels: ["Intake:Triage"] });
+  const state = resolveTriageState(
+    { repo: REPO, issueNumber: ISSUE_NUMBER, triageLabel: TRIAGE_LABEL, payloadLabels: "[]" },
+    runner,
+  );
+  assert.equal(state.alreadyTriaged, true, "GitHub refuses two labels differing only in case");
+  assert.equal(state.source, "live");
+});
+
+test("payload labels parse from either shape, and unparseable input is empty", () => {
+  assert.deepEqual(parsePayloadLabels(JSON.stringify([{ name: "a" }, { name: "b" }])), ["a", "b"]);
+  assert.deepEqual(parsePayloadLabels(JSON.stringify(["a", "b"])), ["a", "b"]);
+  assert.deepEqual(parsePayloadLabels(""), []);
+  assert.deepEqual(parsePayloadLabels(undefined), []);
+  assert.deepEqual(parsePayloadLabels("{not json"), [], "the degraded path must not throw");
+  assert.deepEqual(parsePayloadLabels(JSON.stringify({ name: "a" })), []);
+});
+
+// ---------------------------------------------------------------------------
+// AC-3 — the fire is BOUNDED, by a race and not by a forwarded signal
+// ---------------------------------------------------------------------------
+
+test("AC-3: a fetch that never settles and ignores init.signal still times out", async () => {
+  const runner = fakeRunner({ labels: [] });
+  const started = Date.now();
+  const { result, err } = await withCapturedConsole(() =>
+    main(
+      envFor({
+        INTAKE_FIRE_URL: FIRE_URL,
+        INTAKE_FIRE_TOKEN: FIRE_TOKEN,
+        INTAKE_FIRE_TIMEOUT_MS: "60",
+      }),
+      {
+        runner,
+        // A wedged endpoint: the connection is accepted and nothing ever comes
+        // back. Forwarding `init.signal` alone would hang here forever.
+        fetchImpl: () => new Promise(() => {}),
+      },
+    ),
+  );
+  const elapsed = Date.now() - started;
+
+  assert.equal(result, 1, "a bounded-out fire is a refusal, and a refusal reds the run");
+  assert.ok(elapsed < 2000, `the run must not outlive its bound (took ${elapsed}ms)`);
+  assert.ok(err.some((l) => l.startsWith("::error::") && l.includes("refused")));
+});
+
+test("AC-3: the timeout is reported as such, not as a mystery transport error", async () => {
+  const outcome = await fireRoutine(
+    { url: FIRE_URL, token: FIRE_TOKEN, payload: "{}", timeoutMs: 25 },
+    () => new Promise(() => {}),
+  );
+  assert.equal(outcome.delivered, false);
+  assert.match(outcome.detail, /no response within 25ms/);
+});
+
+test("AC-3: an abort signal is still forwarded, for a fetch that honours one", async () => {
+  const seen = [];
+  await fireRoutine({ url: FIRE_URL, token: FIRE_TOKEN, payload: "{}", timeoutMs: 500 }, async (_u, init) => {
+    seen.push(init.signal);
+    return { ok: true, status: 200 };
+  });
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0] instanceof AbortSignal, "a compliant fetch should still tear the socket down");
+  assert.equal(seen[0].aborted, false);
+});
+
+test("AC-3: a fire well inside its bound is delivered normally", async () => {
+  const outcome = await fireRoutine(
+    { url: FIRE_URL, token: FIRE_TOKEN, payload: "{}", timeoutMs: 1000 },
+    async () => ({ ok: true, status: 202 }),
+  );
+  assert.deepEqual(outcome, { delivered: true, detail: "HTTP 202" });
+});
+
+test("the fire timeout falls back to the production default on a nonsense value", () => {
+  assert.equal(resolveFireTimeoutMs("250"), 250);
+  assert.equal(resolveFireTimeoutMs(" 250 "), 250);
+  assert.equal(resolveFireTimeoutMs(""), DEFAULT_FIRE_TIMEOUT_MS);
+  assert.equal(resolveFireTimeoutMs(undefined), DEFAULT_FIRE_TIMEOUT_MS);
+  assert.equal(resolveFireTimeoutMs("soon"), DEFAULT_FIRE_TIMEOUT_MS);
+  assert.equal(resolveFireTimeoutMs("0"), DEFAULT_FIRE_TIMEOUT_MS, "a zero bound would refuse everything");
+  assert.equal(resolveFireTimeoutMs("-5"), DEFAULT_FIRE_TIMEOUT_MS);
+  assert.equal(resolveConfig(envFor({ INTAKE_FIRE_TIMEOUT_MS: "90" })).fireTimeoutMs, 90);
+});
+
+// ---------------------------------------------------------------------------
+// AC-4 / AC-5 — dry-run previews the LIVE verdict, and parses strictly
+// ---------------------------------------------------------------------------
+
+test("AC-4: a dry run previews `duplicate`, because the lookup is a read", async () => {
+  const runner = fakeRunner({
+    labels: [],
+    duplicates: [{ number: 88, body: "Fingerprint: alert-7731-cpu" }],
+  });
+  const { result, log } = await withCapturedConsole(() =>
+    main(envFor({ INTAKE_DRY_RUN: "true", INTAKE_FIRE_URL: FIRE_URL, INTAKE_FIRE_TOKEN: FIRE_TOKEN }), {
+      runner,
+      fetchImpl: async () => {
+        throw new Error("a dry run must not fire");
+      },
+    }),
+  );
+
+  assert.equal(result, 0);
+  assert.deepEqual(runner.mutations(), [], "a preview writes nothing");
+  assert.ok(
+    log.some((l) => l.includes(`${DUPLICATE} —`)),
+    "the preview reports the verdict the real run would reach",
+  );
+  assert.ok(
+    !log.some((l) => l.includes("would label issue #412 `intake:triage`")),
+    "a preview that skipped the lookup would print the wrong verdict",
+  );
+});
+
+test("AC-5: dry-run accepts either boolean in any casing", () => {
+  for (const raw of ["true", "True", "TRUE", " true "]) {
+    assert.equal(resolveConfig(envFor({ INTAKE_DRY_RUN: raw })).dryRun, true, raw);
+  }
+  for (const raw of ["false", "FALSE", "False", ""]) {
+    const cfg = resolveConfig(envFor({ INTAKE_DRY_RUN: raw }));
+    assert.equal(cfg.dryRun, false, raw);
+    assert.equal(cfg.error, null, raw);
+  }
+});
+
+test("AC-5: `dry-run: True` really does suppress the writes", async () => {
+  const runner = fakeRunner({ labels: [] });
+  const { result, log } = await withCapturedConsole(() =>
+    main(envFor({ INTAKE_DRY_RUN: "True" }), { runner }),
+  );
+  assert.equal(result, 0);
+  assert.deepEqual(runner.mutations(), [], "a strict `=== \"true\"` compare would have written here");
+  assert.ok(log.some((l) => l.includes("(dry-run)")));
+});
+
+test("AC-5: an unrecognised dry-run value fails the run and names what is accepted", async () => {
+  const runner = fakeRunner({ labels: [] });
+  const { result, err } = await withCapturedConsole(() =>
+    main(envFor({ INTAKE_DRY_RUN: "yes" }), { runner }),
+  );
+
+  assert.equal(result, 1, "guessing a typo's meaning could turn a preview into a real run");
+  assert.deepEqual(runner.calls, [], "the refusal precedes every call");
+  const message = err.join("\n");
+  for (const accepted of BOOLEAN_INPUT_VALUES) assert.ok(message.includes(accepted), accepted);
+});
+
+test("parseBooleanInput reports the offending value, and falls back safely", () => {
+  assert.deepEqual(parseBooleanInput("TRUE", { name: "dry-run" }), { value: true, error: null });
+  assert.deepEqual(parseBooleanInput(undefined, { name: "dry-run" }), { value: false, error: null });
+  const bad = parseBooleanInput("1", { name: "dry-run" });
+  assert.equal(bad.value, false, "the fallback is the safe reading, whatever the error does");
+  assert.match(String(bad.error), /dry-run must be one of true, false/);
+  assert.match(String(bad.error), /got "1"/);
+});
+
+// ---------------------------------------------------------------------------
 // Configuration contract
 // ---------------------------------------------------------------------------
 
-test("resolveConfig defaults the label prefix and reads the dry-run flag literally", () => {
-  const cfg = resolveConfig(envFor({ INTAKE_LABEL_PREFIX: "", INTAKE_DRY_RUN: "TRUE" }));
+test("resolveConfig defaults the label prefix and the fire bound", () => {
+  const cfg = resolveConfig(envFor({ INTAKE_LABEL_PREFIX: "", INTAKE_FIRE_TIMEOUT_MS: "" }));
   assert.equal(cfg.error, null);
   assert.equal(cfg.labelPrefix, DEFAULT_LABEL_PREFIX);
-  assert.equal(cfg.dryRun, false, "only the exact string `true` enables a dry run");
+  assert.equal(cfg.fireTimeoutMs, DEFAULT_FIRE_TIMEOUT_MS);
 });
 
 test("resolveConfig rejects each misconfiguration with a named reason", () => {
@@ -569,6 +898,7 @@ test("resolveConfig rejects each misconfiguration with a named reason", () => {
     [{ INTAKE_PRODUCER_LOGINS: " , " }, /INTAKE_PRODUCER_LOGINS is required/],
     [{ INTAKE_LABEL_PREFIX: "not a prefix!" }, /not a usable label-name prefix/],
     [{ INTAKE_FIRE_URL: "https://x.test", INTAKE_FIRE_TOKEN: "" }, /needs its bearer token/],
+    [{ INTAKE_DRY_RUN: "yes" }, /dry-run must be one of true, false/],
   ];
   for (const [overrides, shape] of cases) {
     const cfg = resolveConfig(envFor(overrides));

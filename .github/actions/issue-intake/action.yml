@@ -2,7 +2,7 @@
 #
 # Wiring an external issue producer (a monitor, a scanner, a bot, another
 # repo's workflow) to an agent is a trust decision, and every consumer that has
-# done it re-derived the same three things by hand — and got at least one of
+# done it re-derived the same five things by hand — and got at least one of
 # them wrong:
 #
 #   1. WHAT MAY CONSCRIPT THE AGENT. The label this action applies is the
@@ -10,6 +10,10 @@
 #      applied only when the producer login AND the body shape both match:
 #      either signal alone lets any account that can open an issue put words in
 #      the agent's mouth.
+#      The action owns TWO labels — `<prefix>:triage` and `<prefix>:duplicate`.
+#      There is no `<prefix>:ignored`: an `ignored` verdict is inert, so that
+#      label could never be applied to anything, and shipping a label the
+#      action has promised never to write only misleads whoever reads it.
 #   2. LABEL DISCOVERY THAT PAGES. `gh label list` returns the first page. A
 #      consumer with 313 labels lost the intake labels off the end of it, so
 #      every run after the first tried to re-create them and died on the
@@ -19,6 +23,17 @@
 #      was never wired at all is a repo that has not opted in yet and must stay
 #      green with a warning. Collapsing those two into one behaviour makes the
 #      action either unadoptable or silently useless.
+#   4. IDEMPOTENCE THAT THE EVENT PAYLOAD CANNOT PROVIDE. A GitHub "Re-run
+#      jobs" replays the ORIGINAL `issues.opened` payload, so its `labels[]`
+#      predates the first run's own label write and reports an untriaged issue
+#      forever. The action therefore re-reads the issue's labels LIVE before
+#      any write, and stops — no label, no fire, exit 0 — when the trigger
+#      label is already there. Payload labels are a logged fallback for a
+#      failed read, never the primary answer.
+#   5. A BOUND ON THE FIRE. A wedged endpoint that accepts the connection and
+#      never answers would hold the consumer's runner for the job's whole
+#      timeout. The POST is raced against an abort timer (`fire-timeout-ms`),
+#      and a timeout is a refusal — it lands on the red path in 3.
 #
 # Every input reaches the script through step-level `env:`, never `${{ }}`
 # inside the `run:` body — an issue title or body is attacker-controlled text,
@@ -49,9 +64,11 @@ inputs:
     required: true
   label-prefix:
     description: >
-      Prefix of the three intake labels this action owns — `<prefix>:triage`,
-      `<prefix>:duplicate` and `<prefix>:ignored`. `<prefix>:triage` is the
-      trigger label an agent workflow keys off.
+      Prefix of the two intake labels this action owns — `<prefix>:triage` and
+      `<prefix>:duplicate`. `<prefix>:triage` is the trigger label an agent
+      workflow keys off, and an issue that already carries it is left alone.
+      There is no `<prefix>:ignored` label: an `ignored` verdict is inert, so
+      the action never writes one.
     required: false
     default: 'intake'
   fire-url:
@@ -68,9 +85,21 @@ inputs:
       lands in secrets, never vars.
     required: false
     default: ''
+  fire-timeout-ms:
+    description: >
+      How long the fire POST may take, in milliseconds, before it is treated as
+      refused. Blank uses the action's default (15000). A wedged endpoint that
+      never answers would otherwise hold this job for its whole timeout.
+    required: false
+    default: ''
   dry-run:
     description: >
       Print the verdict without creating labels, labelling the issue or firing.
+      Accepts `true` or `false` in any casing; any other value fails the run
+      rather than being read as `false` — silently downgrading a requested dry
+      run into a real one is the worst possible reading of a typo. The
+      duplicate lookup still runs, because it is a read: a preview that skipped
+      it would print `triage` for an issue the real run calls `duplicate`.
     required: false
     default: 'false'
   repo:
@@ -88,7 +117,9 @@ outputs:
       The classification this run resolved to — `triage`, `duplicate` or
       `ignored`. `ignored` is inert: no label is created or applied and no fire
       is sent, so an issue that fails the trust boundary is left exactly as its
-      author wrote it.
+      author wrote it. A re-run over an already-triaged issue also reports
+      `triage` — that is what the issue is — but writes nothing and fires
+      nothing, so the routine is woken exactly once.
     value: ${{ steps.issue-intake.outputs.action }}
   issue:
     description: >
@@ -108,6 +139,7 @@ runs:
         INTAKE_LABEL_PREFIX: ${{ inputs.label-prefix }}
         INTAKE_FIRE_URL: ${{ inputs.fire-url }}
         INTAKE_FIRE_TOKEN: ${{ inputs.fire-token }}
+        INTAKE_FIRE_TIMEOUT_MS: ${{ inputs.fire-timeout-ms }}
         INTAKE_DRY_RUN: ${{ inputs.dry-run }}
         INTAKE_REPO: ${{ inputs.repo }}
         INTAKE_ISSUE_NUMBER: ${{ github.event.issue.number }}
@@ -115,6 +147,10 @@ runs:
         INTAKE_ISSUE_BODY: ${{ github.event.issue.body }}
         INTAKE_ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
         INTAKE_ISSUE_URL: ${{ github.event.issue.html_url }}
+        # The DEGRADED answer only — used when the live label read fails. A
+        # re-run replays the original payload, so this list predates the first
+        # run's own label write.
+        INTAKE_ISSUE_LABELS: ${{ toJSON(github.event.issue.labels) }}
         GH_TOKEN: ${{ inputs.github-token }}
         ACTION_PATH: ${{ github.action_path }}
       run: |

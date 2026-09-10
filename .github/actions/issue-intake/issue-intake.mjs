@@ -24,7 +24,10 @@
  *
  * An `ignored` verdict is deliberately INERT — no label is created, none is
  * applied, nothing is fired. The action leaves an issue it does not trust
- * exactly as its author wrote it.
+ * exactly as its author wrote it. That is why the label plan owns TWO labels,
+ * not three: an `<prefix>:ignored` label that is created but can never be
+ * applied is a promise the trust invariant forbids the action from keeping,
+ * and a label nothing ever wears only tells a reader it means something.
  *
  * ## 2. Matchers are regex LITERALS in a preset table
  *
@@ -39,11 +42,17 @@
  *
  * ## 3. Label discovery pages, and an "already exists" refusal is a SKIP
  *
- * `gh label list` returns one page. A consumer with 313 labels lost the intake
- * labels off the end of it, so every run after the first tried to re-create
- * them and died on GitHub's "already exists" refusal. Discovery therefore
- * pages to exhaustion, and a create refused as already-existing is reported as
- * a skip — the desired end state (the label exists) is reached either way.
+ * `gh label list` returns one page. A consumer with 313 labels lost the two
+ * intake labels (`<prefix>:triage` and `<prefix>:duplicate`) off the end of
+ * it, so every run after the first tried to re-create them and died on
+ * GitHub's "already exists" refusal. Discovery therefore pages to exhaustion,
+ * and a create refused as already-existing is reported as a skip — the desired
+ * end state (the label exists) is reached either way.
+ *
+ * Discovery reaches `gh` through the `api` subcommand, which — unlike `gh
+ * issue` and `gh label` — takes no `--repo` flag and exits non-zero on one.
+ * The adapter therefore scopes an `api` call by spelling `owner/repo` into the
+ * endpoint path, and appends `--repo` only for the subcommands that accept it.
  *
  * ## 4. Fire semantics invert on configuration
  *
@@ -53,6 +62,32 @@
  * carries `Authorization: Bearer`, `Content-Type: application/json` and BOTH
  * Anthropic headers — omitting either returns 400 — with a `{"text": "…"}`
  * body.
+ *
+ * ## 5. The CURRENT labels decide, and they are read LIVE
+ *
+ * Applying the trigger label twice wakes a second routine on an issue that was
+ * already routed. Two triggers reach here on an issue that has been triaged
+ * once: a GitHub "Re-run jobs", and an `issues: edited` caller. Neither can be
+ * answered from `github.event`, because a re-run REPLAYS the original
+ * `issues.opened` payload — whose `labels[]` was captured before the first
+ * run's own label write, and so reports an untriaged issue forever.
+ *
+ * So the labels are re-read live through the `runner` seam before any write.
+ * When `<prefix>:triage` is already present the run stops there: no duplicate
+ * lookup, no label write, no fire, exit 0. Payload labels remain as a degraded
+ * fallback for the case where the live read itself fails — a read outage
+ * should not strand intake — and taking it is logged, because the fallback is
+ * exactly the stale answer the live read exists to replace.
+ *
+ * ## 6. The fire is bounded, by a RACE and not by a forwarded signal
+ *
+ * A wedged endpoint that accepts a connection and never answers would hold a
+ * consumer's runner for the job's whole timeout. `fireRoutine` therefore
+ * arms an `AbortController` and RACES the fetch against its abort event rather
+ * than merely passing `init.signal` down: forwarding alone delegates the
+ * bound to the fetch implementation, and an implementation that ignores the
+ * signal — every injected test fake, and any polyfill — is then unbounded. A
+ * timeout is a refusal, so it lands on the same red path as invariant 4.
  */
 
 import { createHash } from "node:crypto";
@@ -80,6 +115,16 @@ export const LABEL_PAGE_SIZE = 100;
 
 /** Hard stop on the paging loop, so a pathological repo cannot spin forever. */
 export const MAX_LABEL_PAGES = 50;
+
+/**
+ * How long the fire POST may take before it is treated as refused. Long enough
+ * that a slow-but-healthy endpoint still lands, short enough that a wedged one
+ * cannot hold a consumer's runner for the job's whole timeout.
+ */
+export const DEFAULT_FIRE_TIMEOUT_MS = 15_000;
+
+/** `gh` subcommands that take no `--repo` flag and exit non-zero on one. */
+const REPO_FLAG_UNSUPPORTED = new Set(["api"]);
 
 /**
  * Characters that terminate a URL token in prose. This pattern names no host,
@@ -347,9 +392,14 @@ export function classifyIntake({ login, body, preset, logins, duplicateOf = null
 export const labelFor = (prefix, action) => `${prefix}:${action}`;
 
 /**
- * The three labels this action owns. `<prefix>:triage` is first because it is
+ * The two labels this action owns. `<prefix>:triage` is first because it is
  * the trigger label — the one whose existence has to be guaranteed before any
  * issue is labelled with it.
+ *
+ * There is deliberately no `<prefix>:ignored` label. An `ignored` verdict is
+ * inert by invariant (header § 1), so the label could never be applied to
+ * anything; creating it would advertise a classification the action has
+ * promised never to write, on repos that take public issues.
  *
  * @param {string} prefix
  * @returns {Array<{name: string, color: string, description: string}>}
@@ -365,11 +415,6 @@ export function intakeLabelPlan(prefix) {
       name: labelFor(prefix, DUPLICATE),
       color: "cfd3d7",
       description: "Intake: duplicate of an already-open intake issue.",
-    },
-    {
-      name: labelFor(prefix, IGNORED),
-      color: "e4e669",
-      description: "Intake: did not clear the two-signal trust boundary.",
     },
   ];
 }
@@ -403,9 +448,21 @@ export function classifyLabelCreateFailure(failure) {
   return ALREADY_EXISTS.test(message) ? "skip" : "error";
 }
 
-/** `gh` adapter — thin, so everything above stays pure and testable. */
+/**
+ * `gh` adapter — thin, so everything above stays pure and testable.
+ *
+ * `gh api` takes no `--repo` flag and exits non-zero on one, so an `api` call
+ * is scoped by the `owner/repo` its caller already spelled into the endpoint
+ * path. Arguments are passed as an argv array to `execFileSync`: no shell is
+ * involved, so an issue title or body can never be read as shell syntax.
+ *
+ * @param {string[]} args
+ * @param {{repo: string}} ctx
+ * @returns {string} stdout
+ */
 function gh(args, { repo }) {
-  return execFileSync("gh", [...args, "--repo", repo], { encoding: "utf8" });
+  const argv = REPO_FLAG_UNSUPPORTED.has(args[0]) ? [...args] : [...args, "--repo", repo];
+  return execFileSync("gh", argv, { encoding: "utf8" });
 }
 
 /**
@@ -458,7 +515,7 @@ export function listRepoLabels({ repo }, runner = gh) {
 }
 
 /**
- * Ensure all three intake labels exist. Never throws on an already-existing
+ * Ensure both intake labels exist. Never throws on an already-existing
  * label; a genuine create failure (permissions, a bad colour) still throws.
  *
  * @param {{repo: string, prefix: string}} args
@@ -537,6 +594,108 @@ export function findDuplicateIssue({ repo, label, fingerprint, selfNumber }, run
 }
 
 // ---------------------------------------------------------------------------
+// Current labels — the idempotence signal
+// ---------------------------------------------------------------------------
+
+/**
+ * The issue's labels as they are RIGHT NOW, read live.
+ *
+ * This is the whole of invariant 5: a re-run replays the original
+ * `issues.opened` payload, so `github.event.issue.labels` is frozen at a
+ * moment before this action's own first write and can never report the run's
+ * own effect. Throws on failure, so the caller can decide — the fallback is a
+ * policy decision, not this function's.
+ *
+ * @param {{repo: string, issueNumber: number}} args
+ * @param {Function} [runner]
+ * @returns {string[]} label names, in GitHub's order
+ */
+export function readIssueLabels({ repo, issueNumber }, runner = gh) {
+  let raw;
+  try {
+    raw = runner(
+      [
+        "api",
+        `repos/${repo}/issues/${issueNumber}/labels`,
+        "--method",
+        "GET",
+        "-F",
+        `per_page=${LABEL_PAGE_SIZE}`,
+      ],
+      { repo },
+    );
+  } catch (e) {
+    throw new Error(`live label read failed for issue #${issueNumber}: ${e.message}`);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(raw || "[]");
+  } catch (e) {
+    throw new Error(`live label read returned unparseable JSON: ${e.message}`);
+  }
+  if (!Array.isArray(payload)) {
+    throw new Error("live label read returned a non-array payload.");
+  }
+  return payload.map((label) => String(label?.name ?? "")).filter(Boolean);
+}
+
+/**
+ * Label names out of a `github.event.issue.labels` value.
+ *
+ * GitHub sends an array of label objects; a caller that pre-flattened it to
+ * names is accepted too, because either shape answers the only question asked
+ * of it. Anything unparseable is an empty list rather than a throw: this is
+ * already the degraded path, and failing it would turn a read outage into a
+ * failed run.
+ *
+ * @param {string|undefined} raw JSON, as forwarded through step-level `env:`
+ * @returns {string[]}
+ */
+export function parsePayloadLabels(raw) {
+  let payload;
+  try {
+    payload = JSON.parse(String(raw ?? "").trim() || "[]");
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(payload)) return [];
+  return payload
+    .map((label) => (typeof label === "string" ? label : String(label?.name ?? "")))
+    .filter(Boolean);
+}
+
+/**
+ * Whether the issue already wears the trigger label, and where that answer
+ * came from. Comparison is case-insensitive, matching GitHub's own label
+ * identity rule — `Intake:Triage` and `intake:triage` cannot coexist, so
+ * treating them as different labels here would re-fire an already-routed
+ * issue.
+ *
+ * @param {{repo: string, issueNumber: number, triageLabel: string, payloadLabels?: string}} args
+ * @param {Function} [runner]
+ * @returns {{alreadyTriaged: boolean, source: "live"|"payload", labels: string[], readError: string|null}}
+ */
+export function resolveTriageState({ repo, issueNumber, triageLabel, payloadLabels }, runner = gh) {
+  let labels;
+  let source = "live";
+  let readError = null;
+  try {
+    labels = readIssueLabels({ repo, issueNumber }, runner);
+  } catch (e) {
+    labels = parsePayloadLabels(payloadLabels);
+    source = "payload";
+    readError = e.message;
+  }
+  const wanted = triageLabel.toLowerCase();
+  return {
+    alreadyTriaged: labels.some((name) => name.toLowerCase() === wanted),
+    source,
+    labels,
+    readError,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Fire
 // ---------------------------------------------------------------------------
 
@@ -596,30 +755,104 @@ export function resolveFireOutcome({ configured, delivered = false, detail = "" 
 }
 
 /**
- * POST the routine. Returns the delivery result rather than throwing, so the
- * caller applies `resolveFireOutcome` to every path identically.
+ * The fire timeout in milliseconds: the configured value when it is a positive
+ * integer, the production default otherwise. An unset, blank or nonsense value
+ * falls back rather than failing the run — a malformed tuning knob must not
+ * take intake down, and the default is always a safe answer.
  *
- * @param {{url: string, token: string, payload: string}} args
+ * @param {string|number|undefined} raw
+ * @param {number} [fallback]
+ * @returns {number}
+ */
+export function resolveFireTimeoutMs(raw, fallback = DEFAULT_FIRE_TIMEOUT_MS) {
+  const parsed = Number.parseInt(String(raw ?? "").trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * POST the routine, bounded. Returns the delivery result rather than throwing,
+ * so the caller applies `resolveFireOutcome` to every path identically — a
+ * timeout included, which is why a wedged endpoint reds the run exactly as an
+ * HTTP 500 does.
+ *
+ * The bound is a RACE, not a forwarded signal (header § 6). `init.signal` is
+ * still passed so a compliant `fetch` tears the socket down, but correctness
+ * does not depend on the implementation honouring it.
+ *
+ * @param {{url: string, token: string, payload: string, timeoutMs?: number}} args
  * @param {Function} [fetchImpl]
  * @returns {Promise<{delivered: boolean, detail: string}>}
  */
-export async function fireRoutine({ url, token, payload }, fetchImpl = globalThis.fetch) {
+export async function fireRoutine(
+  { url, token, payload, timeoutMs = DEFAULT_FIRE_TIMEOUT_MS },
+  fetchImpl = globalThis.fetch,
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // `Promise.race` subscribes to both arms, so a late rejection from an
+  // abort-aware fetch is consumed rather than surfacing as an unhandled one.
+  const expiry = new Promise((resolve) => {
+    controller.signal.addEventListener("abort", () => resolve({ kind: "timeout" }), { once: true });
+  });
   try {
-    const res = await fetchImpl(url, {
-      method: "POST",
-      headers: fireHeaders(token),
-      body: payload,
-    });
+    const settled = await Promise.race([
+      Promise.resolve(
+        fetchImpl(url, {
+          method: "POST",
+          headers: fireHeaders(token),
+          body: payload,
+          signal: controller.signal,
+        }),
+      ).then((response) => ({ kind: "response", response })),
+      expiry,
+    ]);
+    if (settled.kind === "timeout") {
+      return { delivered: false, detail: `no response within ${timeoutMs}ms` };
+    }
+    const res = settled.response;
     if (res?.ok) return { delivered: true, detail: `HTTP ${res.status}` };
     return { delivered: false, detail: `HTTP ${res ? res.status : "no response"}` };
   } catch (e) {
     return { delivered: false, detail: e.message };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Environment contract
 // ---------------------------------------------------------------------------
+
+/** The only two values a boolean action input may carry, once lowercased. */
+export const BOOLEAN_INPUT_VALUES = Object.freeze(["true", "false"]);
+
+/**
+ * Parse a boolean action input, failing CLOSED on anything unrecognised.
+ *
+ * A strict `=== "true"` compare silently reads `True`, `yes` and `1` as
+ * false — so an operator who asked for a dry run gets a real one that labels
+ * the issue and fires the routine. Both halves of the fix matter: accept the
+ * casings GitHub's own YAML makes easy to write, and REFUSE everything else
+ * loudly rather than guessing which way the author meant it.
+ *
+ * An unset or blank value is the documented default, not an error: the action
+ * declares `default: 'false'`, and a caller that forwards an unset variable
+ * must not red the run.
+ *
+ * @param {string|undefined} raw
+ * @param {{name: string, fallback?: boolean}} args
+ * @returns {{value: boolean, error: string|null}}
+ */
+export function parseBooleanInput(raw, { name, fallback = false }) {
+  const normalized = String(raw ?? "").trim().toLowerCase();
+  if (normalized === "") return { value: fallback, error: null };
+  if (normalized === "true") return { value: true, error: null };
+  if (normalized === "false") return { value: false, error: null };
+  return {
+    value: fallback,
+    error: `${name} must be one of ${BOOLEAN_INPUT_VALUES.join(", ")} (case-insensitive); got "${String(raw).trim()}".`,
+  };
+}
 
 /**
  * Resolve the whole input contract from an environment bag. Pure, so a test
@@ -635,7 +868,8 @@ export function resolveConfig(env) {
   const logins = parseLogins(env.INTAKE_PRODUCER_LOGINS);
   const fireUrl = String(env.INTAKE_FIRE_URL || "").trim();
   const fireToken = String(env.INTAKE_FIRE_TOKEN || "").trim();
-  const dryRun = String(env.INTAKE_DRY_RUN || "").trim() === "true";
+  const dry = parseBooleanInput(env.INTAKE_DRY_RUN, { name: "dry-run" });
+  const fireTimeoutMs = resolveFireTimeoutMs(env.INTAKE_FIRE_TIMEOUT_MS);
   const issueNumber = Number.parseInt(String(env.INTAKE_ISSUE_NUMBER ?? "").trim(), 10);
 
   let error = null;
@@ -653,6 +887,8 @@ export function resolveConfig(env) {
     error = `label-prefix "${labelPrefix}" is not a usable label-name prefix (letters, digits, then . _ -).`;
   } else if (fireUrl && !fireToken) {
     error = "fire-url is set but fire-token is empty — a configured fire needs its bearer token (read it from secrets.*).";
+  } else if (dry.error !== null) {
+    error = dry.error;
   }
 
   return {
@@ -667,7 +903,9 @@ export function resolveConfig(env) {
     labelPrefix,
     fireUrl,
     fireToken,
-    dryRun,
+    fireTimeoutMs,
+    payloadLabels: String(env.INTAKE_ISSUE_LABELS || ""),
+    dryRun: dry.value,
     error,
   };
 }
@@ -755,8 +993,36 @@ export async function main(env = process.env, { runner = gh, fetchImpl } = {}) {
     return 0;
   }
 
+  // Invariant 5: the CURRENT labels decide, and a re-run's replayed payload
+  // cannot report them. This read precedes every write, and follows the
+  // `ignored` short-circuit above so an untrusted issue still costs nothing.
+  const triageState = resolveTriageState(
+    {
+      repo: cfg.repo,
+      issueNumber: cfg.issueNumber,
+      triageLabel,
+      payloadLabels: cfg.payloadLabels,
+    },
+    runner,
+  );
+  if (triageState.source === "payload") {
+    console.error(
+      `::warning::live label read failed (${triageState.readError}) — falling back to the event payload's labels, which a re-run replays stale.`,
+    );
+  }
+  if (triageState.alreadyTriaged) {
+    console.log(
+      `issue-intake: issue #${cfg.issueNumber} already carries \`${triageLabel}\` (read ${triageState.source}) — it was triaged by an earlier run, so nothing is labelled and no routine is fired.`,
+    );
+    publishOutputs(env, { action: TRIAGE, issue: cfg.issueNumber });
+    return 0;
+  }
+
+  // The duplicate lookup is a READ, so a dry run performs it too: a preview
+  // that skipped it would print `triage` for an issue the real run would
+  // classify `duplicate`, which is the one verdict a preview must not invent.
   let duplicateOf = null;
-  if (fingerprint.dedupable && !cfg.dryRun) {
+  if (fingerprint.dedupable) {
     duplicateOf = findDuplicateIssue(
       {
         repo: cfg.repo,
@@ -819,6 +1085,7 @@ export async function main(env = process.env, { runner = gh, fetchImpl } = {}) {
             preset: cfg.preset,
             fingerprint: fingerprint.value,
           }),
+          timeoutMs: cfg.fireTimeoutMs,
         },
         fetchImpl ?? globalThis.fetch,
       )

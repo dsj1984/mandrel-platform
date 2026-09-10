@@ -3209,7 +3209,7 @@ A first-party **composite action**
 that stands between an external issue producer — a monitor, a scanner, a bot,
 another repo's workflow — and whatever the consumer wants to happen next.
 Wiring a producer to an agent is a trust decision, and every consumer that has
-done it by hand re-derived the same three mechanisms and got at least one of
+done it by hand re-derived the same five mechanisms and got at least one of
 them wrong. This ships them once.
 
 The classification is a pure function of `(author login, body text, preset,
@@ -3237,6 +3237,35 @@ An **`ignored` verdict is inert**: no label is created, none is applied, and
 nothing is fired. An issue the action does not trust is left exactly as its
 author wrote it, which is also what keeps the action safe to enable on a repo
 that takes public issues.
+
+That inertness is why the action owns **two** labels, not three:
+`<label-prefix>:triage` and `<label-prefix>:duplicate`. There is deliberately
+no `<label-prefix>:ignored` — it could never be applied to anything, and a
+label that exists but is never worn only tells whoever finds it that it means
+something.
+
+### The run is idempotent, and the payload cannot make it so
+
+Two triggers reach this action on an issue it has already triaged: a GitHub
+**"Re-run jobs"**, and an `issues: edited` caller. Applying the trigger label a
+second time wakes a second routine on work that was already routed — which is
+the same storm dedupe exists to stop, arriving by a different door.
+
+`github.event.issue.labels` **cannot** answer this. A re-run replays the
+*original* `issues.opened` payload, captured before the first run's own label
+write, so it reports an untriaged issue forever. The action therefore re-reads
+the issue's labels **live** (`gh api repos/<repo>/issues/<n>/labels`) before any
+write:
+
+| Live read says                   | Outcome                                                                |
+| -------------------------------- | ---------------------------------------------------------------------- |
+| trigger label already present    | Stop: no duplicate lookup, no label write, no fire. Exit 0, with a log line saying why. `action` still reports `triage` — that is what the issue *is*. |
+| trigger label absent             | Classify and proceed normally.                                          |
+| the read itself **failed**       | Fall back to the payload's labels, **with a warning** — a read outage should not strand intake, but the fallback is exactly the stale answer the live read exists to replace. |
+
+The comparison is case-insensitive, matching GitHub's own label identity rule:
+`Intake:Triage` and `intake:triage` cannot coexist, so treating them as
+different labels would re-fire an already-routed issue.
 
 ### Presets, not patterns
 
@@ -3298,16 +3327,46 @@ agent should read it from the issue, where its provenance is visible.
 A `duplicate` never fires. Something already carrying that fingerprint was
 routed, and re-firing is the storm dedupe exists to stop.
 
+### The fire is bounded — by a race, not by a forwarded signal
+
+A wedged endpoint that accepts the connection and never answers would hold the
+consumer's runner for the job's entire timeout. The POST is therefore raced
+against an `AbortController` armed at `fire-timeout-ms` (default `15000`), and
+a timeout is a **refusal** — it lands on the red path above, because a
+classified issue nothing picked up is a broken pipeline whether the endpoint
+said so or simply went quiet.
+
+The bound is a **race**, not merely a forwarded `init.signal`. Passing the
+signal down delegates the bound to the fetch implementation, and an
+implementation that ignores it is then unbounded again — which is not a
+theoretical concern: every injected test fake ignores it, exactly as a wedged
+socket does. The signal is still forwarded, so a compliant `fetch` also tears
+the connection down.
+
+### `dry-run` is parsed strictly, and previews the live verdict
+
+`dry-run` accepts `true` or `false` in any casing. Any **other** value fails
+the run with an error naming the two accepted ones, rather than being read as
+`false`: silently downgrading a requested preview into a real run — one that
+labels the issue and fires the routine — is the worst available reading of a
+typo like `yes`.
+
+A dry run still performs the duplicate lookup, because that lookup is a *read*.
+Skipping it would make the preview print `triage` for an issue the real run
+would classify `duplicate`, and a preview that invents a different verdict than
+the one being previewed is worse than no preview at all.
+
 ### Inputs
 
 | Input             | Required | Default    | Notes                                                                              |
 | ----------------- | -------- | ---------- | ---------------------------------------------------------------------------------- |
 | `producer-logins` | yes      | —          | Comma-separated logins, matched case-insensitively. Signal one.                     |
 | `producer-preset` | yes      | —          | One of the presets above. Signal two. An unknown value is a configuration error.    |
-| `label-prefix`    | no       | `'intake'` | Owns `<prefix>:triage`, `<prefix>:duplicate`, `<prefix>:ignored`.                    |
+| `label-prefix`    | no       | `'intake'` | Owns `<prefix>:triage` and `<prefix>:duplicate` — two labels, no `ignored`.          |
 | `fire-url`        | no       | `''`       | Empty means not wired: warn, stay green. Set means a refusal reds the run.           |
 | `fire-token`      | no       | `''`       | Bearer token; required whenever `fire-url` is set. Read it from `secrets.*`.         |
-| `dry-run`         | no       | `'false'`  | Classify and print; create no label, apply none, fire nothing.                       |
+| `fire-timeout-ms` | no       | `''`       | Bound on the fire POST; blank uses `15000`. A timeout is a refusal.                  |
+| `dry-run`         | no       | `'false'`  | Classify and print; create no label, apply none, fire nothing. `true`/`false` in any casing; anything else fails the run. |
 | `repo`            | yes      | —          | `owner/repo` the inbound issue lives in.                                             |
 | `github-token`    | yes      | —          | Needs `issues: write` on `repo`; an `issues: opened` caller already has one.          |
 
@@ -3320,7 +3379,7 @@ that hand-off right itself.
 
 | Output   | Value                                                                      |
 | -------- | -------------------------------------------------------------------------- |
-| `action` | `triage`, `duplicate` or `ignored` — always populated, including `ignored`. |
+| `action` | `triage`, `duplicate` or `ignored` — always populated, including `ignored`. A re-run over an already-triaged issue reports `triage` and writes nothing. |
 | `issue`  | Decimal number of the issue this run classified.                            |
 
 ### Consumer caller
