@@ -39,6 +39,18 @@ const WORKFLOW = ".github/workflows/pr-quality.yml";
 const UPDATER = "scripts/update-semgrep-rules.mjs";
 
 const lockfile = readFileSync(LOCKFILE, "utf8");
+const workflow = readFileSync(WORKFLOW, "utf8");
+
+// semgrep's own `requires_python`, recorded per release. Verified on PyPI
+// 2026-09-10: 1.97.0 was `>=3.8`, 1.136.0 `>=3.9`, and 1.137.0 raised it to
+// `>=3.10` — which is why a runner on macOS system Python (3.9.6) could not
+// install the 1.176.1 pin at all (issue #480).
+//
+// This table is what makes the floor in pr-quality.yml checkable without a
+// network call: a bump to a release with no entry here fails loudly, so
+// "look up the new requires_python" becomes a step of the bump rather than
+// something discovered by a consumer's red CI.
+const SEMGREP_PYTHON_FLOORS = new Map([["1.176.1", "3.10"]]);
 
 /**
  * Parse `name==version` requirement lines, ignoring comments and hash
@@ -118,7 +130,6 @@ test("the lockfile, the workflow, and the rules updater pin the same semgrep", (
   const lockVersion = REQS.get("semgrep");
   assert.ok(lockVersion, `${LOCKFILE}: semgrep must be pinned`);
 
-  const workflow = readFileSync(WORKFLOW, "utf8");
   const wf = workflow.match(/SEMGREP_PIN='semgrep==([^']+)'/);
   assert.ok(wf, `${WORKFLOW}: SEMGREP_PIN not found`);
   assert.equal(wf[1], lockVersion, "workflow SEMGREP_PIN disagrees with the lockfile");
@@ -202,4 +213,131 @@ test("the header warns about the manylinux_2_34 wheel tag", () => {
     /pip download semgrep/,
     "the header must carry a regeneration command",
   );
+});
+
+// ---------------------------------------------------------------------------
+// 5. The interpreter floor on the non-lockfile install path (Story #482)
+// ---------------------------------------------------------------------------
+
+test("pr-quality.yml declares an interpreter floor matching the pinned semgrep", () => {
+  const version = REQS.get("semgrep");
+  const declared = workflow.match(/SEMGREP_PYTHON_FLOOR='([^']+)'/);
+  assert.ok(
+    declared,
+    `${WORKFLOW}: SEMGREP_PYTHON_FLOOR must be declared beside SEMGREP_PIN — without it the SAST step cannot tell a too-old interpreter from a working one`,
+  );
+
+  const recorded = SEMGREP_PYTHON_FLOORS.get(version);
+  assert.ok(
+    recorded,
+    `no requires_python floor recorded for semgrep ${version} — read it off PyPI and add it to SEMGREP_PYTHON_FLOORS before bumping SEMGREP_PIN`,
+  );
+  assert.equal(
+    declared[1],
+    recorded,
+    `SEMGREP_PYTHON_FLOOR is ${declared[1]} but semgrep ${version} requires Python >= ${recorded}`,
+  );
+});
+
+test("the selector rides the same side-checkout as the lockfile", () => {
+  // The sparse-checkout is NON-CONE and lists exact paths, so a script the
+  // SAST step sources is absent at run time unless it is named here — and a
+  // missing `source` target kills the security tier for every consumer at
+  // once. Both files must sit in the one list.
+  const start = workflow.indexOf("- name: Checkout Semgrep lockfile");
+  assert.notEqual(start, -1, `${WORKFLOW}: the Semgrep side-checkout step was renamed or removed`);
+  const step = workflow.slice(start, workflow.indexOf("path: _mandrel-platform-semgrep", start));
+
+  assert.ok(
+    step.includes("scripts/semgrep-requirements.txt"),
+    "the side-checkout must still carry the lockfile",
+  );
+  assert.ok(
+    step.includes("scripts/select-semgrep-python.sh"),
+    "the side-checkout must carry the interpreter selector the SAST step sources",
+  );
+  assert.ok(
+    step.includes("sparse-checkout-cone-mode: false"),
+    "non-cone mode is what makes the exact-path list meaningful",
+  );
+});
+
+test("the SAST step selects an interpreter before it creates the venv", () => {
+  // A venv inherits the interpreter that built it, so a floor enforced after
+  // `-m venv` cannot fix anything. Order is the whole guarantee.
+  const select = workflow.indexOf("select-semgrep-python.sh");
+  const venv = workflow.indexOf("-m venv");
+  assert.notEqual(select, -1, `${WORKFLOW}: the SAST step must source the interpreter selector`);
+  assert.notEqual(venv, -1, `${WORKFLOW}: the SAST step must still create a venv`);
+  assert.ok(select < venv, "the selector must be sourced BEFORE the venv is created");
+
+  assert.ok(
+    workflow.includes('"${SEMGREP_PYTHON}" -m venv'),
+    "the venv must be built from the selected interpreter, not from bare python3",
+  );
+});
+
+test("the non-lockfile path installs exactly SEMGREP_PIN, never a resolved older release", () => {
+  // Downgrading to fit an old interpreter re-admits CVE-2026-0994: the newest
+  // py3.9-compatible semgrep (1.136.0) pins opentelemetry ~=1.25.0, which caps
+  // protobuf below 5.0, and every protobuf 4.x is affected. This path is not
+  // hash-pinned and its closure is not OSV-scanned, so it would be silent.
+  assert.ok(
+    workflow.includes('--retries 3 "${SEMGREP_PIN}"'),
+    "the fallback must install the exact pin",
+  );
+
+  // Matched as literal substrings rather than a regex alternating the
+  // comparison operators: CodeQL reads such a pattern as an attempted HTML-tag
+  // filter and raises js/bad-tag-filter at HIGH, which blocks the merge.
+  const LOOSE = ["semgrep<", "semgrep>", "semgrep~=", "semgrep!=", 'semgrep=="${'];
+  for (const loose of LOOSE) {
+    assert.ok(
+      !workflow.includes(loose),
+      `${WORKFLOW}: '${loose}' would let pip resolve a semgrep other than the pin`,
+    );
+  }
+});
+
+test("the Linux hash-pinned branch keeps its exact cp312 equality", () => {
+  // Widening this to a `>=` (proposed in issue #480) would route a cp313
+  // interpreter onto the lockfile's cp312-only wheels under
+  // `--only-binary :all:`, with no sdist fallback — the fleet-red the fallback
+  // exists to avoid. The equality is the guard, not the oversight.
+  assert.ok(
+    workflow.includes('[ "${pyver}" = "312" ]'),
+    `${WORKFLOW}: the cp312 test must stay an equality`,
+  );
+  assert.ok(
+    workflow.includes('The `= "312"` below is an EQUALITY on purpose'),
+    "the equality must carry a comment saying why a >= test would be wrong",
+  );
+  assert.ok(
+    workflow.includes("sdist fallback"),
+    "that comment must name the missing sdist fallback as the mechanism",
+  );
+});
+
+test("the floor added no workflow_call input and no new job permission", () => {
+  // A consumer-set semgrep pin would re-open the same un-scanned downgrade
+  // hole operator-side; `enable-sast: false` is the escape hatch. And a new
+  // job-level permission is a COMPILE-TIME break for every caller of this
+  // reusable workflow, not a runtime one.
+  assert.ok(!workflow.includes("semgrep-pin:"), "no semgrep-pin input — see the Story's non-goals");
+  assert.ok(!workflow.includes("python-version:"), "no python-version input — see the Story's non-goals");
+
+  const start = workflow.indexOf("name: Security (secret scan + SAST)");
+  assert.notEqual(start, -1, `${WORKFLOW}: the security job was renamed`);
+  const header = workflow.slice(start, workflow.indexOf("steps:", start));
+  const granted = header
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l === "contents: read" || l === "actions: write");
+  assert.equal(
+    granted.length,
+    2,
+    "the security job's permissions must remain exactly contents: read + actions: write",
+  );
+  assert.ok(!header.includes("id-token:"), "no new permission was needed for an interpreter floor");
+  assert.ok(!header.includes("packages:"), "no new permission was needed for an interpreter floor");
 });
