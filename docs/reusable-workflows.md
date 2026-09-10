@@ -896,6 +896,30 @@ Toggle matrix:
 > `'dist coverage tests/fixtures'`). Empty (the default) leaves only the
 > built-in excludes in effect.
 
+> **Python interpreter floor.** The SAST sub-step installs Semgrep into an
+> ephemeral venv built from the runner's own Python — deliberately not via
+> `actions/setup-python`, which dies on a vanilla self-hosted runner with no
+> tool cache. Semgrep declares `requires_python >= 3.10` at the pinned
+> version, so the step **selects an interpreter before it builds the venv**:
+> bare `python3` when it already satisfies the floor — the common case, and
+> byte-identical to previous behaviour — otherwise the first of
+> `python3.13`, `python3.12`, `python3.11`, `python3.10` found on `PATH`.
+>
+> If nothing on `PATH` satisfies the floor the step **fails with an
+> `::error::`** naming the floor, the pin, the version it found, and the
+> remedy: put a Python at or above the floor **earlier on the runner's `PATH`
+> than `/usr/bin`** (macOS ships `/usr/bin/python3` = 3.9.6), or set
+> `enable-sast: false` to skip the sub-step. There is no `semgrep-pin` or
+> `python-version` input, and that is deliberate — see below.
+>
+> **Semgrep is never downgraded to fit an older interpreter.** The newest
+> release supporting Python 3.9 pins `opentelemetry-*~=1.25.0`, which caps
+> `protobuf` below 5.0, and every `protobuf` 4.x is affected by
+> CVE-2026-0994 (CVSS 8.2). Because this install path is intentionally not
+> hash-pinned and its transitive closure is not OSV-scanned, such a downgrade
+> would reintroduce a high-severity advisory with no signal anywhere. Failing
+> closed with an actionable message is the trade this step makes on purpose.
+
 #### SAST ruleset provenance and update process
 
 **The incident.** The 0.14.0 release was blocked when the live registry alias

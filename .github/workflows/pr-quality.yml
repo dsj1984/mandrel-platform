@@ -2171,7 +2171,15 @@ jobs:
       # ruleset — it comes from a dedicated side-checkout. Gated on
       # `enable-sast` (needed regardless of `semgrep-config`, unlike the
       # vendored-ruleset checkout below which is vendored-only).
-      - name: Checkout Semgrep lockfile (mandrel-platform@resolved-sha)
+      #
+      # The same checkout carries `select-semgrep-python.sh`, the interpreter
+      # floor the SAST step sources (Story #482). This `sparse-checkout` is
+      # NON-CONE and lists exact paths, so a script the step needs is simply
+      # absent at run time unless it is named here — the whole fleet would die
+      # on a missing `source` target. Both files resolve at the same
+      # `job.workflow_sha` as the workflow that reads them, so a consumer never
+      # gets a workflow and a script from different versions.
+      - name: Checkout Semgrep lockfile + interpreter floor (mandrel-platform@resolved-sha)
         if: ${{ inputs.enable-sast }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -2179,6 +2187,7 @@ jobs:
           ref: ${{ steps.platform-ref.outputs.sha }}
           sparse-checkout: |
             scripts/semgrep-requirements.txt
+            scripts/select-semgrep-python.sh
           sparse-checkout-cone-mode: false
           path: _mandrel-platform-semgrep
           persist-credentials: false
@@ -2357,6 +2366,21 @@ jobs:
           # M7 hash-pinning is the reason the whole tree now flows through pip.
           SEMGREP_PIN='semgrep==1.176.1'
 
+          # Minimum interpreter for the pin above — semgrep's OWN
+          # `requires_python`, which it raised from `>=3.9` to `>=3.10` at
+          # 1.137.0. Declared here, beside the pin, because the two must move
+          # together: `check-semgrep-lockfile.test.mjs` fails the build when
+          # this disagrees with the floor recorded for the pinned version, so a
+          # future bump cannot land without reviewing it.
+          #
+          # It exists because macOS ships `/usr/bin/python3` = 3.9.6. Before
+          # this floor, a consumer on a macOS self-hosted runner with system
+          # Python got nothing but pip's "Could not find a version that
+          # satisfies the requirement" on blocking `ci-required` — a message
+          # that reads like a registry outage and never names the interpreter
+          # (issue #480).
+          SEMGREP_PYTHON_FLOOR='3.10'
+
           # Build the `--exclude` argument list. The vendored framework tree
           # `.agents/` is ALWAYS excluded: it is materialized from the pinned
           # `mandrel` package and a consumer cannot edit it, so gating on its
@@ -2419,7 +2443,35 @@ jobs:
           # tree into the host-shared $TMPDIR on every run, and nothing reaps
           # it on a persistent self-hosted runner.
           venv_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/semgrep.XXXXXX")/semgrep-venv"
-          python3 -m venv "${venv_dir}"
+
+          # Choose the interpreter BEFORE creating the venv (Story #482). A
+          # venv inherits whichever interpreter built it, so a floor checked
+          # afterwards is already too late — the install would fail inside a
+          # venv that cannot be fixed without rebuilding it. The selector
+          # prefers bare `python3`, so a runner that already satisfies the
+          # floor behaves exactly as it did before this existed; only a
+          # below-floor `python3` falls through to a versioned candidate.
+          # It exports SEMGREP_PYTHON / SEMGREP_PYTHON_VERSION, or emits an
+          # `::error::` naming the floor, the pin, the version found and the
+          # PATH remedy, and returns non-zero — which `set -e` turns into a
+          # failed step. It deliberately never resolves an OLDER semgrep to fit
+          # the interpreter: the newest py3.9-compatible release re-admits
+          # CVE-2026-0994 through opentelemetry/protobuf, on this very path,
+          # which is un-hash-pinned and un-OSV-scanned. Full rationale is in
+          # the script's header.
+          SELECT_PYTHON="${GITHUB_WORKSPACE}/_mandrel-platform-semgrep/scripts/select-semgrep-python.sh"
+          if [ ! -f "${SELECT_PYTHON}" ]; then
+            echo "::error::Semgrep interpreter selector not found at ${SELECT_PYTHON} — the 'Checkout Semgrep lockfile + interpreter floor' step must run before this one, and its sparse-checkout must list scripts/select-semgrep-python.sh."
+            exit 1
+          fi
+          # Pre-declare the selector's outputs so shellcheck sees them assigned
+          # (SC2154); the source path is non-constant, so its follow is
+          # disabled (SC1090) — the same shape the diff-range resolver uses.
+          SEMGREP_PYTHON="" SEMGREP_PYTHON_VERSION=""
+          # shellcheck disable=SC1090
+          source "${SELECT_PYTHON}"
+
+          "${SEMGREP_PYTHON}" -m venv "${venv_dir}"
           # The lockfile pins cp312-only native wheels, so the hash-pinned path
           # is valid ONLY on a Linux interpreter whose ABI tag is cp312. Gating
           # on `uname` alone is a fleet-wide time bomb: when `ubuntu-latest`
@@ -2431,6 +2483,16 @@ jobs:
           # non-312 interpreter, so a Python roll-forward degrades to
           # unpinned-but-green rather than fleet-red. Re-pin the lockfile to the
           # new cpXY when the CI image moves (M7 lockfile-refresh follow-up).
+          #
+          # The `= "312"` below is an EQUALITY on purpose — do not "fix" it to a
+          # `>=` (proposed in issue #480). The lockfile's wheels are cp312-only
+          # and install under `--only-binary :all:`, so on a cp313 interpreter
+          # a `>=` test would route the job ONTO ABI-incompatible wheels with no
+          # sdist fallback and hard-fail `--require-hashes` — causing exactly
+          # the fleet-red the paragraph above degrades to the fallback to avoid.
+          # A wider test here is not a hardening; it is the bug. What the
+          # fallback was actually missing is an interpreter FLOOR of its own,
+          # which `select-semgrep-python.sh` now supplies above.
           pyver="$("${venv_dir}/bin/python" -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
           # `--retries 3` (L8): a PyPI/registry blip must not fail the whole
           # fleet's ci-required and force a manual re-run. `--require-hashes`
@@ -2446,11 +2508,17 @@ jobs:
             "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
               --retries 3 --require-hashes --only-binary :all: -r "${LOCKFILE}"
           else
-            # Fallback for non-Linux (self-hosted darwin) runners: the linux
-            # lockfile's wheels cannot satisfy this platform, so install the
-            # top-pin directly. This path is NOT hash-pinned by design — the M7
-            # lockfile is scoped to the linux CI target; mac hashes are
-            # deliberately not generated.
+            # Fallback for non-Linux (self-hosted darwin) runners, and for any
+            # Linux interpreter that is not cp312: the linux lockfile's wheels
+            # cannot satisfy either, so install the top-pin directly. This path
+            # is NOT hash-pinned by design — the M7 lockfile is scoped to the
+            # linux CI target; mac hashes are deliberately not generated.
+            #
+            # The install target is exactly `${SEMGREP_PIN}` and must stay that
+            # way: no range, no resolution, no downgrade. The interpreter is
+            # already known to satisfy the pin's `requires_python`, because
+            # `select-semgrep-python.sh` failed the step otherwise — so pip has
+            # no reason to walk backwards through older releases here.
             echo "Non-Linux runner (or no lockfile): installing ${SEMGREP_PIN} without hash-pinning."
             "${venv_dir}/bin/python" -m pip install --quiet --disable-pip-version-check \
               --retries 3 "${SEMGREP_PIN}"
