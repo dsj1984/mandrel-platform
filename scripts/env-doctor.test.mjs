@@ -463,7 +463,7 @@ test("renderReport lists a suppressed exception and its revisit date in the summ
   });
   const text = renderReport({ ...applied, surfaces: [], strictOrphans: false, environments: ["staging"] });
   assert.match(text, /Suppressed by an active exception/);
-  assert.match(text, /A \[github\/staging\] — revisit 2027-01-01: deferred pending rotation/);
+  assert.match(text, /A \[github\/staging\] \(fail\) — revisit 2027-01-01: deferred pending rotation/);
   assert.match(text, /1 suppressed/);
 });
 
@@ -941,8 +941,10 @@ test("CLI with no credentials prints one ::notice per unchecked surface and exit
       },
     });
     assert.equal(run.code, 0, run.stdout + run.stderr);
-    const notices = run.stdout.split("\n").filter((l) => l.startsWith("::notice title=env-doctor surface unchecked::"));
-    assert.equal(notices.length, 3, `expected one notice per absent surface, got:\n${run.stdout}`);
+    // On STDERR since Story #487: stdout is the machine channel in every mode.
+    const notices = run.stderr.split("\n").filter((l) => l.startsWith("::notice title=env-doctor surface unchecked::"));
+    assert.equal(notices.length, 3, `expected one notice per absent surface, got:\n${run.stderr}`);
+    assert.ok(!run.stdout.includes("::notice"), "no annotation may share the machine channel");
     assert.match(run.stdout, /offline: checked/);
   } finally {
     rmSync(root, { recursive: true, force: true });
