@@ -82,6 +82,30 @@ test("base config disables bail so every mutant runs its full covering set", () 
   );
 });
 
+/**
+ * The cap this base pins. Stryker's own default is `n-1` logical cores (`n`
+ * when `n <= 4`), so an omitted key is not a small overshoot — it is one
+ * worker per core, 17 on an 18-core host.
+ */
+const PINNED_CONCURRENCY = 1;
+
+test("concurrency is capped so an omitted key cannot fan out to one worker per core", () => {
+  const config = readConfig();
+
+  // Equality, not presence. `Object.hasOwn(config, "concurrency")` passes on
+  // `concurrency: 17` — the very value the cap exists to prevent — so a
+  // presence check would read as covered while leaving the defect fully
+  // reachable. The number is the contract; assert the number.
+  assert.equal(
+    config.concurrency,
+    PINNED_CONCURRENCY,
+    `${CONFIG_PATH} must pin "concurrency": ${PINNED_CONCURRENCY}. Stryker ` +
+      "defaults it to one worker per core less one, so a consumer scope that " +
+      "spreads this base and omits the key takes cores no caller budgeted — " +
+      "on a shared runner host that reds a neighbouring repo's required checks.",
+  );
+});
+
 test("timeouts are raised above both Stryker's defaults and the pre-change floor", async (t) => {
   const config = readConfig();
 
@@ -172,6 +196,15 @@ test("the documented spread-import mechanism delivers the bail-free settings", a
       `that bail-free runs need; got timeoutMS ${base.timeoutMS}.`,
   );
 
+  assert.equal(
+    base.concurrency,
+    PINNED_CONCURRENCY,
+    `Importing "${PACKAGE_SPECIFIER}" must carry the concurrency cap. The ` +
+      "on-disk assertion above guards this repo; this one guards what a " +
+      "consumer's stryker.config.mjs actually receives, which is the only " +
+      "place the uncapped fan-out can happen.",
+  );
+
   // The exports map must reach *this* file, or the assertions in the rest of
   // this suite are guarding a config no consumer receives.
   assert.deepEqual(
@@ -214,6 +247,7 @@ test("annotations use the `_comment` suffix Stryker's validator exempts", () => 
     "coverageAnalysis",
     "ignoreStatic",
     "cleanTempDir",
+    "concurrency",
     "disableBail",
     "timeoutMS",
     "timeoutFactor",

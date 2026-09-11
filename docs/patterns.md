@@ -124,6 +124,16 @@ consequences for a consumer picking up this baseline:
   `disableBail: true` in `stryker.config.json` can remove that key; the shared
   base now carries it, and the local copy is redundant rather than harmful. A
   consumer that never added one needs no action beyond the version bump.
+- **Raise `concurrency` if you do not share a runner host.** The base caps it at
+  `1` because an omitted key inherits Stryker's `n-1`-cores default, and on a
+  host shared between repos that lane spends cores no caller budgeted — the
+  failure surfaces as a red required check in a *neighbouring* repo, which is
+  undiagnosable from inside the run that caused it. The cap makes omission safe;
+  it also makes a cold run serial. On dedicated CI, set a real worker count in
+  your own `stryker.config.mjs` (a later key in the spread wins) or pass
+  `--concurrency` on the CLI, which completely replaces the config value. Adopt
+  the cap first and raise it deliberately — the reverse order is how the
+  unbudgeted fan-out got shipped in the first place.
 - **Set your own `thresholds.break` once the baseline is re-derived.** The base
   ships `break: 50` and leaves it there. It cannot be tightened from the
   platform side without imposing a fail-closed number on consumers whose real

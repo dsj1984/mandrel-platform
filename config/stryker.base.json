@@ -6,6 +6,8 @@
   "coverageAnalysis": "perTest",
   "ignoreStatic": true,
   "cleanTempDir": true,
+  "concurrency_comment": "Capped at 1 deliberately. Stryker defaults `concurrency` to `n-1` logical cores (`n` when `n <= 4`), so a consumer scope that spreads this base and names no `concurrency` of its own silently takes one worker per core — 17 on an 18-core host. Where a runner host is shared between repos, that lane costs cores no caller budgeted, and the damage lands on a neighbouring tenant as a failed required check nobody can diagnose from inside it. Omission is therefore the unsafe direction, and this pins the safe one: more parallelism is opt-in, either by spreading a later `concurrency` key or via `--concurrency` on the CLI, which completely replaces the config value. Consumers on dedicated CI should raise it — see the README. Asserted by scripts/stryker-base-config.test.mjs.",
+  "concurrency": 1,
   "disableBail_comment": "Bail is OFF deliberately. Under Stryker's default bail the vitest runner can score a mutant Survived having completed zero of its covering tests, so a run reports a number nothing measured and a committed baseline becomes a floor under it. Every mutant now runs its full covering set, which lengthens the run — the three timeouts below are sized for that and must move together with this flag. Asserted by scripts/stryker-base-config.test.mjs.",
   "disableBail": true,
   "timeoutMS": 120000,
