@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.13.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.0...mandrel-platform-v1.13.1) (2026-09-11)
+
+
+### Fixed
+
+* audit-check suppresses canonical GHSA ids, audits the right tree, and never infers clean from silence ([#488](https://github.com/dsj1984/mandrel-platform/issues/488)) ([#500](https://github.com/dsj1984/mandrel-platform/issues/500)) ([dd3db30](https://github.com/dsj1984/mandrel-platform/commit/dd3db306f3ef5ec5c55bd906534dee4eda5a3544))
+* env-doctor answers correctly and parseably at its edges ([#487](https://github.com/dsj1984/mandrel-platform/issues/487)) ([#501](https://github.com/dsj1984/mandrel-platform/issues/501)) ([2a4f3ed](https://github.com/dsj1984/mandrel-platform/commit/2a4f3ede4867f573f77f47154d286f1636b4d912))
+* make issue-intake idempotent on re-run and bound its fire on the wire (refs [#491](https://github.com/dsj1984/mandrel-platform/issues/491)) ([#505](https://github.com/dsj1984/mandrel-platform/issues/505)) ([5d9ca81](https://github.com/dsj1984/mandrel-platform/commit/5d9ca818f8115fda13404f3df71dedc839e73818))
+* make the coverage floor exact at its boundary and count each file once (refs [#489](https://github.com/dsj1984/mandrel-platform/issues/489)) ([#502](https://github.com/dsj1984/mandrel-platform/issues/502)) ([8bcb4fc](https://github.com/dsj1984/mandrel-platform/commit/8bcb4fcd17498a61d0f99d9eea0590b1ed1faf20))
+* make the husky pre-commit quality gate executable (refs [#511](https://github.com/dsj1984/mandrel-platform/issues/511)) ([#512](https://github.com/dsj1984/mandrel-platform/issues/512)) ([0d3fdcf](https://github.com/dsj1984/mandrel-platform/commit/0d3fdcf551fc83feeebb3fe9a3792217834218f8))
+* match download-retry flags as whole tokens and widen the download scope (refs [#490](https://github.com/dsj1984/mandrel-platform/issues/490)) ([#498](https://github.com/dsj1984/mandrel-platform/issues/498)) ([7b1394e](https://github.com/dsj1984/mandrel-platform/commit/7b1394e445083dddae7e663b5b0bf38ede7c0592))
+* resolve an empty runner input to the default label at every runs-on site (refs [#493](https://github.com/dsj1984/mandrel-platform/issues/493)) ([#506](https://github.com/dsj1984/mandrel-platform/issues/506)) ([83f6d62](https://github.com/dsj1984/mandrel-platform/commit/83f6d622b4c985c0abe0aa65949777a4e2ed96d9))
+* resolve the runner at the harden-runner gate as runs-on does (refs [#509](https://github.com/dsj1984/mandrel-platform/issues/509)) ([#510](https://github.com/dsj1984/mandrel-platform/issues/510)) ([0cfff21](https://github.com/dsj1984/mandrel-platform/commit/0cfff21129bc69864a63f254ea88bbb02f51bce1))
+* route workflow-lint infrastructure failures through the enforcement dial (refs [#496](https://github.com/dsj1984/mandrel-platform/issues/496)) ([#508](https://github.com/dsj1984/mandrel-platform/issues/508)) ([487627a](https://github.com/dsj1984/mandrel-platform/commit/487627a00d5c625a6a7a21d2afbbd80e64d5247a))
+* the SAST hash-pinned path selects the lockfile's interpreter and says why it falls back ([#495](https://github.com/dsj1984/mandrel-platform/issues/495)) ([#507](https://github.com/dsj1984/mandrel-platform/issues/507)) ([dbc5fc2](https://github.com/dsj1984/mandrel-platform/commit/dbc5fc2bab89a024635d4f2030c2993f001ec18e))
+* wire the local commit-gate surface so its hooks actually run (refs [#513](https://github.com/dsj1984/mandrel-platform/issues/513)) ([#514](https://github.com/dsj1984/mandrel-platform/issues/514)) ([3802f5f](https://github.com/dsj1984/mandrel-platform/commit/3802f5f9540b72f6f872b487dd13d0af1ca7c934))
+
 ## [1.13.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.12.0...mandrel-platform-v1.13.0) (2026-09-10)
 
 
