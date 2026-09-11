@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.13.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.1...mandrel-platform-v1.13.2) (2026-09-11)
+
+
+### Fixed
+
+* cap Stryker base concurrency so an omitted key cannot fan out per core (refs [#516](https://github.com/dsj1984/mandrel-platform/issues/516)) ([#517](https://github.com/dsj1984/mandrel-platform/issues/517)) ([d9058df](https://github.com/dsj1984/mandrel-platform/commit/d9058dfc65f5952f3612b883d0794fed13e92cbb))
+
 ## [1.13.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.0...mandrel-platform-v1.13.1) (2026-09-11)
 
 
