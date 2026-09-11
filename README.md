@@ -179,7 +179,7 @@ export default config;
 
 Shared Stryker mutation-testing defaults: pnpm package manager, `perTest`
 coverage analysis, HTML + clear-text + progress reporters, `ignoreStatic`,
-`disableBail: true`, the timeout budget a bail-free run needs
+`disableBail: true`, `concurrency: 1`, the timeout budget a bail-free run needs
 (`timeoutMS: 120000` — 120 s — plus `timeoutFactor: 3` and
 `dryRunTimeoutMinutes: 15`), and high/low/break thresholds.
 
@@ -201,6 +201,26 @@ export default {
   testRunner: "vitest",
   mutate: ["src/**/*.ts", "!src/**/*.test.ts"],
 };
+```
+
+`concurrency: 1` is a cap, not a recommendation for every host. Stryker's own
+default is `n-1` logical cores (`n` when `n <= 4`), so a scope that spreads this
+base and names no `concurrency` of its own would take one worker per core — the
+unsafe direction to inherit by omission, because on a runner host shared between
+repos those cores are billed to a neighbouring tenant as a failed required
+check. Raising it is one line, either in the spread (a later key wins) or on the
+CLI:
+
+```js
+export default {
+  ...base,
+  concurrency: 4, // dedicated CI — no other tenant on this host
+};
+```
+
+```bash
+# CLI wins over the config file: it completely replaces the value, not supplements it
+npx stryker run --concurrency 4
 ```
 
 Adopting the base is not a drop-in bump: `disableBail: true` changes what the
