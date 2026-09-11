@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.13.3](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.2...mandrel-platform-v1.13.3) (2026-09-11)
+
+
+### Fixed
+
+* bump the workflow-lint self-pin so the infra-failure dial actually runs (refs [#508](https://github.com/dsj1984/mandrel-platform/issues/508)) ([#519](https://github.com/dsj1984/mandrel-platform/issues/519)) ([241f2ab](https://github.com/dsj1984/mandrel-platform/commit/241f2ab1a0a67de37dcf31641924058b32f4cd28))
+
 ## [1.13.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.1...mandrel-platform-v1.13.2) (2026-09-11)
 
 
