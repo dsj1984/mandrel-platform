@@ -1363,7 +1363,7 @@ jobs:
       # the action would fail EVERY consumer at action-load time — immediately
       # for the smoke consumer, which pins @main.
       - name: Lint workflows (actionlint + zizmor)
-        uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@0aabaee76c45ac93561848c9b3122b633f3a9b8e
+        uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@487627a00d5c625a6a7a21d2afbbd80e64d5247a
         with:
           enforce: ${{ inputs.workflow-lint-enforce }}
           # Left off for consumers: actionlint resolves shellcheck from PATH,
