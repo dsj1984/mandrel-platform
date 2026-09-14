@@ -20,10 +20,17 @@
 #
 # ── WHAT IT REPORTS ─────────────────────────────────────────────────────────
 #
-# PRESENCE — never value — of the four keys `.env.example` mandates:
-# ACTIONS_RUNNER_HOOK_JOB_STARTED, RUNNER_TOOL_CACHE, AGENT_TOOLSDIRECTORY,
-# LANG. Values are deliberately not compared: every one of them embeds the
-# runner's own absolute root path, so they are SUPPOSED to differ per runner.
+# PRESENCE — never value — of the five keys `.env.example` mandates:
+# ACTIONS_RUNNER_HOOK_JOB_STARTED, ACTIONS_RUNNER_HOOK_JOB_COMPLETED,
+# RUNNER_TOOL_CACHE, AGENT_TOOLSDIRECTORY, LANG. Values are deliberately not
+# compared: every one of them embeds the runner's own absolute root path, so
+# they are SUPPOSED to differ per runner.
+#
+# Both hook keys are mandated, because the two hooks close different halves of
+# the same gap: the started hook defends the NEXT job against the previous
+# one's orphans, the completed hook makes each job reap its own tree before it
+# releases the runner. A runner carrying only one of them is exactly the
+# half-provisioned shape this tool exists to name.
 #
 # The drift signal is a key set on SOME runners but not all — the 16-of-19
 # shape. A key absent from EVERY runner is a uniform gap: reported as such, and
@@ -56,12 +63,12 @@
 #
 # READ-ONLY, and never fails soft on a broken runner. It writes nothing into a
 # runner root and never touches a launchd service. A runner whose `.env` is
-# missing or unreadable is recorded as all four keys unset and the walk
+# missing or unreadable is recorded as all five keys unset and the walk
 # continues — one broken runner must not shrink the sample the verdict is
 # computed over.
 #
-# This is an OPERATOR-run tool, not a job hook. Do not wire it into
-# ACTIONS_RUNNER_HOOK_JOB_STARTED: that hook runs inside the job's clock, where
+# This is an OPERATOR-run tool, not a job hook. Do not wire it into either job
+# hook: both run inside the job's clock, where
 # every read is billed to `Set up runner` and counts against the job's
 # `timeout-minutes` (issue #343). A pool-wide walk belongs outside that clock.
 #
@@ -86,6 +93,7 @@ set -u
 
 MANDATED_KEYS=(
   ACTIONS_RUNNER_HOOK_JOB_STARTED
+  ACTIONS_RUNNER_HOOK_JOB_COMPLETED
   RUNNER_TOOL_CACHE
   AGENT_TOOLSDIRECTORY
   LANG

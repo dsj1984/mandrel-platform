@@ -87,13 +87,16 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, "..", "templates", "runner", "check-runner-env-drift.sh");
 const RUNBOOK = join(HERE, "..", "templates", "runbooks", "runner-provisioning.md");
 
-/** The four keys `templates/runner/.env.example` mandates. */
+/** The five keys `templates/runner/.env.example` mandates. */
 const HOOK = "ACTIONS_RUNNER_HOOK_JOB_STARTED";
-const MANDATED = [HOOK, "RUNNER_TOOL_CACHE", "AGENT_TOOLSDIRECTORY", "LANG"];
+/** The job-END hook (Story #524) — mandated on the same footing as the start one. */
+const HOOK_COMPLETED = "ACTIONS_RUNNER_HOOK_JOB_COMPLETED";
+const MANDATED = [HOOK, HOOK_COMPLETED, "RUNNER_TOOL_CACHE", "AGENT_TOOLSDIRECTORY", "LANG"];
 
 /** Representative values — the checker reports PRESENCE, never value. */
 const VALUES = {
   ACTIONS_RUNNER_HOOK_JOB_STARTED: "/Users/ci/runners/a/job-cleanup.sh",
+  ACTIONS_RUNNER_HOOK_JOB_COMPLETED: "/Users/ci/runners/a/job-completed.sh",
   RUNNER_TOOL_CACHE: "/Users/ci/runners/a/_work/_tool",
   AGENT_TOOLSDIRECTORY: "/Users/ci/runners/a/_work/_tool",
   LANG: "en_US.UTF-8",
@@ -128,7 +131,7 @@ function envWith(keys) {
  * Build a synthetic pool root.
  *
  * Each entry maps a child directory name to its spec:
- *   `keys`     — mandated keys to set in that runner's `.env` (default: all four)
+ *   `keys`     — mandated keys to set in that runner's `.env` (default: all five)
  *   `env`      — raw `.env` body, overriding `keys`
  *   `noEnv`    — create no `.env` at all
  *   `isRunner` — false to omit `config.sh`, i.e. not a runner directory
@@ -240,6 +243,52 @@ test("AC-2: names every runner missing a key that others have, and exits non-zer
   assert.match(stdout, /runner-b/, "the partially-provisioned runner must be named, not just counted");
   assert.match(stdout, /runner-c/, "the partially-provisioned runner must be named, not just counted");
   assert.match(stdout, new RegExp(HOOK), "the drifting key must be named");
+});
+
+test("Story #524: a runner missing only the job-COMPLETED hook is named as drifted", () => {
+  // The two hooks close different halves of one gap — started defends the next
+  // job against the previous one's orphans, completed makes each job reap its
+  // own tree — so a runner carrying only the started hook is half-provisioned,
+  // and this checker is the only observer that can see it. Provisioning the
+  // completed hook across a fleet is an operator-applied, per-host step, which
+  // is exactly the shape that lands on some runners and not others.
+  const root = makePool({
+    "runner-a": { keys: MANDATED },
+    "runner-b": { keys: MANDATED.filter((key) => key !== HOOK_COMPLETED) },
+  });
+
+  const { status, stdout } = runChecker(["--pool-root", root]);
+
+  assert.notEqual(status, 0, "a missing completed hook must drift like a missing started hook");
+  assert.match(stdout, new RegExp(`${HOOK_COMPLETED}: DRIFT`), "the drifting key must be named");
+  assert.match(stdout, /runner-b/, "the runner missing it must be named, not just counted");
+});
+
+test("Story #524: `.env.example` sets every key the checker mandates", () => {
+  // The runbook's provisioning step is `cp .env.example <RUNNER_DIR>/.env`. If
+  // the checker mandated a key the example never sets, an operator who
+  // followed the runbook exactly could not satisfy it — the alert would fire
+  // on a correctly-provisioned fleet, and the operator would learn to ignore
+  // the exit code.
+  const example = readFileSync(join(HERE, "..", "templates", "runner", ".env.example"), "utf8");
+  const mandatedInScript = readFileSync(SCRIPT, "utf8")
+    .split("MANDATED_KEYS=(")[1]
+    .split(")")[0]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  assert.deepEqual(
+    mandatedInScript,
+    MANDATED,
+    "the checker's mandated keys and this suite's list have diverged",
+  );
+  for (const key of mandatedInScript) {
+    assert.ok(
+      new RegExp(`^\\s*${key}=`, "m").test(example),
+      `.env.example does not set ${key}, but the checker reports a runner without it`,
+    );
+  }
 });
 
 test("AC-3: a fully provisioned pool exits 0", () => {
@@ -480,7 +529,7 @@ test("a commented-out assignment does not count as set", () => {
   const root = makePool({
     "runner-a": { keys: MANDATED },
     "runner-b": {
-      env: `# ${HOOK}=/Users/ci/runners/b/job-cleanup.sh\nRUNNER_TOOL_CACHE=${VALUES.RUNNER_TOOL_CACHE}\nAGENT_TOOLSDIRECTORY=${VALUES.AGENT_TOOLSDIRECTORY}\nLANG=${VALUES.LANG}\n`,
+      env: `# ${HOOK}=/Users/ci/runners/b/job-cleanup.sh\n${HOOK_COMPLETED}=${VALUES[HOOK_COMPLETED]}\nRUNNER_TOOL_CACHE=${VALUES.RUNNER_TOOL_CACHE}\nAGENT_TOOLSDIRECTORY=${VALUES.AGENT_TOOLSDIRECTORY}\nLANG=${VALUES.LANG}\n`,
     },
   });
 
@@ -494,7 +543,7 @@ test("a leading-whitespace assignment counts as set", () => {
   const root = makePool({
     "runner-a": { keys: MANDATED },
     "runner-b": {
-      env: `  ${HOOK}=/Users/ci/runners/b/job-cleanup.sh\n\tRUNNER_TOOL_CACHE=${VALUES.RUNNER_TOOL_CACHE}\nAGENT_TOOLSDIRECTORY=${VALUES.AGENT_TOOLSDIRECTORY}\nLANG=${VALUES.LANG}\n`,
+      env: `  ${HOOK}=/Users/ci/runners/b/job-cleanup.sh\n\t${HOOK_COMPLETED}=${VALUES[HOOK_COMPLETED]}\n\tRUNNER_TOOL_CACHE=${VALUES.RUNNER_TOOL_CACHE}\nAGENT_TOOLSDIRECTORY=${VALUES.AGENT_TOOLSDIRECTORY}\nLANG=${VALUES.LANG}\n`,
     },
   });
 
@@ -509,7 +558,7 @@ test("a longer key that merely starts with a mandated key does not count as set"
   const root = makePool({
     "runner-a": { keys: MANDATED },
     "runner-b": {
-      env: `${HOOK}=/Users/ci/runners/b/job-cleanup.sh\nRUNNER_TOOL_CACHE=${VALUES.RUNNER_TOOL_CACHE}\nAGENT_TOOLSDIRECTORY=${VALUES.AGENT_TOOLSDIRECTORY}\nLANGUAGE=en_US\n`,
+      env: `${HOOK}=/Users/ci/runners/b/job-cleanup.sh\n${HOOK_COMPLETED}=${VALUES[HOOK_COMPLETED]}\nRUNNER_TOOL_CACHE=${VALUES.RUNNER_TOOL_CACHE}\nAGENT_TOOLSDIRECTORY=${VALUES.AGENT_TOOLSDIRECTORY}\nLANGUAGE=en_US\n`,
     },
   });
 

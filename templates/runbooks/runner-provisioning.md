@@ -4,8 +4,9 @@
 > this directory, there is no canonical `docs/runbooks/` counterpart to link —
 > this file IS the process. It provisions a **persistent** (non-ephemeral)
 > GitHub Actions runner on a macOS host using the mandrel-platform runner kit
-> (`templates/runner/`), which ships the job-start hygiene hook
-> (`job-cleanup.sh`) and the per-runner `.env` (`.env.example`).
+> (`templates/runner/`), which ships the two job hooks — job-start hygiene
+> (`job-cleanup.sh`) and job-end reaping (`job-completed.sh`) — and the
+> per-runner `.env` (`.env.example`).
 >
 > Placeholder convention: `<UPPER_SNAKE>` between angle brackets — search for
 > `<` after copying to find everything that still needs a value.
@@ -113,13 +114,15 @@ installs the pnpm shim to a **runner-scoped** destination:
 There is **no runner-side override** for the pnpm `dest` — it is a workflow
 input — which is why this step is a rollout gate, not an `.env` line.
 
-## 4. Install the hygiene kit (hook + `.env`)
+## 4. Install the hygiene kit (hooks + `.env`)
 
 Copy the kit from the platform payload into the runner root:
 
 ```bash
 cp node_modules/mandrel-platform/templates/runner/job-cleanup.sh <RUNNER_DIR>/job-cleanup.sh
 chmod +x <RUNNER_DIR>/job-cleanup.sh
+cp node_modules/mandrel-platform/templates/runner/job-completed.sh <RUNNER_DIR>/job-completed.sh
+chmod +x <RUNNER_DIR>/job-completed.sh
 cp node_modules/mandrel-platform/templates/runner/check-runner-env-drift.sh <RUNNER_DIR>/check-runner-env-drift.sh
 chmod +x <RUNNER_DIR>/check-runner-env-drift.sh
 cp node_modules/mandrel-platform/templates/runner/.env.example <RUNNER_DIR>/.env
@@ -142,19 +145,52 @@ with the runner root's absolute path. The resulting file wires:
   jobs were killed before their first real step — surfacing as `cancelled`
   on unrelated diffs. If you add a sweep to this hook, root it at
   `_work/_temp`, never at `$TMPDIR`.
+- `ACTIONS_RUNNER_HOOK_JOB_COMPLETED=<RUNNER_DIR>/job-completed.sh` — the
+  job-end hook. After the last step of every job it terminates whatever of
+  **this** job's process tree is still alive — SIGTERM, a bounded grace, then
+  SIGKILL — matching processes whose command line resolves inside
+  `<RUNNER_DIR>/_work/` plus their descendants. It never signals itself, its
+  own ancestors, or the runner's `Runner.Worker`/`Runner.Listener`, never
+  fails a job (always exits 0), and does nothing at all when the job left
+  nothing behind.
 - `RUNNER_TOOL_CACHE=<RUNNER_DIR>/_work/_tool` and
   `AGENT_TOOLSDIRECTORY=<RUNNER_DIR>/_work/_tool` — runner-scoped tool cache
   (two env names, one dir; some actions read the legacy name).
 - `LANG=en_US.UTF-8`.
 
-Neither shipped script needs per-runner editing: each derives its paths from
-its own location, so the same files work verbatim on every runner.
+None of the shipped scripts needs per-runner editing: each derives its paths
+from its own location, so the same files work verbatim on every runner.
+
+### Why both hooks
+
+They cover opposite ends of the same job and neither substitutes for the
+other:
+
+| Hook | Runs | Defends against |
+|------|------|-----------------|
+| `job-cleanup.sh` (`..._JOB_STARTED`) | before the first step | the **previous** job's leftovers — orphaned pnpm/node processes and stale `_work/_temp` artifacts already on the runner |
+| `job-completed.sh` (`..._JOB_COMPLETED`) | after the last step | **this** job's own survivors reaching the **next** job |
+
+The started hook cannot close the second case: it runs before the new job's
+processes exist, so once a job is minutes in, nothing it did can help. A
+**cancelled** job is where survivors are most likely — the runner terminates
+the step it is executing, not everything that step forked — so a coalesced
+push (`concurrency: cancel-in-progress`) is the routine way a runner ends up
+hosting a previous job's vitest forks or dev server. The observed symptom is
+the next job on that runner exiting 143 (SIGTERM) mid-run, with no
+cancellation request in the runner's `Worker_*.log` and every concurrent job
+on the pool's other runners passing.
+
+The completed hook runs on the **job's** clock, like the started one, so it is
+held to the same cost rule: its whole input is one `ps` snapshot, and it
+sleeps only while waiting out the grace period of a tree it actually
+signalled. A job with nothing to reap pays a few milliseconds.
 
 ### Confirm the pool is uniform (`check-runner-env-drift.sh`)
 
 Run this **after provisioning each runner**, and again whenever two runners
 behave differently on the same job. It walks the pool and names the runners
-missing any of the four mandated keys:
+missing any of the five mandated keys:
 
 ```bash
 cd <RUNNER_DIR>
@@ -200,8 +236,10 @@ cd <RUNNER_DIR>
 
 Verify end-to-end: push a trivial workflow run targeting
 `runs-on: [self-hosted, macOS, ARM64, <REPO>-runner]` and confirm (a) the job
-is picked up and (b) the job log shows the `Set up runner` hook phase running
-`job-cleanup.sh` before the first step.
+is picked up, (b) the job log shows the `Set up runner` hook phase running
+`job-cleanup.sh` before the first step, and (c) the job log shows
+`job-completed.sh` running after the last step (it prints either what it
+reaped or `nothing to reap`).
 
 The runner loads `.env` at service start — after any `.env` change, restart:
 
@@ -216,10 +254,11 @@ The runner loads `.env` at service start — after any `.env` change, restart:
   pinned or the self-update wedges, stop the service, download/unpack the new
   tarball over `<RUNNER_DIR>` (config and `.env` survive), and restart via
   `svc.sh`.
-- **Kit updates.** The hook and `.env.example` are versioned in
+- **Kit updates.** The hooks and `.env.example` are versioned in
   mandrel-platform. On a platform release that touches `templates/runner/`,
-  re-copy `job-cleanup.sh` and `check-runner-env-drift.sh` (both verbatim —
-  they are parameterized) and diff `.env.example` against the live `.env`,
+  re-copy `job-cleanup.sh`, `job-completed.sh` and
+  `check-runner-env-drift.sh` (all verbatim — they are parameterized) and
+  diff `.env.example` against the live `.env`,
   then `./svc.sh stop && ./svc.sh start`. There is no `mandrel sync`
   equivalent for a runner host's filesystem — this is an operator-applied
   step. Re-run `./check-runner-env-drift.sh` afterwards: a kit update applied
