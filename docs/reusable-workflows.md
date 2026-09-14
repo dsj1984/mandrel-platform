@@ -128,6 +128,7 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `secret-scan-allow-default-rule-replacement` | string | `'false'` | Set `'true'` only for a `secret-scan-config-path` that deliberately ships a complete rule set instead of extending the default one. Default `'false'` keeps the `[extend] useDefault = true` guard that stops an allowlist becoming a tier-wide opt-out. |
 | `toolchain-cache`  | string  | `'auto'`         | Passed through to `setup-toolchain`'s `cache` input. **`'auto'` derives the value from `runner`**: `'false'` when the runner labels name `self-hosted`, `'true'` otherwise (unchanged hosted behaviour). A self-hosted runner already has a warm store, so the cache only adds a **post-job save** — and that save runs after every work step reports success, inside the job's own `timeout-minutes`, so a slow one is killed as a timeout and recorded as `cancelled`, which `ci-required` reads as a red gate with every step green. Pass `'true'` or `'false'` to pin it explicitly on either runner class. See [Derived `toolchain-cache` default](#derived-toolchain-cache-default). |
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
+| `checkout-clean-excludes` | string | `''`      | Newline-separated gitignore-syntax paths (e.g. `node_modules`) to preserve across `actions/checkout`'s clean, at **every** checkout of your repo. Empty (the default) is today's full clean, byte for byte. Set it only on a **persistent self-hosted** fleet whose workspaces are reused between jobs: everything not named is still discarded, so the guarantee is preserved rather than traded away. Does not affect the platform side-checkouts. See [Preserving a warm tree across the checkout clean](#preserving-a-warm-tree-across-the-checkout-clean-checkout-clean-excludes). |
 | `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
 | `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest` — including when `runner` is omitted **or** empty, both of which resolve to that default; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
 | `enable-osv-scan`  | boolean | `true`           | Enable the OSV-scanner advisory tier (scans the lockfile/manifest tree for known dependency advisories via a pinned, checksum-verified binary; no SARIF/GHAS). Set `false` to skip. See [OSV advisory tier](#osv-advisory-tier-enable-osv-scan).                                  |
@@ -557,6 +558,75 @@ identically-named input behaves identically.
 > to infer it from timings. Raise
 > [`tier-timeouts`](#caller-addressable-tier-timeouts-tier-timeouts) only when
 > the **work** needs the room.
+
+### Preserving a warm tree across the checkout clean (`checkout-clean-excludes`)
+
+**Who should set this.** Only a caller whose runner **workspaces persist
+between jobs** — a self-hosted fleet where `_work/<repo>/<repo>` is the same
+directory next run. A GitHub-hosted caller gets a fresh runner every job and
+has nothing to preserve; leave the input unset there.
+
+**What it does.** `actions/checkout` runs `git clean -ffdx && git reset --hard
+HEAD` **before** fetching. That is what makes a reused workspace behave like a
+fresh one — and it is also what deletes the `node_modules` tree the very next
+step re-creates identically, in every tier job of every run. Setting the input
+takes that clean off the action (`clean: false`) at every checkout of **your**
+repo and moves it to a shared `Restore clean tree` step that runs immediately
+after each one:
+
+```yaml
+    with:
+      runner: '["self-hosted","my-runner"]'
+      checkout-clean-excludes: |
+        node_modules
+        .turbo
+```
+
+That step discards **exactly what the built-in clean would have, minus the
+paths you named** — one `git clean -ffdx` carrying an `-e <pattern>` operand per
+line, then `git reset --hard HEAD`. So an ignored file you did not name, an
+untracked leftover, and a locally-modified tracked file are all still gone by
+the time your first real step runs. It is a cost change, not a correctness
+trade.
+
+Two properties make that true rather than merely cheaper:
+
+- **Coverage is total, not partial.** `pr-quality.yml` checks your repo out in
+  ten places — one anchored step plus bespoke full-history ones in
+  `migration-guard`, `security` and `osv-scan`, which cannot reuse the anchor
+  because Actions supports YAML anchors but not merge keys. All ten are gated
+  and all ten are followed by the hygiene step
+  (`scripts/check-checkout-clean-excludes.test.mjs` fails if a new one is added
+  without them), because a fleet that still pays the full clean in three jobs
+  has been given most of an opt-in, which is the worst version of one.
+- **Nothing untracked outlives the job except what you named**, and what you
+  named is gitignored — so the next job's `git checkout --force` (which still
+  runs; only the clean is skipped) cannot collide with a stale untracked file.
+
+**Why preserving a gitignored install tree is safe against `--frozen-lockfile`.**
+The install step is `pnpm install --frozen-lockfile`: the lockfile is the
+authority and the resolution is fully determined by it, so a warm
+`node_modules` is either already exactly what the lockfile describes — in which
+case pnpm re-links it and does nothing else — or it is not, in which case pnpm
+reconciles it to what the lockfile says. It cannot silently accept a stale tree,
+because it never reads `node_modules` as an input to resolution. What a warm
+tree changes is how much work the reconcile does, not what it produces. The
+tree is gitignored, so it is also never a source of drift in the diff the tiers
+scan.
+
+**What it is not.** It is not derived from `runner`. A self-hosted label says
+nothing about whether that pool's workspaces persist, and preserving a stale
+tree on an ephemeral or shared-workspace pool would be a silent behaviour
+change; only the caller knows. It also does not touch the
+`_mandrel-platform-*` side-checkouts, which are path-scoped, small, and
+deliberately rebuilt from the pinned SHA every job.
+
+**The caller's string never becomes workflow text.** It reaches the hygiene
+step through `env:` and is read as a shell variable; each line is passed as a
+separately quoted `-e` operand. A pattern with a leading dash is an operand
+value rather than a git flag, and one containing shell metacharacters is a
+literal (`rules/security-baseline.md`; asserted by executing the real step body
+in the guard test).
 
 ### Playwright browser cache (`playwright-cache-salt`)
 

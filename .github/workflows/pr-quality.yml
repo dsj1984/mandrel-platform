@@ -585,6 +585,39 @@ on:
         type: string
         default: ''
 
+      # Warm-tree preservation across the checkout clean (Story #525).
+      # `actions/checkout` runs `git clean -ffdx && git reset --hard HEAD`
+      # BEFORE fetching, and every tier job pays it: on a persistent
+      # self-hosted fleet that deletes the `node_modules` tree the very next
+      # step re-creates identically, measured at 123-248s per job.
+      #
+      # Naming paths here takes the clean off `actions/checkout` (`clean:
+      # false`) at every checkout OF THE CONSUMER REPO and moves it onto the
+      # shared `&checkout-hygiene` step, which discards exactly what the
+      # built-in clean would have MINUS the named paths. The guarantee is
+      # therefore preserved rather than traded away: after the hygiene step the
+      # only untracked content that survives a job is the named paths, which
+      # are gitignored, so the next job's forced checkout still cannot collide
+      # with an untracked file.
+      #
+      # Empty (the default) is today's behaviour byte for byte on every runner
+      # class — `clean:` resolves to true and the hygiene step does not run.
+      # This is deliberately NOT derived from `runner`: a self-hosted label
+      # says nothing about whether the fleet's workspaces persist between jobs,
+      # and preserving a stale tree on an ephemeral one would be a silent
+      # correctness change. Only the caller knows.
+      checkout-clean-excludes:
+        description: >
+          Newline-separated gitignore-syntax paths (e.g. node_modules) to
+          preserve across the checkout clean of YOUR repo. Empty (the default)
+          keeps the full clean actions/checkout performs today. Set it only on
+          a persistent self-hosted fleet whose workspaces are reused between
+          jobs; everything not named here is still discarded. Does not affect
+          the platform side-checkouts.
+        required: false
+        type: string
+        default: ''
+
       # Transitional lockfile-policy exception (Story #149). Passed through to
       # every setup-toolchain invocation's `trust-lockfile` input, appending
       # --trust-lockfile to the install step's `pnpm install --frozen-lockfile`
@@ -928,6 +961,58 @@ jobs:
           # token carrying `actions: write` — a compromised package could read
           # it from .git/config (M5). The side-checkouts already set this.
           persist-credentials: false
+          # Story #525. Empty input (the default) → `true`, the built-in
+          # `git clean -ffdx && git reset --hard HEAD` this action has always
+          # run before fetching. Non-empty → `false`, and the discard is
+          # performed instead by `&checkout-hygiene` immediately below, minus
+          # the caller's paths. Every checkout of the CONSUMER repo in this
+          # file carries this pair; the `_mandrel-platform-*` side-checkouts
+          # are deliberately untouched (path-scoped, small, and rebuilt from a
+          # pinned SHA rather than reused).
+          clean: ${{ inputs.checkout-clean-excludes == '' }}
+
+      # The other half of `checkout-clean-excludes` (Story #525): the step that
+      # keeps `clean: false` a COST change rather than a correctness one. It
+      # restores exactly what `actions/checkout`'s own clean would have left —
+      # a tree with no untracked or ignored content and no modified tracked
+      # file — except for the caller-named paths. Anchored here on the first
+      # job because Actions supports YAML anchors but NOT merge keys, so a step
+      # shared across tiers has to be a whole-step alias; every consumer
+      # checkout below is followed by `*checkout-hygiene`.
+      #
+      # Skipped entirely when the input is empty, so a caller that sets nothing
+      # runs the same steps it runs today.
+      - &checkout-hygiene
+        name: Restore clean tree (preserving caller-named paths)
+        if: ${{ inputs.checkout-clean-excludes != '' }}
+        shell: bash
+        env:
+          # SECURITY (rules/security-baseline.md): the caller's string reaches
+          # this step ONLY through the environment. Interpolating `${{ }}` into
+          # the `run:` body below would splice caller-controlled text into the
+          # script itself before bash ever sees it — the classic
+          # script-injection sink for a workflow_call input.
+          CHECKOUT_CLEAN_EXCLUDES: ${{ inputs.checkout-clean-excludes }}
+        run: |
+          set -euo pipefail
+          # One `-e <pattern>` operand per non-empty line, each a separate
+          # quoted argv entry. That is what makes a pattern with a leading dash
+          # an operand VALUE rather than a git flag, and a pattern containing
+          # shell metacharacters a literal rather than something the shell
+          # expands. Blank lines (and a trailing newline) are ignored so the
+          # natural YAML block-scalar spelling works.
+          clean_args=(-ffdx)
+          while IFS= read -r pattern; do
+            pattern="${pattern%$'\r'}"
+            if [[ "${pattern}" =~ ^[[:space:]]*$ ]]; then
+              continue
+            fi
+            clean_args+=(-e "${pattern}")
+          done <<< "${CHECKOUT_CLEAN_EXCLUDES}"
+          echo "::group::Restoring a clean tree (${#clean_args[@]} git-clean args)"
+          git clean "${clean_args[@]}"
+          git reset --hard HEAD
+          echo "::endgroup::"
 
       # Affected-mode setup (Story #315), aliased (`*checkout-range` /
       # `*resolve-affected`) into every other diff-scoped tier below. BOTH steps
@@ -1352,6 +1437,7 @@ jobs:
     steps:
       - *harden-runner
       - *checkout
+      - *checkout-hygiene
 
       # First-party composite, pinned by absolute SHA like every other call
       # site (docs/reusable-workflows.md § First-party self-pin freshness).
@@ -1385,6 +1471,7 @@ jobs:
       - *harden-runner
 
       - *checkout
+      - *checkout-hygiene
 
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
@@ -1434,6 +1521,7 @@ jobs:
       - *harden-runner
 
       - *checkout
+      - *checkout-hygiene
 
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
@@ -1490,6 +1578,7 @@ jobs:
       - *harden-runner
 
       - *checkout
+      - *checkout-hygiene
 
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
@@ -1590,6 +1679,7 @@ jobs:
       # each key by resolving it against THIS checkout. That is what lets two
       # tiers' summaries merge when they ran under different workspace roots.
       - *checkout
+      - *checkout-hygiene
 
       # Every tier's results land under `_tier-coverage/<artifact>/…`, each in
       # its own subdirectory (no `merge-multiple`), so same-named files from
@@ -1688,6 +1778,7 @@ jobs:
       - *harden-runner
 
       - *checkout
+      - *checkout-hygiene
 
       # Affected-mode setup (Story #315) — gated on `inputs.affected`, no-op
       # otherwise. See the lint tier's `&checkout-range` / `&resolve-affected`
@@ -1858,6 +1949,11 @@ jobs:
           # authenticated git network ops, so do not persist GITHUB_TOKEN in
           # .git/config while it runs (M5).
           persist-credentials: false
+          # Story #525 — same pair as the `&checkout` anchor. A bespoke
+          # checkout is not an exemption: a fleet that still pays the full
+          # clean in this job has not been given the opt-in, only most of it.
+          clean: ${{ inputs.checkout-clean-excludes == '' }}
+      - *checkout-hygiene
 
       # Fetch the tested gate script at the exact SHA the caller's
       # `uses: …/pr-quality.yml@<ref>` pin resolved to — the same
@@ -2073,6 +2169,11 @@ jobs:
           # binary); no step does authenticated git network ops, so do not
           # persist GITHUB_TOKEN in .git/config while it runs (M5).
           persist-credentials: false
+          # Story #525 — same pair as the `&checkout` anchor. A bespoke
+          # checkout is not an exemption: a fleet that still pays the full
+          # clean in this job has not been given the opt-in, only most of it.
+          clean: ${{ inputs.checkout-clean-excludes == '' }}
+      - *checkout-hygiene
 
       # Story #314: fetch the single event-agnostic diff-range derivation
       # (`scripts/resolve-diff-range.sh`) from THIS reusable workflow at the
@@ -2680,6 +2781,11 @@ jobs:
         with:
           fetch-depth: ${{ inputs.osv-scan-mode == 'full' && '1' || '0' }}
           persist-credentials: false
+          # Story #525 — same pair as the `&checkout` anchor. A bespoke
+          # checkout is not an exemption: a fleet that still pays the full
+          # clean in this job has not been given the opt-in, only most of it.
+          clean: ${{ inputs.checkout-clean-excludes == '' }}
+      - *checkout-hygiene
 
       # Side-check-out ONLY the canonical diff-range derivation from THIS repo
       # at the exact SHA the caller pinned (`job.workflow_sha`) — the same
