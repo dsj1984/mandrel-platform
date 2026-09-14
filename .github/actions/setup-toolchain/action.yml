@@ -119,6 +119,35 @@ inputs:
       it caches. Set explicitly only to override that choice.
     required: false
     default: ''
+  install-stall-timeout:
+    description: >
+      Seconds the install's process tree may stay below install-min-cpu-rate
+      before the watchdog kills it and fails the step with exit 75. '0'
+      disables supervision entirely and restores the plain, unsupervised
+      install. Default '600': a pnpm install that has been under the CPU floor
+      for ten unbroken minutes has stopped, not slowed, and holding the runner
+      until the job's own timeout-minutes only delays the same failure while
+      redding a required check on a diff that could not have caused it.
+    required: false
+    default: '600'
+  install-stall-grace:
+    description: >
+      Seconds after the install starts during which the watchdog does not arm
+      at all. A cold install is legitimately quiet early — resolving the
+      lockfile and opening the store costs wall clock before it costs CPU — so
+      the floor must not be applied to it. Default '120'.
+    required: false
+    default: '120'
+  install-min-cpu-rate:
+    description: >
+      The CPU floor, as a fraction of one core (0..1), measured as the mean
+      accumulated CPU of the install's whole process TREE over the trailing
+      install-stall-timeout window. Default '0.05' (5%). The measured wedge
+      this exists for sat at ~1.3% for 27 minutes while sleeping at 0%, which
+      is why the instrument is a rate and not an absence: a flat-but-nonzero
+      tree still advances its CPU counter.
+    required: false
+    default: '0.05'
 
 runs:
   using: composite
@@ -185,6 +214,14 @@ runs:
         # it during the frozen install. Empty for repos without a private dep —
         # nothing references it, and pnpm never sees an unset-variable error.
         PACKAGES_READ_TOKEN: ${{ inputs['packages-read-token'] }}
+        # Watchdog knobs (Story #530). Read by pnpm-install-watchdog.mjs, and
+        # by the branch below that decides whether to invoke it at all. They are
+        # deliberately NOT interpolated into the command line: a caller-supplied
+        # value reaches the shell as an environment variable and nothing else.
+        PNPM_WATCHDOG_STALL_TIMEOUT: ${{ inputs['install-stall-timeout'] }}
+        PNPM_WATCHDOG_GRACE: ${{ inputs['install-stall-grace'] }}
+        PNPM_WATCHDOG_MIN_CPU_RATE: ${{ inputs['install-min-cpu-rate'] }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -eu
         store_dir="${STORE_DIR_INPUT}"
@@ -200,10 +237,31 @@ runs:
           set --
           echo "pnpm store: pnpm default (caching enabled, or no tool cache resolved)"
         fi
-        if [ "${TRUST_LOCKFILE}" = "true" ]; then
-          pnpm install --frozen-lockfile --trust-lockfile "$@"
+        # Supervise the install, unless switched off (Story #530). The watchdog
+        # spawns pnpm with the argv below passed through untouched, samples the
+        # accumulated CPU of the whole child tree, and kills a tree that has
+        # provably stopped — so a wedged install fails in minutes with a named
+        # cause instead of holding this runner to the job's timeout-minutes.
+        #
+        # Both guards matter. An empty or '0' timeout is the documented off
+        # switch; an empty ACTION_PATH means the script cannot be located, and a
+        # watchdog that cannot be found must not be allowed to fail the install
+        # it was only meant to watch. Either way this falls back to exactly the
+        # command that ran before there was a watchdog.
+        #
+        # `${VAR:-}` throughout, because this body also runs under `set -u` in
+        # `scripts/check-setup-toolchain-store.test.mjs`, which knows nothing
+        # about these variables and must keep asserting what pnpm receives.
+        if [ -n "${ACTION_PATH:-}" ] && [ -n "${PNPM_WATCHDOG_STALL_TIMEOUT:-}" ] &&
+           [ "${PNPM_WATCHDOG_STALL_TIMEOUT:-0}" != "0" ]; then
+          run_install() { node "${ACTION_PATH}/pnpm-install-watchdog.mjs" -- pnpm "$@"; }
         else
-          pnpm install --frozen-lockfile "$@"
+          run_install() { pnpm "$@"; }
+        fi
+        if [ "${TRUST_LOCKFILE}" = "true" ]; then
+          run_install install --frozen-lockfile --trust-lockfile "$@"
+        else
+          run_install install --frozen-lockfile "$@"
         fi
 
     # Wrangler preflight (opt-in, Story #231). The ONE authoritative
