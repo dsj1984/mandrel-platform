@@ -247,10 +247,15 @@ runs:
         # host-shared $TMPDIR, which nothing reaps on a persistent runner.
         tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/osv-scanner.XXXXXX")"
         echo "Downloading pinned OSV-scanner: ${url}"
-        # Retry a release-asset blip rather than fail fleet-wide. Fail-closed
-        # is preserved — the SHA-256 check below still gates trust; retries
-        # only widen the availability window.
-        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$url" -o "${tmp}/osv-scanner"
+        # Retry a release-asset blip rather than fail fleet-wide.
+        # `--retry-all-errors` is the load-bearing flag: a release-CDN 504
+        # reaches curl as exit 56 (CURLE_RECV_ERROR), outside the 408/429/5xx
+        # set `--retry` alone treats as transient, so the previous flags
+        # retried none of what the CDN actually produces. `--retry-delay 2`
+        # spans ~6 s of recovery instead of curl's ~3 s. Fail-closed is
+        # preserved — the SHA-256 check below still gates trust; the retry
+        # only widens what is attempted, never what is trusted.
+        curl -fsSL --retry 3 --retry-all-errors --retry-connrefused --retry-delay 2 --max-time 300 "$url" -o "${tmp}/osv-scanner"
 
         actual="$(shasum -a 256 "${tmp}/osv-scanner" | awk '{print $1}')"
         if [ "$actual" != "$expected" ]; then
