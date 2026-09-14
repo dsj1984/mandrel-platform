@@ -189,11 +189,19 @@ runs:
         # this `gitleaks.*` glob under RUNNER_TEMP.
         tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gitleaks.XXXXXX")"
         echo "Downloading pinned gitleaks: ${url}"
-        # Retry flags match the osv-scan and workflow-lint siblings exactly. A
-        # single transient 504 from the release CDN used to fail this job
-        # outright (run 34133838332), and the job is a `needs:` of
-        # `ci-required` for every consumer of pr-quality.yml.
-        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$url" -o "${tmp}/${asset}"
+        # Retry flags match the osv-scan and workflow-lint siblings exactly.
+        # `--retry-all-errors` is the load-bearing one: a 504 from the release
+        # CDN reaches curl as a failed transfer — exit 56, CURLE_RECV_ERROR —
+        # which sits outside the 408/429/5xx set `--retry` alone treats as
+        # transient, so before this flag no retry fired at all (run
+        # 34133838332 died in 196 ms, far short of a single backoff).
+        # `--retry-delay 2` replaces curl's 1 s starting backoff so three
+        # attempts span ~6 s of CDN recovery rather than ~3 s. This job is a
+        # `needs:` of `ci-required` for every consumer of pr-quality.yml, so
+        # one blip cost a human round trip fleet-wide. Fail-closed is
+        # untouched: the SHA-256 check below still gates trust, and the retry
+        # only widens what is attempted, never what is trusted.
+        curl -fsSL --retry 3 --retry-all-errors --retry-connrefused --retry-delay 2 --max-time 300 "$url" -o "${tmp}/${asset}"
 
         # Verify the pinned SHA-256 before trusting the binary.
         actual="$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')"

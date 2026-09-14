@@ -239,12 +239,19 @@ runs:
         al_asset="actionlint_${ACTIONLINT_VERSION}_${al_os}_${al_arch}.tar.gz"
         al_url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${al_asset}"
         echo "Downloading pinned actionlint: ${al_url}"
-        # Retry a release-asset blip rather than fail fleet-wide. Fail-closed is
-        # preserved — the SHA-256 check below still gates trust. A download that
-        # exhausts its retries is an INFRASTRUCTURE failure, not a finding and
-        # not an automatic red — see `infra_fail` above.
+        # Retry a release-asset blip rather than fail fleet-wide.
+        # `--retry-all-errors` is the load-bearing flag: a release-CDN 504
+        # reaches curl as exit 56 (CURLE_RECV_ERROR), outside the 408/429/5xx
+        # set `--retry` alone treats as transient — which is how the zizmor
+        # fetch below went down with `infra_fail download-failed` while this
+        # one had succeeded seconds earlier. `--retry-delay 2` spans ~6 s of
+        # recovery instead of curl's ~3 s. Fail-closed is preserved — the
+        # SHA-256 check below still gates trust, and the retry only widens
+        # what is attempted, never what is trusted. A download that exhausts
+        # its retries is an INFRASTRUCTURE failure, not a finding and not an
+        # automatic red — see `infra_fail` above.
         set +e
-        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$al_url" -o "${tmp}/${al_asset}"
+        curl -fsSL --retry 3 --retry-all-errors --retry-connrefused --retry-delay 2 --max-time 300 "$al_url" -o "${tmp}/${al_asset}"
         al_curl=$?
         set -e
         if [ "$al_curl" -ne 0 ]; then
@@ -262,8 +269,13 @@ runs:
         zz_asset="zizmor-${zz_arch}-${zz_os}.tar.gz"
         zz_url="https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${zz_asset}"
         echo "Downloading pinned zizmor: ${zz_url}"
+        # Same flag set as the actionlint fetch above, for the same reason:
+        # `--retry-all-errors` is what covers the exit-56 case (a release-CDN
+        # 504 read as a failed transfer) that `--retry` alone leaves
+        # uncovered. The checksum gate below is unchanged and still fails
+        # closed on a mismatch.
         set +e
-        curl -fsSL --retry 3 --retry-connrefused --max-time 300 "$zz_url" -o "${tmp}/${zz_asset}"
+        curl -fsSL --retry 3 --retry-all-errors --retry-connrefused --retry-delay 2 --max-time 300 "$zz_url" -o "${tmp}/${zz_asset}"
         zz_curl=$?
         set -e
         if [ "$zz_curl" -ne 0 ]; then
