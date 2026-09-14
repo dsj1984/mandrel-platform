@@ -350,14 +350,37 @@ test("a silent parent whose GRANDCHILD burns CPU is not killed", { timeout: 30_0
   // This parent writes nothing at all for its whole life — an output-based
   // watchdog would kill it — while a descendant pins a core.
   const burn = "const end = Date.now() + 8000; while (Date.now() < end) {}";
+  // Record what the REAL sampler saw, so the test proves the CPU was actually
+  // attributed to the tree rather than merely proving nothing was killed — a
+  // watchdog that silently failed to sample would also "not kill".
+  const treeTotals = [];
+  let rootPid = null;
   const code = await supervise({
     command: process.execPath,
     args: ["-e", silentParent(burn, 4000)],
     config: config({ ...REAL_TREE, minCpuRate: 0.3 }),
-    sampler: psSampler,
+    sampler: async () => {
+      const rows = await psSampler();
+      // The supervised child is this process's own descendant; find it by the
+      // parent link rather than guessing at argv.
+      rootPid ??= rows.find((r) => r.ppid === process.pid)?.pid ?? null;
+      if (rootPid !== null) {
+        const total = sumTreeCpuSeconds(rows, rootPid);
+        if (total !== null) treeTotals.push({ total, members: collectTree(rows, rootPid).length });
+      }
+      return rows;
+    },
     log: () => {},
   });
   assert.equal(code, 0, "a tree burning a full core must survive a 30% floor");
+
+  assert.ok(treeTotals.length > 0, "the sampler never resolved the supervised tree");
+  const last = treeTotals[treeTotals.length - 1];
+  assert.ok(last.members >= 2, `expected parent + grandchild in the tree, saw ${last.members}`);
+  // The parent is asleep in a timer for its whole life, so essentially all of
+  // this is the grandchild's. One second is far above the parent's own cost and
+  // far below what a burning core accrues over the run.
+  assert.ok(last.total >= 1, `expected the grandchild's CPU in the tree total, got ${last.total}s`);
 });
 
 test("a sleeping tree is killed, and no member of it survives", { timeout: 30_000 }, async () => {
@@ -435,19 +458,25 @@ test("pnpm receives byte-identical argv armed and disabled, in every combination
     { CACHE_ENABLED: "false", TOOL_CACHE: "/opt/hostedtoolcache", TRUST_LOCKFILE: "true" },
     { CACHE_ENABLED: "false", STORE_DIR_INPUT: "/mnt/my store" },
   ];
+  const watchdogEnv = (stallTimeout) => ({
+    ACTION_PATH: actionPath,
+    PNPM_WATCHDOG_STALL_TIMEOUT: stallTimeout,
+    PNPM_WATCHDOG_GRACE: "120",
+    PNPM_WATCHDOG_MIN_CPU_RATE: "0.05",
+    // Never sample in a unit test: the point here is argv, and a real sampler
+    // would make this suite depend on host process state.
+    PNPM_WATCHDOG_SAMPLE_INTERVAL: "3600",
+  });
+
   for (const base of combinations) {
     const disabled = argvOf(runInstall(base));
+    // The documented off switch is the literal '0', not an absent variable —
+    // and it is a different branch of the shell condition, so it gets its own
+    // comparison rather than riding on the unset case.
+    const offSwitch = argvOf(runInstall({ ...base, ...watchdogEnv("0") }));
+    assert.equal(offSwitch, disabled, `install-stall-timeout '0' drifted for ${JSON.stringify(base)}`);
     const armed = argvOf(
-      runInstall({
-        ...base,
-        ACTION_PATH: actionPath,
-        PNPM_WATCHDOG_STALL_TIMEOUT: "600",
-        PNPM_WATCHDOG_GRACE: "120",
-        PNPM_WATCHDOG_MIN_CPU_RATE: "0.05",
-        // Never sample in a unit test: the point here is argv, and a real
-        // sampler would make this suite depend on host process state.
-        PNPM_WATCHDOG_SAMPLE_INTERVAL: "3600",
-      }),
+      runInstall({ ...base, ...watchdogEnv("600") }),
     );
     assert.notEqual(disabled, null, `no argv captured for ${JSON.stringify(base)}`);
     assert.equal(armed, disabled, `argv drifted for ${JSON.stringify(base)}`);
