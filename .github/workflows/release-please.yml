@@ -182,9 +182,66 @@ jobs:
           echo "::error::Timed out waiting for cross-repo smoke on ${SHA} after ~$(( MAX_ATTEMPTS * INTERVAL / 60 )) min. The smoke never posted a terminal status (likely a wedged or queued smoke run — check dsj1984/mandrel-platform-smoke). Recover by re-running this workflow once the smoke is green, or dispatch release-please with force_publish=true if the smoke has already passed for ${SHA}."
           exit 1
 
+  # ── A RELEASE MUST NOT SHIP AN INERT FIX (issue #533) ──────────────────────
+  #
+  # This repo calls its own composite actions by absolute
+  # `owner/repo/subpath@<sha>` reference, so the PINNED revision is what runs —
+  # for every consumer. Editing an action changes nothing until every call site
+  # is repointed, and two releases shipped exactly that way: v1.14.0's
+  # asset-download retry fix and v1.15.0's install watchdog both landed in the
+  # action directories while every workflow still called a sha that predated
+  # them. Consumers upgraded and got nothing.
+  #
+  # Downstream the lag is invisible. The release notes, the closed issues, and a
+  # byte-diff of the called WORKFLOWS all read correct, because the staleness is
+  # one level down in the inner action pin — and a consumer's own pin tripwire
+  # asserts the workflow sha, which moves correctly.
+  #
+  # THE GATE BELONGS HERE, NOT IN `ci.yml`. A PR that edits an action cannot pin
+  # its own not-yet-existing merge commit, so a PR-time gate would be
+  # unsatisfiable on precisely the changes this protects — see the `wiring: the
+  # check is absent from the PR-gating ci.yml` case in
+  # scripts/check-first-party-pin-freshness.test.mjs, which stays true. At
+  # release time the commit exists on `main`, so the check is both satisfiable
+  # and exactly on the boundary that matters: nothing reaches a consumer
+  # un-repointed.
+  #
+  # Its own job rather than a step inside `npm-publish`, so the publish
+  # checkout stays shallow and tagless — the force_publish guard's API-based tag
+  # resolution documents that assumption, and the freshness check needs the
+  # opposite (full ancestry). `pin-drift.yml` still reports the same drift
+  # weekly; that stays a dashboard. This is the gate.
+  pin-freshness-gate:
+    name: First-party pin freshness
+    needs: [release-please]
+    if: >-
+      ${{ !cancelled()
+          && ( (github.event_name == 'workflow_dispatch' && inputs.force_publish)
+               || needs.release-please.outputs.root_release_created == 'true' ) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          # Full ancestry: the check resolves each pinned sha against real
+          # history, which a shallow checkout cannot do.
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Refuse to publish stale first-party pins
+        run: node scripts/check-first-party-pin-freshness.mjs
+
   npm-publish:
     name: Publish to npm
-    needs: [release-please, await-smoke]
+    needs: [release-please, await-smoke, pin-freshness-gate]
     # Normal path: publish when release-please cut a release AND the await-smoke
     # gate passed. Recovery path: a manual workflow_dispatch with
     # force_publish=true republishes an already-tagged release whose publish was
@@ -199,8 +256,15 @@ jobs:
     # keeps the genuine recovery case working: when force_publish targets an
     # already-tagged release with no new release cut, await-smoke is `skipped`
     # (its `if:` gates on root_release_created), and `skipped != 'failure'` holds.
+    # The pin-freshness result is asserted EXPLICITLY, and that is load-bearing:
+    # `!cancelled()` is an always()-family condition, so a FAILED `needs` job
+    # does not skip this one — without the clause below the gate would be
+    # decorative and a release could still publish inert first-party pins
+    # (issue #533). `== 'success'` also rejects a gate that was itself
+    # cancelled, which is the fail-closed direction for a publish.
     if: >-
       ${{ !cancelled()
+          && needs.pin-freshness-gate.result == 'success'
           && ( (github.event_name == 'workflow_dispatch' && inputs.force_publish
                 && needs.await-smoke.result != 'failure')
                || (needs.release-please.outputs.root_release_created == 'true'

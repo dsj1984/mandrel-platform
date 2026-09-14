@@ -1224,7 +1224,7 @@ jobs:
       # through the first arm correctly.
       - &setup-toolchain
         name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@edd3a2713e0a37acf9fceda4e1436bef2d58c266
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           cache: ${{ inputs.toolchain-cache != 'auto' && inputs.toolchain-cache || (contains(inputs.runner, 'self-hosted') && 'false' || 'true') }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
@@ -1506,7 +1506,7 @@ jobs:
       # the action would fail EVERY consumer at action-load time — immediately
       # for the smoke consumer, which pins @main.
       - name: Lint workflows (actionlint + zizmor)
-        uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@487627a00d5c625a6a7a21d2afbbd80e64d5247a
+        uses: dsj1984/mandrel-platform/.github/actions/workflow-lint@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           enforce: ${{ inputs.workflow-lint-enforce }}
           # Left off for consumers: actionlint resolves shellcheck from PATH,
@@ -2331,7 +2331,7 @@ jobs:
       # first SHA whose tree contains it. Bump to the next release SHA in the
       # post-release pin-bump follow-up.
       - name: Secret scan (pinned gitleaks, blocking)
-        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@083578ce67fe10db82d64b772bf2672048b34402
+        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           # 'range' mode from the resolver maps to a range-scoped git-history
           # scan; the no-ranged-base fallback stays a full working-tree scan.
@@ -2957,7 +2957,7 @@ jobs:
       # reusable workflow references a first-party composite by absolute
       # owner/repo/path@<sha> form only — never a relative ./ path.
       - name: OSV advisory scan (pinned binary)
-        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@0fe1a6e8f6d1ca952a67d8f962a0da9562a499cd
+        uses: dsj1984/mandrel-platform/.github/actions/osv-scan@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           osv-scanner-version: ${{ inputs.osv-scanner-version }}
           fail-on-severity: ${{ inputs.osv-fail-on-severity }}
