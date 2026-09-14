@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.15.0...mandrel-platform-v1.15.1) (2026-09-14)
+
+
+### Fixed
+
+* repoint every stale first-party action pin, and gate the release on freshness ([#534](https://github.com/dsj1984/mandrel-platform/issues/534)) ([3fbe6b6](https://github.com/dsj1984/mandrel-platform/commit/3fbe6b6af7f8e3178b80112dbf755e2bdeb004a3))
+
 ## [1.15.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.14.0...mandrel-platform-v1.15.0) (2026-09-14)
 
 
