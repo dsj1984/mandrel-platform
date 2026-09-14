@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.14.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.3...mandrel-platform-v1.14.0) (2026-09-14)
+
+
+### Added
+
+* **pr-quality:** let callers preserve chosen paths across the checkout clean (refs [#525](https://github.com/dsj1984/mandrel-platform/issues/525)) ([#529](https://github.com/dsj1984/mandrel-platform/issues/529)) ([8f3a78b](https://github.com/dsj1984/mandrel-platform/commit/8f3a78b650926d576ae01cf32ea5aa3e93b61d86))
+* reap a finished job's own process tree with a job-completed runner hook (refs [#524](https://github.com/dsj1984/mandrel-platform/issues/524)) ([#528](https://github.com/dsj1984/mandrel-platform/issues/528)) ([7b82f1a](https://github.com/dsj1984/mandrel-platform/commit/7b82f1ad5cff66a6e868c4b4fbb08b490263fe08))
+
+
+### Fixed
+
+* retry the exit-56 failure a release CDN actually produces (refs [#523](https://github.com/dsj1984/mandrel-platform/issues/523)) ([#526](https://github.com/dsj1984/mandrel-platform/issues/526)) ([715f694](https://github.com/dsj1984/mandrel-platform/commit/715f694e1f0c91a24184da4c5018d0b04dab8c97))
+
 ## [1.13.3](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.2...mandrel-platform-v1.13.3) (2026-09-11)
 
 
