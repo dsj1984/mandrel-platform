@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.14.0...mandrel-platform-v1.15.0) (2026-09-14)
+
+
+### Added
+
+* setup-toolchain supervises its pnpm install, so a wedged install fails fast with a named cause instead of holding a shared tier to its timeout ([#530](https://github.com/dsj1984/mandrel-platform/issues/530)) ([#531](https://github.com/dsj1984/mandrel-platform/issues/531)) ([2d64a18](https://github.com/dsj1984/mandrel-platform/commit/2d64a18c66a558f0d351aa695688ad058a91d27c))
+
 ## [1.14.0](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.13.3...mandrel-platform-v1.14.0) (2026-09-14)
 
 
