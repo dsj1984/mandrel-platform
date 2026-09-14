@@ -667,7 +667,7 @@ jobs:
         # pinned to the intra-PR commit that introduced the composite — the
         # first SHA whose tree contains it. Bump to the next release SHA in
         # the post-release pin-bump follow-up.
-        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@083578ce67fe10db82d64b772bf2672048b34402
+        uses: dsj1984/mandrel-platform/.github/actions/gitleaks-scan@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           mode: dir
 
@@ -801,7 +801,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@edd3a2713e0a37acf9fceda4e1436bef2d58c266
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           cache: 'true'
           packages-read-token: ${{ secrets.packages-read-token }}
@@ -1005,7 +1005,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@edd3a2713e0a37acf9fceda4e1436bef2d58c266
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           cache: 'true'
           packages-read-token: ${{ secrets.packages-read-token }}
@@ -1270,7 +1270,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@edd3a2713e0a37acf9fceda4e1436bef2d58c266
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
         with:
           cache: 'true'
           packages-read-token: ${{ secrets.packages-read-token }}

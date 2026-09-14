@@ -783,3 +783,55 @@ test("wiring: the check is absent from the PR-gating ci.yml", () => {
     "ci.yml must not invoke the freshness check"
   );
 });
+
+// ── The release gate (issue #533) ──────────────────────────────────────────
+//
+// The reasoning above is why a PR cannot carry this check — but it left the
+// drift ungated entirely: `pin-drift.yml` reports it weekly and on push to
+// main, both AFTER the merge that caused it, and nothing stopped a release
+// shipping on top. Two did. v1.14.0's asset-download retry fix and v1.15.0's
+// install watchdog both landed in the action directories while every workflow
+// still pinned a sha that predated them, so every consumer that upgraded got
+// an inert release.
+//
+// Release time is the one moment that is both satisfiable (the commit exists
+// on main) and on the boundary that matters (nothing reaches a consumer
+// un-repointed), so that is where the gate lives.
+test("wiring: the release path REFUSES to publish stale first-party pins", () => {
+  const wf = readFileSync(join(REPO_ROOT, ".github/workflows/release-please.yml"), "utf8");
+
+  assert.ok(
+    wf.includes(SCRIPT_INVOCATION),
+    "release-please.yml invokes the freshness check"
+  );
+
+  const gate = jobBlock(wf, "pin-freshness-gate");
+  assert.ok(gate, "the gate runs in its own job");
+  assert.ok(gate.includes(SCRIPT_INVOCATION), "that job invokes the checker");
+  assert.match(
+    gate,
+    /fetch-depth: 0/,
+    "a shallow checkout cannot resolve the pinned manifests"
+  );
+});
+
+test("wiring: a FAILED freshness gate actually blocks the publish", () => {
+  // The load-bearing half. `npm-publish` is guarded by `!cancelled()`, an
+  // always()-family condition: a failed `needs` job does NOT skip it. Without
+  // an explicit success assertion the gate would be decorative — present,
+  // green-looking, and unable to stop anything.
+  const wf = readFileSync(join(REPO_ROOT, ".github/workflows/release-please.yml"), "utf8");
+  const publish = jobBlock(wf, "npm-publish");
+
+  assert.ok(publish, "the npm-publish job exists");
+  assert.match(
+    publish,
+    /needs: \[[^\]]*pin-freshness-gate[^\]]*\]/,
+    "npm-publish depends on the gate"
+  );
+  assert.match(
+    publish,
+    /needs\.pin-freshness-gate\.result == 'success'/,
+    "npm-publish asserts the gate SUCCEEDED, not merely that it ran"
+  );
+});
