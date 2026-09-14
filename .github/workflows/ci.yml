@@ -286,6 +286,24 @@ jobs:
           RUNNER_KIT_BASH: /bin/bash
         run: node --test scripts/runner-env-drift.test.mjs
 
+      # The job hooks are the shells the fleet's RUNNER executes, on every job,
+      # under the same system bash 3.2 — and a hook that fails to parse is
+      # skipped silently by the runner rather than reported, so the fleet would
+      # simply stop being cleaned up with nothing red anywhere. The completed
+      # hook additionally signals processes, so its behaviour (not just its
+      # syntax) is worth proving on the fleet's interpreter.
+      - name: Syntax-check the runner job hooks under bash 3.2
+        shell: bash
+        run: |
+          /bin/bash -n templates/runner/job-cleanup.sh
+          /bin/bash -n templates/runner/job-completed.sh
+
+      - name: Run the job-completed hook suite under bash 3.2
+        shell: bash
+        env:
+          RUNNER_KIT_BASH: /bin/bash
+        run: node --test scripts/job-completed-hook.test.mjs
+
       # `runner-toggle.sh` is the other shell the fleet's operator executes, and
       # the only one that STOPS runners — a bash 3.2 syntax error in it surfaces
       # at a prompt, mid-scale-down, with no CI in between. `bash -n` is the
