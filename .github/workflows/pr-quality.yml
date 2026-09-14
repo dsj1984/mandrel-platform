@@ -573,6 +573,60 @@ on:
         type: string
         default: ''
 
+      # Install supervision (Story #530). The install inside setup-toolchain is
+      # the one install a caller cannot reach: a consumer can wrap the installs
+      # in its own repo-owned jobs, but every shared tier installs inside the
+      # composite and a caller cannot inject a step there. So when a pnpm
+      # install WEDGES, the tier holds its runner until timeout-minutes kills
+      # it and reds ci-required on a diff that could not have caused it.
+      #
+      # Measured in Beestera/swarm-os on 2026-09-14 (run 34876024126, pnpm
+      # 11.5.2): `Lint & format` entered `Setup toolchain` and never left it,
+      # its pnpm process accumulating 20.99s of CPU across 27 MINUTES — flat,
+      # sleeping at 0%, with ~1,200 descriptors open on the store's SQLite
+      # index.db. The Checkout before it took 6s. Two jobs wedged that way in
+      # the same window with DIFFERENT store topologies, so store isolation is
+      # not the remedy.
+      #
+      # These default ON, unlike trust-lockfile and checkout-clean-excludes.
+      # Those surface pre-existing consumer debt, so an unchanged-on-pin-bump
+      # default is the right one for them. This cannot: it fires only on a tree
+      # that has been provably under 5% CPU for ten unbroken minutes, which is
+      # longer than the entire budget of the coverage-floor (5) and
+      # workflow-lint (10) tiers. Set install-stall-timeout: '0' to switch it
+      # off and get exactly the unsupervised install that ran before.
+      #
+      # It does not make a wedged tier pass. The tier still fails — it fails in
+      # minutes with a cause, and it releases the runner.
+      install-stall-timeout:
+        description: >
+          Passed through to setup-toolchain's `install-stall-timeout` input on
+          every call site. Seconds the install's process tree may stay below
+          install-min-cpu-rate before the watchdog kills it and fails the step
+          with exit 75. '0' disables supervision entirely.
+        required: false
+        type: string
+        default: '600'
+
+      install-stall-grace:
+        description: >
+          Passed through to setup-toolchain's `install-stall-grace` input.
+          Seconds after the install starts during which the watchdog does not
+          arm at all, because a cold install is legitimately quiet early.
+        required: false
+        type: string
+        default: '120'
+
+      install-min-cpu-rate:
+        description: >
+          Passed through to setup-toolchain's `install-min-cpu-rate` input. The
+          CPU floor as a fraction of one core (0..1), measured as the mean
+          accumulated CPU of the install's whole process TREE over the trailing
+          install-stall-timeout window. The wedge this exists for sat at ~1.3%.
+        required: false
+        type: string
+        default: '0.05'
+
       # pnpm shim destination for self-hosted runners.
       pnpm-dest:
         description: >
@@ -1177,6 +1231,9 @@ jobs:
           store-dir: ${{ inputs.toolchain-store-dir }}
           trust-lockfile: ${{ inputs.trust-lockfile }}
           packages-read-token: ${{ secrets.packages-read-token }}
+          install-stall-timeout: ${{ inputs.install-stall-timeout }}
+          install-stall-grace: ${{ inputs.install-stall-grace }}
+          install-min-cpu-rate: ${{ inputs.install-min-cpu-rate }}
 
       - name: Lint
         run: pnpm run lint

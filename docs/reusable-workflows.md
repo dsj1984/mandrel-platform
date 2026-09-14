@@ -130,6 +130,9 @@ With no inputs, every tier runs on `ubuntu-latest` with a single shard.
 | `pnpm-dest`        | string  | `''`             | Passed through to `setup-toolchain`'s `pnpm-dest`. Self-hosted callers should set this (e.g. the `runner.temp/pnpm` path) to avoid `$HOME` races. |
 | `checkout-clean-excludes` | string | `''`      | Newline-separated gitignore-syntax paths (e.g. `node_modules`) to preserve across `actions/checkout`'s clean, at **every** checkout of your repo. Empty (the default) is today's full clean, byte for byte. Set it only on a **persistent self-hosted** fleet whose workspaces are reused between jobs: everything not named is still discarded, so the guarantee is preserved rather than traded away. Does not affect the platform side-checkouts. See [Preserving a warm tree across the checkout clean](#preserving-a-warm-tree-across-the-checkout-clean-checkout-clean-excludes). |
 | `trust-lockfile`   | string  | `'false'`        | Passed through to `setup-toolchain`'s `trust-lockfile` input on **all five** `setup-toolchain` call sites (`Lint & format`, `Typecheck`, `Unit`, `Contract`, `E2E / Smoke`). Appends `--trust-lockfile` to the install step when `'true'`. Default `'false'` is byte-for-byte identical to today's behaviour. See [`trust-lockfile` — transitional lockfile-policy exception](#trust-lockfile--transitional-lockfile-policy-exception). |
+| `install-stall-timeout` | string | `'600'`      | Seconds the `setup-toolchain` install's process tree may stay below `install-min-cpu-rate` before the watchdog kills it and fails the step with **exit 75**. `'0'` disables supervision and restores the plain, unsupervised install. **This default is on** — see [Install stall supervision](#install-stall-supervision-install-stall-timeout). |
+| `install-stall-grace` | string | `'120'`        | Seconds after the install starts during which the watchdog does not arm at all. A cold install is legitimately quiet early — resolving the lockfile and opening the store costs wall clock before it costs CPU — so the floor is not applied to it. |
+| `install-min-cpu-rate` | string | `'0.05'`      | The CPU floor, as a fraction of one core (`0`–`1`), measured as the **mean accumulated CPU of the install's whole process tree** over the trailing `install-stall-timeout` window. The wedge this exists for sat at ~1.3%. |
 | `enable-harden-runner` | boolean | `true`       | Adds `step-security/harden-runner` (egress **audit** mode, non-blocking) as the first step of every tier job. Effective on GitHub-hosted `ubuntu-latest` — including when `runner` is omitted **or** empty, both of which resolve to that default; a no-op on self-hosted runners. Set `false` to opt out entirely. See [Egress audit](#egress-audit-enable-harden-runner). |
 | `enable-osv-scan`  | boolean | `true`           | Enable the OSV-scanner advisory tier (scans the lockfile/manifest tree for known dependency advisories via a pinned, checksum-verified binary; no SARIF/GHAS). Set `false` to skip. See [OSV advisory tier](#osv-advisory-tier-enable-osv-scan).                                  |
 | `osv-fail-on-severity` | string | `'high'`     | Lowest CVSS severity band that **fails** the OSV-scan tier (and therefore `ci-required`): `critical` (≥9.0), `high` (≥7.0), `medium` (≥4.0), `low` (>0), or `none` (any advisory, including unscored). Advisories below the band are reported as warnings without blocking. |
@@ -1247,6 +1250,103 @@ arbitrary pnpm-install-flags mechanism, and it does not change the canonical
 pnpm supply-chain config values from #133 — it only lets a consumer opt a
 specific install invocation out of the lockfile-resolution verification those
 values enforce.
+
+### Install stall supervision (`install-stall-timeout`)
+
+A `pnpm install` can **stop** rather than slow, and when it does inside a shared
+tier the job holds its runner until `timeout-minutes` kills it.
+
+Measured in the consumer `Beestera/swarm-os` on 2026-09-14, run
+[34876024126](https://github.com/Beestera/swarm-os/actions/runs/34876024126),
+on pnpm 11.5.2:
+
+- `ci / Lint & format` on a self-hosted runner entered `Setup toolchain` and
+  never left it.
+- Its pnpm process accumulated **20.99 s of CPU across 27 minutes** — flat,
+  re-sampled 20 s apart, sleeping at 0 %.
+- `lsof` showed roughly **1,200 file descriptors open on one file**, the
+  store's SQLite `index.db`.
+- The `Checkout` before it took **6 s**. The job was not slow; it was stopped.
+- It died on the tier ceiling, redding `ci-required` on a diff that could not
+  have caused it.
+
+**It is not store sharing.** Two jobs wedged in that window with the same
+signature and *different* store topologies — one on a fleet-shared store via
+`toolchain-store-dir`, one on its own per-runner `runner.tool_cache/pnpm-store`.
+Isolation is not the remedy.
+
+**Why the caller could not fix it.** A consumer can supervise the installs in
+its own repo-owned jobs, but every shared tier installs inside
+`setup-toolchain`'s `Install dependencies` step, and a caller cannot inject a
+step there. The measured incident was a shared tier.
+
+#### What the watchdog does
+
+`setup-toolchain` now runs the install under
+`.github/actions/setup-toolchain/pnpm-install-watchdog.mjs`, which spawns pnpm
+with its argv passed through untouched and samples the **accumulated CPU of the
+whole child process tree**.
+
+- **Progress is CPU, not output.** A wedged pnpm still holds its pipes, so
+  silence proves nothing and noise proves nothing.
+- **A stall is a rate, not an absence.** The wedge still ticked, at ~1.3 % of
+  one core. A watchdog testing "has CPU advanced at all" would never have fired
+  on the incident it exists for. The verdict is the **mean rate over a trailing
+  window**, and a burst of real work anywhere in that window defers the kill.
+- **A grace window before arming** (`install-stall-grace`, default 120 s),
+  because a cold install is legitimately quiet early.
+- **Fail-safe.** Every path that cannot answer the question — an unreadable
+  process table, an unparseable `ps` field, a config value that is not a
+  number — disarms for the rest of the run and lets the install finish under
+  its own exit status. A supervisor that can red a job on its own bug is worse
+  than the stall it prevents.
+- **A distinct exit code.** A stall kill exits **75** (`EX_TEMPFAIL`), so the
+  failure is greppable in a log and cannot be confused with anything pnpm
+  itself returns.
+
+#### It does not make a wedged tier pass
+
+The tier **still fails**. What changes is that it fails in roughly twelve
+minutes with a named cause and a measured rate in the log, instead of at the
+tier ceiling with none — and it releases the runner rather than holding it for
+the rest of the job's budget.
+
+#### Why this one defaults on
+
+Unlike [`trust-lockfile`](#trust-lockfile--transitional-lockfile-policy-exception)
+and
+[`checkout-clean-excludes`](#preserving-a-warm-tree-across-the-checkout-clean-checkout-clean-excludes),
+which surface pre-existing consumer debt and therefore ship inert, this one
+cannot: it fires only on a tree that has been provably under 5 % CPU for ten
+unbroken minutes — longer than the entire budget of the `coverage-floor` (5)
+and `workflow-lint` (10) tiers.
+
+#### Turning it off, or tuning it
+
+```yaml
+    with:
+      # Off — exactly the unsupervised install that ran before.
+      install-stall-timeout: '0'
+```
+
+```yaml
+    with:
+      # A fleet whose installs are legitimately slow and quiet: wait longer
+      # before concluding the install has stopped.
+      install-stall-timeout: '1800'
+      install-min-cpu-rate: '0.02'
+```
+
+> **Note on `ps` resolution.** Linux `ps -o time` reports whole seconds, so the
+> window has to be long enough that a busy tree cannot read as idle inside it.
+> The 600 s default has three orders of magnitude of headroom; do not lower
+> `install-stall-timeout` below a minute or so for that reason alone.
+
+#### Also worth investigating upstream
+
+~1,200 descriptors on a single SQLite file is not normal use and points at pnpm
+itself rather than at load. Worth confirming against a newer pnpm — that is not
+addressed here, and this watchdog is a containment, not a fix for the cause.
 
 ### Egress audit (`enable-harden-runner`)
 
