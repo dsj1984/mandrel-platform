@@ -496,9 +496,9 @@ on:
         description: >
           Optional token for reading a private npm registry (GitHub Packages
           etc.) during the build/snapshot jobs' install. Passed to every
-          setup-toolchain call site so a consumer whose committed .npmrc
-          authenticates a private scope via ${PACKAGES_READ_TOKEN} installs
-          cleanly on the frozen-lockfile deploy jobs. Omit for repos without a
+          setup-toolchain call site and expanded from a trusted userconfig
+          (pnpm >= 11.5.3 ignores ${PACKAGES_READ_TOKEN} in a committed
+          project .npmrc — GHSA-3qhv-2rgh-x77r). Omit for repos without a
           private-registry dependency (default behaviour unchanged).
         required: false
       # ----- worker-secrets passthrough (opt-in, Story #170) -----

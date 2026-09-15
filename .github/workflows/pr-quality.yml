@@ -916,9 +916,9 @@ on:
         description: 'Turbo team slug for remote cache scoping.'
         required: false
       # Private-registry read token (GitHub Packages etc.). Passed to every
-      # setup-toolchain call site so a consumer whose committed .npmrc
-      # authenticates a private scope via ${PACKAGES_READ_TOKEN} installs
-      # cleanly on the frozen-lockfile tiers. Optional — repos without a
+      # setup-toolchain call site and expanded from a trusted userconfig
+      # (pnpm >= 11.5.3 ignores ${PACKAGES_READ_TOKEN} in a committed project
+      # .npmrc — GHSA-3qhv-2rgh-x77r). Optional — repos without a
       # private-registry dependency omit it (default behavior unchanged).
       packages-read-token:
         description: 'Token for reading a private npm registry during install.'

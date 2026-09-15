@@ -2350,11 +2350,17 @@ tiers run without remote caching when the Turbo secrets are absent.
 
 `packages-read-token` is forwarded to every `setup-toolchain` call site and
 exported as the `PACKAGES_READ_TOKEN` environment variable for the
-`pnpm install --frozen-lockfile` step. A consumer whose committed `.npmrc`
-authenticates a private scope through that variable (e.g. a GitHub Packages
-scope such as `@acme`) then installs cleanly on every tier. Consumers with no
-private-registry dependency omit it — the variable is exported empty and
-nothing references it, so behaviour is unchanged.
+`pnpm install --frozen-lockfile` step. pnpm ≥ 11.5.3 ignores `${...}` in a
+committed project `.npmrc` for registry credentials
+([GHSA-3qhv-2rgh-x77r](https://github.com/advisories/GHSA-3qhv-2rgh-x77r)),
+so the install step also writes a job-scoped trusted userconfig that still
+expands the placeholder. A consumer whose `.npmrc` only *maps* the private
+scope (literal registry URL) then installs cleanly on every tier; keeping the
+`${PACKAGES_READ_TOKEN}` line in project `.npmrc` is no longer enough.
+Consumers with no private-registry dependency omit the secret — the variable
+is exported empty and the userconfig line expands to nothing, so behaviour is
+unchanged. Do not set `PNPM_CONFIG_NPMRC_AUTH_FILE=.npmrc` in CI: that trusts
+the pull-request `.npmrc` and re-opens the CVE.
 
 ### The `ci-required` aggregator
 
@@ -3068,8 +3074,9 @@ plaintext public build-time values.
 > `packages-read-token` secret is not a deploy/seam secret and is never mapped
 > into a deploy `env:` block. It is forwarded to each `setup-toolchain` call
 > site so the build/snapshot jobs' `pnpm install --frozen-lockfile` can read a
-> private npm registry when a consumer's committed `.npmrc` authenticates a
-> private scope through `${PACKAGES_READ_TOKEN}`. Consumers without a
+> private npm registry. `setup-toolchain` writes a trusted userconfig that
+> expands `${PACKAGES_READ_TOKEN}` (pnpm ≥ 11.5.3 ignores that placeholder in
+> a committed project `.npmrc` — GHSA-3qhv-2rgh-x77r). Consumers without a
 > private-registry dependency omit it (behaviour unchanged).
 
 ### The `gh-environment` model
