@@ -1224,7 +1224,7 @@ jobs:
       # through the first arm correctly.
       - &setup-toolchain
         name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@8d7866209dda93ed8c66a9e8500ed3d29f906d93
         with:
           cache: ${{ inputs.toolchain-cache != 'auto' && inputs.toolchain-cache || (contains(inputs.runner, 'self-hosted') && 'false' || 'true') }}
           pnpm-dest: ${{ inputs.pnpm-dest }}
