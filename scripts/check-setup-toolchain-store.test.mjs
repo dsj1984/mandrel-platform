@@ -121,6 +121,19 @@ test("the store never resolves inside the directory the pre-clean removes", () =
   );
 });
 
+test("writes a trusted GitHub Packages userconfig with the placeholder, never a resolved token", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "setup-toolchain-auth-"));
+  try {
+    runInstall({ CACHE_ENABLED: "true", RUNNER_TEMP: dir });
+    const dest = path.join(dir, "npmrc-packages-auth");
+    const body = readFileSync(dest, "utf8");
+    assert.equal(body, "//npm.pkg.github.com/:_authToken=${PACKAGES_READ_TOKEN}\n");
+    assert.doesNotMatch(body, /ghp_|github_pat_/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("pr-quality threads toolchain-store-dir to the shared setup-toolchain anchor", () => {
   const workflow = readFileSync(WORKFLOW, "utf8");
   assert.match(

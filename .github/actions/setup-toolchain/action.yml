@@ -100,13 +100,14 @@ inputs:
     description: >
       Optional token for authenticating the install step against a private npm
       registry (e.g. GitHub Packages). When set, it is exported as the
-      PACKAGES_READ_TOKEN environment variable for the pnpm install step, so a
-      consumer whose committed .npmrc authenticates a private scope through
-      that variable resolves it during the frozen install. Leave unset
-      (default '') for repos with no private-registry dependency: the variable
-      is exported empty and harmlessly ignored (nothing references it). It is
-      always exported (defaulting to '') so pnpm never hits an unset-variable
-      expansion error.
+      PACKAGES_READ_TOKEN environment variable for the pnpm install step, and
+      a job-scoped trusted userconfig is written so pnpm still expands it.
+      pnpm >= 11.5.3 ignores `${...}` in a committed project .npmrc for
+      registry credentials (GHSA-3qhv-2rgh-x77r); a consumer that still keeps
+      the placeholder only in .npmrc will 401. Leave unset (default '') for
+      repos with no private-registry dependency: the variable is exported
+      empty and the userconfig line expands to nothing. It is always exported
+      (defaulting to '') so pnpm never hits an unset-variable expansion error.
     required: false
     default: ''
   store-dir:
@@ -209,10 +210,11 @@ runs:
         CACHE_ENABLED: ${{ inputs.cache }}
         STORE_DIR_INPUT: ${{ inputs['store-dir'] }}
         TOOL_CACHE: ${{ runner.tool_cache }}
-        # Exported (defaulting to '') so a consumer whose committed .npmrc
-        # authenticates a private registry via ${PACKAGES_READ_TOKEN} resolves
-        # it during the frozen install. Empty for repos without a private dep —
-        # nothing references it, and pnpm never sees an unset-variable error.
+        # Exported (defaulting to '') so the trusted userconfig written below
+        # can expand ${PACKAGES_READ_TOKEN}. Empty for repos without a private
+        # dep — the placeholder expands to nothing, and pnpm never sees an
+        # unset-variable error. Project .npmrc is NOT trusted for this
+        # (GHSA-3qhv-2rgh-x77r).
         PACKAGES_READ_TOKEN: ${{ inputs['packages-read-token'] }}
         # Watchdog knobs (Story #530). Read by pnpm-install-watchdog.mjs, and
         # by the branch below that decides whether to invoke it at all. They are
@@ -224,6 +226,17 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -eu
+        # pnpm >= 11.5.3 ignores ${PACKAGES_READ_TOKEN} in a committed project
+        # .npmrc (GHSA-3qhv-2rgh-x77r / CVE-2026-55180). Write a job-scoped
+        # userconfig that still expands. The file holds the PLACEHOLDER, never
+        # the secret, so a leftover on self-hosted runner.temp cannot leak it.
+        # RUNNER_TEMP is always set in Actions; the `:-.` fallback is for
+        # scripts/check-setup-toolchain-store.test.mjs, which runs this body
+        # outside GHA. Do NOT set PNPM_CONFIG_NPMRC_AUTH_FILE=.npmrc: that
+        # trusts the pull-request .npmrc and re-opens the CVE.
+        auth_dir="${RUNNER_TEMP:-.}"
+        printf '%s\n' '//npm.pkg.github.com/:_authToken=${PACKAGES_READ_TOKEN}' > "${auth_dir}/npmrc-packages-auth"
+        export NPM_CONFIG_USERCONFIG="${auth_dir}/npmrc-packages-auth"
         store_dir="${STORE_DIR_INPUT}"
         if [ -z "${store_dir}" ] && [ "${CACHE_ENABLED}" != "true" ] && [ -n "${TOOL_CACHE}" ]; then
           store_dir="${TOOL_CACHE}/pnpm-store"
