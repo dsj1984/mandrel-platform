@@ -199,7 +199,7 @@ jobs:
 
       - name: Setup toolchain
         if: inputs.setup == 'toolchain'
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@8d7866209dda93ed8c66a9e8500ed3d29f906d93
         with:
           # Resolves the 'auto' default at the use site — see the input's note
           # above. Explicit 'true'/'false' passes straight through (both are

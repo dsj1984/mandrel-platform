@@ -801,7 +801,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@8d7866209dda93ed8c66a9e8500ed3d29f906d93
         with:
           cache: 'true'
           packages-read-token: ${{ secrets.packages-read-token }}
@@ -1005,7 +1005,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@8d7866209dda93ed8c66a9e8500ed3d29f906d93
         with:
           cache: 'true'
           packages-read-token: ${{ secrets.packages-read-token }}
@@ -1270,7 +1270,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup toolchain
-        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@1148395fae4ac5af0cd154223e51dc443c20cfd9
+        uses: dsj1984/mandrel-platform/.github/actions/setup-toolchain@8d7866209dda93ed8c66a9e8500ed3d29f906d93
         with:
           cache: 'true'
           packages-read-token: ${{ secrets.packages-read-token }}
