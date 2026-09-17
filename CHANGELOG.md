@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.15.2](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.15.1...mandrel-platform-v1.15.2) (2026-09-17)
+
+
+### Fixed
+
+* **ci:** expand PACKAGES_READ_TOKEN from a trusted userconfig ([#536](https://github.com/dsj1984/mandrel-platform/issues/536)) ([46fe1b3](https://github.com/dsj1984/mandrel-platform/commit/46fe1b3421ce7e47fe276dc9d4f2587a51983bd6))
+* **ci:** pin setup-toolchain to trusted auth in reusable workflows ([#538](https://github.com/dsj1984/mandrel-platform/issues/538)) ([61c5f3a](https://github.com/dsj1984/mandrel-platform/commit/61c5f3a375621e0306aea5734007d19a887fff2a))
+
 ## [1.15.1](https://github.com/dsj1984/mandrel-platform/compare/mandrel-platform-v1.15.0...mandrel-platform-v1.15.1) (2026-09-14)
 
 
